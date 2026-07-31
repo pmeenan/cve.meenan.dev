@@ -22,6 +22,82 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-006: A shallow clone reports every upstream advance as a forced update  (2026-07-31, status: worked-around)
+
+**Environment.** git 2.54.0 on `plex`, against the `--depth 1 --no-tags` clone
+of cvelistV5 (D-021).
+
+**Repro.**
+
+```bash
+git fetch --depth 1 origin main
+# + a42a2eb6c2...d300c5fcc0 main -> origin/main  (forced update)
+```
+
+**Observed.** The `+` and `(forced update)` markers appear on an ordinary
+fast-forward. A shallow clone records its single commit as a graft root with no
+parents, so the incoming commit is not a *known* descendant of the local ref;
+git cannot prove fast-forward and reports the update as forced.
+
+**Expected.** Naively, a normal fast-forward line, since upstream did nothing
+unusual — 21 changes across 21.4 hours of routine publishing.
+
+**Impact.** This is the answer to an open architecture question: **a shallow
+clone cannot distinguish a normal advance from an upstream force-push or history
+rewrite**, so `git fetch` output is worthless as a cache-invalidation signal.
+Every fetch looks like a rewrite.
+
+Worked around by not depending on it. The ingest pipeline diffs *content
+hashes* between the previous and current working tree (D-031), never git
+history, so a rewritten upstream history produces exactly the same delta as any
+other change to the same files. The signal git cannot give us is one the design
+does not consume.
+
+## RE-005: FTS5 `integrity-check` does not check external content by default  (2026-07-31, status: open)
+
+**Environment.** SQLite 3.45.1 (2024-01-30) on `plex`, native build, against the
+272.8 MB spike database with `fts USING fts5(descr, content='cve_text',
+content_rowid='cve_id')`.
+
+**Repro.** Change the content table without telling the index, then ask all
+three documented forms of the check:
+
+```sql
+UPDATE cve_text SET descr='quenelle placeholder' WHERE cve_id=1;   -- no fts 'delete'
+INSERT INTO fts(fts) VALUES('integrity-check');            -- PASSED
+INSERT INTO fts(fts, rank) VALUES('integrity-check', 0);   -- PASSED
+INSERT INTO fts(fts, rank) VALUES('integrity-check', 1);   -- "database disk image is malformed"
+```
+
+**Observed.** Only the `rank = 1` form detects the drift. The bare form and the
+explicit `0` both pass on a database whose index no longer agrees with its
+content table — and searches confirm the damage is real: the row still matches
+terms its text no longer contains.
+
+**Expected.** Nothing better, on reflection — this is documented behavior, not a
+bug. [The FTS5 documentation](https://www.sqlite.org/fts5.html) states: *"For an
+external content table, the contents of the index are only compared to the
+contents of the external content table if the value specified for the rank
+column is 1."* Verified against the documentation 2026-07-31.
+
+**Impact.** The trap is that the *obvious* invocation is the useless one. An
+agent adding a post-sync integrity check would naturally write
+`INSERT INTO fts(fts) VALUES('integrity-check')`, watch it pass, and conclude
+the index is sound — while shipping exactly the silent search corruption D-025
+hazard 2 exists to prevent. **Always pass `rank = 1`** against an
+external-content table; the bare form only proves the index is not internally
+corrupt.
+
+Cost measured on the spike database: 0.8 s for the full 55 MB index, which is
+affordable as an explicit verification action but not on every sync.
+
+**Note for re-verification.** Behavior confirmed on 3.45.1 only. The browser
+ships a different and newer SQLite via `@sqlite.org/sqlite-wasm`; re-run this in
+M1 rather than assuming it carries over.
+
+**Links.**
+- [SQLite FTS5 — the 'integrity-check' command](https://www.sqlite.org/fts5.html)
+
 ## RE-004: `git log --format=<single-token>` is rejected as a named format  (2026-07-30, status: worked-around)
 
 **Environment.** git 2.54.0 on `plex`.

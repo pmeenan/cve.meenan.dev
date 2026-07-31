@@ -18,12 +18,12 @@ the decision log, not by editing a row.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Server-side git clone of cvelistV5 as source of record | `confirmed` | D-005. Server runs git; the browser never does. |
-| Same-origin PHP ingest endpoint | `confirmed` | D-006. Sole server component; ships corpus data only. |
-| Endpoint hardening — same-origin browser callers, no open-proxy behavior | `confirmed` | D-006. Owner-stated requirement, not polish. |
+| Same-origin data delivery, corpus data only | `confirmed` | D-006, and D-032 made it static files rather than a PHP endpoint — the client sends no parameters. |
+| Endpoint hardening — same-origin browser callers, no open-proxy behavior | `confirmed` | D-006. Owner-stated requirement, not polish. D-032 moves enforcement into nginx, since there is no handler to harden. |
 | Get corpus data into local storage | `confirmed` | The cold-start path; 372,092 records. Settled as a full bulk import by D-025. |
 | Incremental update of the local copy | `confirmed` | Owner-stated: "downloading and updating the list as needed." |
 | Server-side cache of derived baseline/delta artifacts | `confirmed` | Owner-stated; avoids re-deriving from git per request. |
-| Sync watermark so the client requests only what it lacks | `confirmed` | Its identity is Q-001 — a git SHA is unavailable since D-021 made the clone shallow, so the candidates are CNA `dateUpdated` or a server-assigned content-hash sequence. |
+| Sync watermark so the client requests only what it lacks | `confirmed` | D-031: a server-assigned revision number over per-record content hashes. Stored inside the local database and advanced in the same transaction as the rows. |
 | Corpus integrity check | `confirmed` | Detects truncated or corrupted data before a user builds analysis on it. Cheap insurance against the worst failure mode. |
 | "N new CVEs since your last sync" summary | `confirmed` | Turns an invisible background chore into the reason to open the app; near-free once a watermark exists. |
 | Notice carried by every served artifact | `confirmed` | D-008 requires MITRE's copyright designation and license text in any copy; in-band where the format allows. Not discretionary. |
@@ -108,33 +108,14 @@ convention; read those references as historical.
 
 Ordered by how much rework a late answer would cause.
 
-**Q-001. What is the delta format, and what identifies a client's watermark?** Now
-   the central design question, since D-025 settled everything around it. The
-   watermark cannot be a git SHA: D-021 made the clone shallow, so the server
-   has no history to diff against. Two candidates:
-
-   - **CNA-supplied `dateUpdated`.** Present on 100% of records (D-023), so it
-     is free. But it is written by publishers, not by us — clock skew, stale
-     values, and republication without advancing it all produce silently missed
-     updates.
-   - **A server-assigned monotonic sequence over per-record content hashes.**
-     The server rebuilds the artifact after each fetch — 19 s for the whole
-     corpus (D-024), so this is cheap — hashes each record, and assigns a
-     sequence number to anything that changed. The client's watermark is the
-     last sequence it applied. Robust to bad publisher timestamps, at the cost
-     of the server storing a hash per record.
-
-   The second looks right, and notably needs no git history at all, which
-   independently validates D-021. Confirm before building. The format itself is
-   partly settled: D-025 measured positional encoding as no smaller than plain
-   JSON after gzip, so send readable JSON.
-
-   D-026 adds three sub-questions to settle here: how deltas are **merged** so a
-   client catching up a week receives each record's final state rather than every
-   intermediate revision; that the watermark after a download ends at the **last
-   delta applied**, not the snapshot's, or the next sync silently re-fetches a
-   week; and what the **snapshot cadence** should actually be, weekly being a
-   starting point rather than a finding.
+**Q-001. What is the delta format, and what identifies a client's watermark?**
+   **Answered 2026-07-31 by D-031**, measured against a real 21.4-hour upstream
+   window: a server-assigned revision number over per-record content hashes,
+   whole-record JSON at brotli -q5, merged by range query, applied in one
+   idempotent transaction. D-026's three sub-questions — merging, watermark
+   placement after download, and snapshot cadence — are answered there too.
+   **D-032** follows from it: because a delta is named by its revision range, it
+   is a static file, and the sync path needs no request handler at all.
 **Q-002. What else belongs in the schema beyond the spike floor?** D-024's 272.8 MB
    deliberately omits references (10.6% of corpus bytes), affected version
    ranges, CPE applicability, solutions, credits, and timeline — and D-011
@@ -156,15 +137,17 @@ Ordered by how much rework a late answer would cause.
    VFSes are available today and this is now purely a performance and multi-tab
    trade — measured in M1, not argued here. (This also retires D-027's concern
    that Next.js static export cannot emit headers: nginx already does.)
-**Q-005. How is the endpoint locked down, and what else must nginx be configured to
-   do?** Originally just hardening: `Sec-Fetch-Site` and `Origin` header checks,
-   rate limiting, bounded responses — which combination is enforceable here, and
-   what it does about non-browser callers that can forge headers freely. D-025
-   shrank the hardening half considerably, since the full artifact is a static
-   file and only the delta endpoint takes a parameter at all — a watermark, to
-   be validated as an opaque token and never allowed near the filesystem (D-006,
-   D-018). KEV (D-010) adds a second server-fetched source needing the same
-   treatment.
+**Q-005. How is the data plane locked down, and what else must nginx be configured
+   to do?** Originally just hardening: `Sec-Fetch-Site` and `Origin` header
+   checks, rate limiting, bounded responses — which combination is enforceable
+   here, and what it does about non-browser callers that can forge headers
+   freely. D-025 shrank it once; **D-032 shrank it again and changed its
+   character**: there is no request handler left to harden, so what remains is
+   nginx configuration over static files — the `alias` exposing `cve.data/pub/`
+   read-only, bandwidth limits on a 72 MB artifact (`limit_conn`, `limit_rate`),
+   cache headers, and whatever same-origin enforcement is worth doing given that
+   non-browser callers forge headers freely. KEV (D-010) is a third static file
+   under the same treatment.
 
    **The server-configuration half is answered (D-030).** All three dependencies
    were checked on `plex` 2026-07-31 and none of them block M1:
@@ -177,11 +160,10 @@ Ordered by how much rework a late answer would cause.
    - **COOP/COEP** — already served on `cve.meenan.dev`, copied from the
      `webai` and `keepawake` blocks.
 
-   What remains open here is the hardening itself, plus one finding D-030
-   surfaced: php-fpm runs as `pmeenan`, the user owning the clone, the artifacts,
-   *and* the document root — so a flaw in the endpoint has write access to all
-   three, when it only ever needs to read two directories. Narrowing that is a
-   hardening item, not a blocker.
+   The php-fpm privilege breadth D-030 surfaced — the pool runs as `pmeenan`,
+   the user owning the clone, the artifacts, *and* the document root — is now
+   dormant rather than urgent: under D-032 no PHP runs in the data path. It
+   returns the moment any handler is added.
 
 *Answered and removed:* corpus redistribution terms (D-008); telemetry stance
 (D-009); the privacy envelope (D-014); the range-request VFS candidate (D-015);

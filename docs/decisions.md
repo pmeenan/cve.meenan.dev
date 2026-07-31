@@ -23,6 +23,207 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-032: The whole data plane is static files — the sync path has no dynamic endpoint  (2026-07-31, status: accepted, amends D-006)
+
+**Decision.** Everything the browser fetches is a static file served by nginx: the
+snapshot, the manifest, every delta, and the KEV catalog. The client sends no
+parameters at all. D-031's fixed delta granularity is what makes this possible —
+the delta a client needs is *named* by its revision range, so it can be
+pre-built rather than computed per request.
+
+Layout under `cve.data/pub/`, exposed read-only through one nginx `alias`:
+
+```
+manifest.json                       # small, no-cache; lists everything below
+snapshot-<rev>.sqlite.br            # immutable, ~72 MB
+deltas/<from>-<to>.json.br          # immutable, hourly files + daily rollups
+kev.json                            # D-010, refreshed on its own cadence
+```
+
+The client reads `manifest.json`, compares `schema` and its local watermark,
+then fetches a greedy longest-first chain of delta files — preferring a daily
+rollup over the hourly files it covers. Retention follows D-026: files are kept
+back to the current snapshot and no further.
+
+**Context.** D-006 fixed "exactly one server endpoint," written when the design
+still assumed a request handler that took caller-supplied fields and partitions.
+D-025 removed the parameters, and D-031 removed the last one — a delta is
+identified by a revision range that the server already knows, so nothing needs
+computing at request time.
+
+**Consequences.** This *strengthens* D-006 rather than relaxing it. D-006's
+requirement is that the endpoint never accept a caller-supplied path or ref that
+reaches the filesystem; the strongest possible compliance is having no request
+handler in the data path at all. It also makes D-014 vacuous in the sync path:
+the server cannot learn a predicate from a request that carries no fields.
+
+Concretely bought:
+
+- **No injection surface.** No parameter parsing, no path assembly, no PHP in
+  the hot path. Q-005's hardening question shrinks to nginx configuration.
+- **Resumable and cacheable for free.** Immutable files get `expires max` and
+  ordinary HTTP range requests, which is most of what the resumable-download
+  feature needs (D-026 already noted this for the snapshot; it now covers
+  deltas too).
+- **No server-side cache to invalidate.** Files are built once by the pipeline
+  and never rewritten — new revisions mean new filenames.
+
+Costs and obligations:
+
+- **Complexity moves into the build pipeline**, which is ours and is not
+  attacker-facing. That is the right direction, but the rollup logic must
+  guarantee the delta files *tile the revision space contiguously*, or a client
+  at some watermark finds no chain. This is the one correctness burden the
+  design adds, and it belongs in M2's tests.
+- **Three nginx changes now, not two.** D-030's `brotli_static on;` and
+  `trailingSlash: true`, plus an `alias` exposing `cve.data/pub/` read-only.
+  The alias is required regardless: D-003's rsync mirrors `dist/` into the
+  docroot, so served data cannot live there.
+- **Rate limiting becomes an nginx concern** (`limit_conn`, `limit_rate`) rather
+  than application code. Bandwidth, not compute, is the exposure — the snapshot
+  is 72 MB.
+
+PHP is not banned by this; it is simply unused so far. Any future need for it
+returns to D-006's rules in full.
+
+**Reopen if.** A confirmed feature genuinely needs a computed response — at
+which point the question is whether it can be pre-built into a named file
+instead, and only then whether it needs a handler.
+
+## D-031: The delta protocol — content-hash revisions, whole records, merged by range  (2026-07-31, status: accepted, answers Q-001)
+
+**Decision.** Six parts, each measured against a real 21.4-hour upstream window
+on 2026-07-31 (`a42a2eb6c2` → `d300c5fcc0`).
+
+1. **The watermark is a server-assigned revision number.** A monotonic integer
+   `rev`, incremented once per ingest run that produced any change. Not a
+   publisher timestamp, not a git SHA. The client's watermark is the last `rev`
+   it has fully applied.
+2. **Change is detected by hashing the normalized projection**, not the file.
+   Each ingest run walks the working tree, computes a hash over exactly the
+   fields we store, and diffs against the previous run's hashes. Changed or new
+   → upsert; present before and absent now → tombstone. The server keeps a
+   `rev` alongside each record's hash.
+3. **Deltas carry whole records, never field-level diffs.** Replacement
+   semantics: delete the record's dependent rows, insert the new ones.
+4. **Merging is a range query, not a delta-combining step.** A delta for
+   `(from, head]` is every row whose `rev > from` — one query, always each
+   record's final state, no intermediate revisions replayed. Interned lookup
+   rows carry a `rev` too and are selected the same way, so a delta always ships
+   the lookup rows its upserts reference.
+5. **The wire format is JSON, brotli-q5**, with `lookups` ordered before
+   `upsert`, a `delete` array of CVE IDs, `format` and `schema` versions, and
+   the D-008 notice in-band.
+6. **Apply is one SQLite transaction, and the watermark lives inside the
+   database**, written in that same transaction. A crash mid-sync rolls back to
+   the previous consistent state with a watermark that still matches it.
+
+```json
+{"format":1,"schema":1,"from":1204,"to":1236,
+ "generated":"2026-07-31T23:12:13Z","notice":"CVE® is a trademark of …",
+ "lookups":{"cna":[],"cwe":[[798,"CWE-1395","…"]],
+            "vendor":[[24421,"acme"]],"product":[[80149,24421,"widget"]]},
+ "upsert":[{"id":"CVE-2026-14537","y":2026,"st":1,"cna":12,
+            "pub":"…","upd":"…","cvss":[31,7.5,"HIGH","CVSS:3.1/…"],
+            "cwe":[412],"prod":[80149],"descr":"…"}],
+ "delete":[]}
+```
+
+**Context.** Measured rather than argued. The clone was hashed at
+`a42a2eb6c2`, fetched forward 21.4 hours to `d300c5fcc0`, and re-hashed:
+
+| | |
+| --- | --- |
+| Records before → after | 372,092 → 372,322 |
+| Added / updated / **removed** | 230 / 435 / **0** |
+| New lookup rows | 17 vendors, 86 products, 1 CWE, 0 CNAs; **0 vanished** |
+| Delta payload | 382 KB JSON → **95 KB gzip -9 → 87 KB brotli -q5** |
+| Description text | 62% of the uncompressed payload |
+| `git fetch --depth 1` | 1.8 s |
+| Full-corpus hash pass | 15–18 s (the same pass that rebuilds the artifact) |
+| Apply to the 272.8 MB database | **0.08 s**, FTS maintenance included |
+
+Each decision above is answering something specific:
+
+*Why a server-assigned rev rather than `dateUpdated`* (the Q-001 fork): the
+timestamp is publisher-written, so it inherits publisher clock skew and
+republication that does not advance it. The content-hash pass costs 15–18 s and
+is the same walk that rebuilds the artifact, so the robust option is
+effectively free. It also cross-validated: the hash diff found exactly 665
+distinct changed records, matching the 665 distinct IDs in upstream's own
+`deltaLog.json` over the same window.
+
+*Why hash the normalized projection rather than the file*: the hypothesis was
+that dropping `x_legacyV4Record` and `adp` (D-024) would filter out churn that
+changes nothing we store. **It did not** — all 435 raw-byte changes also changed
+the projection, because `dateUpdated` is stored and is bumped on every
+republish. The projection hash is still the right thing to hash, since it is the
+definition of "changed" the client cares about, but it buys no filtering. One
+number worth knowing: **63% of updates change nothing but `dateUpdated`** (275 of
+435). That is the ongoing cost of keeping last-modified (D-020), and at 87 KB a
+day it is not worth reconsidering.
+
+*Why whole records rather than field diffs*: 62% of the payload is description
+text, which is the field most likely to actually change, so diffing saves
+little; and replacement is idempotent, which turns out to matter more.
+
+*Why merge by range query*: a client catching up a week would otherwise replay
+every intermediate revision. Merging one day collapsed 832 upstream change
+events into 665 rows — a 20% saving on payload, but the real win is one request
+instead of 32. Because the server stores `rev` per record, "merged delta" needs
+no merge logic at all; the range query returns final state by construction.
+
+Three hazards were tested rather than reasoned about:
+
+- **FTS5 external content (D-025 hazard 2) is maintainable and cheap.** Explicit
+  `INSERT INTO fts(fts, rowid, descr) VALUES('delete', …)` with the *old* text,
+  then re-insert. 665 records applied in 0.08 s against the 55 MB index. Eight
+  repeated applies of the same delta grew the database 0.1 MB total, so no
+  `'optimize'` is needed per sync — it is a maintenance action, not part of
+  apply. **Verification must use `rank = 1`**; the default form passes on a
+  drifted index (RE-005).
+- **Apply is idempotent.** Eight applications of the same delta produced
+  identical row counts and a stable file size. An interrupted sync is safe to
+  retry with no reconciliation logic.
+- **Deletions barely exist.** Zero records vanished in the window, and
+  upstream's `deltaLog.json` — 923 entries covering a rolling 30 days — models
+  only `new`, `updated`, and `error`. There is no deletion concept upstream;
+  withdrawal is `state: REJECTED` (D-022). Tombstones ship anyway because *our*
+  ingest can lose a record to a bad fetch, which is also why the pipeline aborts
+  rather than publishes if a run would tombstone more than 0.1% of the corpus
+  (~370 records).
+
+**Consequences.** D-026's three sub-questions are answered. **Delta merging**:
+by range query, above. **Watermark after download**: the snapshot embeds its own
+`rev` in a `meta` table, so the client reads its watermark *out of the artifact*
+and cannot end up holding the wrong one; it then fetches deltas from that rev.
+**Snapshot cadence**: the measured rate is ~750 distinct records/day ≈ 87 KB
+compressed, so a month of catch-up would cost a new user ~2.6 MB against a 72 MB
+snapshot — under 4%. Weekly stays the default because it bounds the delta file
+count, not because monthly would hurt.
+
+One schema change falls out of this, and it is the kind a read-only benchmark
+never surfaces. Replacement semantics delete a record's dependent rows by
+`cve_id`; `cve_prod` has an index for that and **`cve_cwe` does not** — its only
+index is `(cwe_id, cve_id)`. Adding `CREATE INDEX ON cve_cwe(cve_id)` took delta
+apply from **1.53 s to 0.08 s, a 19× difference**, for 2.2 MB of index. The
+production schema needs indexes chosen for writes as well as reads.
+
+Two open architecture questions close. FTS delta cost: measured, negligible.
+Cache invalidation on a rewritten upstream history: moot — the pipeline diffs
+content hashes, never git history, so a force-push produces the same delta as
+any other change (RE-006).
+
+All timings are native SQLite on server hardware. The apply path runs in
+SQLite/WASM in a browser, and 0.08 s has enough headroom that this is not
+expected to be the problem — but it is Q-003's job to confirm it, not this
+entry's to assume it.
+
+**Reopen if.** Upstream begins deleting records in volume, publishes fast enough
+that per-run deltas stop being small, or a schema addition (Q-002) makes
+whole-record replacement expensive enough that field-level diffs start paying
+for themselves.
+
 ## D-030: Server configuration baseline, and the two changes M1 needs  (2026-07-31, status: accepted)
 
 **Decision.** Adopt the existing `cve.meenan.dev` nginx block as the baseline.

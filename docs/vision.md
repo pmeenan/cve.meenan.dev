@@ -58,7 +58,7 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
    carries a filter value, a search term, or any indication of what is being
    asked. Analysis — filtering, aggregation, ranking, search — runs entirely on
    the client. D-014 permits requests to name fields and partitions; D-025
-   removed even that, so the endpoint learns nothing about the query at all.
+   removed even that, so the server learns nothing about the query at all.
 5. **It works offline, fully.** Once downloaded, the client holds the entire
    corpus (D-025), so search, analysis, and reporting all work with the network
    disconnected. Only Download and Sync need it.

@@ -42,21 +42,25 @@ evidence.
 - [x] **Research: server configuration baseline.** Read from `plex` — brotli
       modules loaded, COOP/COEP already served, php-fpm as `pmeenan` (D-030).
       Answers most of Q-005.
-- [ ] **Design: the delta protocol.** The last substantial design work. Settle
-      the watermark, delta format, merging, tombstones, and schema-version
-      handling — addressing D-025's four hazards and D-026's three additions.
-      Answers Q-001.
+- [x] **Design: the delta protocol.** Server-assigned revisions over per-record
+      content hashes, whole-record JSON merged by range query, applied in one
+      idempotent transaction (D-031) — measured against a real 21.4-hour
+      upstream window rather than designed on paper. D-025's four hazards and
+      D-026's three additions are all discharged. Answers Q-001, and led to
+      D-032: the data plane is static files with no request handler.
 - [ ] **Decide: schema completeness.** What goes in beyond the D-024 floor:
       references (and FTS over them, per D-011), version ranges, CPE
       applicability, solutions, credits, timeline. Re-measure the artifact
       afterwards. Answers Q-002.
-- [ ] **Design: endpoint hardening.** The half of Q-005 D-030 did not answer:
-      `Sec-Fetch-Site`/`Origin` checks, rate limiting, bounded responses, and
-      whether to narrow php-fpm's privileges.
+- [ ] **Design: data-plane hardening.** The half of Q-005 that D-030 did not
+      answer, reshaped by D-032 — with no request handler left, this is nginx
+      configuration over static files: the read-only `alias`, bandwidth limits
+      on a 72 MB artifact, cache headers, and what same-origin enforcement is
+      worth doing against callers who can forge headers.
 - [ ] First full draft of [architecture.md](architecture.md), replacing the
       skeleton.
 
-**Exit criteria:** the four items above are checked, with decision-log entries
+**Exit criteria:** the three remaining items above are checked, with decision-log entries
 for the significant calls; architecture.md's first full draft is reviewed. Per
 D-029, Q-003 and Q-004 are **not** M0 exit criteria — they need a running
 browser and are answered in M1.
@@ -69,8 +73,9 @@ deferred measurements. Deliberately narrow and deliberately complete.
 Scope: Next.js 16 + React 19 project with `output: 'export'`, `distDir: 'dist'`,
 `trailingSlash: true` (D-027, D-030); TypeScript strict, Vitest, Playwright,
 ESLint + Prettier, pnpm; license-audit script (D-002); `rsync` deploy script;
-`brotli_static on;` added to the nginx block; a PHP endpoint in `public/`
-serving a **bounded slice** of the corpus; SQLite/WASM in a Worker persisting to
+the nginx changes from D-030 and D-032 (`brotli_static on;`, `trailingSlash`,
+and the read-only `alias` onto `cve.data/pub/`); a **bounded slice** of the
+corpus published there as a static file; SQLite/WASM in a Worker persisting to
 OPFS; one query rendered in the UI carrying the D-008 notice.
 
 - Q-003: import wall-clock, peak memory, OPFS footprint, and WASM query latency.
@@ -78,23 +83,27 @@ OPFS; one query rendered in the UI carrying the D-008 notice.
   question, since D-030 confirmed COOP/COEP are already served.
 - Confirm Next copies `public/` into the export root, per D-027's open caveat.
 
-**Exit criteria:** the deployed site loads from `cve.meenan.dev`, fetches a
-slice through the endpoint, stores it in OPFS, and renders one real query
+**Exit criteria:** the deployed site loads from `cve.meenan.dev`, fetches the
+published slice, stores it in OPFS, and renders one real query
 result; Q-003 numbers recorded and vision criteria 1 and 3 given real budgets;
 Q-004 decided and recorded; checks run green in CI-equivalent form.
 
 ## M2 — Full-corpus Download and Sync  `pending`
 
-Scope: the server-side build pipeline (scheduled `git fetch` → normalize →
-weekly snapshot → compress → publish) and the delta generator; the Download
-action fetching snapshot plus catch-up deltas with progress and resumption; the
-Sync action applying merged deltas non-destructively; FTS index maintenance,
-tombstones, integrity check, and the visible staleness indicator.
+Scope: the server-side build pipeline (scheduled `git fetch` → hash → normalize
+→ publish deltas → weekly snapshot → compress) and the D-031 delta generator,
+including the rollup that keeps delta files tiling the revision space
+contiguously and the tombstone-volume abort; the Download action fetching
+snapshot plus catch-up deltas with progress and resumption; the Sync action
+applying merged deltas non-destructively; FTS index maintenance verified with
+`integrity-check` at `rank = 1` (RE-005), and the visible staleness indicator.
 
 **Exit criteria:** a browser downloads the full 372,092-record corpus and
 queries it; a sync applies a real day of upstream changes and the result is
-verified identical to a freshly built database; an interrupted download and an
-interrupted sync both leave a usable prior state.
+verified identical to a freshly built database; a client at *any* watermark back
+to the current snapshot finds a covering chain of delta files; an interrupted
+download and an interrupted sync both leave a usable prior state, and re-running
+either is safe.
 
 ## M3 — Schema and query  `pending`
 
@@ -121,10 +130,10 @@ charted and exportable, with REJECTED records excluded by default (D-022).
 Scope: storage quota and eviction handling, multi-tab behavior per the Q-004
 outcome, browser capability gating against the D-016 floor, the diagnostics
 panel (the only support channel, given D-009), endpoint rate limiting, and an
-adversarial review pass over the endpoint.
+adversarial review pass over the published data plane.
 
 **Exit criteria:** the app degrades honestly on an unsupported browser, under
-quota pressure, and in a second tab; the endpoint survives an adversarial pass;
+quota pressure, and in a second tab; the data plane survives an adversarial pass;
 public launch.
 
 ## M6 — CISA KEV overlay  `pending`

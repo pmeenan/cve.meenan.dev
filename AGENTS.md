@@ -5,9 +5,9 @@ List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, 372,09
 records and growing. The entire data plane runs in the browser: the corpus is
 normalized server-side into a ~72 MB compressed SQLite database, downloaded on
 demand into OPFS, and queried locally — so no search or report ever leaves the
-client. One locked-down same-origin PHP endpoint serves that snapshot and its
-deltas; it performs no analysis. Almost all code is written by AI agents working
-from the project documentation, directed and reviewed by a human.
+client. The server serves that snapshot and its deltas as static files and
+performs no analysis. Almost all code is written by AI agents working from the
+project documentation, directed and reviewed by a human.
 
 **Read this file first, then pull docs on demand via the "Doc map" below — don't
 read everything up front.** This file is long-term project memory and the
@@ -23,21 +23,23 @@ affected docs. Until then, these govern.
   charting, and export all happen in the browser. Any proposal to move analysis
   server-side for performance is a constraint change, not an optimization.
   (D-007)
-- **The endpoint may learn fields and partitions, never predicates.** The client
-  may ask for "these columns, these year ranges." It must never send a filter
-  value (`vendor = cisco`), a search term, or anything else that would let the
-  server evaluate the query. Selecting data is allowed; executing analysis is
-  not. (D-014)
+- **The server may learn fields and partitions, never predicates.** It must
+  never receive a filter value (`vendor = cisco`), a search term, or anything
+  else that would let it evaluate the query. Selecting data is allowed;
+  executing analysis is not. As built this is stronger than the rule requires —
+  the client sends no parameters at all — but the rule is the floor. (D-014,
+  D-032)
 - **Nothing is collected from users — no telemetry, ever.** Not analytics, not
   error reporting, not opt-in. This makes the privacy claim verifiable in a
   network panel rather than a promise. Do not add a reporting channel; improve
   the diagnostics panel instead. (D-009)
-- **Exactly one server endpoint, and it only ships corpus data.** Ingest is a
-  same-origin PHP endpoint under `https://cve.meenan.dev/`. It must never accept
-  a caller-supplied URL, path, or ref that reaches the filesystem or network —
-  that is what turns it into an open proxy. It serves derived CVE data and
-  nothing else, restricted to same-origin browser callers and rate-limited.
-  (D-006)
+- **The data plane is static files, and no request handler stands in it.** The
+  snapshot, manifest, deltas, and KEV catalog are pre-built files served by
+  nginx from `cve.data/pub/`; the client sends no parameters. Adding a dynamic
+  endpoint is a constraint change: it must serve derived CVE data and nothing
+  else, must never accept a caller-supplied URL, path, or ref that reaches the
+  filesystem or network, and must be same-origin-restricted and rate-limited.
+  (D-006, D-032)
 - **The git clone lives on the server, never in the browser.** cvelistV5 is
   ~2.4 GB and every GitHub bulk-download path is CORS-blocked, so in-browser git
   is out. The server maintains the clone and derives baselines and deltas from

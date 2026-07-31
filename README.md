@@ -10,9 +10,9 @@ query it locally from then on.
 
 - **Your queries stay on your machine.** Records are stored in SQLite compiled
   to WebAssembly and persisted to OPFS, and every search, filter, aggregate, and
-  report is evaluated client-side. A single same-origin endpoint feeds data in
-  and runs no analysis: it may be told which fields and time ranges to send, but
-  never a filter value or a search term.
+  report is evaluated client-side. The server hands over static files and runs
+  no analysis — it never sees a filter value, a search term, or any other
+  request parameter.
 - **A real database, not a search box.** The corpus lands as a queryable
   relational store, so questions a keyword search cannot answer are in reach.
 - **Kept current.** The local copy updates incrementally rather than by
