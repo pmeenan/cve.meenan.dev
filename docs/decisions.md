@@ -23,6 +23,93 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-030: Server configuration baseline, and the two changes M1 needs  (2026-07-31, status: accepted)
+
+**Decision.** Adopt the existing `cve.meenan.dev` nginx block as the baseline.
+Two changes are required before M1 ships, both small:
+
+1. Add `brotli_static on;` to the server block, so a precompressed `.br` snapshot
+   (D-026) is served with `Content-Encoding: br`.
+2. Set `trailingSlash: true` in `next.config.js` rather than editing `try_files`.
+   Next then emits `/route/index.html`, which the existing
+   `try_files $uri $uri/ =404;` already resolves — no nginx routing change.
+
+**Context.** Read directly from `plex` on 2026-07-31, answering most of Q-005:
+
+| Fact | Value |
+| --- | --- |
+| nginx | 1.30.2, `--with-http_gzip_static_module` |
+| brotli modules | `ngx_http_brotli_filter_module.so` **and** `..._static_module.so`, both loaded at `nginx.conf:1-2` |
+| brotli directives | **none anywhere** — modules loaded but not enabled |
+| COOP/COEP on `cve.meenan.dev` | **already set**, at server level and in the HTML location |
+| Routing | `try_files $uri $uri/ =404;` — no `$uri.html` |
+| PHP | `include php.conf` → php-fpm 8.4 over a unix socket, running as **user `pmeenan`** |
+| PHP path safety | `if (!-f $document_root$fastcgi_script_name) { return 404; }` |
+| Cache headers | HTML `no-cache, must-revalidate`; `expires max` for `js|css|png|jpg|…` |
+
+**Consequences.** The most significant finding removes a blocker rather than
+adding one: **COOP/COEP are already served**, copied from the `webai` and
+`keepawake` blocks where the owner uses the same pattern. So the `opfs` VFS is
+available today, and D-027's warning that Next.js static export cannot emit
+response headers is moot — nginx already emits them. Q-004 is now a pure
+performance-and-concurrency question with no server-config obstacle on either
+side.
+
+php-fpm running as `pmeenan` means the endpoint can read
+`/var/www/meenan.dev/cve.data/` (D-018) with no permission work. That
+convenience is also a hazard worth recording: the endpoint runs as the user that
+owns the clone, the artifacts, *and* the document root, so a flaw in it has
+write access to all three. The endpoint only ever needs to read two
+directories. Tightening that — a dedicated pool user, or read-only paths — is a
+Q-005 hardening item, not a blocker.
+
+Two smaller gaps: the `expires max` list covers `js|css|png|…` but not
+`.sqlite`, `.br`, or `.wasm`, so the weekly snapshot would not get long-lived
+cache headers it deserves; and `application/wasm` is in `gzip_types` but the
+snapshot's type is not.
+
+**Reopen if.** The host's nginx is rebuilt without the brotli modules, or the
+PHP pool arrangement changes.
+
+## D-029: M0 closes on planning questions; measurement spikes move to M1  (2026-07-31, status: accepted, amends the M0 exit criteria)
+
+**Decision.** M0's exit criteria no longer require every open question answered.
+Q-003 (browser-side budgets) and Q-004 (OPFS VFS selection) move into M1, where
+they are measured against real scaffolding. M0 closes when the *planning*
+questions are settled: the delta protocol, schema completeness, the architecture
+draft, and the milestone ladder.
+
+**Context.** Stated by the project owner 2026-07-31: *"we don't have to have all
+of the answers up front, we can iterate as we go since we will discover more as
+we build."* The trigger was a sequencing problem — Q-003 and Q-004 both require
+running SQLite/WASM in a real browser under Playwright, and no application
+scaffolding exists, so M0 as originally written could not close without either
+building a throwaway harness or pulling M1 forward.
+
+The original criteria were written deliberately airtight, so relaxing them
+deserves a reason rather than just permission. The reason holds: M0's purpose
+was to stop us building on unexamined assumptions, and the assumption with the
+most rework attached — how data reaches the client — was settled with
+measurements in D-024 through D-026. Q-003 and Q-004 are measurements *of an
+implementation*, not inputs to a design; deferring them risks tuning, not
+rework.
+
+**Consequences.** M1 gains two spikes and stops being purely scaffolding, which
+is honest — the "smallest change that exercises the riskiest substrate" was
+always going to answer these. If Q-003's browser numbers come back bad, the
+fallback is already identified in D-024 and D-025: ship the ~86 MB of structured
+data first and defer text plus FTS. That is a real risk being carried
+deliberately into M1 rather than retired in M0.
+
+More broadly this sets the project's posture: milestones close on what they can
+honestly settle, and open questions may cross milestone boundaries so long as
+they stay recorded. Silent drift is still forbidden — a question moving between
+milestones is a plan edit, not a quiet reprioritization.
+
+**Reopen if.** Deferred questions start accumulating faster than they are
+answered, which would mean the posture has become an excuse rather than a
+sequencing choice.
+
 ## D-028: UI dependencies must be free and open-source  (2026-07-31, status: accepted)
 
 **Decision.** Grid, charting, and editor components must be OSS under a

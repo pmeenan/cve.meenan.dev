@@ -1,124 +1,137 @@
 # Plan
 
 **This is a living document.** Milestones will be re-scoped, re-ordered, split,
-or added as planning conversations and findings come in. That churn is
-expected; what is *not* allowed is silent change. Scope changes get a
-decision-log entry; progress is reflected here by checking boxes and updating
-status lines as work lands.
+or added as work and findings come in. That churn is expected; what is *not*
+allowed is silent change. Scope changes get a decision-log entry; progress is
+reflected here by checking boxes and updating status lines as work lands.
 
 Check a box only when the item is done and verified; partially done items stay
 unchecked, optionally with a note.
+
+Per D-029, open questions may cross milestone boundaries so long as they stay
+recorded — a milestone closes on what it can honestly settle, not on everything
+it touched.
 
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
 ## M0 — Plan the plan  `in progress`
 
-Goal: turn the initial feature list into a settled vision, feature matrix,
-architecture, and milestone ladder — through planning conversations with the
-project owner plus targeted research and spikes where a decision needs evidence.
+Goal: settle vision, feature matrix, architecture, and the milestone ladder,
+through planning conversations plus targeted research where a decision needs
+evidence.
 
-- [x] Repo scaffolding for the AI-directed workflow (this scaffold), including
-      the CORS and repository-size measurements that forced D-005 and D-006.
-- [x] **Feature triage.** First full pass ran 2026-07-30; the significant calls
-      are D-009 through D-013. Two open questions closed (telemetry, and the
-      terms question already closed by D-008), and D-011 narrowed the
-      data-delivery question from three candidates to two. The four rows it left
-      gated were resolved by D-025, so every ledger row is now settled.
+- [x] Repo scaffolding for the AI-directed workflow, including the CORS and
+      repository-size measurements that forced D-005 and D-006.
+- [x] **Feature triage.** All 55 ledger rows resolved (D-009 – D-013, D-025).
 - [x] **Provision the corpus on `plex`.** Shallow clone at
-      `/var/www/meenan.dev/cve.data/git/cvelistV5` (D-018, D-021) — 68 s,
-      280.55 MiB pack, 372,092 records at `a42a2eb6c2`. Verified `cve.data/` is
-      not web-reachable. Measured corpus facts are in
-      [architecture.md](architecture.md); the "~300k records" figure used in
-      earlier planning was low, and the corpus is 2,934 MB of raw JSON. Initially
-      provisioned blobless with full history, then re-provisioned shallow once
-      D-020 removed the only consumer of that history.
-- [x] **Spike: normalization.** Built the normalized artifact against the full
-      corpus (D-024, D-023): 2,934 MB of raw JSON becomes a 272.8 MB queryable
-      database, 98.7 MB gzipped, in a 19 s build. Measured delta economics too —
-      median day 0.17 MB gzipped against a 98.7 MB full download. Together these
-      resolved Q-001 without needing the planned bake-off: the owner
-      chose bulk import with explicit Download and Sync actions (D-025).
-- [ ] **Design: the delta protocol.** The main remaining design problem, and the
-      one most likely to be underestimated. Settle the watermark (server-assigned
-      content-hash sequence versus CNA-supplied `dateUpdated`), the delta format,
-      tombstones for removed records, and how schema-version changes force a full
-      re-download. Must address the four hazards enumerated in D-025 — stable
-      server-owned lookup IDs, FTS5 external-content maintenance, tombstones, and
-      non-destructive apply. Answers Q-001.
-- [ ] **Decide: schema completeness.** What goes in beyond the D-024 floor —
-      references (and FTS over them, per D-011), affected version ranges, CPE
-      applicability, solutions, credits, timeline. Every addition grows the
-      download every user takes, so re-measure the artifact after deciding.
-      Answers Q-002.
-- [ ] **Spike: browser-side budgets.** Import the full artifact in a real
-      browser under Playwright and measure what server hardware could not:
-      wall-clock to usable, peak memory, OPFS footprint, and query latency under
-      WASM for the owner's motivating query and a full-text search. This is what
-      confirms or breaks D-025. Answers Q-003 and gives vision criteria
-      1 and 3 real numbers.
-- [ ] **Spike: OPFS VFS selection.** Test `opfs` and `opfs-sahpool` against a
-      corpus-scale database, including what nginx must send for COOP/COEP and
-      what a second tab does under each. Answers Q-004.
-- [ ] **Spike: endpoint hardening.** Determine what same-origin enforcement is
-      achievable in this nginx/PHP setup, with a working demonstration of both
-      the allowed path and a blocked cross-origin attempt, plus rate limiting.
-      Smaller than originally scoped — D-025 makes the full artifact a static
-      file, leaving only the delta endpoint's watermark parameter to validate.
-      Answers Q-005.
-- [x] **Research: corpus redistribution terms.** Confirmed against the terms
-      source on 2026-07-30 — permissive grant, single notice obligation. Recorded
-      as D-008; the resulting attribution surfaces are `proposed` rows for
-      triage.
+      `cve.data/git/cvelistV5` (D-018, D-021) — 68 s, 280 MiB pack, 372,092
+      records. Measured corpus facts in [architecture.md](architecture.md).
+- [x] **Spike: normalization.** 2,934 MB of raw JSON → a 272.8 MB queryable
+      database, 72.1 MB brotli, built in 19 s (D-023, D-024). Delta economics
+      measured alongside: median day 0.17 MB.
+- [x] **Settle the data-delivery architecture.** Bulk import with explicit
+      Download and Sync, snapshot rebuilt weekly with catch-up deltas
+      (D-025, D-026).
+- [x] **Research: corpus redistribution terms.** Permissive grant, single notice
+      obligation (D-008).
 - [x] **Research: browser support floor.** Chrome/Edge 108+, Firefox 111+,
-      Safari 16.4+ — from MDN browser-compat-data, not recollection. The floor is
-      set by the *synchronous* forms of the sync-access-handle methods, which
-      shipped later than the interface itself. Recorded as D-016.
-- [x] **Toolchain decisions.** React 19 on Next.js 16 static export, TypeScript 7
-      strict, Vitest + Playwright, ESLint + Prettier, pnpm, plain PHP 8.4. UI
-      components restricted to OSS licenses. All licenses verified MIT or
-      Apache-2.0. Recorded as D-017, then D-027 and D-028 after the owner
-      revisited the UI framework — bundle size deprioritized in favour of
-      framework richness and SSG.
+      Safari 16.4+ (D-016).
+- [x] **Toolchain decisions.** React 19 on Next.js 16 static export, TypeScript
+      strict, Vitest + Playwright, ESLint + Prettier, pnpm, plain PHP 8.4;
+      OSS-only UI components (D-017, D-027, D-028).
+- [x] **Research: server configuration baseline.** Read from `plex` — brotli
+      modules loaded, COOP/COEP already served, php-fpm as `pmeenan` (D-030).
+      Answers most of Q-005.
+- [ ] **Design: the delta protocol.** The last substantial design work. Settle
+      the watermark, delta format, merging, tombstones, and schema-version
+      handling — addressing D-025's four hazards and D-026's three additions.
+      Answers Q-001.
+- [ ] **Decide: schema completeness.** What goes in beyond the D-024 floor:
+      references (and FTS over them, per D-011), version ranges, CPE
+      applicability, solutions, credits, timeline. Re-measure the artifact
+      afterwards. Answers Q-002.
+- [ ] **Design: endpoint hardening.** The half of Q-005 D-030 did not answer:
+      `Sec-Fetch-Site`/`Origin` checks, rate limiting, bounded responses, and
+      whether to narrow php-fpm's privileges.
 - [ ] First full draft of [architecture.md](architecture.md), replacing the
-      current skeleton.
-- [ ] Rewrite the provisional ladder below into real milestones with exit
-      criteria.
+      skeleton.
 
-**Exit criteria:** every checklist item above is checked; every `proposed` row
-in features.md is resolved **and every features.md open question answered**,
-with decision-log entries for the significant calls; architecture.md first
-draft reviewed; toolchain decided; M1+ milestones have scopes and exit
-criteria. Nothing on this list is optional — M0 is not done while any item
-above remains open.
+**Exit criteria:** the four items above are checked, with decision-log entries
+for the significant calls; architecture.md's first full draft is reviewed. Per
+D-029, Q-003 and Q-004 are **not** M0 exit criteria — they need a running
+browser and are answered in M1.
 
-## Provisional milestone ladder  `pending — to be rewritten in M0`
+## M1 — Scaffolding, one end-to-end path, and the browser measurements  `pending`
 
-Ordered by risk: platform substrate and one working end-to-end path before
-breadth. Sketch only — do not start work from these entries. They freely
-reference `proposed` features.md rows, and nothing here pre-empts the M0 triage.
+The smallest change that exercises every risky layer for real, plus the two
+deferred measurements. Deliberately narrow and deliberately complete.
 
-- **M1 — Scaffolding and one honest end-to-end path.** Toolchain, strict
-  compiler settings, tests, license audit, and the rsync deploy script — plus
-  the smallest change that exercises the riskiest substrate for real: server-side
-  clone → whatever delivery mechanism M0 picked → a WASM SQLite database on
-  OPFS → one query rendered in the UI, carrying the D-008 notice. Deliberately
-  narrow and deliberately complete, so every layer is proven before anything is
-  built on it.
-- **M2 — Ingest at full scale.** Bulk import across the whole corpus (D-025):
-  the Download action with progress, resumption, and integrity checking; the
-  Sync action with the delta protocol and its four hazards; the server-side
-  fetch job and artifact build. Ends with the corpus reliably reachable from a
-  browser and staying current.
-- **M3 — Schema and query.** The real schema: CVSS, CWE, CPE, and product
-  extraction into queryable columns, full-text search, indexing tuned against
-  measured query latency, schema versioning and migration, and the raw SQL
-  console.
-- **M4 — Analysis and reporting.** Structured filtering UI, aggregate and trend
-  reporting, charting, saved queries, shareable query permalinks, and result
-  export. This is where the tool becomes worth the import.
-- **M5 — Resilience and public launch.** Storage quota and eviction handling,
-  multi-tab behavior, browser capability gating, the diagnostics panel, endpoint
-  rate limiting and an adversarial pass over the endpoint, then launch.
-- **M6 — CISA KEV overlay.** The only overlay that survived triage (D-010).
-  Server-side fetch and cache, joined to the corpus client-side. Small and
-  self-contained, which is why it can sit last without blocking anything.
+Scope: Next.js 16 + React 19 project with `output: 'export'`, `distDir: 'dist'`,
+`trailingSlash: true` (D-027, D-030); TypeScript strict, Vitest, Playwright,
+ESLint + Prettier, pnpm; license-audit script (D-002); `rsync` deploy script;
+`brotli_static on;` added to the nginx block; a PHP endpoint in `public/`
+serving a **bounded slice** of the corpus; SQLite/WASM in a Worker persisting to
+OPFS; one query rendered in the UI carrying the D-008 notice.
+
+- Q-003: import wall-clock, peak memory, OPFS footprint, and WASM query latency.
+- Q-004: `opfs` vs `opfs-sahpool` — now a pure performance and multi-tab
+  question, since D-030 confirmed COOP/COEP are already served.
+- Confirm Next copies `public/` into the export root, per D-027's open caveat.
+
+**Exit criteria:** the deployed site loads from `cve.meenan.dev`, fetches a
+slice through the endpoint, stores it in OPFS, and renders one real query
+result; Q-003 numbers recorded and vision criteria 1 and 3 given real budgets;
+Q-004 decided and recorded; checks run green in CI-equivalent form.
+
+## M2 — Full-corpus Download and Sync  `pending`
+
+Scope: the server-side build pipeline (scheduled `git fetch` → normalize →
+weekly snapshot → compress → publish) and the delta generator; the Download
+action fetching snapshot plus catch-up deltas with progress and resumption; the
+Sync action applying merged deltas non-destructively; FTS index maintenance,
+tombstones, integrity check, and the visible staleness indicator.
+
+**Exit criteria:** a browser downloads the full 372,092-record corpus and
+queries it; a sync applies a real day of upstream changes and the result is
+verified identical to a freshly built database; an interrupted download and an
+interrupted sync both leave a usable prior state.
+
+## M3 — Schema and query  `pending`
+
+Scope: the full schema from Q-002 — CVSS v2/v3.x/v4, CWE, CPE, vendor/product,
+references; FTS5 over descriptions and references (D-011, D-023); schema
+versioning and migration; indexing tuned against measured latency; the raw SQL
+console.
+
+**Exit criteria:** every confirmed filter axis is queryable; query latency meets
+the budget set in M1; a schema-version bump triggers a correct re-download.
+
+## M4 — Analysis and reporting  `pending`
+
+Scope: structured filtering UI, aggregate and trend reporting, charting, saved
+queries and history, shareable query permalinks, CSV/JSON export carrying the
+D-008 notice.
+
+**Exit criteria:** the owner's motivating question — counts by vendor, product,
+and severity over the last two years — is answerable entirely through the UI,
+charted and exportable, with REJECTED records excluded by default (D-022).
+
+## M5 — Resilience and public launch  `pending`
+
+Scope: storage quota and eviction handling, multi-tab behavior per the Q-004
+outcome, browser capability gating against the D-016 floor, the diagnostics
+panel (the only support channel, given D-009), endpoint rate limiting, and an
+adversarial review pass over the endpoint.
+
+**Exit criteria:** the app degrades honestly on an unsupported browser, under
+quota pressure, and in a second tab; the endpoint survives an adversarial pass;
+public launch.
+
+## M6 — CISA KEV overlay  `pending`
+
+Scope: server-side KEV fetch and cache (D-010), joined to the corpus
+client-side. Small and self-contained, which is why it sits last without
+blocking anything.
+
+**Exit criteria:** KEV status is a queryable, filterable attribute, and its
+staleness is surfaced separately from the corpus's.

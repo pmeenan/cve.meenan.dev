@@ -141,17 +141,21 @@ Ordered by how much rework a late answer would cause.
    requires FTS over references, which the spike does not index. Each addition
    grows the download every user takes, so this is the question that decides
    whether ~99 MB stays roughly true.
-**Q-003. What are the browser-side budgets?** The D-024 timings are native SQLite on
-   server hardware. Needed in a real browser: import wall-clock for the full
-   artifact, peak memory, OPFS footprint, and query latency under WASM. Gates
-   vision criteria 1 and 3, whose budgets come from here.
-**Q-004. Which OPFS VFS — `opfs` or `opfs-sahpool`?** Per SQLite's documentation the
-   former needs COOP/COEP response headers, which nginx must be configured to
-   send; the latter needs no headers but forbids simultaneous connections.
-   Determines multi-tab behavior and a server configuration dependency. D-027
-   sharpens this: Next.js static export **cannot set response headers at all**,
-   so choosing `opfs` makes nginx configuration a hard prerequisite rather than
-   a convenience, while `opfs-sahpool` sidesteps it entirely.
+**Q-003. What are the browser-side budgets?** *Deferred to M1 by D-029 — needs a
+   running browser, so it is measured against real scaffolding rather than
+   answered on paper.* The D-024 timings are native SQLite on server hardware.
+   Needed in a real browser: import wall-clock for the full artifact, peak
+   memory, OPFS footprint, and query latency under WASM. Gates vision criteria 1
+   and 3, whose budgets come from here. If the numbers come back bad, the
+   fallback is already identified in D-024 — ship the ~86 MB of structured data
+   first and defer text plus FTS.
+**Q-004. Which OPFS VFS — `opfs` or `opfs-sahpool`?** *Deferred to M1 by D-029.*
+   Per SQLite's documentation the former needs COOP/COEP response headers and the
+   latter forbids simultaneous connections. **D-030 removed the server-config
+   half of this question**: `cve.meenan.dev` already serves COOP/COEP, so both
+   VFSes are available today and this is now purely a performance and multi-tab
+   trade — measured in M1, not argued here. (This also retires D-027's concern
+   that Next.js static export cannot emit headers: nginx already does.)
 **Q-005. How is the endpoint locked down, and what else must nginx be configured to
    do?** Originally just hardening: `Sec-Fetch-Site` and `Origin` header checks,
    rate limiting, bounded responses — which combination is enforceable here, and
@@ -162,16 +166,22 @@ Ordered by how much rework a late answer would cause.
    D-018). KEV (D-010) adds a second server-fetched source needing the same
    treatment.
 
-   Three server-configuration dependencies have since accumulated here, none
-   verified on `plex`, and all of them block M1:
+   **The server-configuration half is answered (D-030).** All three dependencies
+   were checked on `plex` 2026-07-31 and none of them block M1:
 
-   - **Brotli**: serving a precompressed `.br` snapshot needs either nginx's
-     brotli module or an explicit `Content-Encoding` header in a location block
-     (D-026).
-   - **Clean URLs**: Next.js static export emits `/route.html`, so nginx needs
-     `try_files $uri $uri.html $uri/ =404;` (D-027).
-   - **COOP/COEP**: only if Q-004 selects the `opfs` VFS — and since Next cannot
-     emit headers in static export, nginx is the only place they can come from.
+   - **Brotli** — both nginx brotli modules are already loaded; enabling it is
+     one line, `brotli_static on;`.
+   - **Clean URLs** — solved without touching nginx by setting
+     `trailingSlash: true` in Next, so routes emit `/route/index.html` and the
+     existing `try_files $uri $uri/ =404;` resolves them.
+   - **COOP/COEP** — already served on `cve.meenan.dev`, copied from the
+     `webai` and `keepawake` blocks.
+
+   What remains open here is the hardening itself, plus one finding D-030
+   surfaced: php-fpm runs as `pmeenan`, the user owning the clone, the artifacts,
+   *and* the document root — so a flaw in the endpoint has write access to all
+   three, when it only ever needs to read two directories. Narrowing that is a
+   hardening item, not a blocker.
 
 *Answered and removed:* corpus redistribution terms (D-008); telemetry stance
 (D-009); the privacy envelope (D-014); the range-request VFS candidate (D-015);
