@@ -1,18 +1,17 @@
 # Feature matrix
 
-The scope ledger for the M0 planning conversations. Three tiers:
+The scope ledger. Tiers:
 
-- **Confirmed** — stated project scope. Milestone assignment happens in
-  [plan.md](plan.md) as the plan firms up.
+- **Confirmed** — in scope. Milestone assignment happens in [plan.md](plan.md).
 - **Proposed** — candidate additions awaiting a yes/no from the project owner.
-- **Open questions** — things that shape architecture and need an answer
-  during M0.
+- **Rejected** — decided against, with the decision entry that explains why.
 
 Status legend: `confirmed` · `proposed` · `rejected (D-NNN)`
 
-Nothing below is committed to a milestone yet. The `proposed` rows are
-candidates only — they are described elsewhere in the docs as conditional, never
-as product.
+**Triage status:** the first full pass ran 2026-07-30 (D-009 through D-013), and
+D-025 subsequently resolved the four rows that had been gated on the data-delivery
+architecture. **Every row is now resolved.** Additions after this point go through
+the decision log, not by editing a row.
 
 ## Data acquisition & sync
 
@@ -21,15 +20,26 @@ as product.
 | Server-side git clone of cvelistV5 as source of record | `confirmed` | D-005. Server runs git; the browser never does. |
 | Same-origin PHP ingest endpoint | `confirmed` | D-006. Sole server component; ships corpus data only. |
 | Endpoint hardening — same-origin browser callers, no open-proxy behavior | `confirmed` | D-006. Owner-stated requirement, not polish. |
-| Get corpus data into local storage | `confirmed` | The cold-start path; must handle ~300k records. Whether this is a full import or a demand-driven partial cache is open question 1. |
+| Get corpus data into local storage | `confirmed` | The cold-start path; 372,092 records. Settled as a full bulk import by D-025. |
 | Incremental update of the local copy | `confirmed` | Owner-stated: "downloading and updating the list as needed." |
 | Server-side cache of derived baseline/delta artifacts | `confirmed` | Owner-stated; avoids re-deriving from git per request. |
-| Demand-driven cache that expands with exploration | `proposed` | Owner-proposed: fetch only the fields and records the current analysis needs, growing the local cache over time. Trades a large cold start for a more complex sync protocol. Leading candidate in open question 1. |
-| Resumable / interruptible bulk import | `proposed` | Only relevant if a bulk import survives triage; a multi-hundred-MB cold start that cannot resume gets abandoned mid-import. |
-| Sync watermark so the client requests only what it lacks | `proposed` | Needed for incremental sync to be cheap; the watermark's identity (git SHA vs. timestamp) is open question 6. |
-| "N new CVEs since your last sync" summary | `proposed` | Turns an invisible background chore into the reason to open the app. |
-| Corpus integrity check after import | `proposed` | Detects a truncated or corrupted import before a user builds analysis on bad data. |
-| Notice carried by every served artifact | `proposed` | D-008 requires MITRE's copyright designation and license text in any copy; in-band where the format allows. |
+| Sync watermark so the client requests only what it lacks | `confirmed` | Its identity is Q-001 — a git SHA is unavailable since D-021 made the clone shallow, so the candidates are CNA `dateUpdated` or a server-assigned content-hash sequence. |
+| Corpus integrity check | `confirmed` | Detects truncated or corrupted data before a user builds analysis on it. Cheap insurance against the worst failure mode. |
+| "N new CVEs since your last sync" summary | `confirmed` | Turns an invisible background chore into the reason to open the app; near-free once a watermark exists. |
+| Notice carried by every served artifact | `confirmed` | D-008 requires MITRE's copyright designation and license text in any copy; in-band where the format allows. Not discretionary. |
+| Scheduled server-side `git fetch` | `confirmed` | Moved from Operations — it is the head of this pipeline. Cadence, failure handling, and staleness signalling still to specify. |
+| Explicit "Download data" action | `confirmed` | D-025, D-026. Cached weekly snapshot *plus* every delta since it was taken, so download leaves the client current. ~72 MB brotli (-q10). |
+| Explicit "Sync" action applying a delta | `confirmed` | D-025. Median day 0.17 MB, busiest observed 0.78 MB — ~574× cheaper than re-downloading. Same apply path as download (D-026). |
+| Weekly snapshot rebuild with cached compressed artifact | `confirmed` | D-026. Compression is the expensive step (minutes at brotli -q10, vs 19 s to rebuild the database), so it runs weekly rather than per upstream fetch. |
+| Merged deltas per watermark range | `confirmed` | D-026. A client catching up a week should get each record's final state, not every intermediate revision. |
+| Resumable / interruptible download | `confirmed` | D-025. Made easy by D-026: the snapshot is a static file, so ordinary HTTP range resume works. |
+| Server-assigned stable IDs for interned lookups | `confirmed` | D-025 hazard 1. Deltas reference CWE/CNA/vendor/product by integer, so the server must own that ID space permanently and ship new lookup rows with the deltas that use them. |
+| FTS index maintenance on delta apply | `confirmed` | D-025 hazard 2. External-content FTS5 does not self-update; a missed `'delete'` silently desynchronizes search from the data. |
+| Tombstones for removed records | `confirmed` | D-025 hazard 3. Without them an upstream removal persists in every client forever. |
+| Visible staleness indicator | `confirmed` | Follows from sync being manual: a silently month-old corpus producing confident counts is its own form of quiet wrongness. |
+| Demand-driven cache that expands with exploration | `rejected (D-025)` | Candidate (b). Its cold-start advantage evaporated once D-024 measured the full corpus at 98.7 MB gzipped. |
+| Cache coverage tracking with loud failure on gaps | `rejected (D-025)` | Moot under bulk import — the client either has the whole corpus or has not downloaded it. This is the debt D-015 took on, now discharged. |
+| Layout tuned for partial fetch (partitioning, covering indexes) | `rejected (D-025)` | No partial fetch to tune for. |
 
 ## Storage & schema
 
@@ -37,126 +47,132 @@ as product.
 | --- | --- | --- |
 | SQLite compiled to WASM as the query engine | `confirmed` | D-004. |
 | OPFS persistence of the database | `confirmed` | D-004. |
-| Analytics/reporting layer over the local corpus | `confirmed` | Owner-stated. Deliberately unbounded at kickoff — bounded below. |
-| Extraction of CVSS metrics (v2 / v3.x / v4) into queryable columns | `proposed` | Records carry several metric formats; severity filtering is unusable until they are normalized. |
-| Extraction of CWE, CPE, and affected product/vendor into queryable form | `proposed` | The most common filter axes after severity and date. |
-| Full-text search index over descriptions and references | `proposed` | SQLite FTS5 is available; keyword search is table stakes for a search tool. |
-| Schema versioning and migration on app update | `proposed` | Without it, every schema change forces users through a full re-import. |
-| Storage quota handling and `navigator.storage.persist()` | `proposed` | A corpus this size runs into quota and eviction; silent eviction looks like data loss. |
-| Import/export of the whole local database | `proposed` | Lets a user move or back up a costly import instead of re-downloading it. |
-| Cache coverage tracking with loud failure on gaps | `proposed` | Mandatory if the demand-driven cache is adopted: a partially populated cache that answers a query it cannot fully cover returns a plausible undercount, which for security analysis is worse than an error. See open question 1. |
-| Layout tuned for partial fetch (partitioning, covering indexes) | `proposed` | What makes demand-driven fetching cheap or expensive; a row-oriented layout defeats it, a year-partitioned columnar-ish one makes narrow queries nearly free. |
+| Analytics/reporting layer over the local corpus | `confirmed` | Owner-stated. Bounded by the criteria below. |
+| Extraction of CVSS metrics (v2 / v3.x / v4) into queryable columns | `confirmed` | Records carry several metric formats; severity filtering is unusable until they are normalized. |
+| Extraction of CWE, CPE, and affected product/vendor into queryable form | `confirmed` | The most common filter axes after severity and date. |
+| Full-text search (FTS5) over descriptions and references | `confirmed` | D-011, English-only per D-023. Measured: descriptions + FTS index are 187 MB of the 273 MB database — the expensive half, and the natural thing to defer if cold start needs to be faster. References are not yet in the spike index. |
+| Interned lookup tables for CWE, CNA, vendor, product | `confirmed` | D-024. 797 CWEs and 479 CNAs replace text repeated across 372k records; the corpus drops 16× to 272.8 MB. |
+| Published and last-modified dates | `confirmed` | D-020. Sourced from `cveMetadata.datePublished` / `dateUpdated` in the record JSON — 98.4% / 100% coverage — not from git. |
+| Record state (`PUBLISHED` / `REJECTED`) as a queryable column | `confirmed` | D-022. ~4.9% of the corpus is REJECTED; excluded from counts by default, filterable on request. |
+| Per-record revision count | `rejected (D-020)` | No confirmed feature queries it, and it was the only consumer of git history. |
+| Schema versioning and migration on app update | `confirmed` | Without it, every schema change forces users through a full re-import. |
+| Storage quota handling and `navigator.storage.persist()` | `confirmed` | A corpus this size runs into quota and eviction; silent eviction looks like data loss. |
+| Import/export of the whole local database | `rejected (D-013)` | The local database is a rebuildable cache, not a user asset. |
 
 ## Search, query & reporting
 
 Bounding the "analytics/reporting tools" scope: candidates qualify only if they
 (a) answer a question about the corpus itself, (b) are computable from data the
 client already holds, and (c) need no additional network source. Anything
-failing (c) is an overlay and is triaged separately below. The M0 feature-triage
-conversation closes this list; additions afterward go through the decision log.
+failing (c) is an overlay and is triaged separately below. **This list is closed
+as of the 2026-07-30 triage** — additions go through the decision log.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Search across CVE records | `confirmed` | Stated in the repository description. |
-| Structured filtering (date, severity, CNA, CWE, product) | `proposed` | The concrete form of "analyzing"; the axes follow from the extraction rows above. |
-| Aggregate reporting and trend views over time | `proposed` | The main thing a local full-corpus copy enables over a search box. |
-| Charting for report output | `proposed` | Aggregates without visualization push users back to a spreadsheet. |
-| Raw SQL console | `proposed` | Cheap given D-004, and the escape hatch for every question the UI did not anticipate. |
-| Saved queries and query history | `proposed` | Analysis is iterative; losing a refined query on reload is a real cost. |
-| Shareable query/report permalinks (query only, never data) | `proposed` | Supports vision success criterion 6 while preserving the privacy property. |
-| Per-record change history | `proposed` | The server has full git history (D-005), so "what changed in this record and when" is uniquely available here. |
-| Export result sets (CSV / JSON) | `proposed` | Makes the tool a step in a workflow rather than a dead end. Exports are "copies" under D-008, so the notice must travel with them. |
-| Visible attribution and warranty disclaimer | `proposed` | D-008 obligation plus plain honesty: the terms disclaim all warranties on data people will use for security decisions. |
+| Structured filtering (date, severity, CNA, CWE, product) | `confirmed` | The concrete form of "analyzing"; the axes follow from the extraction rows above. |
+| Aggregate reporting and trend views over time | `confirmed` | The main thing a local corpus enables over a search box — the reason the project exists. |
+| Charting for report output | `confirmed` | Aggregates without visualization push users back to a spreadsheet. |
+| Raw SQL console | `confirmed` | Nearly free given D-004, and the escape hatch for every question the UI did not anticipate. |
+| Saved queries and query history | `confirmed` | Analysis is iterative; losing a refined query on reload is a real cost. |
+| Shareable query/report permalinks (query only, never data) | `confirmed` | Supports vision criterion 6 while preserving the privacy property. |
+| Export result sets (CSV / JSON) | `confirmed` | Makes the tool a step in a workflow rather than a dead end. Exports are "copies" under D-008, so the notice travels with them. |
+| Visible attribution and warranty disclaimer | `confirmed` | D-008 obligation plus plain honesty: the terms disclaim all warranties on data people use for security decisions. |
+| Per-revision diff view | `rejected (D-020)` | Rejected first in D-012 as too heavy, then removed entirely with the revision count. Rebuilding it needs D-021 reopened, since a shallow clone has no history. |
 
-## Enrichment overlays (each is a separate network source)
+## Enrichment overlays
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| CISA KEV overlay | `proposed` | High analytical value; needs a CORS, licensing, and sync answer of its own. |
-| EPSS score overlay | `proposed` | Scores change frequently, so it is a recurring sync problem, not a one-time import. |
-| NVD enrichment overlay | `proposed` | NVD's API returns `access-control-allow-origin: *` (checked 2026-07-30) but is rate-limited; full-corpus enrichment client-side may be impractical. |
+| CISA KEV overlay | `confirmed` | D-010. 1,656 entries / 1.5 MB, ~daily. Sends no CORS header (checked 2026-07-30), so it routes through the existing server. |
+| EPSS score overlay | `rejected (D-010)` | Daily-changing scores across the whole corpus — a recurring sync problem for a secondary signal. |
+| NVD enrichment overlay | `rejected (D-010)` | Would mean operating a second mirror; rate limits make client-side full-corpus enrichment impractical. |
 
 ## Operations & resilience
 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Rsync deploy from `dist/` | `confirmed` | D-003. |
-| Scheduled server-side `git fetch` to keep the clone current | `proposed` | Implied by D-005 but not yet specified: cadence, failure handling, and staleness signalling are undecided. |
-| Multi-tab behavior | `proposed` | Forced by D-004: `opfs-sahpool` does not support simultaneous connections, so a second tab needs a defined behavior. |
-| Browser support floor and capability gating | `proposed` | An unsupported browser should say so on arrival rather than fail deep inside an import. |
-| Diagnostics panel (storage used, last sync, record counts, schema version) | `proposed` | Makes "measure, don't assert" possible for users and for bug reports. |
-| Endpoint rate limiting and abuse metrics | `proposed` | D-006 requires the endpoint not become an open endpoint; enforcement needs a concrete mechanism. |
+| Multi-tab behavior | `confirmed` | Forced by D-004: `opfs-sahpool` does not support simultaneous connections, so a second tab needs defined behavior. |
+| Browser support floor and capability gating | `confirmed` | An unsupported browser should say so on arrival, not fail deep inside an import. |
+| Diagnostics panel (storage used, last sync, record counts, schema version) | `confirmed` | Makes "measure, don't assert" possible for users, and is the only support channel given D-009. |
+| Endpoint rate limiting and abuse metrics | `confirmed` | D-006 requires the endpoint not become an open endpoint; enforcement needs a concrete mechanism (Q-005). |
+| Client-side telemetry | `rejected (D-009)` | No collection of any kind. |
 
 ## Open questions (answer during M0)
 
+**Q-numbers are stable and never reused or renumbered** — answered questions are
+struck from the list, not shifted. Earlier decision entries (D-011 and before)
+cite open questions by ordinal position, which was renumbered twice before this
+convention; read those references as historical.
+
 Ordered by how much rework a late answer would cause.
 
-1. **Which data-delivery architecture?** This is the single highest-leverage
-   question — it sets transfer size, cold-start time, schema ownership, sync
-   complexity, and how migrations work. Three candidates, to be measured
-   head-to-head by the spike in [plan.md](plan.md):
+**Q-001. What is the delta format, and what identifies a client's watermark?** Now
+   the central design question, since D-025 settled everything around it. The
+   watermark cannot be a git SHA: D-021 made the clone shallow, so the server
+   has no history to diff against. Two candidates:
 
-   - **(a) Bulk import.** Server ships the whole corpus (as a prebuilt database
-     or as JSON the client inserts); client holds a complete local copy. Simple
-     sync, simple correctness, expensive cold start.
-   - **(b) Projection API.** Client requests only the fields and partitions its
-     current analysis needs; cache grows with exploration. Owner-proposed. Cheap
-     cold start, but the client must track what it does and does not have, and
-     the endpoint learns something about what is being asked.
-   - **(c) Range-request VFS.** Server publishes one read-only SQLite file;
-     nginx serves HTTP range requests; a browser-side VFS fetches only the
-     database pages a query touches, persisting them to OPFS as a growing cache.
-     Achieves (b)'s goal at page granularity with a *dumb* static server. Prior
-     art exists — `sql.js-httpvfs` and `sqlite-wasm-http` — but both are
-     self-described as experimental/demo-grade, and neither persists its page
-     cache to OPFS out of the box, so the persistence layer is ours to build.
+   - **CNA-supplied `dateUpdated`.** Present on 100% of records (D-023), so it
+     is free. But it is written by publishers, not by us — clock skew, stale
+     values, and republication without advancing it all produce silently missed
+     updates.
+   - **A server-assigned monotonic sequence over per-record content hashes.**
+     The server rebuilds the artifact after each fetch — 19 s for the whole
+     corpus (D-024), so this is cheap — hashes each record, and assigns a
+     sequence number to anything that changed. The client's watermark is the
+     last sequence it applied. Robust to bad publisher timestamps, at the cost
+     of the server storing a hash per record.
 
-   Note that (c) largely dissolves the correctness hazard in (b): SQLite decides
-   what pages it needs, so a query cannot silently run against a partial view.
-   That is a strong argument, but it is an argument, not a measurement — decide
-   on the spike's numbers.
+   The second looks right, and notably needs no git history at all, which
+   independently validates D-021. Confirm before building. The format itself is
+   partly settled: D-025 measured positional encoding as no smaller than plain
+   JSON after gzip, so send readable JSON.
 
-2. **What does the server learn under the chosen architecture?** Directly
-   constrains D-007 and success criterion 4 in [vision.md](vision.md). A bulk
-   import leaks nothing about queries; a projection API leaks the field set and
-   partition range; page-level range requests leak access patterns. Any design
-   that pushes *predicates* to the server ("vendor = X", "severity ≥ 7") forfeits
-   the property the project exists for and should be rejected on that basis
-   alone. Where the acceptable line sits between those is an owner decision.
-3. **What is the wire format or artifact layout?** Follows from (1), but needs
-   its own answer: compression, partitioning granularity, chunk sizing, and —
-   under (c) — SQLite page size and index design, since those determine how much
-   a narrow query actually costs.
-4. **What are the working-set and latency budgets?** Measured numbers for bytes
-   transferred, wall-clock, peak memory, OPFS footprint, and representative
-   query latency under each candidate. Gates success criteria 1 and 3 in
-   [vision.md](vision.md); the budgets in those criteria come from here.
-5. **Which OPFS VFS — `opfs` or `opfs-sahpool`?** Per SQLite's documentation the
+   D-026 adds three sub-questions to settle here: how deltas are **merged** so a
+   client catching up a week receives each record's final state rather than every
+   intermediate revision; that the watermark after a download ends at the **last
+   delta applied**, not the snapshot's, or the next sync silently re-fetches a
+   week; and what the **snapshot cadence** should actually be, weekly being a
+   starting point rather than a finding.
+**Q-002. What else belongs in the schema beyond the spike floor?** D-024's 272.8 MB
+   deliberately omits references (10.6% of corpus bytes), affected version
+   ranges, CPE applicability, solutions, credits, and timeline — and D-011
+   requires FTS over references, which the spike does not index. Each addition
+   grows the download every user takes, so this is the question that decides
+   whether ~99 MB stays roughly true.
+**Q-003. What are the browser-side budgets?** The D-024 timings are native SQLite on
+   server hardware. Needed in a real browser: import wall-clock for the full
+   artifact, peak memory, OPFS footprint, and query latency under WASM. Gates
+   vision criteria 1 and 3, whose budgets come from here.
+**Q-004. Which OPFS VFS — `opfs` or `opfs-sahpool`?** Per SQLite's documentation the
    former needs COOP/COEP response headers, which nginx must be configured to
    send; the latter needs no headers but forbids simultaneous connections.
-   Determines multi-tab behavior and a server configuration dependency. Under
-   candidate (c) there is a second half to this: how a range-request VFS and an
-   OPFS-persistence VFS compose, which may mean writing the combination rather
-   than picking one.
-6. **How does the cache stay correct as upstream changes?** Under (a) this is a
-   sync watermark — git SHA (exact, from server-side history) versus timestamp
-   (simpler, ambiguous for republished records). Under (b) and (c) it is harder
-   and 2-dimensional: a rebuilt artifact can invalidate every cached page a
-   client holds, so daily rebuilds could wipe every user's accumulated cache.
-   Stable page layout, immutable per-year partitions, or versioned artifacts are
-   the candidate mitigations. This is where the owner's anticipated "more effort
-   in the sync protocol" actually lands.
-7. **How is the ingest endpoint actually locked down?** `Sec-Fetch-Site` and
-   `Origin` header checks, rate limiting, bounded responses, strict parameter
-   validation — which combination is enforceable in this nginx/PHP setup, and
-   what does it do about non-browser callers that can forge headers freely?
-   Note that candidate (c) shrinks this problem considerably: a static file with
-   range requests has far less attack surface than a query endpoint.
-8. **What is the telemetry stance for a public tool?** The privacy property
-   argues for none, but that forfeits any signal about whether imports succeed
-   in the wild. An explicit owner decision either way, recorded in the log.
-9. **What is the browser support floor?** OPFS synchronous access handles
-   constrain this. The floor determines both the capability-gating feature and
-   what "modern desktop browser" means in the success criteria.
+   Determines multi-tab behavior and a server configuration dependency. D-027
+   sharpens this: Next.js static export **cannot set response headers at all**,
+   so choosing `opfs` makes nginx configuration a hard prerequisite rather than
+   a convenience, while `opfs-sahpool` sidesteps it entirely.
+**Q-005. How is the endpoint locked down, and what else must nginx be configured to
+   do?** Originally just hardening: `Sec-Fetch-Site` and `Origin` header checks,
+   rate limiting, bounded responses — which combination is enforceable here, and
+   what it does about non-browser callers that can forge headers freely. D-025
+   shrank the hardening half considerably, since the full artifact is a static
+   file and only the delta endpoint takes a parameter at all — a watermark, to
+   be validated as an opaque token and never allowed near the filesystem (D-006,
+   D-018). KEV (D-010) adds a second server-fetched source needing the same
+   treatment.
 
-*Answered and removed:* the corpus's redistribution terms, resolved by D-008.
+   Three server-configuration dependencies have since accumulated here, none
+   verified on `plex`, and all of them block M1:
+
+   - **Brotli**: serving a precompressed `.br` snapshot needs either nginx's
+     brotli module or an explicit `Content-Encoding` header in a location block
+     (D-026).
+   - **Clean URLs**: Next.js static export emits `/route.html`, so nginx needs
+     `try_files $uri $uri.html $uri/ =404;` (D-027).
+   - **COOP/COEP**: only if Q-004 selects the `opfs` VFS — and since Next cannot
+     emit headers in static export, nginx is the only place they can come from.
+
+*Answered and removed:* corpus redistribution terms (D-008); telemetry stance
+(D-009); the privacy envelope (D-014); the range-request VFS candidate (D-015);
+browser support floor (D-016); the data-delivery architecture (D-025).

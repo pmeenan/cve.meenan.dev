@@ -2,25 +2,25 @@
 
 ## What this is
 
-The CVE List is published as ~300k JSON records in a single 2.4 GB git
-repository. That format is excellent for distribution and terrible for asking
-questions. Anyone who wants to know *which CNAs publish the most disputed
+The CVE List is published as 372,092 JSON records — 2.9 GB of them — in a single
+git repository. That format is excellent for distribution and terrible for
+asking questions. Anyone who wants to know *which CNAs publish the most disputed
 records*, *how CVSS severity distributions shifted year over year*, or *every
 CVE mentioning a given product with a CVSS ≥ 7 since 2023* currently either
 writes throwaway scripts against a local clone or hands their query to somebody
 else's search service.
 
 cve.meenan.dev is the third option: bring the corpus into your own browser and
-query it locally, without telling anyone what you asked. Records live in SQLite
-compiled to WebAssembly and persisted to OPFS, so what sits in local storage is
-a real relational database with real SQL behind it. A single locked-down
-same-origin endpoint feeds data in and does nothing else — no query, filter, or
-report ever leaves the client.
+query it there. Records live in SQLite compiled to WebAssembly and persisted to
+OPFS, so what sits in local storage is a real relational database with real SQL
+behind it. A single locked-down same-origin endpoint feeds data in and runs no
+analysis: your filters, aggregates, and search terms are evaluated on your
+machine and never sent anywhere.
 
-How much of the corpus is local, and when, is deliberately still open: a full
-up-front copy and a cache that grows as you explore are both live candidates
-(see [features.md](features.md) open question 1). The properties below are
-written to hold either way.
+You get the whole corpus, not a slice of it: an explicit "Download data" action
+fetches a complete prebuilt database — roughly 72 MB compressed for all 372,092
+records — and an explicit "Sync" action applies deltas, typically well under a
+megabyte a day (D-025). Nothing fetches behind your back.
 
 ## Who it's for
 
@@ -52,23 +52,27 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
    over the whole corpus (e.g. group by CNA and year with a CVSS predicate)
    returns within a latency budget set from M0 measurements on real data — not
    an assumed one.
-4. **Query privacy is verifiable, not promised.** With the network panel open, a
-   user can confirm that searching and reporting issue no requests at all, and
-   that sync requests carry no query content. This is a property anyone can
-   check, which is the point.
-5. **Work already done stays available offline.** Any analysis whose data is
-   already local runs with the network disconnected, and the app says plainly
-   when a query needs data it does not have rather than failing obscurely. If
-   M0 selects a full-copy architecture this strengthens to "everything works
-   offline"; the weaker form is what holds under every candidate.
+4. **What the server can learn is bounded and checkable.** With the network
+   panel open, a user can confirm that the app makes exactly two kinds of
+   request: fetch the snapshot, and fetch deltas since a watermark. Neither
+   carries a filter value, a search term, or any indication of what is being
+   asked. Analysis — filtering, aggregation, ranking, search — runs entirely on
+   the client. D-014 permits requests to name fields and partitions; D-025
+   removed even that, so the endpoint learns nothing about the query at all.
+5. **It works offline, fully.** Once downloaded, the client holds the entire
+   corpus (D-025), so search, analysis, and reporting all work with the network
+   disconnected. Only Download and Sync need it.
 6. **Reports are shareable without the data being shareable.** A user can hand
    someone a query or report definition that reproduces the analysis on their
    own local copy, and separately export result sets in a standard format —
    carrying the attribution the CVE terms require (D-008).
-7. **Results are never quietly wrong.** A query that cannot be fully answered
-   from local data either fetches what it needs or reports the gap. It never
-   returns a plausible-looking undercount. This matters most under a partial
-   cache, which is precisely where it is easiest to get wrong.
+7. **Results are never quietly wrong.** Bulk import makes this largely
+   structural — the client either holds the whole corpus or has not downloaded
+   it yet, so there is no partial view to undercount from. Two ways it can still
+   break, and both are guarded deliberately: a stale corpus producing confident
+   counts, which the visible freshness indicator exists to prevent; and a search
+   index drifted out of step with the data during a delta apply (D-025 hazard 2),
+   which is where the correctness effort belongs.
 
 ## Non-goals
 
@@ -85,6 +89,12 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
   the user's behalf, which contradicts the client-side model. In-app watchlists
   evaluated at sync time are a separate, and permitted, idea.
 - **Not an aggregator of every vulnerability data source.** The cvelistV5 corpus
-  is the subject. Overlays such as KEV, EPSS, or NVD enrichment are candidates
-  to be triaged in M0 ([features.md](features.md)), not assumed scope — each one
-  adds a fetch path, a license question, and a sync problem.
+  is the subject. Triage settled this at exactly one overlay — CISA KEV, because
+  "is this actually being exploited" is the question analysts ask next. EPSS and
+  NVD enrichment were rejected (D-010): each adds a fetch path, a license
+  question, and a recurring sync problem to a tool whose pitch is not needing
+  the network.
+- **Nothing is collected from users.** No telemetry, no analytics, no error
+  reporting, not even opt-in (D-009). The tradeoff is accepted knowingly: we are
+  blind to production failures, and the diagnostics panel exists so users can
+  tell us what we cannot see.

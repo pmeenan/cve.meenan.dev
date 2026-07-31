@@ -2,15 +2,17 @@
 
 Browser-based search and analysis over the complete CVE List.
 
-The [CVE List](https://github.com/CVEProject/cvelistV5) ships as roughly 300k
-JSON records in a 2.4 GB git repository — a good distribution format and a poor
-one for asking questions. This tool pulls the corpus into your browser once and
-lets you query it locally from then on.
+The [CVE List](https://github.com/CVEProject/cvelistV5) ships as 372,092 JSON
+records — 2.9 GB of them — which is a good distribution format and a poor one
+for asking questions. This tool normalizes the corpus into a compact SQLite
+database (~72 MB compressed), pulls it into your browser once, and lets you
+query it locally from then on.
 
 - **Your queries stay on your machine.** Records are stored in SQLite compiled
-  to WebAssembly and persisted to OPFS, and every search, filter, and report
-  runs client-side. A single same-origin endpoint feeds the corpus in; it never
-  receives a query.
+  to WebAssembly and persisted to OPFS, and every search, filter, aggregate, and
+  report is evaluated client-side. A single same-origin endpoint feeds data in
+  and runs no analysis: it may be told which fields and time ranges to send, but
+  never a filter value or a search term.
 - **A real database, not a search box.** The corpus lands as a queryable
   relational store, so questions a keyword search cannot answer are in reach.
 - **Kept current.** The local copy updates incrementally rather than by

@@ -1,13 +1,13 @@
 # cve.meenan.dev — browser-based analytics over the full CVE List
 
 A public web app for searching, analyzing, and reporting on the complete CVE
-List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, roughly
-300k records. The entire data plane runs in the browser: records live in SQLite
-compiled to WASM, persisted to OPFS, and are queried locally, so no search or
-report ever leaves the client. One locked-down same-origin PHP endpoint exists
-solely to feed the corpus in; it performs no analysis. Almost all code is
-written by AI agents working from the project documentation, directed and
-reviewed by a human.
+List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, 372,092
+records and growing. The entire data plane runs in the browser: the corpus is
+normalized server-side into a ~72 MB compressed SQLite database, downloaded on
+demand into OPFS, and queried locally — so no search or report ever leaves the
+client. One locked-down same-origin PHP endpoint serves that snapshot and its
+deltas; it performs no analysis. Almost all code is written by AI agents working
+from the project documentation, directed and reviewed by a human.
 
 **Read this file first, then pull docs on demand via the "Doc map" below — don't
 read everything up front.** This file is long-term project memory and the
@@ -20,9 +20,18 @@ making the case in [docs/decisions.md](docs/decisions.md) and updating the
 affected docs. Until then, these govern.
 
 - **The data plane is client-side.** Parsing, storage, indexing, querying,
-  charting, and export all happen in the browser. The server never sees a user's
-  query, filter, or report. Any proposal to move analysis server-side for
-  performance is a constraint change, not an optimization. (D-007)
+  charting, and export all happen in the browser. Any proposal to move analysis
+  server-side for performance is a constraint change, not an optimization.
+  (D-007)
+- **The endpoint may learn fields and partitions, never predicates.** The client
+  may ask for "these columns, these year ranges." It must never send a filter
+  value (`vendor = cisco`), a search term, or anything else that would let the
+  server evaluate the query. Selecting data is allowed; executing analysis is
+  not. (D-014)
+- **Nothing is collected from users — no telemetry, ever.** Not analytics, not
+  error reporting, not opt-in. This makes the privacy claim verifiable in a
+  network panel rather than a promise. Do not add a reporting channel; improve
+  the diagnostics panel instead. (D-009)
 - **Exactly one server endpoint, and it only ships corpus data.** Ingest is a
   same-origin PHP endpoint under `https://cve.meenan.dev/`. It must never accept
   a caller-supplied URL, path, or ref that reaches the filesystem or network —

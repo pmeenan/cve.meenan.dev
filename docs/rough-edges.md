@@ -22,6 +22,72 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-004: `git log --format=<single-token>` is rejected as a named format  (2026-07-30, status: worked-around)
+
+**Environment.** git 2.54.0 on `plex`.
+
+**Repro.**
+
+```bash
+git log --format=C --name-only -n 1     # fatal: invalid --pretty format: C
+git log --format=C%cI --name-only -n 1  # works
+```
+
+**Observed.** A format string consisting of a single bare token is parsed as a
+*named* format (like `oneline`, `medium`, `raw`) and rejected when it does not
+match one. Adding any placeholder makes it a literal format string.
+
+**Expected.** `--format=C` to emit the literal `C` per commit, as `--format=C%cI`
+does.
+
+**Impact.** Low, but it fails in a way that wastes time: with stderr discarded —
+common in a pipeline — git emits nothing, the downstream stage sees empty input,
+and the result looks like "no commits matched" rather than a usage error. Cost
+two debugging round trips here. Use an unambiguous format such as `%H` when
+scripting.
+
+## RE-003: One CVE record has 6,074 revisions — 178× the 99.9th percentile  (2026-07-30, status: open)
+
+**Environment.** cvelistV5 at `a42a2eb6c2` (2026-07-31T01:48Z), 372,092 records,
+74,082 commits.
+
+**Measurement.** Revision counts per record, computed from git history:
+
+| Statistic | Revisions |
+| --- | --- |
+| p50 | 3 |
+| p90 | 5 |
+| p99 | 19 |
+| p99.9 | 34 |
+| max | **6,074** |
+
+Only 28 records exceed 50 revisions; exactly one exceeds 500. The outlier is
+`cves/2025/7xxx/CVE-2025-7195.json` — assigner `redhat`, PUBLISHED, published
+2025-08-07, last updated 2026-07-26, 88,587 bytes. Mean across all records is
+4.10.
+
+Separately, `cves/delta.json` and `cves/deltaLog.json` carry 63,208 revisions
+each. Those are the publishing pipeline's own churn files, not CVE records, and
+must be excluded from any corpus scan — they are the reason a naive
+`find cves -name '*.json'` overcounts.
+
+**Observed vs. expected.** A distribution where 99.9% of records sit at ≤34
+revisions and one sits at 6,074. That is far outside editorial plausibility and
+reads as an upstream publishing-pipeline artifact rather than 6,074 meaningful
+edits.
+
+**Impact.** Now a corpus observation rather than a feature constraint. It was
+originally cited in support of D-012, but D-020 dropped revision counts from
+scope and D-021 made the clone shallow, so nothing ships that surfaces this.
+Retained because it says something durable about the data: revision counts in
+cvelistV5 measure *publishing-pipeline* activity as much as editorial activity,
+and any future feature tempted to present them as "how much this record was
+revised" would be misreading them. Reproducing this measurement now requires an
+unshallow fetch.
+
+**Links.**
+- [CVE-2025-7195](https://www.cve.org/CVERecord?id=CVE-2025-7195)
+
 ## RE-002: cve.org legal pages return no text without JavaScript  (2026-07-30, status: worked-around)
 
 **Environment.** `curl` and any non-JS fetcher against `https://www.cve.org/`,
