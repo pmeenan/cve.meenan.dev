@@ -14,6 +14,11 @@ it touched.
 
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
+Milestones are decomposed into task-sized checkboxes (the workflow's unit of
+work) no later than when they become the next milestone up — M2 is decomposed
+now; M3+ carry scope prose and exit criteria until their turn, and get their
+checkbox breakdown before work starts.
+
 ## M0 — Plan the plan  `done`
 
 Goal: settle vision, feature matrix, architecture, and the milestone ladder,
@@ -97,9 +102,23 @@ OPFS; one query rendered in the UI carrying the D-008 notice.
       Transport is a rounding error; **index building is 91% of import**.
 - [x] Confirmed Next copies `public/` into the export root — closes D-027's
       open caveat.
+- [x] **2026-08-01 external review, highest-priority fixes (D-047).** CVSS
+      version preference corrected — v3.1 no longer beats v4.0 (stored codes
+      31 > 4 were compared numerically), regression-tested in
+      `pipeline/tests/`, now part of `pnpm check`; canonical D-008 notice with
+      the copyright designation and license clause, asserted in unit and e2e
+      tests against a rebuilt fixture; real SPDX `AND`/`OR` evaluation in the
+      license audit with exceptions bound to their reviewed license; builds
+      fail closed on malformed records; published generations immutable;
+      `PRAGMA query_only` on the Worker's query path (first defense — the
+      structural authorizer is M3).
 - [ ] **Q-003 at full scale.** The slice is a tenth of the corpus. Needs the
       full artifact: import wall-clock, peak memory, OPFS footprint, query
-      latency, and how many chunks to decompress concurrently (D-041).
+      latency, and how many chunks to decompress concurrently (D-041) — and
+      from those numbers, **set the vision criterion 1 and 3 budgets**
+      (latency, memory, cold start) that M3's exit verifies against. Note the
+      Timings semantics: per-stage values are cumulative across concurrent
+      chunks; only the total is wall-clock (lib/protocol.ts).
 - [ ] **Q-004:** `opfs` vs `opfs-sahpool`. The `opfs` VFS works; the comparison
       and multi-tab behaviour are unmeasured.
 - [ ] **Deploy.** nginx `^~ /data/` location, Cloudflare cache rules, first
@@ -114,40 +133,80 @@ measurement, Q-004, and the deploy.
 
 ## M2 — Full-corpus Download and Sync  `pending`
 
-Scope: the two cron jobs (daily ingest, monthly chunked snapshot) under `flock`
-with the tombstone guard, atomic publish, and one-generation retention (D-042);
-the D-031 delta generator; the Download action fetching snapshot chunks and
-catch-up deltas, decompressing each in WASM and writing it positionally into
-OPFS, resumable by chunk bitmap (D-040, D-041); client-side construction of the
-full-text indexes over descriptions, vendors and products (D-035), surfaced in
-the same progress display; the Sync action applying merged deltas
-non-destructively; FTS maintenance verified with `integrity-check` at
-`rank = 1` (RE-005); the visible staleness indicator.
+Tasks in dependency order; the wire contract and stable IDs come first because
+everything downstream consumes them.
+
+- [ ] **The delta wire contract.** Finalize the delta format for the full
+      accepted schema — `host`/`url`/`vtype` lookups, reference and version
+      rows, tombstones (the architecture.md example is illustrative and
+      incomplete) — replace `Manifest.deltas: unknown[]` with real types in
+      `lib/protocol.ts`, and contract-test a pipeline-emitted delta against
+      them.
+- [ ] **Stable interned IDs.** Implement Interner seeding from the previous
+      build (promised by D-025 hazard 1, not yet implemented), proven by a
+      snapshot N → delta → snapshot N+1 test: existing IDs never change, new
+      IDs append.
+- [ ] **Daily ingest cron** under `flock`: fetch → hash → diff → tombstone
+      guard (abort is the success case on a broken fetch) → delta file
+      (D-031, D-042). Fail closed on malformed records (D-047).
+- [ ] **Monthly snapshot cron**: rebuild, chunk, compress, publish by atomic
+      rename; previous generation and its deltas retained; generations
+      immutable (D-041, D-042, D-047).
+- [ ] **Download with staged replacement.** Chunks and catch-up deltas land in
+      a *staging* OPFS file — never truncating the live database (the M1 path
+      does, and must not survive into M2) — with a persisted per-chunk
+      completion bitmap bound to the manifest's rev and chunk hashes; validate
+      manifest, hashes, and SQLite `meta` before an atomic promotion that
+      keeps the previous good database until the new one is verified.
+- [ ] **Client-built FTS** over descriptions, vendors and products (D-035),
+      surfaced in the same progress display.
+- [ ] **Sync.** Merged deltas applied in one idempotent transaction, watermark
+      advancing with the rows; FTS maintenance with the explicit `'delete'`
+      protocol, verified by `integrity-check` at `rank = 1` (RE-005).
+- [ ] **Failure and resume tests** — for replacement, not just first
+      download: kill mid-download and resume refetches only missing chunks; a
+      failure during re-download leaves the prior database intact and usable;
+      an interrupted sync rolls back and re-running is safe; a snapshot
+      rotation mid-download does not strand the client.
+- [ ] **Freshness.** The visible staleness indicator and the "N new CVEs
+      since your last sync" summary.
 
 **Exit criteria:** a browser downloads all 372,092 records, decompresses them
 itself, builds its indexes, and queries the result — with one honest progress
 display across all three stages, and peak memory bounded by chunks in flight
 rather than by the corpus; the database is verified identical to a freshly built
-one; a sync applies a real day of upstream changes; killing the download partway
-and resuming refetches only the missing chunks; an interrupted sync leaves a
-usable prior state and re-running is safe; a snapshot rotation during a download
-does not strand the client.
+one; a sync applies a real day of upstream changes; every failure-and-resume
+test above passes, including failure *during replacement* leaving the previous
+copy usable.
 
-## M3 — Schema and query  `pending`
+## M3 — Query surfaces and tuning  `pending`
 
-Scope: the full schema from Q-002 — CVSS v2/v3.x/v4, CWE, CPE, vendor/product,
-references; FTS5 over descriptions and references (D-011, D-023); schema
-versioning and migration; indexing tuned against measured latency; the raw SQL
-console.
+The schema itself shipped in M1 (`pipeline/schema.sql`); this milestone makes
+it queryable, fast, and safe. Scope: every confirmed filter axis — CVSS
+v2/v3.x/v4, CWE, CNA, vendor/product, dates, state, and references *by host*
+(D-033; CPE was rejected there, and FTS never covers references — D-035);
+schema versioning exercised end to end: a bump invalidates and forces an
+announced full re-download, because the local database is a rebuildable cache
+(D-013) and there is no in-place migration; indexing tuned against the latency
+budgets set in M1; the raw SQL console, made structurally read-only here — a
+SQLite authorizer, not query-text inspection or the `query_only` pragma alone —
+row-capped and timed out (this is where D-044's tool-surface commitment starts
+being real code).
 
-**Exit criteria:** every confirmed filter axis is queryable; query latency meets
-the budget set in M1; a schema-version bump triggers a correct re-download.
+**Exit criteria:** every confirmed filter axis is queryable; query latency
+meets the M1 budgets; a schema-version bump triggers a correct, announced
+re-download; hostile SQL in the console (writes, pragma flips, runaway queries)
+is refused by structure, covered by tests.
 
 ## M4 — Analysis and reporting  `pending`
 
 Scope: structured filtering UI, aggregate and trend reporting, charting, saved
 queries and history, shareable query permalinks, CSV/JSON export carrying the
-D-008 notice.
+D-008 notice. Export and render hardening, because CVE text is hostile input
+(rule 5): CSV formula-injection neutralization, control-character stripping,
+URL-scheme allowlisting on anything rendered as a link, and the notice embedded
+in every export format. Accessibility as an acceptance criterion, not a polish
+pass: keyboard operability and labels for filters, tables, and charts.
 
 The serializable report definition behind permalinks is now also the contract
 the AI chat layer emits (D-044) — design it here as a shared primitive, not a
@@ -155,27 +214,46 @@ permalink implementation detail.
 
 **Exit criteria:** the owner's motivating question — counts by vendor, product,
 and severity over the last two years (D-046 benchmark item #2) — is answerable
-entirely through the UI,
-charted and exportable, with REJECTED records excluded by default (D-022).
+entirely through the UI, charted and exportable, with REJECTED records excluded
+by default (D-022). Each promised surface is accepted, not just the one report:
+saved queries and history survive a reload; a permalink reproduces its report
+on a fresh browser profile; CSV/JSON exports carry the D-008 notice and
+neutralize formula injection (covered by tests with hostile records); charts
+and tables pass a keyboard-and-labels accessibility check.
 
 ## M5 — Resilience and public launch  `pending`
 
 Scope: storage quota and eviction handling, multi-tab behavior per the Q-004
-outcome, browser capability gating against the D-016 floor, the diagnostics
-panel (the only support channel, given D-009), and an adversarial review pass
-over the published data plane.
+outcome, browser capability gating against the D-016 floor — with Playwright
+runs on Firefox and WebKit added *before* the floor is claimed publicly
+(Chromium-only today, and rule 3 applies to support claims too); the
+diagnostics panel (the only support channel, given D-009), surfacing service
+worker state alongside storage and sync; an adversarial review pass over the
+published data plane; and the offline app shell (D-048): a service worker
+caching the shell, Worker, WASM, and brotli decoder — scoped to never touch
+`/data/` or model weights — so vision criterion 5 covers reopening the app
+offline, not just an already-open tab.
 
 **Exit criteria:** the app degrades honestly on an unsupported browser, under
-quota pressure, and in a second tab; the data plane survives an adversarial pass;
-public launch.
+quota pressure, and in a second tab — each verified by a test, with the
+capability gate exercised in real Firefox and WebKit runs; the diagnostics
+panel reports storage used, last sync, record counts, and schema version; the
+data plane survives an adversarial pass; an offline *reopen* e2e test passes —
+network killed, app reopened, corpus queried — and a stale-manifest check
+confirms the service worker never serves `/data/` from cache (D-048); public
+launch.
 
 ## M6 — CISA KEV overlay  `pending`
 
 Scope: server-side KEV fetch and cache (D-010), joined to the corpus
 client-side. Small and self-contained, which is why it sits last without
-blocking anything.
+blocking anything. Before anything ships: record KEV's redistribution terms
+and required provenance/notice in the decision log — D-008's reopen-if names
+"a second data source" as exactly this trigger, and only size/CORS were
+researched in D-010.
 
-**Exit criteria:** KEV status is a queryable, filterable attribute, and its
+**Exit criteria:** KEV's terms are recorded and its required notice (if any)
+travels with the data; KEV status is a queryable, filterable attribute; its
 staleness is surfaced separately from the corpus's.
 
 ## M7 — AI chat layer: tool surface, hosted providers, benchmark  `pending`
@@ -188,15 +266,22 @@ Scope: the chat surface; the read-only tool surface over report definitions —
 curated high-level tools plus the `SELECT`-only SQL tool (D-044); provider
 adapters for user-supplied keys — Gemini, OpenRouter, Anthropic, OpenAI — with
 keys stored client-side only and in-browser CORS verified per provider
-(D-045); the D-046 benchmark harness with ground-truth questions, the owner's
-severity-over-time question first.
+(D-045, RE-010); the consent surface: a first-use, per-provider disclosure of
+exactly what leaves the browser (the question and the tool results it
+triggers), key storage with a visible clear action, and CSP `connect-src`
+pinned to the enabled providers so the network boundary is enforced by the
+platform, not by discipline; the D-046 benchmark harness with ground-truth
+questions, the owner's severity-over-time question first.
 
 **Exit criteria:** with a hosted key, the founding question — stacked CVE
 counts by severity over time, all products and per-product (D-046 benchmark
 item #1) — is answered end-to-end through chat, rendering via the fixed UI
 with the backing queries inspectable; the benchmark runs against at least two
-hosted providers and produces a scorecard; a network-panel check confirms chat
-traffic goes only browser → provider and keys never reach `cve.meenan.dev`;
+hosted providers and produces a scorecard; every provider adapter that ships
+passes an in-browser key round-trip and CORS check (adapters that fail
+verification are cut from the release, not shipped hopeful); a network-panel
+check confirms chat traffic goes only browser → provider and keys never reach
+`cve.meenan.dev`;
 and an adversarial pass feeds hostile records — markup, injection payloads,
 hostile URLs — through the chat path and shows containment: nothing beyond
 the read-only tool surface is reachable, and no record-supplied markup or URL
@@ -221,4 +306,6 @@ questions correctly with the network disconnected (corpus and weights already
 local); Gemini Nano works where Chrome offers it and degrades honestly where
 it does not; an unsupported browser is told at the gate, not mid-download; the
 benchmark scorecard for local candidates is recorded and the default model
-choice is justified from it.
+choice is justified from it; and the storage guarantee is tested, not assumed —
+a weight download into a nearly-full quota fails cleanly with the corpus
+intact (weights are D-013-style rebuildable cache, D-045).

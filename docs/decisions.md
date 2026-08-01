@@ -23,6 +23,94 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-048: An offline app shell ships via service worker, scoped to the shell and never the data plane  (2026-08-01, status: accepted)
+
+**Decision.** The app registers a service worker that caches the app shell —
+the exported HTML/JS/CSS, the SQLite/WASM distribution under `/sqlite/`, and
+the brotli decoder — so the app opens and works with the network disconnected,
+not merely survives in an already-open tab. Owner-confirmed 2026-08-01 after
+the external review flagged that vision criterion 5 ("works offline, fully")
+had no implementation path: OPFS preserves the *data*, but nothing preserved
+the app.
+
+Two scope boundaries are load-bearing:
+
+- **The service worker never caches the data plane.** `manifest.json` is the
+  freshness signal (D-042) and the chunks/deltas are immutable and
+  OPFS-resident once imported — an SW cache in front of `/data/` could serve a
+  stale manifest and break the staleness indicator, the one guard vision
+  criterion 7 has against confident-but-old counts. Fetches under `/data/`
+  pass through untouched.
+- **Model weights stay out of the SW cache** (M8): they live in OPFS under the
+  app's own management (D-045), and multi-gigabyte cache entries are the wrong
+  tool.
+
+Update semantics: the SW cache is versioned per deploy and activates on next
+load, so a deploy cannot leave a stale shell talking to a new-schema data
+plane for longer than one session; the schema gate in `assertUsable` remains
+the hard stop either way.
+
+**Context.** The static export makes this cheap — every shell asset is a
+static file — and no dependency is needed beyond a hand-rolled worker
+(D-028/D-002 favor that over a PWA framework). COOP/COEP are already served
+(D-030) and apply to SW-served responses identically; nginx needs no change.
+
+**Consequences.** M5 carries the implementation and an offline *reopen* e2e
+test (kill network, reopen the app, query the corpus). Criterion 5's claim
+becomes fully testable. The diagnostics panel should surface the SW state,
+since a broken SW is invisible by design (D-009 means users report it, not
+telemetry).
+
+**Reopen if.** The SW's cache-versioning interacts badly with the deploy model
+(D-003 has no atomic promotion), or Safari/Firefox SW behavior under COOP/COEP
+turns up a rough edge that outweighs the offline win on those browsers.
+
+## D-047: The pipeline fails closed, generations are immutable, and the notice is canonical  (2026-08-01, status: accepted, extends D-008/D-041/D-042)
+
+Three policies from the 2026-08-01 external review, each previously implicit
+and each violated by the M1 code in a way tests now guard.
+
+**Decision.**
+
+1. **Fail closed on malformed records.** A record that cannot be parsed aborts
+   the build (artifact deleted, nonzero exit) rather than being skipped with a
+   warning. `--allow-skipped` exists for local debugging only and never runs
+   in production. Rationale: a handful of silently dropped records sits far
+   below the 0.1% tombstone guard and undercounts forever — the exact failure
+   vision criterion 7 exists to prevent.
+2. **Published generations are immutable.** `snapshot-<rev>/` chunks carry an
+   immutable cache policy (D-034), so republishing a revision serves
+   stale-vs-new mixes from caches, and the old delete-then-rename opened a 404
+   window for clients mid-download. `publish.py` now refuses a same-rev
+   republish; `--force` (local iteration only) swaps via rename with no
+   window.
+3. **One canonical notice string**, defined in `pipeline/build.py` and carried
+   verbatim into the database `meta`, the manifest, deltas, the UI, and every
+   export. D-008 requires MITRE's copyright designation and the license
+   clause; the previous notice had neither — a trademark sentence and a
+   paraphrase do not satisfy the terms. The canonical text reproduces, checked
+   verbatim against cve.org's sources on 2026-08-01 (via the
+   `CVEProject/cve-website` repo, RE-002's workaround): the footer's
+   designation ("Copyright © 1999-<year>, The MITRE Corporation. CVE is a
+   trademark and the CVE logo is a registered trademark of The MITRE
+   Corporation.") and the Terms of Use "CVE Usage" clause in full, plus the
+   AS-IS disclaimer.
+
+**Consequences.** `pnpm check` now runs the Python pipeline tests
+(`pipeline/tests/`), which regression-test the CVSS version-preference fix
+(v3.1 had beaten v4.0 because stored version codes were compared numerically:
+31 > 4) and assert the notice's required components; the e2e test asserts them
+in the rendered UI. The license audit gained real SPDX `AND`/`OR` evaluation
+(`MIT AND GPL-3.0` previously passed via any-term matching) and its exceptions
+are bound to the exact license they were reviewed under. Changing the notice
+text now requires touching D-008's requirements deliberately, with tests
+failing until both move.
+
+**Reopen if.** Upstream ships records that legitimately fail parsing at scale
+(fail-closed then blocks all publishing and needs a quarantine-with-
+reconciliation design), or the CVE Program changes its terms or designation —
+which D-008 already flags for re-reading before launch.
+
 ## D-046: Tool-calling quality is measured in this repo and gates model selection  (2026-08-01, status: accepted)
 
 **Decision.** The tool-calling benchmark lives in this repository, not in webai.
@@ -1894,7 +1982,7 @@ repurposed into one.
 explicitly user-initiated "copy diagnostics to clipboard" affordance is not
 telemetry and does not require reopening this.
 
-## D-008: CVE content is freely reusable, subject to a notice obligation  (2026-07-30, status: accepted)
+## D-008: CVE content is freely reusable, subject to a notice obligation  (2026-07-30, status: accepted; notice text canonicalized by D-047)
 
 **Decision.** We may reproduce, transform, and redistribute CVE List content —
 including as derived artifacts such as a prebuilt database — provided every copy

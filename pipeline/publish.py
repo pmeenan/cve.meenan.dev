@@ -82,7 +82,7 @@ def compress_chunk(job: tuple[str, str, int]) -> dict:
 compress_chunk.quality = 10
 
 
-def publish(db_path: str, pub_dir: str, quality: int, jobs: int) -> dict:
+def publish(db_path: str, pub_dir: str, quality: int, jobs: int, force: bool = False) -> dict:
     compress_chunk.quality = quality
     meta = read_meta(db_path)
     rev = int(meta.get("rev", 1))
@@ -107,10 +107,25 @@ def publish(db_path: str, pub_dir: str, quality: int, jobs: int) -> dict:
     for index, chunk in enumerate(chunks):
         chunk["name"] = f"{index:03d}.br"
 
-    # Atomic swap: build under a dot-prefixed name, then rename into place.
+    # D-047: a published generation is immutable — its URLs carry an immutable
+    # cache policy (D-034), so rewriting one serves stale-vs-new mixes from
+    # caches and deleting it first would open a 404 window for clients
+    # mid-download. Same-rev republish is therefore refused; --force (local
+    # iteration only) swaps via rename so there is still no window.
+    retired = None
     if os.path.exists(final):
-        shutil.rmtree(final)
+        if not force:
+            shutil.rmtree(staging)
+            raise SystemExit(
+                f"error: {final} is already published and generations are "
+                "immutable (D-047); bump the revision, or --force for local "
+                "iteration"
+            )
+        retired = os.path.join(pub_dir, f".retired-{rev}-{os.getpid()}")
+        os.rename(final, retired)
     os.rename(staging, final)
+    if retired is not None:
+        shutil.rmtree(retired)
 
     manifest = {
         "format": FORMAT_VERSION,
@@ -150,10 +165,18 @@ def main() -> int:
     parser.add_argument("pub_dir")
     parser.add_argument("--quality", type=int, default=10)
     parser.add_argument("--jobs", type=int, default=min(24, (os.cpu_count() or 4)))
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an already-published generation (local iteration only; "
+        "published generations are immutable, D-047).",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.pub_dir, exist_ok=True)
-    print(json.dumps(publish(args.db, args.pub_dir, args.quality, args.jobs), indent=2))
+    print(
+        json.dumps(publish(args.db, args.pub_dir, args.quality, args.jobs, args.force), indent=2)
+    )
     return 0
 
 

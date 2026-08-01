@@ -17,8 +17,9 @@ Runs on `plex`; **never deployed to the docroot** — `scripts/deploy.sh` mirror
 | --- | --- |
 | `schema.sql` | The published schema. Single source of truth for both sides. |
 | `normalize.py` | The stored projection — also the definition of "changed" (D-031). |
-| `build.py` | Corpus → SQLite. |
-| `publish.py` | SQLite → 32 MB chunks at brotli -q10 + manifest (D-041). |
+| `build.py` | Corpus → SQLite. Fails closed on malformed records (D-047); carries the canonical D-008 notice. |
+| `publish.py` | SQLite → 32 MB chunks at brotli -q10 + manifest (D-041). Published generations are immutable (D-047). |
+| `tests/` | unittest suite (CVSS priority, notice components, hostile shapes) — part of `pnpm check` via `pnpm test:pipeline`. |
 
 `pub/` is generated output and is not committed.
 

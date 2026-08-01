@@ -21,7 +21,10 @@ STATE = {"PUBLISHED": 1, "REJECTED": 2}
 SEVERITY = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 VERSION_STATUS = {"affected": 1, "unaffected": 2, "unknown": 3}
 
-# Highest wins. adp containers are mined for these and then discarded (D-024).
+# Preference order, best first: v4.0 over v3.1 over v3.0 over v2.0. The second
+# element is the *stored* version code, which is not ordered (31 > 4) — never
+# compare codes to pick a winner; compare positions in this tuple. adp
+# containers are mined for these and then discarded (D-024).
 CVSS_KEYS = (("cvssV4_0", 4), ("cvssV3_1", 31), ("cvssV3_0", 30), ("cvssV2_0", 2))
 
 _HOST = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://([^/?#]*)")
@@ -59,23 +62,31 @@ def containers(record: dict) -> tuple[dict, list[dict]]:
 
 
 def cvss(cna: dict, adp: list[dict]) -> tuple[int, float | None, int | None, str] | None:
-    """Highest-priority CVSS across cna and adp, or None."""
-    best = None
+    """Highest-priority CVSS across cna and adp, or None.
+
+    Priority is position in CVSS_KEYS (strictly better replaces; ties keep the
+    first seen, so cna beats adp at equal version). The stored version code is
+    deliberately not the sort key: 31 (v3.1) > 4 (v4.0) numerically.
+    """
+    best = None  # (preference, stored tuple)
     for source in (cna, *adp):
         for metric in _dicts(source.get("metrics")):
-            for key, version in CVSS_KEYS:
+            for preference, (key, version) in enumerate(CVSS_KEYS):
                 block = metric.get(key)
                 if not isinstance(block, dict):
                     continue
-                if best is None or version > best[0]:
+                if best is None or preference < best[0]:
                     score = block.get("baseScore")
                     best = (
-                        version,
-                        float(score) if isinstance(score, (int, float)) else None,
-                        SEVERITY.get(_text(block.get("baseSeverity")).upper()),
-                        _text(block.get("vectorString")),
+                        preference,
+                        (
+                            version,
+                            float(score) if isinstance(score, (int, float)) else None,
+                            SEVERITY.get(_text(block.get("baseSeverity")).upper()),
+                            _text(block.get("vectorString")),
+                        ),
                     )
-    return best
+    return best[1] if best else None
 
 
 def cwes(cna: dict, adp: list[dict]) -> set[tuple[str, str]]:

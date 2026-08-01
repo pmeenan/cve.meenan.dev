@@ -228,7 +228,13 @@ function openDatabase(): Database {
   if (!sqlite3) throw new Error('sqlite3 not initialised')
   // Q-004 picks between the `opfs` VFS and `opfs-sahpool`; this build uses
   // `opfs`, which needs COOP/COEP — already served (D-030).
-  return new sqlite3.oo1.OpfsDb(`/${DB_FILE}`, 'c')
+  const database = new sqlite3.oo1.OpfsDb(`/${DB_FILE}`, 'c')
+  // First line of defense for the query path: reads only. This is a
+  // connection flag, not a guarantee — hostile SQL can flip it back — so it
+  // does not discharge D-044's structural read-only commitment (authorizer,
+  // M3); it exists so a stray write is an error today rather than a habit.
+  database.exec('PRAGMA query_only=ON')
+  return database
 }
 
 /**
@@ -238,6 +244,7 @@ function openDatabase(): Database {
  */
 function buildSearchIndexes(database: Database): void {
   database.exec(`
+    PRAGMA query_only=OFF;
     DROP TABLE IF EXISTS fts;
     DROP TABLE IF EXISTS fts_vendor;
     DROP TABLE IF EXISTS fts_product;
@@ -247,6 +254,7 @@ function buildSearchIndexes(database: Database): void {
     INSERT INTO fts_vendor(fts_vendor) VALUES('rebuild');
     CREATE VIRTUAL TABLE fts_product USING fts5(name, content='product', content_rowid='id');
     INSERT INTO fts_product(fts_product) VALUES('rebuild');
+    PRAGMA query_only=ON;
   `)
 }
 

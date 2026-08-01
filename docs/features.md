@@ -29,7 +29,7 @@ the decision log, not by editing a row. The AI chat layer section was added
 | "N new CVEs since your last sync" summary | `confirmed` | Turns an invisible background chore into the reason to open the app; near-free once a watermark exists. |
 | Notice carried by every served artifact | `confirmed` | D-008 requires MITRE's copyright designation and license text in any copy; in-band where the format allows. Not discretionary. |
 | Scheduled server-side `git fetch` | `confirmed` | D-042. Daily cron under `flock`; monthly snapshot rebuild. Failure leaves the previous generation serving; staleness reaches users through the manifest, not a second channel. |
-| Explicit "Download data" action | `confirmed` | D-025, D-026. Cached weekly snapshot *plus* every delta since it was taken, so download leaves the client current. **62.6 MB brotli -q10** for the whole corpus (D-035, D-038). |
+| Explicit "Download data" action | `confirmed` | D-025, D-026. Cached monthly snapshot (D-042) *plus* every delta since it was taken, so download leaves the client current. **62.6 MB brotli -q10** for the whole corpus (D-035, D-038). |
 | Explicit "Sync" action applying a delta | `confirmed` | D-025. Median day 0.17 MB, busiest observed 0.78 MB — ~574× cheaper than re-downloading. Same apply path as download (D-026). |
 | Monthly snapshot rebuild with cached compressed chunks | `confirmed` | D-042, refining D-026. A month of catch-up is ~31 daily deltas and ~2.6 MB against 62.6 MB — about 4%. |
 | Merged deltas per watermark range | `confirmed` | D-026, D-031. A range query over per-record revisions returns final state by construction. Daily ingest (D-042) means one file per day and no rollup. |
@@ -61,7 +61,7 @@ the decision log, not by editing a row. The AI chat layer section was added
 | Published and last-modified dates | `confirmed` | D-020. Sourced from `cveMetadata.datePublished` / `dateUpdated` in the record JSON — 98.4% / 100% coverage — not from git. |
 | Record state (`PUBLISHED` / `REJECTED`) as a queryable column | `confirmed` | D-022. ~4.9% of the corpus is REJECTED; excluded from counts by default, filterable on request. |
 | Per-record revision count | `rejected (D-020)` | No confirmed feature queries it, and it was the only consumer of git history. |
-| Schema versioning and migration on app update | `confirmed` | Without it, every schema change forces users through a full re-import. |
+| Schema versioning with invalidation and explicit re-download | `confirmed` | The manifest's `schema` field gates use (`assertUsable`); a bump forces an announced full re-download. The local database is a rebuildable cache (D-013) — there is no in-place migration, deliberately. |
 | Year-partitioned download with on-demand backfill | `rejected (D-038)` | Would have saved 24.6 MB on a first download in exchange for coverage becoming a thing the whole product reasons about. D-035 had already banked the larger saving. |
 | Client-side brotli decompression in WASM, streamed into OPFS | `confirmed` | D-040, D-041. Opaque `.br` chunks decoded and written positionally, so peak memory is one chunk and no intermediary can re-encode. |
 | Storage quota handling and `navigator.storage.persist()` | `confirmed` | A corpus this size runs into quota and eviction; silent eviction looks like data loss. |
@@ -126,6 +126,7 @@ model drives the same report definitions the fixed UI renders.
 | Multi-tab behavior | `confirmed` | Forced by D-004: `opfs-sahpool` does not support simultaneous connections, so a second tab needs defined behavior. |
 | Browser support floor and capability gating | `confirmed` | An unsupported browser should say so on arrival, not fail deep inside an import. |
 | Diagnostics panel (storage used, last sync, record counts, schema version) | `confirmed` | Makes "measure, don't assert" possible for users, and is the only support channel given D-009. |
+| Offline app shell (service worker) | `confirmed` | D-048, owner-confirmed 2026-08-01. Caches the shell, Worker, WASM and decoder so an offline *reopen* works — OPFS preserves the data, this preserves the app. Never caches `/data/` (the manifest is the freshness signal) or model weights. Lands in M5. |
 | Origin rate limiting and abuse metrics | `rejected (D-039)` | There is no endpoint to protect (D-032) and Cloudflare absorbs abuse; per-IP limits behind a proxy would have throttled everyone through a few edge IPs. |
 | Client-side telemetry | `rejected (D-009)` | No collection of any kind. |
 
@@ -164,6 +165,11 @@ Ordered by how much rework a late answer would cause.
    | Write to OPFS | 301 ms |
    | **Build FTS indexes** | **10,050 ms** |
    | Total | 11.0 s |
+
+   Semantics caveat (lib/protocol.ts): the fetch/decompress/write rows are
+   per-chunk times summed across concurrently-running chunks — work, not
+   elapsed time — so they can exceed wall-clock; the total (and the serial
+   index stage) is wall-clock.
 
    Transport is a rounding error; **index building is 91% of import**. Native
    SQLite built the description index for the *whole* corpus in 3 s, so WASM is

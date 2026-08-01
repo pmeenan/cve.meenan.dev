@@ -103,8 +103,10 @@ every 40 minutes, so a day accumulates ~665 distinct changed records.
    does not start seeing 404s. One spare generation costs 63 MB.
 
 Publication into `pub/` is an atomic rename, so a half-written artifact is never
-reachable. The clone, working databases, and hash state live in sibling
-directories under `cve.data/` and are never under the served root (D-018, D-034).
+reachable — and a published generation is immutable: same-rev republication is
+refused, because its URLs carry an immutable cache policy (D-047). The clone,
+working databases, and hash state live in sibling directories under `cve.data/`
+and are never under the served root (D-018, D-034).
 
 ## The published contract
 
@@ -114,7 +116,7 @@ Everything under `/data/`, served by nginx from `cve.data/pub/` (D-034).
 | --- | --- | --- |
 | `manifest.json` | `no-cache` | The only mutable file. Lists everything else with byte length and SHA-256. |
 | `snapshot-<rev>/NNN.br` | immutable | 12 chunks, ~5.3 MB each, **63.3 MB** total, each expanding to a 32 MB slice of the 391.3 MB database (D-041). |
-| `deltas/<from>-<to>.json.br` | immutable | Hourly files plus daily rollups. |
+| `deltas/<from>-<to>.json.br` | immutable | One per day; consecutive revisions tile the space by construction (D-042). |
 | `kev.json` | short | CISA KEV, its own freshness (D-010). |
 
 The manifest carries `format`, `schema`, the current `rev`, the snapshot, and
@@ -136,7 +138,7 @@ before the upserts that reference them, and the D-008 notice in-band (D-031).
 
 ```json
 {"format":1,"schema":1,"from":1204,"to":1236,
- "generated":"2026-07-31T23:12:13Z","notice":"CVE® is a trademark of …",
+ "generated":"2026-07-31T23:12:13Z","notice":"CVE record content: Copyright © 1999-2026, The MITRE Corporation. …",
  "lookups":{"cna":[],"cwe":[[798,"CWE-1395","…"]],
             "vendor":[[24421,"acme"]],"product":[[80149,24421,"widget"]]},
  "upsert":[{"id":"CVE-2026-14537","y":2026,"st":1,"cna":12,
@@ -144,6 +146,12 @@ before the upserts that reference them, and the D-008 notice in-band (D-031).
             "cwe":[412],"prod":[80149],"descr":"…"}],
  "delete":[]}
 ```
+
+The example is illustrative, not the contract: it omits the `host`, `url`, and
+`vtype` lookups and the reference and version rows the accepted schema (D-033)
+requires. M2's first task finalizes the wire format for the full schema, types
+it in `lib/protocol.ts` (replacing the `deltas: unknown[]` placeholder), and
+contract-tests a pipeline-emitted delta against those types.
 
 A merged delta is not a merge operation: the server stores a revision per record
 and per lookup row, so "everything since `from`" is a range query that returns
@@ -308,6 +316,7 @@ addresses — are simply absent (D-039).
 | Client older than the oldest delta | Full re-download | Delta retention is bounded to the current snapshot (D-026) |
 | Upstream force-push | Nothing special | The pipeline diffs content hashes, never git history (RE-006) |
 | Broken fetch drops records | Pipeline aborts before publishing | The 0.1% tombstone guard |
+| Malformed record in the clone | Build aborts, artifact deleted | Fail closed (D-047): silent skips would undercount below the tombstone guard's radar, forever |
 | FTS index drifts | Search returns wrong results **silently** | The one real threat to vision criterion 7 under this design; verified with `integrity-check` at `rank = 1` (RE-005) |
 | Stale local corpus | Confident-looking counts from old data | Made visible, not prevented — sync is deliberately manual |
 
@@ -438,8 +447,8 @@ via `deltaLog.json`: median day 1,312 events / 0.17 MB gzipped, busiest observed
 6,147 / 0.78 MB, one week ~12,000 / 1.50 MB.
 
 At these rates a month of catch-up costs a new user ~2.6 MB against a 62.6 MB
-snapshot. Weekly snapshots stay the default because they bound the delta file
-count, not because monthly would hurt.
+snapshot — about 4%, which is why the monthly rebuild cadence (D-042) is
+comfortable: daily ingest bounds the delta file count at ~31.
 
 ### Traps worth knowing before writing any corpus scan
 

@@ -56,7 +56,8 @@ the app, never the only one — everything works with no model configured.
 ## Success criteria
 
 Each of these is falsifiable, and several need a measured budget attached during
-M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
+M1 rather than a hand-wave (D-029 moved the browser measurements there). That
+measurement is itself a milestone deliverable.
 
 1. **A first-time visitor gets a real answer in their first session.** On a
    modern desktop browser, someone who arrives with a question reaches a
@@ -68,7 +69,7 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
    and does not discard data the user already has.
 3. **Core analytical queries run at interactive speed.** Filter-and-aggregate
    over the whole corpus (e.g. group by CNA and year with a CVSS predicate)
-   returns within a latency budget set from M0 measurements on real data — not
+   returns within a latency budget set from M1 measurements on real data — not
    an assumed one.
 4. **What the server can learn is bounded and checkable.** With the network
    panel open, a user can confirm that the app makes exactly two kinds of

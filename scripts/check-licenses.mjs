@@ -18,16 +18,74 @@ const ALLOWED = new Set([
   'Python-2.0',
 ])
 
-/** Accept "MIT OR Apache-2.0" and "(MIT AND ISC)" when every term is allowed. */
+/**
+ * Evaluate an SPDX license expression against the allowlist with real AND/OR
+ * semantics: `OR` is a choice (any allowed branch suffices), `AND` is a
+ * conjunction (every branch must be allowed). The previous implementation
+ * split on both operators and accepted if *any* term was allowed, which let
+ * "MIT AND GPL-3.0" through (D-047 review finding).
+ *
+ * Grammar (SPDX simple expressions):
+ *   expr   := term (OR term)*
+ *   term   := factor (AND factor)*
+ *   factor := '(' expr ')' | LICENSE ['WITH' EXCEPTION]
+ *
+ * A `WITH` clause is kept as part of the token and is allowed only if the full
+ * "License WITH Exception" string is explicitly allowlisted — an exception
+ * changes the terms, so the base license being allowed is not enough. Any
+ * malformed expression evaluates to not-allowed (fail closed).
+ */
 function isAllowed(license) {
   if (!license) return false
   if (ALLOWED.has(license)) return true
-  const terms = license
-    .replace(/[()]/g, ' ')
-    .split(/\s+(?:OR|AND)\s+/i)
-    .map((t) => t.trim())
-    .filter(Boolean)
-  return terms.length > 1 && terms.some((t) => ALLOWED.has(t))
+  const tokens = license.replace(/\(/g, ' ( ').replace(/\)/g, ' ) ').split(/\s+/).filter(Boolean)
+  // Reattach WITH clauses: ["MIT", "WITH", "X"] -> ["MIT WITH X"]
+  const merged = []
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].toUpperCase() === 'WITH' && merged.length > 0 && tokens[i + 1]) {
+      merged[merged.length - 1] += ` WITH ${tokens[++i]}`
+    } else {
+      merged.push(tokens[i])
+    }
+  }
+
+  let pos = 0
+  const peek = () => merged[pos]
+  const isOp = (t, op) => t !== undefined && t.toUpperCase() === op
+
+  function factor() {
+    const token = merged[pos++]
+    if (token === undefined || token === ')') throw new Error('malformed')
+    if (token === '(') {
+      const value = expr()
+      if (merged[pos++] !== ')') throw new Error('malformed')
+      return value
+    }
+    return ALLOWED.has(token)
+  }
+  function term() {
+    let value = factor()
+    while (isOp(peek(), 'AND')) {
+      pos++
+      value = factor() && value
+    }
+    return value
+  }
+  function expr() {
+    let value = term()
+    while (isOp(peek(), 'OR')) {
+      pos++
+      value = term() || value
+    }
+    return value
+  }
+
+  try {
+    const value = expr()
+    return pos === merged.length && value
+  } catch {
+    return false
+  }
 }
 
 // `--prod --dev` together is rejected by pnpm 11; the default covers both.
@@ -39,18 +97,33 @@ const raw = execFileSync('pnpm', ['licenses', 'list', '--json'], {
 /**
  * D-002 governs what we *distribute*. These five are build-time or test-only
  * and none of their code reaches dist/ — verified by inspecting the export.
- * Each needs a reason, and anything not listed here fails closed.
+ * Each exception is bound to the exact license it was reviewed under: if the
+ * package's license ever changes, the exception no longer applies and the
+ * audit fails until a human re-reviews (D-047 review finding).
  */
 const EXCEPTIONS = new Map([
   [
     '@img/sharp-libvips-linux-x64',
-    'LGPL-3.0-or-later; optional native binary of sharp, which static export ' +
-      'never invokes (images.unoptimized, D-027) and whose build is disabled.',
+    {
+      license: 'LGPL-3.0-or-later',
+      reason:
+        'optional native binary of sharp, which static export never invokes ' +
+        '(images.unoptimized, D-027) and whose build is disabled.',
+    },
   ],
-  ['axe-core', 'MPL-2.0; Playwright accessibility tooling, test-only.'],
-  ['lightningcss', 'MPL-2.0; build-time CSS transform. Its output is not a derivative work.'],
-  ['lightningcss-linux-x64-gnu', 'MPL-2.0; native binary for the above.'],
-  ['caniuse-lite', 'CC-BY-4.0; build-time browser-support data, not shipped.'],
+  ['axe-core', { license: 'MPL-2.0', reason: 'Playwright accessibility tooling, test-only.' }],
+  [
+    'lightningcss',
+    {
+      license: 'MPL-2.0',
+      reason: 'build-time CSS transform. Its output is not a derivative work.',
+    },
+  ],
+  ['lightningcss-linux-x64-gnu', { license: 'MPL-2.0', reason: 'native binary for the above.' }],
+  [
+    'caniuse-lite',
+    { license: 'CC-BY-4.0', reason: 'build-time browser-support data, not shipped.' },
+  ],
 ])
 
 const byLicense = JSON.parse(raw)
@@ -60,7 +133,9 @@ let count = 0
 for (const [license, packages] of Object.entries(byLicense)) {
   for (const pkg of packages) {
     count++
-    if (isAllowed(license) || EXCEPTIONS.has(pkg.name)) continue
+    if (isAllowed(license)) continue
+    const exception = EXCEPTIONS.get(pkg.name)
+    if (exception && exception.license === license) continue
     offenders.push(`${pkg.name}@${pkg.versions?.join(',')} — ${license}`)
   }
 }

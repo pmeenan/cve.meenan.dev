@@ -37,6 +37,7 @@ export interface Manifest {
     chunk_bytes: number
     chunks: ChunkEntry[]
   }
+  /** Typed by M2's first task (the delta wire contract); empty until then. */
   deltas: unknown[]
 }
 
@@ -59,7 +60,14 @@ export type Response =
   | { type: 'rows'; columns: string[]; rows: unknown[][]; ms: number }
   | { type: 'error'; message: string }
 
-/** Q-003's numbers, reported by the Worker rather than inferred from the UI. */
+/**
+ * Q-003's numbers, reported by the Worker rather than inferred from the UI.
+ *
+ * fetchMs / decompressMs / writeMs are *cumulative per-chunk time* summed
+ * across chunks that run concurrently — they measure work, not elapsed time,
+ * and their sum exceeds wall-clock whenever CONCURRENCY > 1. totalMs (and
+ * openMs / indexMs, which are serial) are wall-clock. Compare like with like.
+ */
 export interface Timings {
   fetchMs: number
   decompressMs: number

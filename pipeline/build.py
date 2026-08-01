@@ -19,18 +19,34 @@ import normalize
 
 SCHEMA_VERSION = 1
 
+# D-008 / D-047: the canonical notice, carried by every copy of CVE data —
+# database, manifest, deltas, UI, exports. The terms require reproducing
+# MITRE's copyright designation and the license clause; both are verbatim from
+# cve.org's sources (footer and Terms of Use, checked 2026-08-01). Tests
+# assert the required components; change this only with D-008 in hand.
 NOTICE = (
-    "CVE® is a trademark of The MITRE Corporation. CVE record content is "
-    "provided by the CVE Program under the CVE Terms of Use, "
-    "https://www.cve.org/legal/termsofuse — AS IS, without warranty."
+    f"CVE record content: Copyright © 1999-{time.gmtime().tm_year}, "
+    "The MITRE Corporation. CVE is a trademark and the CVE logo is a "
+    "registered trademark of The MITRE Corporation. Licensed under the CVE "
+    "Program Terms of Use (https://www.cve.org/legal/termsofuse): \"MITRE "
+    "hereby grants you a perpetual, worldwide, non-exclusive, no-charge, "
+    "royalty-free, irrevocable copyright license to reproduce, prepare "
+    "derivative works of, publicly display, publicly perform, sublicense, "
+    "and distribute Common Vulnerabilities and Exposures (CVE™). Any "
+    "copy you make for such purposes is authorized provided that you "
+    "reproduce MITRE's copyright designation and this license in any such "
+    "copy.\" Provided \"AS IS\", with all warranties disclaimed."
 )
 
 
 class Interner:
     """Server-owned ID space: append-only, never renumbered (D-025 hazard 1).
 
-    A production run seeds this from the previous build so IDs stay stable
-    across snapshots; a from-scratch build starts empty.
+    Seeding from the previous build — so IDs stay stable across snapshots —
+    lands with the M2 delta generator and is *not implemented yet*: today every
+    build starts empty and assigns encounter-order IDs. Until seeding exists,
+    two builds are only ID-compatible if built from the same input in the same
+    order.
     """
 
     def __init__(self) -> None:
@@ -80,7 +96,7 @@ def build(clone: str, out: str, year_min: int | None, limit: int | None) -> dict
 
     started = time.time()
     row_id = 0
-    skipped = 0
+    skipped: list[str] = []
 
     for path in record_paths(clone):
         with open(path, "rb") as handle:
@@ -88,10 +104,10 @@ def build(clone: str, out: str, year_min: int | None, limit: int | None) -> dict
         try:
             record = json.loads(blob)
         except (ValueError, UnicodeDecodeError):
-            skipped += 1
+            skipped.append(path)
             continue
         if not isinstance(record, dict):
-            skipped += 1
+            skipped.append(path)
             continue
 
         proj = normalize.projection(record, os.path.basename(path)[:-5])
@@ -202,12 +218,34 @@ def main() -> int:
     parser.add_argument("out")
     parser.add_argument("--year-min", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--allow-skipped",
+        action="store_true",
+        help="Deliberate escape hatch for local debugging only: keep the "
+        "artifact despite unparseable records.",
+    )
     args = parser.parse_args()
 
     stats = build(args.clone, args.out, args.year_min, args.limit)
+    skipped = stats["skipped"]
+    stats["skipped"] = len(skipped)
     print(json.dumps(stats, indent=2))
-    if stats["skipped"]:
-        print(f"warning: {stats['skipped']} unparseable records skipped", file=sys.stderr)
+
+    # D-047: fail closed. A record that cannot be parsed must never silently
+    # vanish from the published corpus — a handful of losses would sit below
+    # the 0.1% tombstone guard and undercount forever (vision criterion 7).
+    if skipped:
+        for path in skipped:
+            print(f"unparseable record: {path}", file=sys.stderr)
+        if not args.allow_skipped:
+            os.remove(args.out)
+            print(
+                f"error: {len(skipped)} unparseable records; artifact deleted "
+                "(--allow-skipped overrides for local debugging)",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"warning: {len(skipped)} unparseable records skipped", file=sys.stderr)
     return 0
 
 

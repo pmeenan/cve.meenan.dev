@@ -48,8 +48,15 @@ test('imports, queries, and survives a reload', async ({ page }) => {
   })
 
   await test.step('the notice travels with the copy (D-008)', async () => {
-    await expect(page.locator('.notice')).toContainText('MITRE')
-    await expect(page.locator('.notice')).toContainText('cve.org/legal/termsofuse')
+    // The terms require reproducing MITRE's copyright designation and the
+    // license clause — assert the required components, not just the name
+    // (D-047). The canonical string lives in pipeline/build.py.
+    const notice = page.locator('.notice')
+    await expect(notice).toContainText('Copyright © 1999-')
+    await expect(notice).toContainText('The MITRE Corporation')
+    await expect(notice).toContainText('irrevocable copyright license')
+    await expect(notice).toContainText("reproduce MITRE's copyright designation and this license")
+    await expect(notice).toContainText('cve.org/legal/termsofuse')
   })
 
   await test.step('persistence', async () => {
