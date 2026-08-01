@@ -42,19 +42,24 @@ Each is backed by a decision entry and is not up for casual revision.
   browser bundle contains no git implementation. History is deliberately *not*
   retained: nothing in confirmed scope consumes it, and any feature that would
   must reopen D-021 first. (D-005, D-021)
-- **Two upstream sources, both server-fetched.** cvelistV5 and the CISA KEV
-  catalog. KEV sends no CORS header, so like the corpus it reaches the browser
-  only as a file we publish; at ~1.5 MB it ships whole. No third source without a
-  decision entry. (D-010)
+- **Two upstream sources of corpus data, both server-fetched.** cvelistV5 and
+  the CISA KEV catalog. KEV sends no CORS header, so like the corpus it reaches
+  the browser only as a file we publish; at ~1.5 MB it ships whole. No third
+  data source without a decision entry. (D-010) The AI layer's browser-side
+  fetches — model weights from Hugging Face, optional hosted-model calls — are
+  not data sources and are bounded separately by D-045.
 - **Nothing is collected from users.** No telemetry, no analytics, no error
   reporting. Server request logs are an operational fact, not a channel to
   repurpose. (D-009)
 - **The browser's store is SQLite/WASM on OPFS**, owned by a Worker, because
   OPFS synchronous access handles are unavailable on the main thread. (D-004)
-- **One origin.** Everything ships to `plex:/var/www/meenan.dev/cve/` and is
-  served from `https://cve.meenan.dev/`. There is no cross-origin fetch in the
-  normal path, which is what makes same-origin enforcement meaningful.
-  (D-003, D-006)
+- **One origin for the data plane.** Everything ships to
+  `plex:/var/www/meenan.dev/cve/` and is served from
+  `https://cve.meenan.dev/`. There is no cross-origin fetch in the data path,
+  which is what makes same-origin enforcement meaningful. The AI layer's two
+  cross-origin exceptions — model-weight downloads and user-keyed hosted-model
+  calls — are explicit user actions that never carry corpus requests and never
+  touch this origin's data plane. (D-003, D-006, D-045)
 - **Record content is untrusted input.** CVE text is attacker-influenced and
   crosses a trust boundary at parse time, at SQL time, and at render time.
   (AGENTS.md rule 5)
@@ -183,6 +188,39 @@ final state by construction.
   what keeps results honest — it replaces the coverage tracking that bulk import
   made unnecessary.
 
+## The AI layer (planned — M7/M8, D-044 – D-046)
+
+Sits entirely above the client described previously; the data plane below it is
+unchanged, and the two Fixed points it touches — one origin, upstream sources —
+carry their D-045 annotations above. Detail lands here when the layer is
+built — these are the structural commitments:
+
+- **Chat drives the fixed UI through report definitions.** The model's
+  presentation tools emit the same serializable object the deterministic UI
+  builds, renders, and shares. Charts, clickable CVE lists, and drill-downs are
+  the existing UI components fed by the model rather than duplicated for it.
+- **The model orchestrates; it never transcribes.** Small aggregate results may
+  enter model context for trend interpretation; row-level result sets are
+  returned as handles and rendered straight from SQLite. A number the user sees
+  is a query result by construction.
+- **Tool surface: read-only, render-only, forever.** Curated high-level tools
+  with tight schemas, plus a `SELECT`-only, row-capped, timed-out SQL tool —
+  enforced structurally (read-only connection or SQLite authorizer), never by
+  inspecting query text. No tool fetches URLs, writes data, or reaches the
+  network — record text in the prompt is assumed hostile (rule 5), and
+  containment is structural. Report definitions carry structured data only: no
+  model-authored HTML, markdown, or URLs; chat prose renders as plain text,
+  and record URLs appear only through the fixed UI's existing
+  never-auto-fetched treatment.
+- **Provider ladder (D-045):** local WASM/WebGPU model (default; weights from
+  Hugging Face into OPFS on explicit action) → Chrome built-in Gemini Nano →
+  user-supplied keys for Gemini / OpenRouter / Anthropic / OpenAI, called
+  browser-direct. Keys live client-side only. `cve.meenan.dev` serves no
+  inference and proxies no model traffic.
+- **Model selection is benchmarked, not assumed (D-046).** Ground-truth analyst
+  questions scored by data comparison against the real corpus, run through the
+  actual integration.
+
 ## Schema
 
 The floor is D-024; version ranges, references and reference hosts were added by
@@ -246,6 +284,8 @@ Indexes: `cve(year)`, `cve(cna_id)`, `cve(cvss_score)`, `cve(published)`,
 | Pipeline → `pub/` | Finished artifacts only | Atomic rename; working state stays in sibling directories |
 | `pub/` → browser | Static files | No CORS headers, integrity hashes in the manifest; abuse absorbed by Cloudflare rather than origin limits (D-034, D-039) |
 | Database → UI | Record text | Never injected as HTML; URLs from records are never auto-fetched |
+| Database → model prompt | Attacker-influenced record text entering LLM context | Prompt injection is assumed; the tool surface is read-only and render-only with no network reach, and model output carries no markup or minted URLs — a successful injection yields wrong-but-inspectable presentation, nothing more (D-044) |
+| Browser → hosted model provider | The user's question and its tool results — only when the user supplies a key | Explicit opt-in per provider; key stored client-side only; called browser-direct, never proxied, never touching this server (D-045) |
 
 Same-origin enforcement is **the absence of `Access-Control-Allow-Origin`**, not
 a `Sec-Fetch-Site` check. Header sniffing stops nobody who matters — any

@@ -11,7 +11,8 @@ Status legend: `confirmed` · `proposed` · `rejected (D-NNN)`
 **Triage status:** the first full pass ran 2026-07-30 (D-009 through D-013), and
 D-025 subsequently resolved the four rows that had been gated on the data-delivery
 architecture. **Every row is now resolved.** Additions after this point go through
-the decision log, not by editing a row.
+the decision log, not by editing a row. The AI chat layer section was added
+2026-08-01 through D-044 – D-046, per that rule.
 
 ## Data acquisition & sync
 
@@ -86,6 +87,28 @@ as of the 2026-07-30 triage** — additions go through the decision log.
 | Export result sets (CSV / JSON) | `confirmed` | Makes the tool a step in a workflow rather than a dead end. Exports are "copies" under D-008, so the notice travels with them. |
 | Visible attribution and warranty disclaimer | `confirmed` | D-008 obligation plus plain honesty: the terms disclaim all warranties on data people use for security decisions. |
 | Per-revision diff view | `rejected (D-020)` | Rejected first in D-012 as too heavy, then removed entirely with the revision count. Rebuilding it needs D-021 reopened, since a shallow clone has no history. |
+
+## AI chat layer
+
+Added 2026-08-01 (D-044, D-045, D-046). Chat augments the deterministic UI and
+never replaces it: every surface below works with no model configured, and the
+model drives the same report definitions the fixed UI renders.
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Free-form chat surface translating questions into local queries | `confirmed` | D-044. Owner pivot; the founding severity-over-time question is the design test case. |
+| Presentation via shared report definitions | `confirmed` | D-044. Chat emits the same serializable object the UI builds, renders, and shares — one primitive behind UI, chat, and permalinks. |
+| Model orchestrates, never transcribes | `confirmed` | D-044. Aggregates may enter model context; row sets travel as handles rendered straight from SQLite. Numbers come from queries, never token sampling. |
+| Curated high-level query tools (search, aggregate, CVE detail, KEV) | `confirmed` | D-044. Tight schemas sized for small local models. |
+| `SELECT`-only SQL tool for capable models | `confirmed` | D-044. Row-capped, timed out; schema documented in the system prompt. |
+| Local in-browser model as the default (WASM/WebGPU, weights in OPFS) | `confirmed` | D-045. Explicit download, like the corpus; private and offline. Selection gated on the D-046 benchmark. |
+| Chrome built-in Gemini Nano tier (Prompt API) | `confirmed` | D-045. Zero setup — no key, no multi-GB download. Integrated and verified in webai (checked 2026-08-01). |
+| BYO API key: Gemini, OpenRouter, Anthropic, OpenAI | `confirmed` | D-045. Keys client-side only; traffic browser → provider, never via this server. Each adapter ships only after in-browser CORS verification (RE-010); Gemini's subscription quota rides the ordinary key. |
+| Capability tiering above the D-016 floor | `confirmed` | D-045. Base app keeps the D-016 floor; local tier gated on WebGPU/memory, feature-detected. |
+| Tool-calling benchmark and per-model scorecard | `confirmed` | D-046. Ground-truth questions scored by data comparison in Playwright against the real corpus; no LLM judge. |
+| Network, write, or URL-fetch tools for the model | `rejected (D-044)` | CVE text is attacker-influenced input to the prompt; the tool surface is read-only and render-only, permanently. |
+| Consumer-subscription OAuth passthrough | `rejected (D-045)` | Anthropic bans it outright (2026-04-04); risks users' accounts. Google needs no passthrough — quota attaches to the ordinary key. |
+| Server-side inference or model proxying | `rejected (D-045)` | Would forfeit the privacy claim and add the first dynamic endpoint (D-032). |
 
 ## Enrichment overlays
 

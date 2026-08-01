@@ -2,12 +2,16 @@
 
 A public web app for searching, analyzing, and reporting on the complete CVE
 List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, 372,092
-records and growing. The entire data plane runs in the browser: the corpus is
-normalized server-side into a ~63 MB compressed SQLite database, downloaded on
-demand into OPFS, and queried locally — so no search or report ever leaves the
-client. The server serves that snapshot and its deltas as static files and
-performs no analysis. Almost all code is written by AI agents working from the
-project documentation, directed and reviewed by a human.
+records and growing — with a planned AI chat layer (M7/M8) that turns
+plain-language questions into local queries (D-044). The entire data plane runs
+in the browser: the corpus is normalized server-side into a ~63 MB compressed
+SQLite database, downloaded on demand into OPFS, and queried locally — so no
+search or report ever leaves the client. By default the model runs in the
+browser too; the one opt-in exception is a user-supplied hosted-model key,
+which sends chat traffic browser-direct to that provider (D-045). The server
+serves the snapshot and its deltas as static files and performs no analysis and
+no inference. Almost all code is written by AI agents working from the project
+documentation, directed and reviewed by a human.
 
 **Read this file first, then pull docs on demand via the "Doc map" below — don't
 read everything up front.** This file is long-term project memory and the
@@ -29,6 +33,12 @@ affected docs. Until then, these govern.
   executing analysis is not. As built this is stronger than the rule requires —
   the client sends no parameters at all — but the rule is the floor. (D-014,
   D-032)
+- **The AI tool surface is read-only and render-only, permanently.** CVE text
+  flows into LLM prompts, so injection is assumed: no tool may fetch a URL,
+  write data, or reach the network. Hosted models are the user's own key —
+  stored client-side, called browser-direct, never proxied; no bundled key, and
+  no consumer-subscription OAuth where providers forbid it (none is sanctioned
+  today). (D-044, D-045)
 - **Nothing is collected from users — no telemetry, ever.** Not analytics, not
   error reporting, not opt-in. This makes the privacy claim verifiable in a
   network panel rather than a promise. Do not add a reporting channel; improve

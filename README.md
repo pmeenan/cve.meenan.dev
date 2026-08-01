@@ -17,17 +17,23 @@ query it locally from then on.
   relational store, so questions a keyword search cannot answer are in reach.
 - **Kept current.** The local copy updates incrementally rather than by
   re-downloading the corpus.
+- **AI-assisted (planned).** A chat layer will turn plain-language questions
+  into local queries and drive the same charts and lists as the regular UI —
+  by default with a model that also runs in your browser; optionally with your
+  own hosted-model API key, called browser-direct and never through this
+  server (D-044, D-045).
 
-Planned capabilities beyond the above — structured filtering, trend reporting,
-export, enrichment overlays — are being triaged, not yet committed. See
-[docs/features.md](docs/features.md) for what is confirmed versus proposed.
+The feature ledger is fully triaged — see
+[docs/features.md](docs/features.md) for what is confirmed versus rejected.
 
 ## Status
 
-**Pre-code.** Milestone M0 ("plan the plan") is complete — scope,
-architecture, schema, and the data-delivery protocol are settled and measured
-against the real corpus. Implementation starts at M1. There is no application to
-run yet. Progress lives in [docs/plan.md](docs/plan.md).
+**M1 in progress.** Milestone M0 ("plan the plan") closed with scope,
+architecture, schema, and the data-delivery protocol settled and measured
+against the real corpus. Scaffolding and the first end-to-end path — published
+chunks → SQLite/WASM on OPFS → a rendered query — run locally; full-scale
+measurement and the first deploy remain. Progress lives in
+[docs/plan.md](docs/plan.md).
 
 ## How this project is built
 

@@ -23,6 +23,22 @@ fetches a prebuilt database — 62.6 MB compressed for all 372,092 records — a
 an explicit "Sync" action applies deltas, typically well under a megabyte a day
 (D-025, D-038). Nothing fetches behind your back.
 
+On top of that database sits an AI analyst. A free-form chat box turns
+plain-language questions — *"stacked count of CVEs by severity over time, for
+this vendor"* — into local queries and drives the same charts, clickable lists,
+and drill-downs the deterministic UI offers; every answer is backed by queries
+you can inspect, edit, and re-run without the model (D-044). By default the
+model itself runs in your browser, downloaded once like the corpus, so even the
+AI never leaves your machine and works offline. Optionally, a user-supplied API
+key routes chat to a hosted model instead — Gemini (whose Pro/Ultra
+subscription quota rides the ordinary API key), OpenRouter, Anthropic, or
+OpenAI, each adapter shipping only after its browser-direct path is verified
+(D-045). That is the one explicit, opt-in
+exception to "never sent anywhere": your question and the query results behind
+it go directly from your browser to that provider, on your own account and key,
+and still never through this server (D-045). Chat is an additional way to drive
+the app, never the only one — everything works with no model configured.
+
 ## Who it's for
 
 - **Security researchers and vulnerability analysts** who need to slice the full
@@ -30,9 +46,10 @@ an explicit "Sync" action applies deltas, typically well under a megabyte a day
   search service.
 - **CNAs and program participants** looking at publication patterns, record
   quality, and their own output in context.
-- **Anyone with a CVE question** that a keyword search box cannot answer,
-  including people who want raw SQL access to the corpus without provisioning a
-  database.
+- **Anyone with a CVE question** that a keyword search box cannot answer —
+  people who want raw SQL access to the corpus without provisioning a database,
+  and people who would rather ask the question in plain language and let the
+  chat layer write the queries.
 - **The project owner**, as the first user — this is a tool built to be used,
   not a demo.
 
@@ -55,14 +72,21 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
    an assumed one.
 4. **What the server can learn is bounded and checkable.** With the network
    panel open, a user can confirm that the app makes exactly two kinds of
-   request: fetch the snapshot, and fetch deltas since a watermark. Neither
+   request to this server: fetch the snapshot, and fetch deltas since a
+   watermark. Neither
    carries a filter value, a search term, or any indication of what is being
    asked. Analysis — filtering, aggregation, ranking, search — runs entirely on
    the client. D-014 permits requests to name fields and partitions; D-025
    removed even that, so the server learns nothing about the query at all.
+   The AI layer adds two further request kinds, both user-initiated and both
+   bypassing this server entirely: model-weight downloads from Hugging Face,
+   and — only when the user supplies a key — chat traffic direct to their
+   chosen provider (D-045). Neither ever reaches cve.meenan.dev.
 5. **It works offline, fully.** Once downloaded, the client holds the entire
    corpus (D-025), so search, analysis, and reporting all work with the network
-   disconnected. Only Download and Sync need it.
+   disconnected. Only Download, Sync, and the optional model-weight download
+   need it — hosted-model chat is the one feature that inherently requires the
+   network (D-045).
 6. **Reports are shareable without the data being shareable.** A user can hand
    someone a query or report definition that reproduces the analysis on their
    own local copy, and separately export result sets in a standard format —
@@ -75,6 +99,12 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
    confident counts, which the visible freshness indicator exists to prevent;
    and a search index drifted out of step with the data during a delta apply
    (D-025 hazard 2), which is where the correctness effort belongs.
+8. **AI answers are grounded and auditable.** Every number a chat answer shows
+   came from a query, not from the model's token sampling: presentation flows
+   through the same report definitions the deterministic UI renders, and the
+   queries behind an answer are exposed for inspection and re-running (D-044).
+   The chat layer is optional — criteria 1–7 hold with no model configured —
+   and the local-model tier preserves criterion 5 in full, offline included.
 
 ## Non-goals
 
@@ -96,6 +126,11 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
   NVD enrichment were rejected (D-010): each adds a fetch path, a license
   question, and a recurring sync problem to a tool whose pitch is not needing
   the network.
+- **Not a hosted AI service.** No inference runs on this server, no model
+  traffic is proxied through it, and no shared or bundled API key exists.
+  Hosted models are the user's own key and account, called browser-direct
+  (D-045) — and consumer-subscription OAuth passthrough is out permanently
+  where providers forbid it.
 - **Nothing is collected from users.** No telemetry, no analytics, no error
   reporting, not even opt-in (D-009). The tradeoff is accepted knowingly: we are
   blind to production failures, and the diagnostics panel exists so users can

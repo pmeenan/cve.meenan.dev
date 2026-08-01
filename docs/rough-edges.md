@@ -22,6 +22,42 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-010: Hosted-LLM CORS preflights from curl disagree with documented browser support  (2026-08-01, status: open)
+
+**Environment.** curl 8.5.0 on Linux, 2026-08-01. `OPTIONS` requests with
+`Origin: https://cve.meenan.dev`, `Access-Control-Request-Method: POST`, and
+`Access-Control-Request-Headers: authorization,content-type,x-api-key,anthropic-version`
+against the four hosted providers the D-045 ladder names.
+
+**Measurement.**
+
+| Endpoint | Preflight result |
+| --- | --- |
+| `api.openai.com/v1/chat/completions` | 200, `access-control-allow-origin` echoes the origin |
+| `openrouter.ai/api/v1/chat/completions` | 204, `access-control-allow-origin: *` |
+| `api.anthropic.com/v1/messages` | **400**, with `allow-methods`/`allow-headers` present but no `allow-origin` |
+| `generativelanguage.googleapis.com/…:generateContent` | **403**, no CORS headers at all |
+
+**Observed vs. expected.** OpenAI and OpenRouter are unambiguously
+browser-callable. The other two *contradict their documentation*: Anthropic
+documents browser use behind an `anthropic-dangerous-direct-browser-access`
+opt-in header, and Google's official JS SDK claims client-side support — yet
+both preflights failed. The likely cause is methodological: a hand-rolled curl
+preflight may not reproduce what the browser actually sends (Anthropic's 400
+may reflect the opt-in header missing from `Access-Control-Request-Headers`;
+Google's 403 arrived on a keyless request and may mask CORS behavior behind
+auth rejection).
+
+**Impact.** curl preflights are a screening tool, not a verdict, for CORS
+support. D-045's provider claims for Anthropic and Gemini are marked
+needs-verification for exactly this reason; the M7 exit requires re-verifying
+each adapter from a real browser before it ships. Re-measure from an actual
+page on the deployed origin, with a real key, before concluding a provider is
+browser-blocked.
+
+**Links:** D-045 (provider ladder and the sources for each provider's
+documented stance), RE-001 (the same lesson for GitHub's endpoints).
+
 ## RE-009: Latest-version toolchain outruns its own ecosystem  (2026-08-01, status: worked-around)
 
 **Environment.** Scaffolding cve.meenan.dev on 2026-08-01: Node 24.16.0,

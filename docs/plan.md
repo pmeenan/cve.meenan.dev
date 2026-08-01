@@ -149,8 +149,13 @@ Scope: structured filtering UI, aggregate and trend reporting, charting, saved
 queries and history, shareable query permalinks, CSV/JSON export carrying the
 D-008 notice.
 
+The serializable report definition behind permalinks is now also the contract
+the AI chat layer emits (D-044) — design it here as a shared primitive, not a
+permalink implementation detail.
+
 **Exit criteria:** the owner's motivating question — counts by vendor, product,
-and severity over the last two years — is answerable entirely through the UI,
+and severity over the last two years (D-046 benchmark item #2) — is answerable
+entirely through the UI,
 charted and exportable, with REJECTED records excluded by default (D-022).
 
 ## M5 — Resilience and public launch  `pending`
@@ -172,3 +177,48 @@ blocking anything.
 
 **Exit criteria:** KEV status is a queryable, filterable attribute, and its
 staleness is surfaced separately from the corpus's.
+
+## M7 — AI chat layer: tool surface, hosted providers, benchmark  `pending`
+
+The chat loop proven with strong models first, so tool-surface problems are
+never mistaken for model-quality problems. Depends on M4's report definitions
+and, for the KEV tool, on M6.
+
+Scope: the chat surface; the read-only tool surface over report definitions —
+curated high-level tools plus the `SELECT`-only SQL tool (D-044); provider
+adapters for user-supplied keys — Gemini, OpenRouter, Anthropic, OpenAI — with
+keys stored client-side only and in-browser CORS verified per provider
+(D-045); the D-046 benchmark harness with ground-truth questions, the owner's
+severity-over-time question first.
+
+**Exit criteria:** with a hosted key, the founding question — stacked CVE
+counts by severity over time, all products and per-product (D-046 benchmark
+item #1) — is answered end-to-end through chat, rendering via the fixed UI
+with the backing queries inspectable; the benchmark runs against at least two
+hosted providers and produces a scorecard; a network-panel check confirms chat
+traffic goes only browser → provider and keys never reach `cve.meenan.dev`;
+and an adversarial pass feeds hostile records — markup, injection payloads,
+hostile URLs — through the chat path and shows containment: nothing beyond
+the read-only tool surface is reachable, and no record-supplied markup or URL
+renders outside the fixed UI's existing treatment.
+
+## M8 — Local model tier  `pending`
+
+The differentiator: AI analysis that never leaves the machine. Gated on M7's
+benchmark, which is what selects the model.
+
+Scope: in-browser inference (WASM/WebGPU) with weights downloaded from Hugging
+Face into OPFS on explicit user action, lifting webai's acquisition and runtime
+plumbing as prior art; Chrome built-in Gemini Nano via the Prompt API as the
+zero-setup tier; capability gating for the local tier above the D-016 base
+floor; benchmark-driven model shortlist with weight licenses checked
+deliberately (D-045, D-046); and the storage story for multi-gigabyte weights —
+quota, eviction, and the guarantee that a weight download can never evict the
+corpus (weights are D-013-style rebuildable cache).
+
+**Exit criteria:** a shortlisted local model answers the benchmark's core
+questions correctly with the network disconnected (corpus and weights already
+local); Gemini Nano works where Chrome offers it and degrades honestly where
+it does not; an unsupported browser is told at the gate, not mid-download; the
+benchmark scorecard for local candidates is recorded and the default model
+choice is justified from it.

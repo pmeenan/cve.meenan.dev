@@ -23,6 +23,180 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-046: Tool-calling quality is measured in this repo and gates model selection  (2026-08-01, status: accepted)
+
+**Decision.** The tool-calling benchmark lives in this repository, not in webai.
+It is a fixed set of representative analyst questions, each with a hand-written
+ground-truth result computed by SQL against the real corpus. The first two are
+canonical here — other docs' paraphrases defer to this list: **item #1** is the
+owner's founding question, a stacked count of CVEs by severity over time, all
+products and per-product; **item #2** is the M4 exit-criterion variant, counts
+by vendor, product, and severity over the last two years. A harness drives each candidate model through
+the actual chat integration (our tool schemas, our system prompt, our SQLite
+schema) in Playwright and scores by comparing the **data** the model's tool
+calls produced — or the report definition it emitted — against ground truth.
+No LLM judge. The scorecard (tool-call accuracy, turns needed, latency) is what
+selects the local-model default and sets honest expectations per provider tier.
+
+**Context.** webai (the sister project) proved in-browser model acquisition,
+OPFS storage, multi-runtime inference, browser-managed Gemini Nano, and
+structured-output testing — but its tool/function-calling harness was planned
+(its M9+) and never built, and its own findings log notes tool-call token
+coverage is unmeasured.
+So nobody has measured whether a ~2–4B quantized model can reliably chain
+"question → right tool → right arguments → grounded answer" over this schema —
+and that is the make-or-break question for the local default (D-045). The owner
+chose to measure it here (2026-08-01) because the results are specific to this
+integration and are part of model selection, not a general runtime property.
+D-044's report-definition design is what makes scoring cheap: outputs are
+comparable data, not prose.
+
+**Consequences.** Model selection becomes evidence (rule 3), not vibes: a model
+enters the local shortlist by scoring, and if no local model scores acceptably,
+the product ships with hosted-key and deterministic-UI paths while the local
+tier waits for a model that passes. webai remains prior art for the
+acquisition/runtime/OPFS plumbing — lifted as reference, not rebuilt blind.
+The benchmark questions double as living documentation of what the chat layer
+is supposed to handle.
+
+**Reopen if.** webai lands a generic tool-calling harness that can host
+external tool schemas and corpora, at which point running ours there might
+avoid duplicate harness maintenance.
+
+## D-045: Model providers — a local-first ladder with user-supplied keys, and no subscription OAuth  (2026-08-01, status: accepted, amends the consequences of D-009 and D-016)
+
+**Decision.** The chat layer (D-044) offers providers as an explicit ladder,
+best-default first:
+
+1. **Local model** — WASM/WebGPU inference in the browser, weights downloaded
+   from Hugging Face into OPFS on explicit user action. Private and fully
+   offline; the default.
+2. **Chrome built-in Gemini Nano** via the Prompt API — no key, no multi-GB
+   download, browser-managed; the zero-setup tier where available.
+3. **Gemini API key** (Google AI Studio) — a free tier exists, and Google AI
+   Pro/Ultra subscribers' quota attaches to their ordinary API key on Google's
+   side, so "use your subscription" is just "paste your key".
+4. **OpenRouter key** — one integration covering every hosted model.
+5. **Direct Anthropic / OpenAI keys.**
+
+Keys and provider choice are stored client-side only and never touch
+`cve.meenan.dev`; all chat traffic flows browser → provider directly.
+**Consumer-subscription OAuth passthrough is rejected permanently** for
+providers that forbid it: Anthropic blocked Pro/Max subscription tokens in
+third-party tools effective 2026-04-04 and made it a terms violation — building
+around that risks our users' accounts, not just ours.
+
+**Context.** Owner-stated (2026-08-01): default to a local in-browser model,
+allow hosted models via user keys, and reuse existing consumer subscriptions
+wherever genuinely permitted. Grounded per rule 4, checked 2026-08-01:
+
+- **CORS from a browser origin, measured by preflight** (`OPTIONS` with
+  `Origin: https://cve.meenan.dev`; methodology and its caveats in RE-010):
+  OpenAI answered 200 echoing the origin in
+  `access-control-allow-origin`; OpenRouter answered 204 with
+  `allow-origin: *`. Anthropic documents browser use behind an explicit
+  `anthropic-dangerous-direct-browser-access` opt-in header (our preflight got
+  a 400 with partial CORS headers — re-verify in a real browser before
+  building). Google's endpoint returned 403 with no CORS headers to a bare
+  preflight, though its official JS SDK claims client-side support — verify
+  before promising it.
+- **Google subscription quota:** AI Studio is integrated into Google AI
+  Pro/Ultra as of April 2026 — subscribers get paid models and higher limits on
+  their account's API key, Ultra adds monthly Cloud credits
+  (ai.google.dev/gemini-api/docs/google-ai-plans; 9to5google.com 2026-04-20;
+  support.google.com/googleone/answer/16286513).
+- **Anthropic subscription ban:** enforcement from January 2026, documentation
+  2026-02-19, hard cutoff 2026-04-04; subscription OAuth is exclusively for
+  Claude Code and Claude.ai (winbuzzer.com 2026-02-19; dev.to summary).
+- OpenAI offers no subscription-to-API passthrough that we found; re-check when
+  that adapter is built.
+- **Gemini Nano:** integrated and verified in webai as its browser-managed
+  acquisition path (webai README status, checked 2026-08-01). Availability is
+  Chrome-gated and feature-detected, never UA-sniffed.
+
+**Consequences.** The privacy claim gains one explicit, opt-in exception:
+with a user-supplied key, the question and the tool results it triggers go to
+that provider, by the user's own choice and account. The local default
+preserves the full "never leaves your machine" claim — including offline —
+and our server learns nothing in every tier (D-032 untouched; vision.md
+amended accordingly). D-016's browser floor splits into tiers: the base app
+keeps the D-016 floor, hosted-AI works anywhere modern with a key, and the
+local tier is capability-gated on WebGPU and memory, not UA-sniffed.
+Thread-using local runtimes (e.g. wllama) need COOP/COEP — already served on
+`cve.meenan.dev` (D-030), and proven in production by webai on the same nginx;
+the runtime itself is unchosen, an M8 outcome of the D-046 scorecard. Model
+weights are downloaded by the user from Hugging Face, not redistributed by us,
+so they are not dependencies under D-002 — but the shortlist's weight licenses
+(e.g. Gemma's custom terms) get checked deliberately before a model is
+recommended. In OPFS, weights are a rebuildable cache in the D-013 sense —
+evictable and re-downloadable, never a user asset — and the M8 storage story
+must guarantee a multi-gigabyte weight download can never evict the corpus.
+Provider adapters are a thin abstraction: OpenRouter alone would cover
+everything, so direct integrations exist only where they add something real
+(Gemini's subscription quota, Anthropic/OpenAI first-party keys).
+
+**Reopen if.** A provider changes CORS or subscription policy (this landscape
+moved three times in the first half of 2026), a provider ships a *sanctioned*
+OAuth flow for third-party browser apps, or WebGPU/WebNN availability shifts
+enough to change the local tier's floor.
+
+## D-044: An AI chat layer augments the deterministic UI, driving it through shared report definitions  (2026-08-01, status: accepted)
+
+**Decision.** The product grows a free-form chat surface: an LLM translates
+plain-language analyst questions into local queries and presents results. Four
+commitments bound it:
+
+- **Chat augments the deterministic UI; it never replaces it.** The filter,
+  report, chart and SQL-console surfaces remain fully functional with no model
+  configured, and are the fallback on any browser the AI tiers exclude.
+- **One shared primitive.** The model's presentation tools emit the same
+  serializable **report definition** the deterministic UI builds, renders, and
+  shares (the vision-criterion-6 permalink object). The UI is the renderer and
+  editor of report definitions; chat is a generator of them; sharing is
+  serializing them. Every chart or list the chat produces is therefore
+  inspectable, hand-editable, and reproducible without the model.
+- **The model orchestrates; it never transcribes.** Aggregate results (small
+  pivots) may enter the model's context so it can interpret trends; row-level
+  result sets never do — they are returned as handles and rendered directly
+  from SQLite by the fixed UI components. Every number a user sees came from a
+  query, not from token sampling.
+- **The tool surface is read-only and render-only, permanently.** Curated
+  high-level tools (search, filter + aggregate, CVE detail, KEV lookup) with
+  tight schemas for small models, plus a `SELECT`-only, row-capped, timed-out
+  SQL tool for capable models — enforced structurally, by a read-only
+  connection or SQLite authorizer, never by inspecting query text. No tool may
+  fetch a URL, write data, or reach the network — CVE records are
+  attacker-influenced text (rule 5) now flowing into a model's prompt, so
+  injection is assumed and its blast radius is bounded to wrong-but-inspectable
+  presentation. Report definitions carry structured data only: no
+  model-authored HTML, markdown, or URLs; chat prose renders as plain text,
+  and record URLs surface only through the fixed UI's existing
+  never-auto-fetched treatment.
+
+**Context.** Owner pivot, discussed and settled 2026-08-01. The motivating gap:
+vision.md's audience includes "anyone with a CVE question that a keyword search
+box cannot answer," but the answer path was SQL or a report builder. The
+owner's own founding question — severity-over-time trends, per-product —
+is exactly the shape an LLM translates well and a spreadsheet-less user cannot
+write. The pivot strengthens rather than bends the constraint set: with the
+local default (D-045) the model itself obeys "the data plane is client-side"
+(D-007), and the chat path never touches our server, so D-014/D-032 hold
+trivially.
+
+**Consequences.** The report definition becomes an internal contract shared by
+three features and must be designed as one (M4's shape work gains a consumer).
+Vision criterion 7 survives the LLM: answers are auditable because the queries
+behind them are exposed and re-runnable, and the model cannot show a number the
+deterministic path could not reproduce. Benchmarking (D-046) gets cheap scoring
+for free — compare emitted definitions or their result data against ground
+truth. The AI layer is additive: every piece of it sits above the M1–M4 core,
+which is unchanged.
+
+**Reopen if.** Report definitions prove too rigid for what models usefully
+emit (forcing a parallel presentation path), or measured tool-calling quality
+(D-046) is unusable even for frontier hosted models — which would demote chat
+from product pillar to experiment.
+
 ## D-043: The ingest pipeline is Python 3.12, standard library only  (2026-08-01, status: accepted, extends D-017)
 
 **Decision.** Everything server-side — fetch, hash, normalize, chunk, publish —
@@ -1472,7 +1646,7 @@ starts.
 capability exists only in another ecosystem, or the bake-off reveals a data-layer
 constraint the build system cannot accommodate.
 
-## D-016: Browser support floor — Chrome 108, Firefox 111, Safari 16.4  (2026-07-30, status: accepted)
+## D-016: Browser support floor — Chrome 108, Firefox 111, Safari 16.4  (2026-07-30, status: accepted, consequences amended by D-045: the floor governs the base app; AI tiers gate separately)
 
 **Decision.** Supported: Chrome/Edge 108+, Firefox 111+, Safari 16.4+, Chrome
 Android 109+, Safari iOS 16.4+. Below the floor, the capability gate shows an
@@ -1691,7 +1865,7 @@ not find it here.
 obvious next ask, or EPSS begins publishing in a form that composes with the
 chosen delivery architecture instead of fighting it.
 
-## D-009: No telemetry, of any kind  (2026-07-30, status: accepted)
+## D-009: No telemetry, of any kind  (2026-07-30, status: accepted, consequences amended by D-045: user-keyed chat requests carry the user's question browser → provider — by opt-in, and never to us)
 
 **Decision.** The application collects and transmits no usage data, error
 reports, or analytics. Not aggregate counters, not opt-in diagnostics.
