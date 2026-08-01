@@ -27,12 +27,12 @@ the decision log, not by editing a row.
 | Corpus integrity check | `confirmed` | Detects truncated or corrupted data before a user builds analysis on it. Cheap insurance against the worst failure mode. |
 | "N new CVEs since your last sync" summary | `confirmed` | Turns an invisible background chore into the reason to open the app; near-free once a watermark exists. |
 | Notice carried by every served artifact | `confirmed` | D-008 requires MITRE's copyright designation and license text in any copy; in-band where the format allows. Not discretionary. |
-| Scheduled server-side `git fetch` | `confirmed` | Moved from Operations — it is the head of this pipeline. Cadence, failure handling, and staleness signalling still to specify. |
-| Explicit "Download data" action | `confirmed` | D-025, D-026. Cached weekly snapshot *plus* every delta since it was taken, so download leaves the client current. ~72 MB brotli (-q10). |
+| Scheduled server-side `git fetch` | `confirmed` | D-042. Daily cron under `flock`; monthly snapshot rebuild. Failure leaves the previous generation serving; staleness reaches users through the manifest, not a second channel. |
+| Explicit "Download data" action | `confirmed` | D-025, D-026. Cached weekly snapshot *plus* every delta since it was taken, so download leaves the client current. **62.6 MB brotli -q10** for the whole corpus (D-035, D-038). |
 | Explicit "Sync" action applying a delta | `confirmed` | D-025. Median day 0.17 MB, busiest observed 0.78 MB — ~574× cheaper than re-downloading. Same apply path as download (D-026). |
-| Weekly snapshot rebuild with cached compressed artifact | `confirmed` | D-026. Compression is the expensive step (minutes at brotli -q10, vs 19 s to rebuild the database), so it runs weekly rather than per upstream fetch. |
-| Merged deltas per watermark range | `confirmed` | D-026. A client catching up a week should get each record's final state, not every intermediate revision. |
-| Resumable / interruptible download | `confirmed` | D-025. Made easy by D-026: the snapshot is a static file, so ordinary HTTP range resume works. |
+| Monthly snapshot rebuild with cached compressed chunks | `confirmed` | D-042, refining D-026. A month of catch-up is ~31 daily deltas and ~2.6 MB against 62.6 MB — about 4%. |
+| Merged deltas per watermark range | `confirmed` | D-026, D-031. A range query over per-record revisions returns final state by construction. Daily ingest (D-042) means one file per day and no rollup. |
+| Resumable / interruptible download | `confirmed` | D-041. A property of the format rather than a feature: independently-compressed 32 MB chunks make resume a bitmap of what is already written. |
 | Server-assigned stable IDs for interned lookups | `confirmed` | D-025 hazard 1. Deltas reference CWE/CNA/vendor/product by integer, so the server must own that ID space permanently and ship new lookup rows with the deltas that use them. |
 | FTS index maintenance on delta apply | `confirmed` | D-025 hazard 2. External-content FTS5 does not self-update; a missed `'delete'` silently desynchronizes search from the data. |
 | Tombstones for removed records | `confirmed` | D-025 hazard 3. Without them an upstream removal persists in every client forever. |
@@ -49,13 +49,20 @@ the decision log, not by editing a row.
 | OPFS persistence of the database | `confirmed` | D-004. |
 | Analytics/reporting layer over the local corpus | `confirmed` | Owner-stated. Bounded by the criteria below. |
 | Extraction of CVSS metrics (v2 / v3.x / v4) into queryable columns | `confirmed` | Records carry several metric formats; severity filtering is unusable until they are normalized. |
-| Extraction of CWE, CPE, and affected product/vendor into queryable form | `confirmed` | The most common filter axes after severity and date. |
-| Full-text search (FTS5) over descriptions and references | `confirmed` | D-011, English-only per D-023. Measured: descriptions + FTS index are 187 MB of the 273 MB database — the expensive half, and the natural thing to defer if cold start needs to be faster. References are not yet in the spike index. |
+| Extraction of CWE and affected product/vendor into queryable form | `confirmed` | The most common filter axes after severity and date. CPE was dropped by D-033 on 2.2% prevalence. |
+| Full-text search (FTS5) over descriptions, vendors and products | `confirmed` | D-035, English-only per D-023. Built in the browser after import, never shipped — the index compresses at 1.7× and cost 35.1 MB, 31% of the download. |
+| Filter references by host rather than full-text | `confirmed (amends D-011)` | D-033, D-035. Indexing reference URLs pollutes the term space with hosts, slugs and file names; host interning costs 2.0 MB and answers the question exactly. |
+| Affected version ranges | `confirmed` | D-033. 95.0% prevalence, +14.4 MB compressed. |
+| References, as interned URLs | `confirmed` | D-033. 95.1% prevalence, +23.0 MB compressed including host interning. |
+| CPE applicability | `rejected (D-033)` | Present on 2.2% of records — a filter that would look like it works and silently discard 97.8% of the corpus. |
+| Credits, timeline, solutions, workarounds, exploits | `rejected (D-033)` | 0.3–20.1% prevalence; per-record prose no confirmed aggregate consumes. |
 | Interned lookup tables for CWE, CNA, vendor, product | `confirmed` | D-024. 797 CWEs and 479 CNAs replace text repeated across 372k records; the corpus drops 16× to 272.8 MB. |
 | Published and last-modified dates | `confirmed` | D-020. Sourced from `cveMetadata.datePublished` / `dateUpdated` in the record JSON — 98.4% / 100% coverage — not from git. |
 | Record state (`PUBLISHED` / `REJECTED`) as a queryable column | `confirmed` | D-022. ~4.9% of the corpus is REJECTED; excluded from counts by default, filterable on request. |
 | Per-record revision count | `rejected (D-020)` | No confirmed feature queries it, and it was the only consumer of git history. |
 | Schema versioning and migration on app update | `confirmed` | Without it, every schema change forces users through a full re-import. |
+| Year-partitioned download with on-demand backfill | `rejected (D-038)` | Would have saved 24.6 MB on a first download in exchange for coverage becoming a thing the whole product reasons about. D-035 had already banked the larger saving. |
+| Client-side brotli decompression in WASM, streamed into OPFS | `confirmed` | D-040, D-041. Opaque `.br` chunks decoded and written positionally, so peak memory is one chunk and no intermediary can re-encode. |
 | Storage quota handling and `navigator.storage.persist()` | `confirmed` | A corpus this size runs into quota and eviction; silent eviction looks like data loss. |
 | Import/export of the whole local database | `rejected (D-013)` | The local database is a rebuildable cache, not a user asset. |
 
@@ -116,12 +123,13 @@ Ordered by how much rework a late answer would cause.
    placement after download, and snapshot cadence — are answered there too.
    **D-032** follows from it: because a delta is named by its revision range, it
    is a static file, and the sync path needs no request handler at all.
-**Q-002. What else belongs in the schema beyond the spike floor?** D-024's 272.8 MB
-   deliberately omits references (10.6% of corpus bytes), affected version
-   ranges, CPE applicability, solutions, credits, and timeline — and D-011
-   requires FTS over references, which the spike does not index. Each addition
-   grows the download every user takes, so this is the question that decides
-   whether ~99 MB stays roughly true.
+**Q-002. What else belongs in the schema beyond the spike floor?**
+   **Answered 2026-07-31 by D-033**, by building every candidate section against
+   the full corpus and compressing each cumulative variant. Version ranges and
+   references are in, five sections are out, and FTS over references is replaced
+   by host interning — an amendment to D-011. The published artifact measures
+   **95.4 MB at brotli -q10**, up 32% from the floor. D-035 then removed the
+   shipped index, bringing the download to **62.6 MB**.
 **Q-003. What are the browser-side budgets?** *Deferred to M1 by D-029 — needs a
    running browser, so it is measured against real scaffolding rather than
    answered on paper.* The D-024 timings are native SQLite on server hardware.
@@ -144,7 +152,7 @@ Ordered by how much rework a late answer would cause.
    freely. D-025 shrank it once; **D-032 shrank it again and changed its
    character**: there is no request handler left to harden, so what remains is
    nginx configuration over static files — the `alias` exposing `cve.data/pub/`
-   read-only, bandwidth limits on a 72 MB artifact (`limit_conn`, `limit_rate`),
+   read-only,
    cache headers, and whatever same-origin enforcement is worth doing given that
    non-browser callers forge headers freely. KEV (D-010) is a third static file
    under the same treatment.
@@ -152,8 +160,9 @@ Ordered by how much rework a late answer would cause.
    **The server-configuration half is answered (D-030).** All three dependencies
    were checked on `plex` 2026-07-31 and none of them block M1:
 
-   - **Brotli** — both nginx brotli modules are already loaded; enabling it is
-     one line, `brotli_static on;`.
+   - **Brotli** — both nginx brotli modules are already loaded, though D-040
+     made `brotli_static` unnecessary for the data plane: artifacts ship as
+     opaque `.br` and the client decompresses them itself.
    - **Clean URLs** — solved without touching nginx by setting
      `trailingSlash: true` in Next, so routes emit `/route/index.html` and the
      existing `try_files $uri $uri/ =404;` resolves them.

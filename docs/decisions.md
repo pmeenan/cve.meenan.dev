@@ -23,6 +23,579 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-042: The pipeline is a daily cron ingest with a monthly snapshot  (2026-08-01, status: accepted, supersedes the cadence half of D-026)
+
+**Decision.** Two scheduled jobs under `flock`, no daemon:
+
+- **Daily** — `git fetch`, hash, diff, guard, rebuild, publish one delta file.
+  ~40 s of work for ~87 KB of output.
+- **Monthly** — rebuild the database, chunk it, compress the chunks in parallel,
+  publish, then retire the previous generation.
+
+Retention: the current snapshot's chunks, the **previous** snapshot's chunks,
+and every delta back to the older of the two. A generation is not deleted the
+moment its successor appears — a client that read the manifest ten minutes ago
+and is mid-download must not start getting 404s. One extra generation costs
+63 MB.
+
+**Context.** Both cadences chosen by the project owner 2026-08-01: *"a cron job
+of some kind that does the git sync periodically (daily is probably good enough),
+builds the delta files and once a month re-generates the full download."* D-026
+had assumed hourly ingest and weekly snapshots.
+
+Daily is comfortable on the measurements. Upstream publishes about every 40
+minutes, so a day accumulates ~665 distinct changed records — **87 KB
+compressed**, one file. A month of catch-up is ~31 files and ~2.6 MB against a
+62.6 MB snapshot, so a user arriving the day before a rebuild downloads about 4%
+more than one arriving the day after.
+
+**Consequences.** Daily ingest deletes the most fragile thing in the delivery
+design. D-032 required delta files to *tile the revision space contiguously* and
+introduced hourly-to-daily rollups to keep a week's catch-up from being 168
+requests; that was the one correctness burden the static design added, and the
+one thing flagged as needing a property test. **At one run per day there is
+nothing to roll up.** Delta files are consecutive by construction — `<rev-1>` to
+`<rev>`, one per day — so tiling is a property of the loop rather than an
+invariant to defend.
+
+What the jobs owe in return:
+
+- **`flock` on a lockfile**, so a monthly snapshot cannot overlap the next
+  daily ingest.
+- **Publish only after the rebuild succeeds**, by atomic rename, so a failed run
+  leaves the previous generation serving.
+- **The tombstone guard runs before anything is published** (D-031). A run that
+  would delete more than 0.1% of the corpus aborts, and aborting is the success
+  case — it means the fetch broke, not that the CVE Program withdrew 400 records.
+- **Staleness is reported through `manifest.json`'s `generated` field**, not
+  through an operational status file. The client already surfaces it; the server
+  does not need a second channel, and D-009 means it must not become one.
+
+The cost of daily rather than hourly is up to 24 hours of staleness. That is the
+owner's call and it is visible in the UI by design, so a user who needs today's
+disclosures knows they do not have them.
+
+**Reopen if.** Upstream volume grows enough that a day's delta stops being one
+small file, or someone actually needs sub-day freshness — in which case hourly
+ingest returns *and brings the rollup requirement back with it*, which is the
+real cost of that change.
+
+## D-041: The snapshot ships as independently-compressed 32 MB chunks  (2026-08-01, status: accepted, refines D-040)
+
+**Decision.** The snapshot is split into **32 MB slices of the uncompressed
+database**, each compressed separately at brotli -q10 into its own file of
+roughly 5.3 MB. Twelve files today. The client fetches them, decompresses each
+in WASM, and writes the result straight into the OPFS database file at that
+chunk's byte offset — never holding the database in memory. Range requests are
+not the resumption mechanism.
+
+**Context.** The owner asked whether to chunk at ~5 MB or rely on range
+requests, and separately settled the memory question: *"We should stream chunk
+by chunk to OPFS. There's no reason to hold everything in memory."* Measured on
+the 391.3 MB artifact, compressing chunks 24-way in parallel:
+
+| Uncompressed chunk | Files | Total | Versus monolith | Wall clock |
+| --- | --- | --- | --- | --- |
+| monolith | 1 | 62.6 MB | — | 351 s (single-threaded) |
+| 64 MB | 6 | 62.9 MB | +0.5% | 140 s |
+| **32 MB** | **12** | **63.3 MB** | **+1.1%** | **101 s** |
+| 16 MB | 24 | 65.6 MB | +4.8% | 66 s |
+| 8 MB | 47 | 66.7 MB | +6.5% | 36 s |
+
+Brotli's largest standard window is 16 MB (`lgwin` 24), so chunks above that
+size cannot lose backward references the monolith would have used. The residual
+cost is cold-start: each chunk begins with an empty context, and at 8 MB there
+are 47 cold starts to pay for. 32 MB is where the curve flattens — 0.7 MB for
+twelve independent pieces — and it happens to land at almost exactly the ~5 MB
+compressed size the owner guessed at.
+
+**The decisive argument is not size, though — it is that brotli is a stream
+format.** A range-resumed monolith gives you compressed bytes from an arbitrary
+offset, which a decoder cannot use without the state that produced them. Resume
+would mean either re-decompressing from byte zero or persisting the compressed
+stream alongside the database, doubling storage. Independently-compressed chunks
+make resumption a bitmap: which chunks are written. Nothing else needs
+remembering.
+
+Four more things follow from it:
+
+- **Positional writes.** Chunk *k* covers decompressed bytes
+  `[k·32 MiB, (k+1)·32 MiB)`, so `FileSystemSyncAccessHandle.write(buf, {at})`
+  places it directly and chunks may be fetched in parallel or out of order.
+- **Integrity gets granular.** Each chunk carries its own SHA-256 in the
+  manifest, so corruption costs one 5 MB refetch rather than the whole download.
+- **No dependence on edge range behavior.** Cloudflare must cache a full object
+  before it can slice ranges from it; twelve small immutable objects sidestep
+  the question entirely.
+- **Compression parallelizes.** 101 s across 24 cores against 351 s
+  single-threaded — which matters for D-042's monthly rebuild.
+
+**Consequences.** The import path is fetch → decompress → positional write, with
+peak memory bounded by one chunk in flight rather than by the corpus. The
+"resumable download" feature is now a property of the format instead of a
+feature to implement.
+
+Chunk size is a published constant, not an inference: the manifest states each
+chunk's offset and length, so changing 32 MB later is a manifest change rather
+than a protocol change. Deltas are unaffected — they are single files, small
+enough that chunking would be noise.
+
+**Reopen if.** Q-003 finds that twelve concurrent decompressions strain memory
+on a modest device — in which case the fix is a concurrency limit, not a
+different chunk size.
+
+## D-040: Compressed artifacts are decompressed in the client, not by `Content-Encoding`  (2026-08-01, status: accepted, supersedes the transport half of D-026 and D-034)
+
+**Decision.** Snapshots and deltas are published as opaque `.br` files with no
+`Content-Encoding` header, and the client decompresses them with a WASM brotli
+decoder. `brotli_static` is not used and the uncompressed twin is not published.
+
+Dependency: **`brotli-dec-wasm` 2.3.2, MIT OR Apache-2.0** (verified from the
+package's own npm metadata, 2026-08-01), ~200 KB, decode-only. Preferred over
+`brotli-wasm` 3.0.1 (Apache-2.0, also acceptable under D-002) because we never
+compress in the browser and the smaller decode-only build is the honest
+dependency.
+
+**Context.** Stated by the project owner 2026-08-01: *"It would probably be
+worthwhile to do our own client-side brotli decompression … That way we are
+fully in control (and we can easily do it in wasm)."*
+
+The reasoning holds up on several axes at once, which is unusual:
+
+- **Progress reporting becomes honest.** With transparent `Content-Encoding`,
+  `Content-Length` is the compressed size while `fetch` hands you decompressed
+  chunks, so a progress bar is measuring one thing against another. Opaque bytes
+  make both sides compressed and the arithmetic exact — which matters more now
+  that the same progress bar also covers index building (D-039).
+- **Range resume becomes exact.** Byte offsets into an opaque file are stable
+  and meaningful; offsets into a transparently-decoded stream are not.
+- **No intermediary can re-encode.** A proxy or CDN cannot decide to
+  re-compress, double-encode, or strip the encoding on a file that never claims
+  one. This also removes the `Vary: Accept-Encoding` dimension from caching.
+- **`DecompressionStream`'s gzip/deflate-only limitation stops mattering.** It
+  was the reason brotli had to arrive via `Content-Encoding` at all.
+- **Half the disk.** Publishing only `.br` drops the 391 MB uncompressed twin
+  that `brotli_static` required.
+
+**Consequences.** D-030's `brotli_static on;` is no longer needed for the data
+plane — it may still be worth enabling for ordinary site assets, but it is not
+load-bearing. The `.br` files are served as `application/octet-stream` with
+`Cache-Control: public, immutable` and nothing else.
+
+The client's import path gains a stage: fetch → decompress (WASM) → write to
+OPFS → build indexes. That is three passes over ~390 MB rather than two, and
+whether it should stream chunk-by-chunk into OPFS or materialize in memory first
+is a real question with a memory ceiling attached — it belongs to Q-003 in M1.
+
+`manifest.json` stays uncompressed: it is small, it must be readable without the
+decoder loaded, and it is the file that tells the client what to fetch.
+
+**Reopen if.** The WASM decoder turns out to be materially slower than the
+browser's native brotli path, in which case the tradeoff is control versus speed
+and wants a measurement, not an argument.
+
+## D-039: Cloudflare honors origin cache headers; there is no origin rate limiting  (2026-08-01, status: accepted, supersedes the rate-limiting half of D-034 and D-037)
+
+**Decision.** No `limit_conn`, no `limit_req`, and no `limit_rate` at the origin.
+Cloudflare absorbs abuse if it ever materializes. Caching is driven entirely by
+the `Cache-Control` headers nginx already sends, using Cache Rules configured to
+respect them rather than Cloudflare's extension-based defaults.
+
+Per the Cloudflare documentation (verified 2026-08-01), the settings are: **Edge
+TTL** → *"Use cache-control header if present, use default Cloudflare caching
+behavior if not"*, and **Browser TTL** → *"Respect origin"*, with the rule
+marked eligible for cache so that `.sqlite`, `.br` and `.json` are cached
+despite not being in the default extension list.
+
+**Context.** Stated by the project owner 2026-08-01: *"There is no need to do
+origin-level rate-limiting on clients. We can have cloudflare absorb that if it
+becomes a problem. We just need the assets to be cacheable"* and *"cloudflare
+has a cache mode to honor HTTP standards-based caching instead of their own
+layer of extension logic so we are fully in control."*
+
+This retires the most fragile part of D-034. Per-IP limits behind a proxy were
+already a footgun (D-037 item 1) requiring `set_real_ip_from` and
+`CF-Connecting-IP` to be correct at all; removing them removes the footgun
+rather than defusing it. Origin cache headers as the single source of truth also
+means the caching policy lives in the same place as everything else about the
+artifacts, instead of being split between nginx and a dashboard.
+
+**Consequences.** D-034 shrinks to: one `^~ /data/` location with a trailing-slash
+`alias`, `autoindex off`, no CORS headers, correct `Cache-Control` per file kind,
+and integrity hashes in the manifest. That is the whole of the hardening story.
+
+One clarification worth recording, because the owner's phrasing — *"then it's
+just the delta API calls"* — suggests a shape the design does not have: **there
+are no delta API calls.** Under D-032 deltas are static files named by revision
+range, so they cache exactly like the snapshot and there is nothing dynamic left
+to protect. If a dynamic endpoint is ever introduced, D-006 and every question
+D-034 declined to answer come back with it.
+
+The 512 MB Cloudflare object ceiling (D-037) becomes comfortable rather than
+close: D-040 publishes only the compressed artifact, 62.6 MB.
+
+**Reopen if.** Abuse actually materializes and Cloudflare's controls prove
+insufficient, or the site moves off Cloudflare — in which case origin limits
+return, with the real-IP caveat.
+
+## D-038: The full corpus ships; year partitioning is dropped  (2026-08-01, status: accepted, supersedes D-036)
+
+**Decision.** No year partitions, no default window, no backfill. Every client
+downloads the whole corpus, as D-025 established. The download is **62.6 MB at
+brotli -q10** (391.3 MB uncompressed) — the full corpus with no shipped index,
+per D-035.
+
+**Context.** Decided by the project owner 2026-08-01: *"I don't think the
+savings is enough to justify the complexity — full download holds."*
+
+The measurements support it. D-036 would have saved 24.6 MB on a first download
+(38.0 MB against 62.6 MB) in exchange for coverage becoming a thing the product
+has to reason about everywhere. Most of the win the owner was originally after
+came from D-035 instead — dropping the shipped index took 95.4 MB to 62.6 MB
+with no correctness cost at all. Partitioning was the expensive third of a
+saving that was mostly already banked.
+
+**Consequences.** Everything D-036 introduced is withdrawn, and the withdrawal
+is the point:
+
+- **Vision criterion 7 is structural again.** The client either holds the whole
+  corpus or has not downloaded it. No coverage window on aggregates, no
+  boundary on charts, no "your query reaches past your data" path, no backfill
+  flow, no earliest-year scalar to display and test.
+- **D-031's lookup rule stands unamended.** D-036 required deltas to carry every
+  lookup row their upserts referenced, because a partial client could have
+  pruned an older one. With full coverage the client has every lookup row, so
+  revision-selected lookups are sufficient again — and the estimated cost D-036
+  left for M2 to measure evaporates rather than needing measuring.
+- **The snapshot is one file again**, which keeps the delta-tiling invariant as
+  the only correctness burden in the delivery path.
+
+**Reopen if.** The corpus grows enough that a first download becomes a real
+barrier — at current rates roughly 45,000 records a year, or ~7 MB compressed
+annually, so this is a question for several years from now, not this one.
+
+## D-037: Cloudflare fronts the data plane  (2026-08-01, status: accepted; rate-limiting half superseded by D-039)
+
+**Decision.** Cloudflare caching is enabled in front of `cve.meenan.dev`, which
+retires bandwidth as a design constraint. Two changes to D-034 follow, both
+mandatory rather than optional.
+
+1. **Remove the per-IP `limit_conn` from the `/data/` location**, or pair it with
+   `set_real_ip_from` plus `CF-Connecting-IP`. Behind a proxy,
+   `$binary_remote_addr` is *Cloudflare's* address, so a four-connection limit
+   would bucket the entire internet into a handful of edge IPs and throttle
+   legitimate traffic. This is the footgun, not the rate limit itself.
+2. **Add explicit Cache Rules for `/data/*`.** Cloudflare caches by file
+   extension and, per its documentation (verified 2026-08-01), *"does not cache
+   HTML or JSON by default."* Neither `.json`, `.br`, nor `.sqlite` is in the
+   default extension list — so simply proxying would cache none of our
+   artifacts. Deltas and snapshots need a rule with a long edge TTL, and
+   `manifest.json` needs one that bypasses.
+
+**Context.** Offered by the project owner 2026-08-01: *"I can turn on cloudflare
+caching so the bandwidth won't be a problem."*
+
+**Consequences.** D-034's `limit_rate` and immutable cache headers still earn
+their place — they apply to origin misses and to anyone hitting the origin
+directly — but bandwidth stops being a reason to constrain the artifact's size.
+Same-origin enforcement is unaffected: it is the absence of CORS headers, and
+Cloudflare forwards that faithfully.
+
+One ceiling to watch: **Free, Pro and Business plans cap a cacheable object at
+512 MB** (Enterprise 5 GB), verified 2026-08-01. The uncompressed snapshot is
+391 MB today. It is served precompressed in practice, but a schema addition that
+pushes the plain file past 512 MB would silently stop being cached rather than
+fail loudly — worth an assertion in the publish step.
+
+**Reopen if.** The site moves off Cloudflare, or a plan change alters the object
+ceiling.
+
+## D-036: The download is partitioned by year, defaulting to the last five  (2026-08-01, status: **superseded by D-038**)
+
+**Decision.** The snapshot is published as year partitions rather than one file.
+The default download is **2022 onward**; older years are fetched on demand as
+backfill. The client records the earliest year it holds, and that single number
+is the coverage invariant.
+
+**Context.** Proposed by the project owner 2026-08-01, who asked the right
+prior question: has recent volume grown enough that newer years are the bulk
+anyway? **No — measured, they are about half.**
+
+| Window | Records | Share | Database | brotli -q5 |
+| --- | --- | --- | --- | --- |
+| 2022+ (5 years) | 182,182 | 48.9% | 225.3 MB | 46.9 MB |
+| 2021+ (6 years) | 205,619 | 55.2% | 247.5 MB | 51.4 MB |
+| 2017+ (10 years) | 279,217 | 75.0% | 308.4 MB | 62.7 MB |
+| all years | 372,322 | 100% | 391.3 MB | 77.9 MB |
+| backfill ≤2021 | 190,140 | 51.1% | 166.6 MB | 31.1 MB |
+
+Recent records are individually *larger* — richer references, version ranges and
+descriptions — so five years is 48.9% of records but 60% of the compressed
+bytes. The window saves less than record counts suggest, and it still saves 40%.
+
+Combined with D-035, the default download measures **38.0 MB at brotli -q10**,
+against 95.4 MB for the whole corpus with a shipped index (D-033). The complete
+backfilled corpus is 62.6 MB.
+
+**Consequences.** This is the one place the project deliberately takes back
+something D-025 bought: the client no longer necessarily holds everything, so
+vision criterion 7 — results are never quietly wrong — stops being purely
+structural. That is acceptable *only* because the coverage state is a single
+scalar rather than the field-and-partition matrix D-025 rejected. It is
+testable, explainable in one sentence, and cheap to display.
+
+The obligations that follow are functional requirements, not polish:
+
+- Every aggregate, chart and export states the window it covers.
+- A query with an explicit date range reaching past the window says so and
+  offers the backfill, rather than returning a confident short answer.
+- Charts render the boundary, so a trend line does not appear to begin in 2022.
+
+Two protocol consequences:
+
+- **Deltas must carry every lookup row their upserts reference, not just rows
+  created since the client's watermark.** This amends D-031's range-query rule.
+  A 2026 record can newly cite a vendor first interned in 2015, which a
+  five-year client pruned away; selecting lookups by revision would leave a
+  dangling reference. Shipping referenced rows with `INSERT OR IGNORE` keeps the
+  server parameterless (D-032) and correct for any window. The added cost is
+  lookup rows only — the record's own text ships regardless — and is *estimated*
+  in the low tens of KB per delta. Measure it in M2 rather than trusting this
+  estimate.
+- **The client filters delta upserts to its own window**, and after a backfill
+  re-applies the retained deltas for the newly added years. Apply is idempotent
+  (D-031), so re-application needs no bookkeeping.
+
+**Reopen if.** The coverage window starts showing up as a source of confusing
+results despite the display obligations above — in which case the honest fix is
+to default to the whole corpus, which after D-035 costs 62.6 MB rather than the
+95.4 MB that made partitioning attractive.
+
+## D-035: Full-text indexes are built in the browser and cover descriptions, vendors and products  (2026-08-01, status: accepted, supersedes the FTS half of D-011 and D-033)
+
+**Decision.** No FTS index is shipped. The client builds its indexes after
+import, over **descriptions, vendor names and product names**. References are
+not indexed in any form — neither URLs nor names — and D-033's host interning
+remains the way to filter by reference source.
+
+**Context.** Two owner decisions on 2026-08-01, measured the same day.
+
+On coverage: *"We should only FTS over descriptions, vendors and products — the
+references will pollute the results."* This confirms and extends D-033's
+amendment of D-011. The pollution argument is the decisive one and is better
+than the cost argument D-033 made: FTS5's default tokenizer shreds a URL into
+path segments, so every reference URL injects host names, vendor slugs, ticket
+IDs and file names into the same term space as the prose. A search for a product
+name would match any advisory URL containing it.
+
+On placement: shipping the index costs far more than building it.
+
+| Artifact | Database | brotli -q5 |
+| --- | --- | --- |
+| All years, FTS over descriptions shipped (D-033) | 452.5 MB | 113.0 MB |
+| All years, **no FTS shipped** | 391.3 MB | **77.9 MB** |
+| All years, FTS over descriptions + vendor + product shipped | 455.4 MB | 114.2 MB |
+
+**Dropping the index saves 35.1 MB compressed — 31%** — because an inverted
+index is already entropy-dense and compresses at about 1.7× where the rest of
+the database compresses at 5×. It is the single most expensive thing per byte
+that we were shipping. Adding vendor and product to the index costs 1.2 MB
+shipped and nothing at all when built locally.
+
+**Consequences.** The client runs `INSERT INTO fts(fts) VALUES('rebuild')` once
+after import and maintains the index incrementally thereafter, exactly as
+D-031's delta apply already does. Delta application is unchanged.
+
+The cost moves from bandwidth to first-run CPU, and **that cost is unmeasured in
+a browser**. Native SQLite rebuilt the description index in 3 s; WASM writing
+~61 MB of index pages through OPFS could be far slower. This is now the most
+important thing Q-003 measures in M1. If it turns out bad, the fallback is
+narrow and known: ship the index for the default year window only, at 35.1 MB
+compressed for all years and proportionally less for five.
+
+Because the index is derived rather than delivered, it also stops being part of
+the integrity contract — a corrupted index is rebuilt locally, not
+re-downloaded. Verification still uses `integrity-check` at `rank = 1` (RE-005).
+
+**Reopen if.** M1 measures the in-browser rebuild as slow enough to hurt first
+run, or a confirmed feature needs full-text over something these three fields do
+not cover.
+
+## D-034: Data-plane hardening is nginx configuration, and same-origin means no CORS headers  (2026-07-31, status: accepted; rate limiting removed by D-039, brotli transport replaced by D-040)
+
+**Decision.** With no request handler in the data path (D-032), every control is
+server configuration. Six of them, plus one explicit refusal.
+
+1. **One serving location, both paths ending in `/`.**
+
+   ```nginx
+   location ^~ /data/ {
+       alias /var/www/meenan.dev/cve.data/pub/;
+       autoindex off;
+       brotli_static on;
+       limit_conn cvedata 4;
+       limit_rate_after 16m;
+       limit_rate 25m;
+   }
+   ```
+
+   `^~` matters: without it the existing `location ~* \.(js|css|…)$` regex block
+   can win over a prefix match and apply the wrong cache policy.
+
+2. **`pub/` contains only finished artifacts.** The clone, the working
+   databases, and the ingest hash state stay in sibling directories under
+   `cve.data/` (D-018) and are never reachable. Publication is an atomic rename
+   into `pub/`, so a half-written artifact is never served.
+
+3. **Same-origin enforcement is the absence of CORS headers.** No
+   `Access-Control-Allow-Origin` on anything under `/data/`. That is what
+   actually stops another origin's JavaScript from using this server as its
+   backend, and it is the correct reading of the owner's requirement that the
+   data "only works same-origin from the browser."
+
+4. **Bandwidth is the only real exposure, so bandwidth is what is limited.**
+   `limit_conn_zone $binary_remote_addr zone=cvedata:10m;` in `http`, four
+   concurrent connections per address, and a rate cap that starts after the
+   first 16 MB so small delta fetches are never throttled.
+
+5. **Cache policy by kind.** Snapshots and deltas are immutable and get
+   `expires max` with `Cache-Control: public, immutable`; `manifest.json` gets
+   `no-cache`. This also closes the D-030 gap where `expires max` covered only
+   `js|css|png|…` and would have missed the artifacts entirely.
+
+6. **Integrity travels in the manifest.** Every file is listed with its byte
+   length and SHA-256, and the client verifies after download. This is the
+   confirmed "corpus integrity check" feature and the answer to a truncated
+   transfer.
+
+**Rejected: blocking on `Sec-Fetch-Site` or `Origin`.** It was the obvious
+reading of "locked down to same-origin browser callers," and it is security
+theater here. Any non-browser client omits the header or sets it to whatever it
+likes, so it stops nobody who matters; meanwhile it breaks `curl`, breaks direct
+download links, and would make the artifacts unverifiable by anyone auditing our
+privacy claim. The requirement it was meant to satisfy is met properly by item 3.
+
+**Context.** Read from `plex` 2026-07-31. There are no `limit_req`, `limit_conn`,
+`limit_rate`, `map`, or `alias` directives anywhere in the current configuration,
+so all of the above is additive. nginx workers run as `pmeenan` (as does
+php-fpm, D-030), so the `alias` needs no permission work. Disk is not a
+constraint: 1.1 TB free.
+
+**Consequences.** The nginx changes M1 needs are now three: `brotli_static on;`,
+`trailingSlash: true` in Next (D-030), and this location block with its
+`limit_conn_zone`. `brotli_static` requires **both** the plain and `.br` file
+present in `pub/` — it serves the `.br` only to clients that ask for it and
+falls back otherwise. That costs disk (a 452 MB database beside its 95 MB
+compressed form) and was chosen over publishing only `.br` with a hand-set
+`Content-Encoding`, which is smaller but breaks any client that does not accept
+brotli and forces per-file `Content-Type` overrides.
+
+One trap is worth naming because it is the classic nginx `alias` vulnerability:
+if the location is written `location /data` without the trailing slash while the
+alias has one, `/data../` escapes the intended directory. Both must end in `/`,
+and the location must not use a regex capture in the alias path.
+
+The php-fpm privilege breadth D-030 flagged is not fixed here — it is dormant,
+because no PHP runs in the data path. It becomes live again the moment a handler
+is added, which is one more reason not to add one.
+
+**Reopen if.** Bandwidth costs become real, in which case the answer is a CDN or
+a signed-URL scheme, both of which change more than this entry; or a dynamic
+endpoint is introduced, which restores every question this entry declined to
+answer.
+
+## D-033: Schema completeness — version ranges and references in, five sections out  (2026-07-31, status: accepted, answers Q-002, amends D-011)
+
+**Decision.** Beyond the D-024 floor the published schema adds three things and
+declines five.
+
+**In:**
+
+- **Affected version ranges** — `cve_ver(cve_id, product_id, status, version,
+  lt, lte, vtype)`. Present on 95.0% of records.
+- **References, as interned URLs** — `url(id, url, host_id)` and
+  `cve_ref(cve_id, url_id)`. Present on 95.1% of records.
+- **Reference hosts, interned** — `host(id, name)`, 18,986 distinct. This is
+  what makes "which CVEs cite this advisory source" a real filter.
+
+**Out:** FTS5 over reference URLs and names; reference display names; reference
+tags; CPE applicability; solutions, workarounds, configurations and exploits;
+credits; timeline.
+
+Two schema rules fall out of the measurement and apply everywhere:
+
+- **Build-only `UNIQUE` constraints are dropped from the published artifact.**
+  Interning happens once, on the server. `url TEXT UNIQUE` cost **59.7 MB** — a
+  second full copy of every URL — to support a lookup the client never performs.
+  The same applies to `product`. `cve.cve_id` keeps its unique index, because
+  the client genuinely looks records up by ID.
+- **Link tables are `WITHOUT ROWID`** on their natural primary key. `cve_ref_tag`
+  as an ordinary rowid table with two indexes cost 148 MB; the same data as a
+  `WITHOUT ROWID` table cost 33 MB.
+
+**Context.** Priced by building the whole candidate schema against the full
+corpus and compressing each cumulative variant, because the only cost that
+matters is download bytes. Prevalence came from a 20,000-record sample.
+
+| Cumulative variant | Database | brotli -q5 |
+| --- | --- | --- |
+| Floor (D-024) | 271.4 MB | **75.6 MB** |
+| + version ranges | 338.4 MB | 90.0 MB |
+| + references (URLs + links) | 441.4 MB | 111.0 MB |
+| **+ interned hosts — the decision** | **452.5 MB** | **113.0 MB** |
+| *(alternative)* + FTS over URLs instead of hosts | 482.7 MB | 126.6 MB |
+| + reference names | 474.6 MB | 119.2 MB |
+| + FTS over reference names | 489.8 MB | 124.7 MB |
+| + reference tags | 515.2 MB | 132.0 MB |
+| + CPE, remedies, credits, timeline | 532.1 MB | 135.5 MB |
+
+Prevalence, which is what decided the five exclusions:
+
+| Section | Records carrying it |
+| --- | --- |
+| references | 95.1% |
+| version ranges | 95.0% |
+| credits | 20.1% |
+| timeline | 7.1% |
+| solutions | 4.5% |
+| **CPE** | **2.2%** |
+| exploits / workarounds / configurations | 1.3% / 1.2% / 0.3% |
+
+**CPE is excluded on correctness, not size** — it costs almost nothing. A filter
+that matches 2.2% of the corpus looks like a working filter and behaves like a
+broken one: every query through it silently discards 97.8% of the data. That is
+vision criterion 7's failure mode dressed as a feature. If CPE coverage improves
+materially upstream, reopen.
+
+Credits, timeline, solutions, workarounds and exploits are excluded on value per
+byte: they are per-record prose that no aggregate or filter in confirmed scope
+consumes, and at 1–20% prevalence they cannot support one.
+
+**This amends D-011**, which confirmed "full FTS5 over descriptions *and*
+references" during triage. Descriptions keep their index. References do not, for
+two reasons. Cost: 13.6 MB compressed for URLs, 5.5 MB more for names, against
+2.0 MB for interning hosts. And precision: FTS5's default tokenizer splits a URL
+into path segments, so searching `github` matches any URL with `github`
+anywhere, while the question people actually ask — "references from this source"
+— is a host predicate that host interning answers exactly. The owner chose the
+D-011 wording, so this is flagged as an amendment rather than an implementation
+detail; reversing it costs the 13.6 MB above and is a one-line schema change.
+
+**Consequences.** The published artifact is **95.4 MB at brotli -q10**, measured,
+up from ~72 MB for the floor — **a 32% increase in what every user downloads**,
+in exchange for the two axes with near-universal coverage. Compression took
+416 s, consistent with D-026's sizing of a weekly rebuild.
+
+Nothing here changes the delta protocol's character (D-031): references and
+versions are ordinary dependent rows, deleted and reinserted with the record,
+and both need an index on `cve_id` for that — `cve_ref`'s primary key provides
+it, `cve_ver` needs `i13` explicitly, exactly as `cve_cwe` did.
+
+**Reopen if.** CPE coverage rises materially upstream; a confirmed report needs
+one of the excluded sections; or browser measurement (Q-003) shows 95 MB is over
+budget, in which case the cheapest 23 MB to give back is references, and the
+D-024 hybrid — structured first, text later — is the next lever after that.
+
 ## D-032: The whole data plane is static files — the sync path has no dynamic endpoint  (2026-07-31, status: accepted, amends D-006)
 
 **Decision.** Everything the browser fetches is a static file served by nginx: the
@@ -390,7 +963,7 @@ application bundler.
 confirmed feature, or the framework proves to be fighting the Worker/WASM/OPFS
 boundary that D-004 forces.
 
-## D-026: Download is snapshot + catch-up deltas; snapshots rebuild weekly  (2026-07-30, status: accepted, refines D-025)
+## D-026: Download is snapshot + catch-up deltas; snapshots rebuild weekly  (2026-07-30, status: accepted; cadence superseded by D-042, transport by D-040/D-041)
 
 **Decision.** The server publishes a **compressed full snapshot on a slow
 cadence — weekly by default** — and a continuous stream of deltas keyed to it.

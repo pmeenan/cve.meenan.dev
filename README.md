@@ -5,7 +5,7 @@ Browser-based search and analysis over the complete CVE List.
 The [CVE List](https://github.com/CVEProject/cvelistV5) ships as 372,092 JSON
 records — 2.9 GB of them — which is a good distribution format and a poor one
 for asking questions. This tool normalizes the corpus into a compact SQLite
-database (~72 MB compressed), pulls it into your browser once, and lets you
+database (~63 MB compressed), pulls it into your browser once, and lets you
 query it locally from then on.
 
 - **Your queries stay on your machine.** Records are stored in SQLite compiled
@@ -24,10 +24,10 @@ export, enrichment overlays — are being triaged, not yet committed. See
 
 ## Status
 
-**Pre-code.** The project is in milestone M0 ("plan the plan"): scope,
-architecture, and the milestone ladder are being settled before implementation
-starts. There is no application to run yet. Progress lives in
-[docs/plan.md](docs/plan.md).
+**Pre-code.** Milestone M0 ("plan the plan") is complete — scope,
+architecture, schema, and the data-delivery protocol are settled and measured
+against the real corpus. Implementation starts at M1. There is no application to
+run yet. Progress lives in [docs/plan.md](docs/plan.md).
 
 ## How this project is built
 

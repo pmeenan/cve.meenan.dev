@@ -3,7 +3,7 @@
 A public web app for searching, analyzing, and reporting on the complete CVE
 List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, 372,092
 records and growing. The entire data plane runs in the browser: the corpus is
-normalized server-side into a ~72 MB compressed SQLite database, downloaded on
+normalized server-side into a ~63 MB compressed SQLite database, downloaded on
 demand into OPFS, and queried locally — so no search or report ever leaves the
 client. The server serves that snapshot and its deltas as static files and
 performs no analysis. Almost all code is written by AI agents working from the
@@ -122,7 +122,9 @@ commit gate.
 
 ## Current status
 
-Milestone **M0 (plan the plan)** — the full feature set, architecture, and
-milestone ladder are being worked out through planning conversations. See
-[docs/plan.md](docs/plan.md). No application code exists yet; scaffolding is
-M1. Keep this paragraph current when plan.md milestone status changes (rule 6).
+Milestone **M0 (plan the plan) is complete** as of 2026-07-31: scope,
+architecture, schema, delivery protocol, and the milestone ladder are settled
+and measured (D-001 – D-034), and [architecture.md](docs/architecture.md) has
+its first full draft. **M1 is next** — scaffolding, one end-to-end path, and the
+two browser measurements deferred by D-029. No application code exists yet. Keep
+this paragraph current when plan.md milestone status changes (rule 6).

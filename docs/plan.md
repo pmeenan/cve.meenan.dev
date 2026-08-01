@@ -14,7 +14,7 @@ it touched.
 
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
-## M0 — Plan the plan  `in progress`
+## M0 — Plan the plan  `done`
 
 Goal: settle vision, feature matrix, architecture, and the milestone ladder,
 through planning conversations plus targeted research where a decision needs
@@ -48,19 +48,21 @@ evidence.
       upstream window rather than designed on paper. D-025's four hazards and
       D-026's three additions are all discharged. Answers Q-001, and led to
       D-032: the data plane is static files with no request handler.
-- [ ] **Decide: schema completeness.** What goes in beyond the D-024 floor:
-      references (and FTS over them, per D-011), version ranges, CPE
-      applicability, solutions, credits, timeline. Re-measure the artifact
-      afterwards. Answers Q-002.
-- [ ] **Design: data-plane hardening.** The half of Q-005 that D-030 did not
-      answer, reshaped by D-032 — with no request handler left, this is nginx
-      configuration over static files: the read-only `alias`, bandwidth limits
-      on a 72 MB artifact, cache headers, and what same-origin enforcement is
-      worth doing against callers who can forge headers.
-- [ ] First full draft of [architecture.md](architecture.md), replacing the
-      skeleton.
+- [x] **Decide: schema completeness.** Version ranges and references in, five
+      sections out, FTS over references replaced by host interning (D-033,
+      amending D-011). Every candidate was built against the full corpus and
+      priced in compressed bytes. Answers Q-002. Superseded in part the same
+      week by D-035, which moved index building to the client and took the
+      download to **62.6 MB at brotli -q10**.
+- [x] **Design: data-plane hardening.** One nginx location, no CORS headers
+      as the actual same-origin control, connection and rate limits, immutable
+      cache policy, and integrity hashes in the manifest — with `Sec-Fetch-Site`
+      blocking explicitly rejected as theater (D-034). Closes Q-005.
+- [x] **First full draft of [architecture.md](architecture.md)**, replacing the
+      skeleton: overview, server pipeline, published contract, client, schema
+      DDL, trust boundaries, failure modes, and every measurement in one place.
 
-**Exit criteria:** the three remaining items above are checked, with decision-log entries
+**Exit criteria:** every item above is checked, with decision-log entries
 for the significant calls; architecture.md's first full draft is reviewed. Per
 D-029, Q-003 and Q-004 are **not** M0 exit criteria — they need a running
 browser and are answered in M1.
@@ -73,12 +75,16 @@ deferred measurements. Deliberately narrow and deliberately complete.
 Scope: Next.js 16 + React 19 project with `output: 'export'`, `distDir: 'dist'`,
 `trailingSlash: true` (D-027, D-030); TypeScript strict, Vitest, Playwright,
 ESLint + Prettier, pnpm; license-audit script (D-002); `rsync` deploy script;
-the nginx changes from D-030 and D-032 (`brotli_static on;`, `trailingSlash`,
-and the read-only `alias` onto `cve.data/pub/`); a **bounded slice** of the
+the nginx changes from D-030 and D-034 (`trailingSlash`, and the `^~ /data/`
+location aliasing `cve.data/pub/`), plus the Cloudflare cache rules honoring
+origin headers (D-039); a **bounded slice** of the
 corpus published there as a static file; SQLite/WASM in a Worker persisting to
 OPFS; one query rendered in the UI carrying the D-008 notice.
 
-- Q-003: import wall-clock, peak memory, OPFS footprint, and WASM query latency.
+- Q-003: import wall-clock, peak memory, OPFS footprint, and WASM query
+  latency. Index build time is measured too, but the owner has ruled it a
+  progress-bar concern rather than a gate (D-035). The open tuning question is
+  how many chunks to decompress concurrently (D-041).
 - Q-004: `opfs` vs `opfs-sahpool` — now a pure performance and multi-tab
   question, since D-030 confirmed COOP/COEP are already served.
 - Confirm Next copies `public/` into the export root, per D-027's open caveat.
@@ -90,20 +96,24 @@ Q-004 decided and recorded; checks run green in CI-equivalent form.
 
 ## M2 — Full-corpus Download and Sync  `pending`
 
-Scope: the server-side build pipeline (scheduled `git fetch` → hash → normalize
-→ publish deltas → weekly snapshot → compress) and the D-031 delta generator,
-including the rollup that keeps delta files tiling the revision space
-contiguously and the tombstone-volume abort; the Download action fetching
-snapshot plus catch-up deltas with progress and resumption; the Sync action
-applying merged deltas non-destructively; FTS index maintenance verified with
-`integrity-check` at `rank = 1` (RE-005), and the visible staleness indicator.
+Scope: the two cron jobs (daily ingest, monthly chunked snapshot) under `flock`
+with the tombstone guard, atomic publish, and one-generation retention (D-042);
+the D-031 delta generator; the Download action fetching snapshot chunks and
+catch-up deltas, decompressing each in WASM and writing it positionally into
+OPFS, resumable by chunk bitmap (D-040, D-041); client-side construction of the
+full-text indexes over descriptions, vendors and products (D-035), surfaced in
+the same progress display; the Sync action applying merged deltas
+non-destructively; FTS maintenance verified with `integrity-check` at
+`rank = 1` (RE-005); the visible staleness indicator.
 
-**Exit criteria:** a browser downloads the full 372,092-record corpus and
-queries it; a sync applies a real day of upstream changes and the result is
-verified identical to a freshly built database; a client at *any* watermark back
-to the current snapshot finds a covering chain of delta files; an interrupted
-download and an interrupted sync both leave a usable prior state, and re-running
-either is safe.
+**Exit criteria:** a browser downloads all 372,092 records, decompresses them
+itself, builds its indexes, and queries the result — with one honest progress
+display across all three stages, and peak memory bounded by chunks in flight
+rather than by the corpus; the database is verified identical to a freshly built
+one; a sync applies a real day of upstream changes; killing the download partway
+and resuming refetches only the missing chunks; an interrupted sync leaves a
+usable prior state and re-running is safe; a snapshot rotation during a download
+does not strand the client.
 
 ## M3 — Schema and query  `pending`
 
@@ -129,8 +139,8 @@ charted and exportable, with REJECTED records excluded by default (D-022).
 
 Scope: storage quota and eviction handling, multi-tab behavior per the Q-004
 outcome, browser capability gating against the D-016 floor, the diagnostics
-panel (the only support channel, given D-009), endpoint rate limiting, and an
-adversarial review pass over the published data plane.
+panel (the only support channel, given D-009), and an adversarial review pass
+over the published data plane.
 
 **Exit criteria:** the app degrades honestly on an unsupported browser, under
 quota pressure, and in a second tab; the data plane survives an adversarial pass;

@@ -1,36 +1,60 @@
 # Architecture
 
-> **Status: skeleton.** The first full draft is an M0 exit criterion; what is
-> written here now is the load-bearing shape already settled, so drafting can
-> build on it rather than re-derive it.
+> **Status: first full draft**, 2026-07-31, closing the last M0 item. Everything
+> here is either backed by a decision entry or by a measurement recorded below.
+> Where something is genuinely unsettled it is in [Open questions](#open-questions),
+> not softened in the prose.
 
-## Fixed points (from decisions)
+## Overview
 
-Each of these is backed by a decision entry and is not up for casual revision.
+Two components and one direction of data flow.
+
+```
+GitHub                plex                                        browser
+──────                ────────────────────────────────            ─────────────────
+cvelistV5  ──fetch──▶ shallow clone                               ┌──────────────┐
+CISA KEV   ──fetch──▶      │                                      │ React 19 UI  │
+                           ▼                                      │              │
+                      hash + normalize                            └──────┬───────┘
+                           │                                             │ messages
+                           ▼                                             ▼
+                      cve.data/pub/  ──nginx, static──▶  fetch  ──▶ Worker
+                        manifest.json                               SQLite/WASM
+                        snapshot-<rev>/000.br … 011.br              on OPFS
+                        deltas/<from>-<to>.json.br
+                        kev.json
+```
+
+The server derives artifacts and publishes files. The browser downloads them
+once, keeps them current with deltas, and does every query locally. **No request
+the client makes carries a parameter**, so there is nothing for the server to
+learn and nothing for it to execute (D-032).
+
+## Fixed points
+
+Each is backed by a decision entry and is not up for casual revision.
 
 - **Two components, one direction of data flow.** A static browser application
-  and a set of static same-origin files. Data flows server → browser only. The
-  server receives no analytical input and stores no user state — under D-032 it
-  receives no request parameters at all. (D-006, D-007, D-032)
+  and a set of static same-origin files. The server receives no analytical input
+  and stores no user state. (D-006, D-007, D-032)
 - **git runs server-side, and shallow.** `plex` holds a `--depth 1` clone of
   cvelistV5 and is the source of record for every artifact we publish. The
   browser bundle contains no git implementation. History is deliberately *not*
   retained: nothing in confirmed scope consumes it, and any feature that would
-  must reopen D-021 before it can be built. (D-005, D-021)
+  must reopen D-021 first. (D-005, D-021)
 - **Two upstream sources, both server-fetched.** cvelistV5 and the CISA KEV
   catalog. KEV sends no CORS header, so like the corpus it reaches the browser
-  only as a file we publish; at ~1.5 MB it ships whole and adds no partial-fetch
-  complexity. No third source without a decision entry. (D-010)
+  only as a file we publish; at ~1.5 MB it ships whole. No third source without a
+  decision entry. (D-010)
 - **Nothing is collected from users.** No telemetry, no analytics, no error
   reporting. Server request logs are an operational fact, not a channel to
   repurpose. (D-009)
-- **The browser's store is SQLite/WASM on OPFS.** The database is owned by a
-  Worker, because OPFS synchronous access handles are unavailable on the main
-  thread. (D-004)
+- **The browser's store is SQLite/WASM on OPFS**, owned by a Worker, because
+  OPFS synchronous access handles are unavailable on the main thread. (D-004)
 - **One origin.** Everything ships to `plex:/var/www/meenan.dev/cve/` and is
-  served from `https://cve.meenan.dev/`; nginx routes `*.php`. There is no
-  cross-origin fetch in the normal path, which is what makes same-origin
-  enforcement meaningful. (D-003, D-006)
+  served from `https://cve.meenan.dev/`. There is no cross-origin fetch in the
+  normal path, which is what makes same-origin enforcement meaningful.
+  (D-003, D-006)
 - **Record content is untrusted input.** CVE text is attacker-influenced and
   crosses a trust boundary at parse time, at SQL time, and at render time.
   (AGENTS.md rule 5)
@@ -39,26 +63,231 @@ Each of these is backed by a decision entry and is not up for casual revision.
   exports. A format that cannot carry the notice in-band needs a deliberate
   answer, not an omission. (D-008)
 
-## Measured corpus facts (2026-07-30)
+## The server pipeline
 
-Measured on the provisioned clone at `a42a2eb6c2`, not estimated. These are the
-numbers every sizing argument should start from — the "~300k records" figure
-used in earlier planning was low.
+Two cron jobs under `flock`, no daemon (D-042). **Daily** ingest, ~40 s of work
+for ~87 KB of output; **monthly** snapshot rebuild. Upstream publishes about
+every 40 minutes, so a day accumulates ~665 distinct changed records.
+
+1. **Fetch.** `git fetch --depth 1 origin main` into `cve.data/git/cvelistV5`,
+   then reset. Measured at 1.8 s. A shallow clone reports every advance as a
+   forced update, so git's output is not a usable change signal (RE-006) — the
+   pipeline ignores it.
+2. **Hash.** Walk the working tree, compute a hash over each record's normalized
+   projection — exactly the fields we store — and diff against the previous
+   run's hashes. 15–18 s for all 372k records. Records changed or added become
+   upserts; records present before and absent now become tombstones.
+3. **Guard.** If the run would tombstone more than 0.1% of the corpus (~370
+   records), abort and alert rather than publish. Upstream has no deletion
+   concept at all, so a mass deletion means our fetch broke, not that the CVE
+   Program withdrew 400 records.
+4. **Normalize.** Build the relational artifact (see [Schema](#schema)). 19 s.
+   New interned values get IDs from the server-owned, append-only ID space and
+   are stamped with the current revision.
+5. **Publish the delta.** If anything changed, increment the revision and write
+   `deltas/<rev-1>-<rev>.json.br`. One run per day means one file per day and
+   consecutive revisions, so the files tile the revision space by construction —
+   there is no rollup and no invariant to defend (D-042).
+6. **Snapshot, monthly.** Rebuild the database, split it into 32 MB slices of
+   the uncompressed file, and compress each at brotli -q10 — 101 s across 24
+   cores, against 351 s for a monolith (D-041). Only the compressed chunks are
+   published; the client decompresses in WASM (D-040), and no full-text index is
+   built server-side because the client builds its own (D-035).
+7. **Retire, one generation behind.** Keep the previous snapshot and every delta
+   back to it, so a client that read the manifest minutes ago and is mid-download
+   does not start seeing 404s. One spare generation costs 63 MB.
+
+Publication into `pub/` is an atomic rename, so a half-written artifact is never
+reachable. The clone, working databases, and hash state live in sibling
+directories under `cve.data/` and are never under the served root (D-018, D-034).
+
+## The published contract
+
+Everything under `/data/`, served by nginx from `cve.data/pub/` (D-034).
+
+| File | Cache | Notes |
+| --- | --- | --- |
+| `manifest.json` | `no-cache` | The only mutable file. Lists everything else with byte length and SHA-256. |
+| `snapshot-<rev>/NNN.br` | immutable | 12 chunks, ~5.3 MB each, **63.3 MB** total, each expanding to a 32 MB slice of the 391.3 MB database (D-041). |
+| `deltas/<from>-<to>.json.br` | immutable | Hourly files plus daily rollups. |
+| `kev.json` | short | CISA KEV, its own freshness (D-010). |
+
+The manifest carries `format`, `schema`, the current `rev`, the snapshot, and
+the list of delta files, each with its byte length and SHA-256. The client reads
+it, compares its local schema version, and either re-downloads (on a schema bump
+— deltas cannot bridge one) or fetches a greedy longest-first chain of delta
+files from its watermark. It is the one file served uncompressed, because it has
+to be readable before the brotli decoder matters.
+
+Delta files must tile the revision space contiguously, or a client at some
+watermark finds no covering chain and can never sync again. Daily ingest makes
+that automatic — one run, one revision, one file — which is why D-042's cadence
+choice removed the rollup machinery rather than just slowing it down.
+
+### Delta format
+
+JSON at brotli -q5, whole records rather than field-level diffs, lookups ordered
+before the upserts that reference them, and the D-008 notice in-band (D-031).
+
+```json
+{"format":1,"schema":1,"from":1204,"to":1236,
+ "generated":"2026-07-31T23:12:13Z","notice":"CVE® is a trademark of …",
+ "lookups":{"cna":[],"cwe":[[798,"CWE-1395","…"]],
+            "vendor":[[24421,"acme"]],"product":[[80149,24421,"widget"]]},
+ "upsert":[{"id":"CVE-2026-14537","y":2026,"st":1,"cna":12,
+            "pub":"…","upd":"…","cvss":[31,7.5,"HIGH","CVSS:3.1/…"],
+            "cwe":[412],"prod":[80149],"descr":"…"}],
+ "delete":[]}
+```
+
+A merged delta is not a merge operation: the server stores a revision per record
+and per lookup row, so "everything since `from`" is a range query that returns
+final state by construction.
+
+## The client
+
+- **A Worker owns the database.** This follows from OPFS's threading
+  constraints, not taste, and it means every query is asynchronous from the UI's
+  perspective regardless of framework. The UI (React 19 on Next.js 16 static
+  export, D-027) talks to it over messages.
+- **Sync state lives inside the database.** A `meta` table holds the watermark,
+  the schema version, and the notice, and the watermark advances in the *same
+  transaction* as the rows it describes, so a crash cannot leave the two
+  disagreeing. The snapshot carries its own revision in that table, which is how
+  a fresh download starts with a correct watermark rather than an assumed one.
+- **Apply is one transaction and is idempotent.** Measured: eight applications
+  of the same delta left row counts identical and the file 0.1 MB larger. An
+  interrupted sync is safe to retry with no reconciliation logic.
+- **The client builds its own full-text indexes** after import, over
+  descriptions, vendor names and product names — never references, whose URLs
+  would shred into the same term space as the prose (D-035). Shipping the
+  description index instead would cost 35.1 MB compressed, 31% of the download.
+- **FTS5 maintenance is explicit.** The indexes are external-content, so every
+  update must issue `INSERT INTO fts(fts, rowid, descr) VALUES('delete', …)`
+  with the *old* text before writing the new row. Skipping it corrupts search
+  silently, and the default `integrity-check` will not catch it — only the
+  `rank = 1` form does (RE-005).
+- **Decompression is ours, and it streams.** Chunks arrive as opaque `.br`
+  bytes with no `Content-Encoding`; a WASM decoder unpacks each one and writes
+  it straight into the OPFS database at that chunk's byte offset, so peak memory
+  is one chunk rather than the corpus (D-040, D-041). Resumption is a bitmap of
+  completed chunks — brotli is a stream format, so a range-resumed monolith
+  could not be decoded from an arbitrary offset at all.
+- **Capability gate before the import path**, so an unsupported browser is told
+  on arrival rather than failing partway through a large import (D-016).
+- **Storage sized in advance.** Quota, eviction, and
+  `navigator.storage.persist()` are part of the import design, not error
+  handling bolted on later.
+- **Staleness is visible.** Sync is manual (D-025), so a user can sit on a
+  month-old corpus getting confident-looking counts. The freshness indicator is
+  what keeps results honest — it replaces the coverage tracking that bulk import
+  made unnecessary.
+
+## Schema
+
+The floor is D-024; version ranges, references and reference hosts were added by
+D-033 after pricing every candidate. Interning is server-side, so the published
+artifact carries no `UNIQUE` constraints that exist only to support it.
+
+```sql
+-- interned lookups: server-owned ID space, append-only, never renumbered
+CREATE TABLE cna(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE cwe(id INTEGER PRIMARY KEY, cwe TEXT, descr TEXT);
+CREATE TABLE vendor(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE product(id INTEGER PRIMARY KEY, vendor_id INT, name TEXT);
+CREATE TABLE host(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE url(id INTEGER PRIMARY KEY, url TEXT, host_id INT);
+CREATE TABLE vtype(id INTEGER PRIMARY KEY, name TEXT);
+
+CREATE TABLE cve(id INTEGER PRIMARY KEY, cve_id TEXT UNIQUE, year INT, state INT,
+  cna_id INT, published INT, updated INT,
+  cvss_ver INT, cvss_score REAL, cvss_sev INT, cvss_vec TEXT);
+CREATE TABLE cve_text(cve_id INTEGER PRIMARY KEY, descr TEXT);
+
+CREATE TABLE cve_cwe (cve_id INT, cwe_id     INT, PRIMARY KEY(cve_id,cwe_id))     WITHOUT ROWID;
+CREATE TABLE cve_prod(cve_id INT, product_id INT, PRIMARY KEY(cve_id,product_id)) WITHOUT ROWID;
+CREATE TABLE cve_ref (cve_id INT, url_id     INT, PRIMARY KEY(cve_id,url_id))     WITHOUT ROWID;
+CREATE TABLE cve_ver(cve_id INT, product_id INT, status INT,
+  version TEXT, lt TEXT, lte TEXT, vtype INT);
+
+CREATE TABLE meta(k TEXT PRIMARY KEY, v);   -- rev, schema, earliest_year, notice
+
+-- built by the client after import, never shipped (D-035)
+CREATE VIRTUAL TABLE fts         USING fts5(descr, content='cve_text', content_rowid='cve_id');
+CREATE VIRTUAL TABLE fts_vendor  USING fts5(name,  content='vendor',   content_rowid='id');
+CREATE VIRTUAL TABLE fts_product USING fts5(name,  content='product',  content_rowid='id');
+```
+
+Three properties are load-bearing rather than stylistic:
+
+- **`WITHOUT ROWID` with `cve_id` leading the primary key** is what makes delta
+  apply cheap. Replacement semantics delete a record's dependent rows by
+  `cve_id`; the spike's rowid table with only a `(cwe_id, cve_id)` index made
+  that a full scan, costing 19× (D-031). Here the access path is structural.
+  `cve_ver` is the exception — it carries non-key columns and permits duplicate
+  pairs — so it needs `cve_ver(cve_id)` declared explicitly.
+- **`cve.cve_id` keeps its unique index** because the client genuinely looks
+  records up by ID; `url` and `product` do not, and dropping their build-time
+  `UNIQUE` saved 63 MB (D-033).
+- **`state` is a column, not a filter applied at ingest.** ~4.9% of the corpus
+  is REJECTED; it is imported, excluded from aggregates by default, and
+  filterable on request (D-022). That default belongs in a shared query layer,
+  not in each report.
+
+Indexes: `cve(year)`, `cve(cna_id)`, `cve(cvss_score)`, `cve(published)`,
+`cve_cwe(cwe_id,cve_id)`, `cve_prod(product_id,cve_id)`, `cve_ref(url_id,cve_id)`,
+`cve_ver(cve_id)`, `cve_ver(product_id)`, `product(vendor_id)`, `url(host_id)`.
+
+## Trust boundaries
+
+| Boundary | What crosses | Control |
+| --- | --- | --- |
+| Upstream → pipeline | Attacker-influenced JSON | Parse defensively; never build SQL by concatenation; the tombstone guard bounds the blast radius of a broken fetch |
+| Pipeline → `pub/` | Finished artifacts only | Atomic rename; working state stays in sibling directories |
+| `pub/` → browser | Static files | No CORS headers, integrity hashes in the manifest; abuse absorbed by Cloudflare rather than origin limits (D-034, D-039) |
+| Database → UI | Record text | Never injected as HTML; URLs from records are never auto-fetched |
+
+Same-origin enforcement is **the absence of `Access-Control-Allow-Origin`**, not
+a `Sec-Fetch-Site` check. Header sniffing stops nobody who matters — any
+non-browser client forges or omits it — while breaking `curl` and direct
+downloads, including by anyone auditing our privacy claim (D-034). There is no
+origin rate limiting: Cloudflare fronts the data plane and honors our own
+`Cache-Control` headers rather than its extension defaults, so per-IP limits
+behind a proxy — which would have bucketed the internet into a few edge
+addresses — are simply absent (D-039).
+
+## Failure modes
+
+| Failure | What happens | Why it is acceptable |
+| --- | --- | --- |
+| Interrupted download | Refetch the missing chunks | Each chunk is independently compressed and verified, so resume is a bitmap (D-041) |
+| Corrupted chunk | Refetch that chunk | Per-chunk SHA-256 in the manifest; costs 5 MB, not 63 |
+| Snapshot rotates mid-download | Old generation still served | One previous generation is retained (D-042) |
+| Interrupted sync | Transaction rolls back; watermark unchanged; retry is safe | Apply is idempotent, measured |
+| Schema version bump | Full re-download, announced in the UI | The local database is a rebuildable cache (D-013), but it must not be a surprise |
+| Client older than the oldest delta | Full re-download | Delta retention is bounded to the current snapshot (D-026) |
+| Upstream force-push | Nothing special | The pipeline diffs content hashes, never git history (RE-006) |
+| Broken fetch drops records | Pipeline aborts before publishing | The 0.1% tombstone guard |
+| FTS index drifts | Search returns wrong results **silently** | The one real threat to vision criterion 7 under this design; verified with `integrity-check` at `rank = 1` (RE-005) |
+| Stale local corpus | Confident-looking counts from old data | Made visible, not prevented — sync is deliberately manual |
+
+## Measurements
+
+All measured against the full corpus on `plex`, not sampled or estimated.
+
+### Corpus (2026-07-30, clone at `a42a2eb6c2`)
 
 | | |
 | --- | --- |
 | CVE records | **372,092** (years 1999–2026) |
 | Raw JSON | **2,934 MB** (~7.9 KB mean per record) |
-| Compressed | 261.5 MB for current content (~11× ratio) |
 | Record state | ~95.1% `PUBLISHED`, **~4.9% `REJECTED`** (D-022) |
 | `dateUpdated` present | 100% · `datePublished` 98.4% (D-020) |
-| Clone | shallow, `--depth 1 --no-tags` (D-021) |
 
 *Measured before D-021 made the clone shallow: 74,082 commits, 581 MiB pack with
-history, mean 4.10 revisions per record. Reproducing those now needs an unshallow
-fetch — see RE-003. The clone was advanced to `d300c5fcc0` on 2026-07-31 for the
-delta measurement below, so a re-run will see slightly larger figures than the
-table.*
+history, mean 4.10 revisions per record — reproducing those needs an unshallow
+fetch (RE-003). The clone was advanced to `d300c5fcc0` on 2026-07-31 for the
+delta measurement, so a re-run sees slightly larger figures.*
 
 Recent partitions, which bound the owner's motivating query:
 
@@ -68,10 +297,9 @@ Recent partitions, which bound the owner's motivating query:
 | 2025 | 45,031 | 315 MB |
 | 2026 (partial) | 38,972 | 307 MB |
 
-## Normalization spike (2026-07-30) — and how it settled the data-delivery question
+### Normalization (2026-07-30)
 
-Built against the full corpus, not sampled. Raw JSON was normalized into a
-relational schema with interned lookup tables per D-024:
+Raw JSON to a queryable database, per D-024:
 
 | Stage | Size |
 | --- | --- |
@@ -80,46 +308,54 @@ relational schema with interned lookup tables per D-024:
 | Normalized base tables | **182.8 MB** |
 | + indexes | 215.9 MB |
 | + FTS5 over descriptions | **272.8 MB** |
-| gzip -9 | **98.7 MB** |
-| zstd -19 | 76.0 MB |
 
-Build time: 19 s to parse 372,092 records; 3 s to build FTS5. On server hardware
-with native SQLite, `MATCH 'buffer overflow'` returned 19,019 hits in 1 ms, and
-the owner's motivating query — vendor × severity for 2025 onward — ran in 99 ms.
+19 s to parse 372,092 records, 3 s to build FTS5. Native SQLite on server
+hardware answered `MATCH 'buffer overflow'` in 1 ms and the owner's motivating
+query — vendor × severity for 2025 onward — in 99 ms.
 
-**This is what settled the data-delivery architecture (D-025).** The argument
-for projection was that bulk import meant moving hundreds of megabytes before a
-user saw anything; the two-year window alone is ~622 MB of raw JSON. Normalized, the
-*entire corpus from 1999 to 2026* is 98.7 MB gzipped — smaller than the
-projection candidate's own motivating slice. Because a user can have everything
-for that, bulk import buys back:
+The interning cardinalities are why this works: 797 distinct CWEs were being
+carried across 189,690 associations, and 479 CNA names across all 372,092
+records. Dropped outright: `x_legacyV4Record` (19.1% of compact bytes),
+`containers.adp` as a stored blob (21.5%, mined for CVSS and CWE first), and
+`providerMetadata` (3.0%).
 
-- No coverage tracking, which D-015 identified as the debt taken on when the
-  range-request VFS was rejected. Vision criterion 7 becomes structural again.
-- No ragged multi-version cache; Q-001 reduces to ordinary delta application.
-- No caller-supplied field or partition parameters, shrinking Q-005 to a static
-  file plus one watermark-keyed endpoint — and D-032 later removed the endpoint
-  too.
-- Full offline capability rather than offline-for-what-you-fetched.
+**This is what settled the data-delivery architecture.** The projection design
+existed because bulk import meant moving hundreds of megabytes; normalized, the
+entire corpus is smaller than that design's own motivating two-year slice, which
+made bulk import (D-025) both simpler and more capable.
 
-Two caveats survive the decision and are the reason Q-002 and Q-003 are still
-open:
+### Schema pricing (2026-07-31)
 
-1. These timings are native SQLite on server hardware. WASM in a browser will be
-   slower, by a factor nobody has measured yet — the D-025 reopen condition
-   hangs on it.
-2. The schema is a floor (D-024): references, version ranges, CPE applicability,
-   and FTS over references are all still missing, and each one grows the download
-   every user takes.
+Every Q-002 candidate built against the full corpus and compressed, because
+download bytes are the only cost that matters (D-033):
 
-Storage itself is not among the caveats: the owner runs other work storing tens
-of gigabytes in OPFS, so a few hundred megabytes is unremarkable (D-025).
+| Cumulative variant | Database | brotli -q5 |
+| --- | --- | --- |
+| Floor (D-024) | 271.4 MB | **75.6 MB** |
+| + version ranges | 338.4 MB | 90.0 MB |
+| + references (URLs + links) | 441.4 MB | 111.0 MB |
+| **+ interned hosts — shipped** | **452.5 MB** | **113.0 MB** |
+| *(alternative)* FTS over URLs instead | 482.7 MB | 126.6 MB |
+| + reference names | 474.6 MB | 119.2 MB |
+| + FTS over reference names | 489.8 MB | 124.7 MB |
+| + reference tags | 515.2 MB | 132.0 MB |
+| + CPE, remedies, credits, timeline | 532.1 MB | 135.5 MB |
 
-### Compression for transport
+Prevalence decided the exclusions: references 95.1%, version ranges 95.0%,
+credits 20.1%, timeline 7.1%, solutions 4.5%, **CPE 2.2%**, exploits 1.3%,
+workarounds 1.2%, configurations 0.3%.
 
-Measured on the 272.8 MB artifact:
+That artifact measured **95.4 MB at brotli -q10** (416 s). D-035 then dropped
+the shipped full-text index — 35.1 MB of q5, since an inverted index compresses
+at only 1.7× — taking the published artifact to **62.6 MB at brotli -q10** over
+391.3 MB of database. Year partitioning was measured too (a 2022+ window would
+have been 38.0 MB) and rejected as not worth the coverage complexity (D-038).
 
-| Codec | Size | Compress time | Browser support above the D-016 floor |
+### Compression
+
+Measured on the 272.8 MB floor artifact:
+
+| Codec | Size | Compress time | Support above the D-016 floor |
 | --- | --- | --- | --- |
 | gzip -9 | 98.7 MB | 29.4 s | universal |
 | brotli -q5 | 83.2 MB | 5.2 s | universal |
@@ -128,186 +364,101 @@ Measured on the 272.8 MB artifact:
 | brotli -q11 | abandoned | > 2 min, unfinished | universal |
 | zstd -19 | 76.0 MB | not recorded | **no Safari** |
 
-The q10 figure was measured twice — once alongside a stray q11 process (241.5 s)
-and once on an otherwise idle host (239.3 s) — so the ~4-minute cost is real
-rather than a contention artifact. That is the number D-026's weekly cadence is
-sized against.
+**brotli -q10 settles the codec question outright**: smaller than zstd -19 *and*
+universally supported, so the tradeoff that made zstd tempting does not exist.
+Quality is capped at 10 per the project owner — q11 costs significantly more for
+very little gain. q5 is the right setting for deltas, where turnaround matters
+more than the last few percent.
 
-**brotli -q10 settles the codec question outright.** At 72.1 MB it is smaller
-than zstd -19 (76.0 MB) *and* universally supported above the D-016 floor, so
-the tradeoff that made zstd tempting — better ratio at the cost of excluding
-Safari — simply does not exist. It also beats gzip by 27%.
+`DecompressionStream` supports only gzip and deflate, which once made
+`Content-Encoding` the only route for brotli. D-040 makes that moot: artifacts
+ship as opaque `.br` with no encoding header and a WASM decoder
+(`brotli-dec-wasm`, MIT OR Apache-2.0, ~200 KB) unpacks them, so progress
+reporting and range resume both count the same bytes that cross the wire.
 
-**Cap quality at 10.** Per the project owner, q11 costs significantly more time
-for very little additional gain; the q11 run here was abandoned after exceeding
-two minutes unfinished. Under D-026 the snapshot is compressed weekly, so even a
-four-minute pass is unremarkable — it is the *hourly* recompression that D-026
-exists to avoid, not compression itself. q5 remains the right setting for delta
-payloads, where 5-second turnaround matters more than the last few percent.
+### Delta, over a real 21.4-hour window (2026-07-31)
 
-Note that `DecompressionStream` in the browser supports only gzip and deflate,
-so brotli must arrive via `Content-Encoding` and be decompressed transparently
-by the browser — not fetched as an opaque `.br` file and decoded in JS. Serving
-a precompressed `.br` snapshot therefore needs either nginx's brotli module or
-an explicit header in a location block. **Verified on `plex` 2026-07-31:** both
-brotli modules are already loaded and enabling `brotli_static on;` is a one-line
-change (D-030).
-
-**The composition suggests the hedge if cold start proves too slow.** Text is
-the expensive half:
-
-| Object | MB | Share |
-| --- | --- | --- |
-| `cve_text` (descriptions) | 131.6 | 48% |
-| `fts_data` (search index) | 55.1 | 20% |
-| `cve` (main table) | 25.5 | 9% |
-| indexes | ~40 | 15% |
-| everything else | ~20 | 7% |
-
-Every structured column anyone filters or aggregates on fits in roughly **86 MB**
-— call it 25–30 MB compressed. So a hybrid is available without building the
-full projection machinery: ship structured data eagerly, and descriptions plus
-the FTS index on first search. That earlier note about facets being cheap and
-text being expensive is now quantified rather than asserted.
-
-Three traps worth knowing before writing any corpus scan:
-
-- `cves/delta.json` and `cves/deltaLog.json` are the publishing pipeline's own
-  churn files, not CVE records. A naive `find cves -name '*.json'` includes them.
-- **~4.9% of records are `REJECTED`.** Any aggregate without a
-  `state = 'PUBLISHED'` predicate overcounts by roughly that much, and it will
-  look plausible (D-022). This belongs in a shared query layer, not in each
-  report.
-- Records are nested as `cves/<year>/<N>xxx/CVE-<year>-<N>.json`, so the year
-  partition is a directory level and comes free — relevant to whatever
-  partitioning Q-002 settles on.
-
-## Delta measurement (2026-07-31) — a real upstream window
-
-The corpus was hashed at `a42a2eb6c2`, fetched forward 21.4 hours to
-`d300c5fcc0`, and re-hashed. This is the evidence behind D-031; the numbers to
-size the sync path from.
+`a42a2eb6c2` → `d300c5fcc0`, the evidence behind D-031:
 
 | | |
 | --- | --- |
 | Records before → after | 372,092 → 372,322 |
 | Added / updated / **removed** | 230 / 435 / **0** |
-| Updates that changed only `dateUpdated` | 275 of 435 (**63%**) |
-| New lookup rows | 17 vendors, 86 products, 1 CWE, 0 CNAs; **0 vanished** |
+| Updates changing only `dateUpdated` | 275 of 435 (**63%**) |
+| New lookup rows | 17 vendors, 86 products, 1 CWE; **0 vanished** |
 | Payload | 382 KB JSON → 95 KB gzip -9 → **87 KB brotli -q5** |
 | Description text as a share of payload | 62% |
-| `git fetch --depth 1` | 1.8 s |
-| Full-corpus hash pass | 15–18 s |
 | Apply to the 272.8 MB database | **0.08 s**, FTS maintenance included |
 | `integrity-check` at `rank = 1` | 0.8 s |
 
-Upstream published in 32 ingest-sized batches over the window — roughly every 40
-minutes — producing 832 change events against 665 distinct records. Merging
-therefore saves 20% of the payload, but the reason to merge is request count:
-one file instead of 32.
+Upstream published in 32 batches over the window, producing 832 change events
+against 665 distinct records — so merging saves 20% of the payload, and one
+request instead of 32. Earlier delta economics (D-025), measured over 31 days
+via `deltaLog.json`: median day 1,312 events / 0.17 MB gzipped, busiest observed
+6,147 / 0.78 MB, one week ~12,000 / 1.50 MB.
 
-Three results worth carrying forward:
+At these rates a month of catch-up costs a new user ~2.6 MB against a 62.6 MB
+snapshot. Weekly snapshots stay the default because they bound the delta file
+count, not because monthly would hurt.
 
-- **Apply is idempotent.** Eight applications of the same delta left row counts
-  identical and the file 0.1 MB larger in total. Interrupted syncs are safe to
-  retry, with no reconciliation logic.
-- **Delta apply needs its own indexes.** Replacement semantics delete dependent
-  rows by `cve_id`; `cve_prod` has an index for that and `cve_cwe` does not.
-  Adding one took apply from **1.53 s to 0.08 s** — 19×, for 2.2 MB.
-- **The FTS index does not police itself, and neither does the obvious check.**
-  `INSERT INTO fts(fts) VALUES('integrity-check')` passes on a drifted
-  external-content index; only the `rank = 1` form catches it (RE-005).
+### Traps worth knowing before writing any corpus scan
 
-All of the above is native SQLite on server hardware. The apply path runs in
-WASM in a browser, which Q-003 measures.
-
-## Expected shape (to be validated in the M0 draft)
-
-The 2026-07-30 triage resolved the feature ledger, so bullets below no longer
-rest on untriaged rows, and D-025 settled the data-delivery seam. What remains
-provisional is anything downstream of the still-open Q-001 through Q-005.
-
-- **A four-stage pipeline:** shallow clone → server-derived normalized artifact
-  → explicit user-initiated transfer → local SQLite. D-025 settled the seam:
-  bulk import. The client holds a *complete* copy of the corpus, obtained via a
-  "Download data" action and kept current via a "Sync" action applying deltas.
-  Nothing fetches automatically.
-- **Correctness is structural, not machinery.** Because the client holds
-  everything, a query cannot run against a partial view and return a plausible
-  undercount — the client either has the corpus or has not downloaded it yet.
-  Vision criterion 7 is satisfied by the architecture rather than by a coverage
-  tracker, which is what D-025 bought back after D-015 took that debt on. The
-  one place this can still break is FTS index drift during delta application
-  (D-025 hazard 2), so that is where the correctness effort belongs.
-- **Privacy is total by construction in the sync path.** The server serves named
-  static files. It receives no fields, no partitions, no predicates, no search
-  terms, and no watermark — the client picks which files to fetch. That is a
-  stronger position than D-014 requires, reached as a side effect of D-031's
-  fixed delta granularity rather than by design.
-- **Staleness is the new user-facing risk.** Manual sync means a user can sit on
-  a month-old corpus while getting confident-looking counts. The UI owes them a
-  visible freshness indicator; this replaces coverage tracking as the thing that
-  keeps results honest.
-- **A Worker-owned database, with the UI talking to it over messages.** This
-  follows from OPFS's threading constraints rather than from taste, and it means
-  every query is asynchronous from the UI's perspective regardless of framework.
-- **Derived artifacts are published as immutable static files** under
-  `cve.data/pub/`, named by the revision range they cover, and served through a
-  read-only nginx `alias`. Nothing is computed per request; there is no request
-  handler in the data path at all (D-031, D-032).
-- **Client-side sync state lives inside the database** — the watermark and
-  schema version in a `meta` table, advanced in the same transaction as the rows
-  they describe, so a crash cannot leave the two disagreeing. The snapshot
-  carries its own revision in that table, which is how a fresh download starts
-  with a correct watermark rather than an assumed one.
-- **A capability gate before the import path**, since an unsupported browser
-  should be told on arrival rather than fail partway through a large import.
-- **Storage sized in advance, not discovered.** The corpus is large enough that
-  quota, eviction, and `navigator.storage.persist()` are part of the import
-  design rather than error handling bolted on later.
+- `cves/delta.json` and `cves/deltaLog.json` are the publishing pipeline's own
+  churn files, not CVE records. A naive `find cves -name '*.json'` includes them.
+  `deltaLog.json` is also a rolling 30-day window, and models only `new`,
+  `updated`, and `error` — there is no deletion concept upstream.
+- **~4.9% of records are `REJECTED`.** Any aggregate without a state predicate
+  overcounts by roughly that much, and it will look plausible.
+- Records are nested as `cves/<year>/<N>xxx/CVE-<year>-<N>.json`, so the year
+  partition is a directory level and comes free.
+- 4.46% of records carry no description at all, so `cve_text` holds fewer rows
+  than `cve`. Those records cannot match a search, and the UI must not present
+  that as "no results" when the truth is "this record has no indexed text"
+  (D-023).
 
 ## Deliberately absent
 
 - **No client-side git.** Rejected with measurements in D-005; do not
-  reintroduce isomorphic-git or a CORS proxy without reopening that decision.
-- **No server-side query execution.** Rejected in D-007 and reaffirmed in
-  D-014: the server ships data, it does not filter, rank, or aggregate.
+  reintroduce isomorphic-git or a CORS proxy without reopening it.
+- **No server-side query execution.** Rejected in D-007, reaffirmed in D-014:
+  the server ships data, it does not filter, rank, or aggregate.
+- **No dynamic endpoint at all**, as built (D-032). Adding one is a constraint
+  change and restores every question D-034 declined to answer.
 - **No custom SQLite VFS.** The range-request VFS was rejected in D-015 on
   simplicity grounds; do not reintroduce `sql.js-httpvfs`, `sqlite-wasm-http`,
-  or a hand-written page-fetching VFS without reopening that decision.
-- **No direct browser fetches to GitHub bulk endpoints.** Measured
-  CORS-blocked on 2026-07-30 (release assets, codeload zipball/tarball, git
-  smart-HTTP). `raw.githubusercontent.com` and `api.github.com` do send
-  `access-control-allow-origin: *` and remain usable as a fallback or
-  cross-check, but they are not the primary path.
+  or a hand-written page-fetching VFS without reopening it.
+- **No direct browser fetches to GitHub bulk endpoints.** Measured CORS-blocked
+  2026-07-30 (RE-001). `raw.githubusercontent.com` and `api.github.com` do send
+  `access-control-allow-origin: *` and remain usable as a cross-check, but they
+  are not the primary path.
 
-## Open architecture questions
+## Open questions
 
-The full list, with the M0 task that answers each, lives in
-[features.md](features.md) under "Open questions" — questions 1–6 are
-architectural. Purely technical questions not tracked there:
+Tracked in [features.md](features.md); Q-001, Q-002 and Q-005 are answered.
+Q-003 (browser-side budgets) and Q-004 (OPFS VFS selection) need a running
+browser and are measured in M1 (D-029). Purely technical questions not tracked
+there:
 
-- **Where the JSON→relational transform runs** has a corollary nobody has
-  costed: whichever side owns it also owns schema migration. A server-owned
-  schema makes migrations a server deploy plus a client re-import; a
-  client-owned schema makes them a client-side migration against a large local
-  database. Both are viable; they are not equally cheap.
-- **What a schema-version bump costs the user.** D-025 hazard 4 says deltas
-  cannot bridge it, so the client re-downloads ~83 MB. That is acceptable rarely
-  and unacceptable often, which makes schema stability a release-discipline
-  question rather than a technical one.
-- **Whether the delta rollup can be made obviously correct.** D-032 requires
-  the published delta files to tile the revision space contiguously, so a client
-  at any watermark finds a covering chain. That is a small invariant with a
-  nasty failure mode — a client that can never sync again — and it wants a
-  property test, not a code review.
+- **Where schema migration lives.** A server-owned schema makes a migration a
+  server deploy plus a client re-import; a client-owned schema makes it a
+  migration against a large local database. We have chosen server-owned by
+  implication, and never costed the alternative.
+- **What a schema-version bump costs the user.** Deltas cannot bridge one, so
+  the client re-downloads 62.6 MB. Acceptable rarely, unacceptable often — which
+  makes schema stability a release-discipline question, not a technical one.
+- **Whether the delta rollup can be made obviously correct.** The tiling
+  invariant has a nasty failure mode — a client that can never sync again — and
+  wants a property test.
+- **What building the full-text indexes costs in WASM.** Native SQLite rebuilt
+  the description index in 3 s; writing ~61 MB of index pages through OPFS could
+  be far slower. The owner has ruled this a progress-bar concern rather than a
+  gate (D-035), so it is a number to know, not a risk to carry.
+- **How many chunks to decompress concurrently.** Twelve at once bounds memory
+  at twelve buffers; one at a time wastes the network. Q-003 picks the number
+  (D-041).
 
-*Resolved:* whether the deploy's rsync semantics can coexist with server-side
-state — yes, via D-018's peer directory. Whether a partial cache can be quietly
-wrong — moot under D-025. **Cache invalidation on a rewritten upstream
-history** — moot under D-031: the pipeline diffs content hashes and never reads
-git history, so a force-push produces the same delta as any other change (and a
-shallow clone could not have told us anyway — RE-006). **Whether the FTS index
-can be delta-updated or must be rebuilt** — measured: 665 records applied in
-0.08 s including FTS maintenance, with no bloat across eight repeated applies,
-so `'optimize'` is a maintenance action rather than part of sync (D-031).
+*Resolved:* rsync semantics versus server-side state — D-018's peer directory.
+Whether a partial cache can be quietly wrong — moot under D-025. Cache
+invalidation on a rewritten upstream history — moot under D-031. Whether the FTS
+index can be delta-updated or must be rebuilt — measured, 0.08 s with no bloat
+across eight applies, so `'optimize'` is maintenance rather than part of sync.

@@ -13,14 +13,15 @@ else's search service.
 cve.meenan.dev is the third option: bring the corpus into your own browser and
 query it there. Records live in SQLite compiled to WebAssembly and persisted to
 OPFS, so what sits in local storage is a real relational database with real SQL
-behind it. A single locked-down same-origin endpoint feeds data in and runs no
+behind it. Data arrives as static same-origin files and the server runs no
 analysis: your filters, aggregates, and search terms are evaluated on your
-machine and never sent anywhere.
+machine and never sent anywhere — the client sends no query parameters at all
+(D-032).
 
 You get the whole corpus, not a slice of it: an explicit "Download data" action
-fetches a complete prebuilt database — roughly 72 MB compressed for all 372,092
-records — and an explicit "Sync" action applies deltas, typically well under a
-megabyte a day (D-025). Nothing fetches behind your back.
+fetches a prebuilt database — 62.6 MB compressed for all 372,092 records — and
+an explicit "Sync" action applies deltas, typically well under a megabyte a day
+(D-025, D-038). Nothing fetches behind your back.
 
 ## Who it's for
 
@@ -66,13 +67,14 @@ M0 rather than a hand-wave. That measurement is itself an M0 deliverable.
    someone a query or report definition that reproduces the analysis on their
    own local copy, and separately export result sets in a standard format —
    carrying the attribution the CVE terms require (D-008).
-7. **Results are never quietly wrong.** Bulk import makes this largely
-   structural — the client either holds the whole corpus or has not downloaded
-   it yet, so there is no partial view to undercount from. Two ways it can still
-   break, and both are guarded deliberately: a stale corpus producing confident
-   counts, which the visible freshness indicator exists to prevent; and a search
-   index drifted out of step with the data during a delta apply (D-025 hazard 2),
-   which is where the correctness effort belongs.
+7. **Results are never quietly wrong.** Bulk import makes this structural — the
+   client either holds the whole corpus or has not downloaded it yet, so there
+   is no partial view to undercount from. Year partitioning would have traded
+   this away and was rejected for that reason as much as any other (D-038). Two
+   ways it can still break, both guarded deliberately: a stale corpus producing
+   confident counts, which the visible freshness indicator exists to prevent;
+   and a search index drifted out of step with the data during a delta apply
+   (D-025 hazard 2), which is where the correctness effort belongs.
 
 ## Non-goals
 
