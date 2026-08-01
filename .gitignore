@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+test-results/
+playwright-report/
+coverage/
+__pycache__/
+.venv/
+public/sqlite/
+pipeline/pub/

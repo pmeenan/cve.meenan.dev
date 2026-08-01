@@ -23,6 +23,47 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-043: The ingest pipeline is Python 3.12, standard library only  (2026-08-01, status: accepted, extends D-017)
+
+**Decision.** Everything server-side — fetch, hash, normalize, chunk, publish —
+is Python 3.12 using only the standard library, plus the `git` and `brotli`
+binaries already installed. It lives in `pipeline/` in the repo and is *not*
+part of the `dist/` rsync (D-003). The browser application stays TypeScript
+(D-017, D-027).
+
+**Context.** D-017 settled the app toolchain and D-027 revised it, but neither
+covered the pipeline — it did not exist yet. It now does, in the form of the M0
+spike scripts, and D-042 turns it into a cron job someone has to maintain.
+
+Python wins on evidence rather than preference: every M0 measurement was
+produced by these scripts, so the parse-and-normalize path is already proven
+against the real corpus at 15–18 s for 372,092 records. `json`, `sqlite3`,
+`hashlib` and `pathlib` cover the entire job with no dependencies to audit
+(D-002) or update. Python 3.12.3 is present on `plex` and locally.
+
+The counter-argument is one language across the repo, and it is real but weak
+here: the pipeline shares no code with the browser, runs in a different place,
+on a different schedule, against a different data model. TypeScript would mean
+installing Node on the server purely to run cron.
+
+**Consequences.** Two languages, and the boundary between them is the published
+contract in `manifest.json` — which is also the boundary a test can hold. The
+schema exists in both worlds, so the DDL needs a single source of truth: it
+lives in `pipeline/schema.sql`, is executed by the builder, and is what the
+client asserts against after import.
+
+`sqlite3` in the standard library is dynamically linked against the system
+SQLite, which on `plex` is 3.45.1 — older than the `@sqlite.org/sqlite-wasm`
+build the browser will use. That asymmetry is fine for the file format, which is
+stable, but it means FTS5 behavior must be verified on the browser's version and
+not inferred from the server's (RE-005 already carries this warning).
+
+`pipeline/` must be excluded from the deploy: D-003 mirrors `dist/` into the
+docroot, and the pipeline has no business being web-reachable.
+
+**Reopen if.** The pipeline grows a dependency that Python makes awkward, or the
+schema starts drifting between the two languages despite the single DDL file.
+
 ## D-042: The pipeline is a daily cron ingest with a monthly snapshot  (2026-08-01, status: accepted, supersedes the cadence half of D-026)
 
 **Decision.** Two scheduled jobs under `flock`, no daemon:

@@ -1,0 +1,9 @@
+# pnpm 11 reads build-script policy from here (the "pnpm" field in package.json
+# is ignored with only a warning), and expects the `allowBuilds` map rather
+# than the older onlyBuiltDependencies/ignoredBuiltDependencies lists.
+allowBuilds:
+  # Native resolver used by the ESLint import plugin.
+  unrs-resolver: true
+  # Next's image optimizer. Static export sets images.unoptimized (D-027), so
+  # it is never invoked.
+  sharp: false

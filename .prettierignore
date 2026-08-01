@@ -1,0 +1,12 @@
+dist/
+.next/
+node_modules/
+public/sqlite/
+pnpm-lock.yaml
+
+# Documentation is hand-wrapped prose; reformatting it produces churn that
+# obscures real changes in review.
+*.md
+
+# Generated data artifacts.
+pipeline/pub/

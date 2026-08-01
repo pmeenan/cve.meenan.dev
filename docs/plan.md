@@ -54,20 +54,22 @@ evidence.
       priced in compressed bytes. Answers Q-002. Superseded in part the same
       week by D-035, which moved index building to the client and took the
       download to **62.6 MB at brotli -q10**.
-- [x] **Design: data-plane hardening.** One nginx location, no CORS headers
-      as the actual same-origin control, connection and rate limits, immutable
-      cache policy, and integrity hashes in the manifest — with `Sec-Fetch-Site`
-      blocking explicitly rejected as theater (D-034). Closes Q-005.
+- [x] **Design: data-plane hardening.** One nginx location, no CORS headers as
+      the actual same-origin control, immutable cache policy, and integrity
+      hashes in the manifest — with `Sec-Fetch-Site` blocking rejected as
+      theater (D-034) and origin rate limiting since removed in favour of
+      Cloudflare (D-039). Closes Q-005.
 - [x] **First full draft of [architecture.md](architecture.md)**, replacing the
       skeleton: overview, server pipeline, published contract, client, schema
       DDL, trust boundaries, failure modes, and every measurement in one place.
 
-**Exit criteria:** every item above is checked, with decision-log entries
-for the significant calls; architecture.md's first full draft is reviewed. Per
-D-029, Q-003 and Q-004 are **not** M0 exit criteria — they need a running
-browser and are answered in M1.
+**Exit criteria met 2026-08-01:** every item checked, decision entries recorded
+for the significant calls (D-001 – D-042), and architecture.md's first full
+draft reviewed and accepted by the project owner. Per D-029, Q-003 and Q-004
+were **not** M0 exit criteria — they need a running browser and are answered
+here in M1.
 
-## M1 — Scaffolding, one end-to-end path, and the browser measurements  `pending`
+## M1 — Scaffolding, one end-to-end path, and the browser measurements  `in progress`
 
 The smallest change that exercises every risky layer for real, plus the two
 deferred measurements. Deliberately narrow and deliberately complete.
@@ -81,18 +83,34 @@ origin headers (D-039); a **bounded slice** of the
 corpus published there as a static file; SQLite/WASM in a Worker persisting to
 OPFS; one query rendered in the UI carrying the D-008 notice.
 
-- Q-003: import wall-clock, peak memory, OPFS footprint, and WASM query
-  latency. Index build time is measured too, but the owner has ruled it a
-  progress-bar concern rather than a gate (D-035). The open tuning question is
-  how many chunks to decompress concurrently (D-041).
-- Q-004: `opfs` vs `opfs-sahpool` — now a pure performance and multi-tab
-  question, since D-030 confirmed COOP/COEP are already served.
-- Confirm Next copies `public/` into the export root, per D-027's open caveat.
+- [x] **Scaffolding.** Next.js 16 + React 19 static export, TypeScript strict,
+      Vitest, Playwright, ESLint, Prettier, pnpm, license audit, deploy script,
+      and a local server that reproduces production headers. `pnpm check` and
+      `pnpm e2e` both green.
+- [x] **The pipeline's first half** (D-043): `schema.sql`, `normalize.py`,
+      `build.py`, `publish.py`. Produces the bounded slice — 39,196 records for
+      2026, 51.9 MB expanding from 9.9 MB in 2 chunks.
+- [x] **The end-to-end path.** Manifest → chunked fetch → WASM brotli →
+      positional OPFS writes → client-built FTS → a real aggregate rendered with
+      the D-008 notice, covered by one Playwright test.
+- [x] **Q-003, first numbers.** Recorded in [features.md](features.md).
+      Transport is a rounding error; **index building is 91% of import**.
+- [x] Confirmed Next copies `public/` into the export root — closes D-027's
+      open caveat.
+- [ ] **Q-003 at full scale.** The slice is a tenth of the corpus. Needs the
+      full artifact: import wall-clock, peak memory, OPFS footprint, query
+      latency, and how many chunks to decompress concurrently (D-041).
+- [ ] **Q-004:** `opfs` vs `opfs-sahpool`. The `opfs` VFS works; the comparison
+      and multi-tab behaviour are unmeasured.
+- [ ] **Deploy.** nginx `^~ /data/` location, Cloudflare cache rules, first
+      rsync to `cve.meenan.dev`.
 
 **Exit criteria:** the deployed site loads from `cve.meenan.dev`, fetches the
-published slice, stores it in OPFS, and renders one real query
-result; Q-003 numbers recorded and vision criteria 1 and 3 given real budgets;
-Q-004 decided and recorded; checks run green in CI-equivalent form.
+published chunks, decompresses them itself, writes them into OPFS, and renders
+one real query result; Q-003 numbers recorded and vision criteria 1 and 3 given
+real budgets; Q-004 decided and recorded; checks run green in CI-equivalent
+form. **Locally green as of 2026-08-01**; what remains is full-scale
+measurement, Q-004, and the deploy.
 
 ## M2 — Full-corpus Download and Sync  `pending`
 

@@ -62,11 +62,19 @@ affected docs. Until then, these govern.
 
 ## Repository layout
 
-| Path    | What lives there |
-| ------- | ---------------- |
-| `docs/` | Vision, plan, architecture, decisions, features, rough edges, workflow |
+| Path         | What lives there |
+| ------------ | ---------------- |
+| `docs/`      | Vision, plan, architecture, decisions, features, rough edges, workflow |
+| `app/`       | Next.js App Router pages and styles |
+| `lib/`       | Shared types — notably the published contract in `protocol.ts` |
+| `workers/`   | The Worker that owns SQLite/WASM on OPFS |
+| `pipeline/`  | Python ingest and publish (D-043). **Never deployed** |
+| `scripts/`   | Build, serve, deploy, license audit |
+| `tests/`     | `unit/` (Vitest) and `e2e/` (Playwright) |
+| `public/`    | Static passthrough into the export root |
 
-The application scaffolding lands in M1 — update this table when it does.
+`pnpm check` runs typecheck, lint, format, unit tests and the license audit.
+`pnpm e2e` runs the browser path end to end.
 
 ## Doc map — pull what the task needs, not everything
 
@@ -122,9 +130,9 @@ commit gate.
 
 ## Current status
 
-Milestone **M0 (plan the plan) is complete** as of 2026-07-31: scope,
-architecture, schema, delivery protocol, and the milestone ladder are settled
-and measured (D-001 – D-034), and [architecture.md](docs/architecture.md) has
-its first full draft. **M1 is next** — scaffolding, one end-to-end path, and the
-two browser measurements deferred by D-029. No application code exists yet. Keep
-this paragraph current when plan.md milestone status changes (rule 6).
+Milestone **M1 is in progress**: scaffolding, one end-to-end path from
+published brotli chunks through SQLite/WASM on OPFS to a rendered query, and the
+two browser measurements deferred by D-029 (Q-003, Q-004). M0 closed 2026-08-01
+with scope, architecture, schema and the delivery protocol settled and measured
+(D-001 – D-043). Keep this paragraph current when plan.md milestone status
+changes (rule 6).

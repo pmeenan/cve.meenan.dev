@@ -103,7 +103,7 @@ as of the 2026-07-30 triage** — additions go through the decision log.
 | Multi-tab behavior | `confirmed` | Forced by D-004: `opfs-sahpool` does not support simultaneous connections, so a second tab needs defined behavior. |
 | Browser support floor and capability gating | `confirmed` | An unsupported browser should say so on arrival, not fail deep inside an import. |
 | Diagnostics panel (storage used, last sync, record counts, schema version) | `confirmed` | Makes "measure, don't assert" possible for users, and is the only support channel given D-009. |
-| Endpoint rate limiting and abuse metrics | `confirmed` | D-006 requires the endpoint not become an open endpoint; enforcement needs a concrete mechanism (Q-005). |
+| Origin rate limiting and abuse metrics | `rejected (D-039)` | There is no endpoint to protect (D-032) and Cloudflare absorbs abuse; per-IP limits behind a proxy would have throttled everyone through a few edge IPs. |
 | Client-side telemetry | `rejected (D-009)` | No collection of any kind. |
 
 ## Open questions (answer during M0)
@@ -130,14 +130,27 @@ Ordered by how much rework a late answer would cause.
    by host interning — an amendment to D-011. The published artifact measures
    **95.4 MB at brotli -q10**, up 32% from the floor. D-035 then removed the
    shipped index, bringing the download to **62.6 MB**.
-**Q-003. What are the browser-side budgets?** *Deferred to M1 by D-029 — needs a
-   running browser, so it is measured against real scaffolding rather than
-   answered on paper.* The D-024 timings are native SQLite on server hardware.
-   Needed in a real browser: import wall-clock for the full artifact, peak
-   memory, OPFS footprint, and query latency under WASM. Gates vision criteria 1
-   and 3, whose budgets come from here. If the numbers come back bad, the
-   fallback is already identified in D-024 — ship the ~86 MB of structured data
-   first and defer text plus FTS.
+**Q-003. What are the browser-side budgets?** **First real numbers, 2026-08-01**,
+   from the M1 end-to-end path against a 39,196-record slice (2026 only, 9.9 MB
+   compressed expanding to 51.9 MB), Chromium via Playwright:
+
+   | Stage | Time |
+   | --- | --- |
+   | Fetch (2 chunks) | 542 ms |
+   | Decompress (WASM brotli) | 353 ms |
+   | Write to OPFS | 301 ms |
+   | **Build FTS indexes** | **10,050 ms** |
+   | Total | 11.0 s |
+
+   Transport is a rounding error; **index building is 91% of import**. Native
+   SQLite built the description index for the *whole* corpus in 3 s, so WASM is
+   roughly two orders of magnitude slower per record here. Naive scaling to
+   372,322 records puts index building near 95 s — which is the number D-035's
+   "progress-bar concern rather than a gate" has to hold up against, and it was
+   ruled before any measurement existed.
+
+   Still open: the same measurements against the full artifact, peak memory,
+   OPFS footprint, and query latency at full scale.
 **Q-004. Which OPFS VFS — `opfs` or `opfs-sahpool`?** *Deferred to M1 by D-029.*
    Per SQLite's documentation the former needs COOP/COEP response headers and the
    latter forbids simultaneous connections. **D-030 removed the server-config
@@ -150,12 +163,12 @@ Ordered by how much rework a late answer would cause.
    checks, rate limiting, bounded responses — which combination is enforceable
    here, and what it does about non-browser callers that can forge headers
    freely. D-025 shrank it once; **D-032 shrank it again and changed its
-   character**: there is no request handler left to harden, so what remains is
+   character**: there is no request handler left to harden. What remains is
    nginx configuration over static files — the `alias` exposing `cve.data/pub/`
-   read-only,
-   cache headers, and whatever same-origin enforcement is worth doing given that
-   non-browser callers forge headers freely. KEV (D-010) is a third static file
-   under the same treatment.
+   read-only, cache headers, and no CORS headers as the real same-origin control
+   (D-034) — with abuse absorbed by Cloudflare rather than origin limits
+   (D-039). KEV (D-010) is another static file under the same treatment.
+   **Answered by D-034 and D-039.**
 
    **The server-configuration half is answered (D-030).** All three dependencies
    were checked on `plex` 2026-07-31 and none of them block M1:

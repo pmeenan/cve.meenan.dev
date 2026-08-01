@@ -22,6 +22,102 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-009: Latest-version toolchain outruns its own ecosystem  (2026-08-01, status: worked-around)
+
+**Environment.** Scaffolding cve.meenan.dev on 2026-08-01: Node 24.16.0,
+pnpm 11.14.0, Next.js 16.2.12.
+
+**Measurement.** Three independent breakages from installing `@latest`, each
+fatal to a different check:
+
+| Installed | Breaks | Symptom |
+| --- | --- | --- |
+| typescript 7.0.2 | `next build` type check | *"TypeScript 7.0.2 does not provide the compiler API required by Next.js"* |
+| typescript 7.0.2 | typescript-eslint 8.65.0 | *"typescript-eslint does not support TS 7.0"* ([issue 10940](https://github.com/typescript-eslint/typescript-eslint/issues/10940)) |
+| eslint 10.8.0 | eslint-plugin-react 7.37.5 | `TypeError: contextOrFilename.getFilename is not a function` |
+
+Two smaller ones in the same session: pnpm 11 ignores the `pnpm` field in
+`package.json` with only a warning and expects `allowBuilds` in
+`pnpm-workspace.yaml` instead — and until build policy is declared,
+`pnpm install` exits non-zero, which makes `next build` fail before it starts.
+And a `licenses` entry in `scripts` is shadowed by pnpm's built-in
+`pnpm licenses`, so the script silently never runs.
+
+**Observed vs. expected.** Naively, that the newest releases of a mainstream
+toolchain work together. TypeScript 7 is the Go rewrite and ESLint 10 is a major
+with API changes; both landed ahead of the plugins that depend on their internals.
+
+**Impact.** Cost most of the scaffolding time in M1, and every failure was a
+confusing error a long way from its cause. Resolved by pinning **TypeScript 6**
+(which also removed the need for Next's `experimental.useTypeScriptCli`) and
+**ESLint 9**. Both are deliberate downgrades recorded in `package.json`, not
+accidents — revisit when typescript-eslint supports TS 7 and eslint-plugin-react
+supports ESLint 10.
+
+The general lesson for a project where agents write most of the code (D-001):
+`@latest` is the wrong default for anything a *plugin ecosystem* attaches to.
+Compilers and linters are exactly that.
+
+## RE-008: A worker spawned from a COEP document must itself be served with COEP  (2026-08-01, status: worked-around)
+
+**Environment.** Chromium via Playwright 1.62.1, cross-origin isolated page,
+Next.js 16 static export, 2026-08-01.
+
+**Repro.** Serve the document with `Cross-Origin-Embedder-Policy: require-corp`
+but serve `.js` without it, then `new Worker(url, { type: 'module' })`.
+
+**Observed.** The request fails with `net::ERR_BLOCKED_BY_RESPONSE`. There is
+**no console message, no exception, and no error event** — the worker simply
+never starts, so the application hangs in whatever state preceded it. The
+failure is visible only in the network log.
+
+**Expected.** At minimum a console diagnostic. `Cross-Origin-Resource-Policy:
+same-origin` on the script is *not* sufficient: a dedicated worker inherits the
+embedder policy and its own response must carry COEP.
+
+**Impact.** Cost a debugging cycle on a symptom that looked like the import path
+hanging. Production is unaffected — nginx sets COOP/COEP at *server* level
+(D-030), which covers scripts as well as documents — but the local Playwright
+server initially set them only on HTML, which is exactly the plausible-looking
+mistake. `scripts/serve.mjs` now sets them on every response and says why.
+
+Anything that reproduces production headers must reproduce them at the same
+scope, or it tests a different application.
+
+## RE-007: Closing an OPFS sync access handle is async, and opening the file again hangs  (2026-08-01, status: worked-around)
+
+**Environment.** Chromium via Playwright 1.62.1, `@sqlite.org/sqlite-wasm`
+3.53.0-build1, `opfs` VFS, cross-origin isolated, 2026-08-01.
+
+**Repro.** In a Worker: write a database file through a
+`FileSystemSyncAccessHandle`, call `close()` without awaiting it, then open the
+same path with `new sqlite3.oo1.OpfsDb(...)`.
+
+```js
+const access = await handle.createSyncAccessHandle()
+access.write(bytes, { at: 0 })
+access.flush()
+access.close()            // not awaited
+db = new sqlite3.oo1.OpfsDb('/cve.sqlite', 'c')   // never returns
+```
+
+**Observed.** `OpfsDb` never returns and never throws. No exception, no console
+output, no timeout — the import sits at "Opening database" indefinitely.
+Diagnostics at that moment report everything as healthy: `crossOriginIsolated`
+true, the `opfs` VFS registered, `OpfsDb` a function.
+
+**Expected.** Either `close()` to be synchronous as the current spec declares,
+or a lock error from the second opener.
+
+**Impact.** High, because the failure mode is a silent hang in the one path
+every user takes. The exclusive lock is not released until `close()` settles,
+and Chromium has shipped promise-returning forms of these methods, so the
+declared-synchronous signature cannot be relied on.
+
+**Workaround.** `await access.close()`. Awaiting a non-promise is harmless, so
+this is correct under either behavior — and worth doing for `flush()` on the
+same reasoning.
+
 ## RE-006: A shallow clone reports every upstream advance as a forced update  (2026-07-31, status: worked-around)
 
 **Environment.** git 2.54.0 on `plex`, against the `--depth 1 --no-tags` clone
