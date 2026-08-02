@@ -16,6 +16,7 @@
     "test:watch": "vitest",
     "test:pipeline": "python3 -m unittest discover -s pipeline/tests",
     "e2e": "playwright test",
+    "measure": "rm -f measurements/measurement.jsonl && MEASURE=1 playwright test measure",
     "check": "pnpm typecheck && pnpm lint && pnpm format && pnpm test && pnpm test:pipeline && pnpm licenses:check",
     "deploy": "bash scripts/deploy.sh",
     "prebuild": "node scripts/copy-wasm.mjs",

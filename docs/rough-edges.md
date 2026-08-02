@@ -22,6 +22,175 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-014: `FileSystemSyncAccessHandle.write()` may write fewer bytes than asked  (2026-08-01, status: worked-around)
+
+**Environment.** The File System Standard, `write()` on
+`FileSystemSyncAccessHandle`
+(https://fs.spec.whatwg.org/#api-filesystemsyncaccesshandle-write, read
+2026-08-01). Applies to every OPFS-writing browser, not one engine.
+
+**The trap.** `write()` *returns the number of bytes written*, and the standard
+requires callers to handle a short write rather than assume it took the whole
+buffer. Nothing about the API's shape suggests that: it is synchronous, it takes
+a buffer and an offset, and the return value is easy to discard — which is
+exactly what this project did for its first two months.
+
+**Why it is worse here than usual.** The import writes twelve 32 MiB chunks
+positionally into a 377 MB database. A short write does not throw and does not
+truncate the file — the file is pre-sized by `truncate()` — so the result is a
+correctly-sized SQLite database with a hole in it. Nothing detects it at import
+time: the chunk's SHA-256 was verified *before* the write, `count(*)` reads a
+different page, and the damage surfaces later as a malformed page in whichever
+query first touches that region. A user would report "some queries are broken",
+which points nowhere near the cause.
+
+**Fix.** `writeFully()` in `lib/opfs.ts` loops until the buffer is drained,
+advancing the offset by bytes actually written, and throws if a call reports no
+progress rather than spinning forever (a hang would violate D-052's requirement
+that stalls be distinguishable from slowness). Regression-tested in
+`tests/unit/opfs.test.ts` against a handle that deliberately writes 300 bytes at
+a time.
+
+**Not observed in the wild.** Chromium has not been seen writing short in this
+project's runs — this is a standard-conformance fix, not a reproduction. That
+is the point: it would be invisible until it was not.
+
+**Links:** D-041 (chunked positional writes), D-052 (stalls versus slowness).
+
+## RE-013: A hard reload does not bypass the cache for a dedicated Worker's dynamic import  (2026-08-01, status: open)
+
+**Environment.** Chromium 151 (Playwright 1.62) on Linux 6.17, 2026-08-01.
+Observed first by the project owner in desktop Chrome against the deployed
+site, then reproduced.
+
+**Why it matters here.** The Worker loads the SQLite distribution with a runtime
+`import()` (`workers/db.worker.ts`, `SQLITE_ENTRY`). When RE-012 left a wrong
+`Content-Type` in a browser's HTTP cache, **Ctrl+Shift+R did not clear it** —
+only DevTools' "Disable cache" did. The standard remedy for a stale asset does
+not reach this class of request, so a user in this state has no obvious way out.
+
+**Measurement.** A page and a dedicated module Worker each `import()` the *same*
+URL. The server sends `Last-Modified` and no `Cache-Control` (heuristic
+freshness — what nginx sent for `/sqlite/`), and flips that file's
+`Content-Type` from `application/octet-stream` to `text/javascript` **without
+changing the file**, exactly as fixing `mime.types` does. `Page.reload` with
+`ignoreCache: true` is Chrome's hard reload.
+
+| Step | Document's import | Worker's import | Network responses seen |
+| --- | --- | --- | --- |
+| Broken MIME | fails | fails | 1 |
+| Server fixed, then **hard reload** | **succeeds** | **still fails** | **1** |
+| Server fixed, then cache disabled | succeeds | succeeds | 2 |
+
+The single response on the middle row is the point: only the document re-fetched.
+The Worker reused its cached entry and never hit the network.
+
+A first attempt to reproduce this *failed to reproduce it* — because it changed
+the file's contents, which moved `Last-Modified`, drove heuristic freshness to
+about zero and forced the Worker to revalidate anyway. The bug only bites when
+the cached entry is still heuristically fresh, which is the normal state for an
+asset deployed any length of time ago. Worth knowing before concluding that a
+cache problem "isn't reproducible".
+
+**Observed vs. expected.** Expected a hard reload to mean "fetch everything this
+page needs from the network". It means "…everything the *document* fetches";
+a dedicated Worker's module imports are a separate fetch path and keep using the
+HTTP cache.
+
+**Impact.** The client-side remedy for a poisoned cache entry effectively does
+not exist for anything the Worker loads, which makes the server-side cache
+policy load-bearing rather than a tidiness matter — this is the direct
+justification for D-054 serving `/sqlite/` as `no-cache`. It also means M5's
+service worker must be network-first (D-054): a cache-first SW would reintroduce
+exactly this trap one layer up, where a user cannot clear it at all.
+
+**Not established.** Whether the same holds for the Worker's *own* script, for
+`importScripts()` in a classic worker, or in Firefox/WebKit. Only the module
+`import()` case above was measured.
+
+## RE-012: nginx's stock `mime.types` has no `.mjs`, and the local dev server hid it  (2026-08-01, status: fixed-upstream-config)
+
+**Environment.** nginx 1.30.2 on `plex`, Debian package defaults, 2026-08-01,
+during the first deploy of `cve.meenan.dev`.
+
+**Measurement.** The Worker loads the SQLite distribution at runtime from
+`/sqlite/index.mjs` (a runtime URL, not a bundled import). In production that
+request returned:
+
+```
+$ curl -sI https://cve.meenan.dev/sqlite/index.mjs
+HTTP/2 200
+content-type: application/octet-stream
+```
+
+`/etc/nginx/mime.types` shipped `application/javascript js;` with no `mjs`
+entry, so `.mjs` fell through to `default_type`. Browsers apply strict MIME
+checking to module scripts, so the import was refused and the page reported:
+
+> Failed to fetch dynamically imported module:
+> `https://cve.meenan.dev/sqlite/index.mjs`
+
+The database never opened. `.wasm` was unaffected — `application/wasm wasm;` is
+in the stock file.
+
+**Observed vs. expected.** Expected a `.mjs` file to be served as JavaScript,
+since it is the standard extension for an ES module and the file is part of an
+unmodified upstream distribution. nginx has been slow to add the mapping and
+Debian's package still lacked it here.
+
+**Impact, and the part worth remembering.** `scripts/serve.mjs` exists to
+reproduce production headers so that browser measurements mean something — and
+its type table maps `.mjs` to `text/javascript`, which nginx did not. So the
+one divergence between the two servers was on the exact file whose MIME type is
+load-bearing, and it was invisible until the first deploy: `pnpm e2e` passed
+locally against the same code that could not boot in production.
+
+A local server that is *more* permissive than production does not fail safe. If
+`serve.mjs` and nginx disagree about anything, prefer teaching `serve.mjs` to be
+as strict as nginx rather than the reverse.
+
+**Fix.** `text/javascript js mjs;` in `/etc/nginx/mime.types` (owner-applied).
+Verified: `content-type: text/javascript`, and the full-corpus import now
+completes against the deployed origin.
+
+**Links:** D-030 (server configuration baseline), `scripts/serve.mjs`.
+
+## RE-011: `performance.measureUserAgentSpecificMemory()` is unusable for measuring this app  (2026-08-01, status: worked-around)
+
+**Environment.** Playwright 1.62's bundled Chromium (headless), Linux
+6.17, 2026-08-01. Page served by `scripts/serve.mjs` with production's
+COOP/COEP, `self.crossOriginIsolated === true` in both the document and the
+dedicated Worker.
+
+**Measurement.** Probed the API from a page and from a dedicated Worker.
+
+| Context | `typeof performance.measureUserAgentSpecificMemory` | Call result |
+| --- | --- | --- |
+| Document | `function` | `SecurityError: … is not available.` |
+| Dedicated Worker | `undefined` | `TypeError: … is not a function` |
+
+Adding `--site-per-process` to the browser launch changed nothing. Also probed:
+`performance.memory` is present on the document but **absent in the Worker**,
+which is where all the memory that matters is allocated.
+
+**Observed vs. expected.** The API is the standardized way to ask "how much
+memory is this page using", is documented as available in dedicated workers,
+and gates itself on cross-origin isolation — which is satisfied here. It threw
+anyway, and is missing outright in the Worker. Cause not established; the
+plausible candidates (headless shell process model, a Blink flag) were not
+worth further pursuit once a better measurement existed.
+
+**Impact.** Peak memory for Q-003 cannot be measured from inside the page. The
+sweep reads `VmHWM` — the kernel's own high-water mark — from
+`/proc/<pid>/status` for the renderer processes Playwright launched
+(`tests/e2e/measure.spec.ts`, `rendererPeak()`), which is both exact and
+immune to sampling gaps, at the cost of being Linux-only and unavailable to
+the future diagnostics panel (D-009). The Worker additionally reports SQLite's
+WASM linear memory, which it *can* see.
+
+**Links:** [MDN: measureUserAgentSpecificMemory](https://developer.mozilla.org/en-US/docs/Web/API/Performance/measureUserAgentSpecificMemory),
+Q-003 in [features.md](features.md).
+
 ## RE-010: Hosted-LLM CORS preflights from curl disagree with documented browser support  (2026-08-01, status: open)
 
 **Environment.** curl 8.5.0 on Linux, 2026-08-01. `OPTIONS` requests with

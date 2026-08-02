@@ -2,7 +2,15 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { Progress, Request, Response, Timings } from '@/lib/protocol'
+import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
+import type {
+  BenchResult,
+  ImportOptions,
+  Progress,
+  Request,
+  Response,
+  Timings,
+} from '@/lib/protocol'
 
 /**
  * M1's end-to-end path: download the published chunks, decompress them in
@@ -21,6 +29,33 @@ LIMIT 15`
 
 const IDLE: Progress = { phase: 'idle', fraction: null, detail: '' }
 
+/**
+ * Import knobs from the query string, for the Q-003/Q-004 sweep only
+ * (`?vfs=opfs-sahpool&concurrency=8&cache=64`). Every default is the measured
+ * one (D-049 – D-051); anything unrecognised falls back rather than failing,
+ * because this is a diagnostic affordance and not a feature.
+ *
+ * These are only a convenience: the Worker clamps them again, because a URL is
+ * something a stranger can hand you and the memory bound is not negotiable
+ * there.
+ */
+function importOptions(search: string): ImportOptions {
+  const params = new URLSearchParams(search)
+  const vfs = params.get('vfs')
+  return {
+    concurrency: positive(params.get('concurrency')) ?? DEFAULT_CONCURRENCY,
+    cacheMib: positive(params.get('cache')) ?? DEFAULT_CACHE_MIB,
+    vfs: vfs === 'opfs' || vfs === 'opfs-sahpool' ? vfs : DEFAULT_VFS,
+  }
+}
+
+/** A positive integer, or null for absent/empty/NaN/fractional/negative. */
+function positive(raw: string | null): number | null {
+  if (raw === null || raw.trim() === '') return null
+  const value = Number(raw)
+  return Number.isInteger(value) && value > 0 ? value : null
+}
+
 export default function Home() {
   const workerRef = useRef<Worker | null>(null)
   const [progress, setProgress] = useState<Progress>(IDLE)
@@ -31,6 +66,10 @@ export default function Home() {
   const [result, setResult] = useState<{ columns: string[]; rows: unknown[][]; ms: number } | null>(
     null
   )
+  const [benchmark, setBenchmark] = useState<{
+    results: BenchResult[]
+    wasmHeapBytes: number
+  } | null>(null)
 
   useEffect(() => {
     const worker = new Worker(new URL('../workers/db.worker.ts', import.meta.url), {
@@ -46,6 +85,19 @@ export default function Home() {
           break
         case 'status':
           setReady(message.ready)
+          // Every panel below is derived from a local copy that may have just
+          // stopped existing — "Clear local copy" and a failed re-download both
+          // land here. Leaving stale timings, results and a benchmark on screen
+          // next to a "Download data" button is the UI asserting something
+          // false. The notice is restored rather than cleared when a copy *is*
+          // present, because D-008 requires it to accompany the data even for a
+          // visitor whose page never ran an import.
+          setNotice(message.notice ?? '')
+          if (!message.ready) {
+            setTimings(null)
+            setResult(null)
+            setBenchmark(null)
+          }
           break
         case 'imported':
           setReady(true)
@@ -54,6 +106,9 @@ export default function Home() {
           break
         case 'rows':
           setResult({ columns: message.columns, rows: message.rows, ms: message.ms })
+          break
+        case 'bench':
+          setBenchmark({ results: message.results, wasmHeapBytes: message.wasmHeapBytes })
           break
         case 'error':
           setError(message.message)
@@ -81,11 +136,26 @@ export default function Home() {
       </p>
 
       <section className="controls">
-        <button onClick={() => send({ type: 'import' })} disabled={busy}>
+        <button
+          onClick={() => send({ type: 'import', options: importOptions(location.search) })}
+          disabled={busy}
+        >
           {ready ? 'Re-download data' : 'Download data'}
         </button>
         <button onClick={() => send({ type: 'query', sql: DEMO_QUERY })} disabled={!ready || busy}>
           Run query
+        </button>
+        <button
+          onClick={() => {
+            // Drop the previous table before re-running: the Worker reports no
+            // progress for this, so a stale result on screen is indistinguishable
+            // from a finished one — to a reader and to the sweep alike.
+            setBenchmark(null)
+            send({ type: 'bench' })
+          }}
+          disabled={!ready || busy}
+        >
+          Measure query latency
         </button>
         <button onClick={() => send({ type: 'reset' })} disabled={busy} className="quiet">
           Clear local copy
@@ -113,7 +183,10 @@ export default function Home() {
       {timings && (
         <section>
           <h2>Import</h2>
-          <dl className="timings">
+          {/* The rendered rows are rounded for reading; the sweep in
+              tests/e2e/measure.spec.ts reads this instead, so a recorded number
+              is the Worker's, not a re-parsed label. */}
+          <dl className="timings" data-json={JSON.stringify(timings)}>
             <Timing label="Records" value={timings.records.toLocaleString()} />
             <Timing label="Downloaded" value={`${(timings.compressedBytes / 1e6).toFixed(1)} MB`} />
             <Timing label="Expanded to" value={`${(timings.rawBytes / 1e6).toFixed(1)} MB`} />
@@ -122,7 +195,52 @@ export default function Home() {
             <Timing label="Write to OPFS" value={`${timings.writeMs} ms`} />
             <Timing label="Build indexes" value={`${timings.indexMs} ms`} />
             <Timing label="Total" value={`${(timings.totalMs / 1000).toFixed(1)} s`} />
+            <Timing
+              label="OPFS footprint"
+              value={
+                timings.opfsBytes === null
+                  ? 'could not be measured'
+                  : `${(timings.opfsBytes / 1e6).toFixed(1)} MB`
+              }
+            />
+            <Timing
+              label="SQLite WASM heap"
+              value={`${(timings.wasmHeapBytes / 1e6).toFixed(1)} MB`}
+            />
+            <Timing
+              label="VFS"
+              value={`${timings.vfs} × ${timings.concurrency}, ${timings.cacheMib} MiB cache`}
+            />
           </dl>
+        </section>
+      )}
+
+      {benchmark && (
+        <section>
+          <h2>Query latency</h2>
+          <p className="muted">
+            SQLite WASM heap after these queries: {(benchmark.wasmHeapBytes / 1e6).toFixed(1)} MB
+          </p>
+          <div className="scroll">
+            <table className="bench" data-json={JSON.stringify(benchmark)}>
+              <thead>
+                <tr>
+                  <th>Query</th>
+                  <th>ms</th>
+                  <th>rows</th>
+                </tr>
+              </thead>
+              <tbody>
+                {benchmark.results.map((entry) => (
+                  <tr key={entry.name}>
+                    <td>{entry.name}</td>
+                    <td>{entry.ms}</td>
+                    <td>{entry.rows}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       )}
 
@@ -134,7 +252,7 @@ export default function Home() {
             excluded by default.
           </p>
           <div className="scroll">
-            <table>
+            <table className="results">
               <thead>
                 <tr>
                   {result.columns.map((column) => (
@@ -178,6 +296,8 @@ function phaseLabel(phase: Progress['phase']): string {
       return 'Downloading and decompressing'
     case 'index':
       return 'Building search indexes'
+    case 'query':
+      return 'Running query'
     default:
       return 'Working'
   }

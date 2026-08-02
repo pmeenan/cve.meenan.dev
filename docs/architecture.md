@@ -18,7 +18,7 @@ CISA KEV   ──fetch──▶      │                                      �
                       hash + normalize                            └──────┬───────┘
                            │                                             │ messages
                            ▼                                             ▼
-                      cve.data/pub/  ──nginx, static──▶  fetch  ──▶ Worker
+                      cve.pub/data/  ──nginx, static──▶  fetch  ──▶ Worker
                         manifest.json                               SQLite/WASM
                         snapshot-<rev>/000.br … 011.br              on OPFS
                         deltas/<from>-<to>.json.br
@@ -110,14 +110,75 @@ and are never under the served root (D-018, D-034).
 
 ## The published contract
 
-Everything under `/data/`, served by nginx from `cve.data/pub/` (D-034).
+Everything under `/data/`, served by nginx from `cve.pub/data/` — a peer of the
+document root and of `cve.data/`, so nothing under `cve.data/` is web-reachable
+(D-034, D-053).
 
 | File | Cache | Notes |
 | --- | --- | --- |
 | `manifest.json` | `no-cache` | The only mutable file. Lists everything else with byte length and SHA-256. |
-| `snapshot-<rev>/NNN.br` | immutable | 12 chunks, ~5.3 MB each, **63.3 MB** total, each expanding to a 32 MB slice of the 391.3 MB database (D-041). |
+| `snapshot-<rev>/NNN.br` | immutable | 12 chunks, ~5.2 MB each, **62.7 MB** total, each expanding to a 32 MB slice of the 376.7 MB database (D-041). Measured on the first published generation, 2026-08-01. |
 | `deltas/<from>-<to>.json.br` | immutable | One per day; consecutive revisions tile the space by construction (D-042). |
 | `kev.json` | short | CISA KEV, its own freshness (D-010). |
+
+### Assets the export ships but never loads
+
+Turbopack emits `_next/static/media/db.worker.<hash>.ts` — the Worker's
+TypeScript *source* — beside the bundled `turbopack-worker-<hash>.js` chunk it
+actually runs. A network trace of a production page load confirms the `.ts` is
+never requested; nginx serves it as `video/mp2t` if anyone asks. `copy-wasm.mjs`
+likewise copies the whole SQLite distribution, including `index.d.mts`,
+`node.mjs` and `sqlite3-worker1.mjs`, none of which the client loads.
+
+None of this is a correctness or disclosure problem — the code is Apache-2.0 and
+the bundled equivalents are public anyway — but it is dead weight on an origin
+whose `/sqlite/` tree now revalidates on every load (D-054), and a `video/mp2t`
+response is the kind of thing that wastes an afternoon during the *next*
+investigation. Trimming `copy-wasm.mjs` to the three files the client requests
+(`index.mjs`, `sqlite3.wasm`, `sqlite3-opfs-async-proxy.js`) is the obvious fix
+and is unclaimed.
+
+### The nginx block, as deployed
+
+This supersedes the snippet in D-034, which still carried the rate limiting
+D-039 removed and the `brotli_static` D-040 made wrong. Two locations, in the
+`cve.meenan.dev` server block:
+
+```nginx
+location = /data/manifest.json {
+    root /var/www/meenan.dev/cve.pub;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Embedder-Policy "require-corp" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+    add_header Cache-Control "no-cache" always;
+}
+
+location ^~ /data/ {
+    root /var/www/meenan.dev/cve.pub;
+    autoindex off;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Embedder-Policy "require-corp" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+}
+```
+
+Four things about it are load-bearing rather than stylistic:
+
+- **`root`, not `alias`** — and the directory is named `data` so the URL maps
+  straight through. This server block defines `try_files` at server level, which
+  every location inherits, and `alias` + `try_files` is a long-standing nginx
+  defect that appends `$uri` to the alias and 404s every artifact (D-053).
+- **`^~`** outranks the regex locations in the same server block, so neither the
+  `expires max` static-file rule nor `php.conf` can ever apply to an artifact.
+- **The repeated `add_header`s.** nginx drops *all* inherited `add_header`
+  directives as soon as a location declares one of its own, so leaving
+  COOP/COEP to the server level would strip cross-origin isolation from every
+  artifact — and the `opfs` VFS needs it (D-030, D-051).
+- **What is absent.** No `Access-Control-Allow-Origin` — its absence is the
+  same-origin control (D-034). No `brotli_static`, because artifacts are opaque
+  `.br` the client decodes itself and an added `Content-Encoding` would corrupt
+  that path (D-040). No `limit_conn`/`limit_rate` (D-039).
 
 The manifest carries `format`, `schema`, the current `rev`, the snapshot, and
 the list of delta files, each with its byte length and SHA-256. The client reads
@@ -163,6 +224,12 @@ final state by construction.
   constraints, not taste, and it means every query is asynchronous from the UI's
   perspective regardless of framework. The UI (React 19 on Next.js 16 static
   export, D-027) talks to it over messages.
+- **Through the `opfs` VFS, with a 256 MiB page cache.** The VFS is measured,
+  not assumed: `opfs-sahpool` imports ~10% faster and then freezes any second
+  tab, and its `importDb` cannot express a resumable staged replacement
+  (D-051). The page cache is the single largest lever on latency in the whole
+  client — stock 2 MiB turns sub-second aggregates into tens of seconds
+  (D-050).
 - **Sync state lives inside the database.** A `meta` table holds the watermark,
   the schema version, and the notice, and the watermark advances in the *same
   transaction* as the rows it describes, so a crash cannot leave the two
@@ -175,6 +242,9 @@ final state by construction.
   descriptions, vendor names and product names — never references, whose URLs
   would shred into the same term space as the prose (D-035). Shipping the
   description index instead would cost 35.1 MB compressed, 31% of the download.
+  Building them costs 66.1 s at full scale and 64.4 MB in OPFS — ~90% of import
+  time, and the reason the progress display has to treat it as its own phase
+  (D-049).
 - **FTS5 maintenance is explicit.** The indexes are external-content, so every
   update must issue `INSERT INTO fts(fts, rowid, descr) VALUES('delete', …)`
   with the *old* text before writing the new row. Skipping it corrupts search
@@ -183,9 +253,17 @@ final state by construction.
 - **Decompression is ours, and it streams.** Chunks arrive as opaque `.br`
   bytes with no `Content-Encoding`; a WASM decoder unpacks each one and writes
   it straight into the OPFS database at that chunk's byte offset, so peak memory
-  is one chunk rather than the corpus (D-040, D-041). Resumption is a bitmap of
-  completed chunks — brotli is a stream format, so a range-resumed monolith
-  could not be decoded from an arbitrary offset at all.
+  is four chunks in flight rather than the corpus (D-040, D-041; four is the
+  measured number, D-049). Resumption is a bitmap of completed chunks — brotli
+  is a stream format, so a range-resumed monolith could not be decoded from an
+  arbitrary offset at all.
+- **Nothing cached ever beats a reachable network** (D-054). The SQLite/WASM
+  distribution lives at unversioned paths and its three files resolve each other
+  by relative URL, so it is served `no-cache` (revalidate) rather than left to
+  heuristic freshness or pinned by the static-file rule — both of which bit on
+  deploy day (RE-012). The M5 service worker follows the same rule: network
+  first, cache as fallback, so the offline story never costs a user a stale
+  shell while online.
 - **Capability gate before the import path**, so an unsupported browser is told
   on arrival rather than failing partway through a large import (D-016).
 - **Storage sized in advance.** Quota, eviction, and
@@ -290,7 +368,7 @@ Indexes: `cve(year)`, `cve(cna_id)`, `cve(cvss_score)`, `cve(published)`,
 | --- | --- | --- |
 | Upstream → pipeline | Attacker-influenced JSON | Parse defensively; never build SQL by concatenation; the tombstone guard bounds the blast radius of a broken fetch |
 | Pipeline → `pub/` | Finished artifacts only | Atomic rename; working state stays in sibling directories |
-| `pub/` → browser | Static files | No CORS headers, integrity hashes in the manifest; abuse absorbed by Cloudflare rather than origin limits (D-034, D-039) |
+| `pub/` → browser | Static files | No CORS headers, integrity hashes in the manifest. D-039 removed origin rate limiting in favour of Cloudflare — but as of the first deploy the hostname is **not proxied through Cloudflare**, so nothing is absorbing abuse today. M5 owns closing that before launch (D-034, D-039) |
 | Database → UI | Record text | Never injected as HTML; URLs from records are never auto-fetched |
 | Database → model prompt | Attacker-influenced record text entering LLM context | Prompt injection is assumed; the tool surface is read-only and render-only with no network reach, and model output carries no markup or minted URLs — a successful injection yields wrong-but-inspectable presentation, nothing more (D-044) |
 | Browser → hosted model provider | The user's question and its tool results — only when the user supplies a key | Explicit opt-in per provider; key stored client-side only; called browser-direct, never proxied, never touching this server (D-045) |
@@ -483,10 +561,11 @@ comfortable: daily ingest bounds the delta file count at ~31.
 
 ## Open questions
 
-Tracked in [features.md](features.md); Q-001, Q-002 and Q-005 are answered.
-Q-003 (browser-side budgets) and Q-004 (OPFS VFS selection) need a running
-browser and are measured in M1 (D-029). Purely technical questions not tracked
-there:
+Tracked in [features.md](features.md); Q-001 – Q-005 are all answered. Q-003
+(browser-side budgets, D-049) and Q-004 (OPFS VFS selection, D-051) were the
+last two, measured in M1 against the full corpus rather than argued — with
+D-050 (the 256 MiB page cache) falling out of the same sweep. Purely technical
+questions not tracked there:
 
 - **Where schema migration lives.** A server-owned schema makes a migration a
   server deploy plus a client re-import; a client-owned schema makes it a
@@ -498,15 +577,22 @@ there:
 - **Whether the delta rollup can be made obviously correct.** The tiling
   invariant has a nasty failure mode — a client that can never sync again — and
   wants a property test.
-- **What building the full-text indexes costs in WASM.** Native SQLite rebuilt
-  the description index in 3 s; writing ~61 MB of index pages through OPFS could
-  be far slower. The owner has ruled this a progress-bar concern rather than a
-  gate (D-035), so it is a number to know, not a risk to carry.
-- **How many chunks to decompress concurrently.** Twelve at once bounds memory
-  at twelve buffers; one at a time wastes the network. Q-003 picks the number
-  (D-041).
+- **Why the reference-table scan has no index.** At ~850 ms it is an order of
+  magnitude slower than the other nine benchmark shapes, and the only one whose
+  access path is a full scan of `cve_ref` joined through `url`. Not a budget
+  violation — D-049 sets no latency ceiling — but the clearest indexing
+  opportunity in the set. M3 owns it.
+- **Why the first query after a reopen costs 9 s.** The page cache starts
+  empty, so it is all OPFS reads (D-049). Whether that is warmed, amortised, or
+  simply shown to the user is M3's call.
 
-*Resolved:* rsync semantics versus server-side state — D-018's peer directory.
+*Resolved:* what building the full-text indexes costs in WASM — 66.1 s for the
+full corpus, ~90% of import, and D-035's "progress-bar concern rather than a
+gate" holds, but only with D-050's page cache (247 s without it). How many
+chunks to decompress concurrently — four, decided on throttled transport
+because loopback cannot tell the settings apart (D-049, settling what D-041
+deferred).
+rsync semantics versus server-side state — D-018's peer directory.
 Whether a partial cache can be quietly wrong — moot under D-025. Cache
 invalidation on a rewritten upstream history — moot under D-031. Whether the FTS
 index can be delta-updated or must be rebuilt — measured, 0.08 s with no bloat

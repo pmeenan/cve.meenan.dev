@@ -4,6 +4,7 @@ dist/
 next-env.d.ts
 *.tsbuildinfo
 test-results/
+measurements/
 playwright-report/
 coverage/
 __pycache__/

@@ -45,7 +45,8 @@ affected docs. Until then, these govern.
   the diagnostics panel instead. (D-009)
 - **The data plane is static files, and no request handler stands in it.** The
   snapshot, manifest, deltas, and KEV catalog are pre-built files served by
-  nginx from `cve.data/pub/`; the client sends no parameters. Adding a dynamic
+  nginx from `cve.pub/data/`, a peer of the document root — nothing under
+  `cve.data/` is web-reachable (D-053); the client sends no parameters. Adding a dynamic
   endpoint is a constraint change: it must serve derived CVE data and nothing
   else, must never accept a caller-supplied URL, path, or ref that reaches the
   filesystem or network, and must be same-origin-restricted and rate-limited.
@@ -140,9 +141,12 @@ commit gate.
 
 ## Current status
 
-Milestone **M1 is in progress**: scaffolding, one end-to-end path from
-published brotli chunks through SQLite/WASM on OPFS to a rendered query, and the
-two browser measurements deferred by D-029 (Q-003, Q-004). M0 closed 2026-08-01
-with scope, architecture, schema and the delivery protocol settled and measured
-(D-001 – D-043). Keep this paragraph current when plan.md milestone status
-changes (rule 6).
+Milestone **M1 closed 2026-08-01**: the site is deployed and a browser imports
+the full corpus from `https://cve.meenan.dev/` and queries it locally. The two
+measurements deferred by D-029 are answered — Q-003 by D-049 (a baseline, not
+budgets: D-052 sets no duration ceilings), Q-004 by D-051 (the `opfs` VFS) —
+with D-050 (a 256 MiB page cache) and D-053 (published artifacts in their own
+peer directory) falling out of the same work. **M2 is next**: full-corpus
+Download and Sync with staged replacement. M0 closed with scope, architecture,
+schema and the delivery protocol settled and measured (D-001 – D-043). Keep
+this paragraph current when plan.md milestone status changes (rule 6).

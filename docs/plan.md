@@ -74,7 +74,7 @@ draft reviewed and accepted by the project owner. Per D-029, Q-003 and Q-004
 were **not** M0 exit criteria — they need a running browser and are answered
 here in M1.
 
-## M1 — Scaffolding, one end-to-end path, and the browser measurements  `in progress`
+## M1 — Scaffolding, one end-to-end path, and the browser measurements  `done`
 
 The smallest change that exercises every risky layer for real, plus the two
 deferred measurements. Deliberately narrow and deliberately complete.
@@ -83,7 +83,7 @@ Scope: Next.js 16 + React 19 project with `output: 'export'`, `distDir: 'dist'`,
 `trailingSlash: true` (D-027, D-030); TypeScript strict, Vitest, Playwright,
 ESLint + Prettier, pnpm; license-audit script (D-002); `rsync` deploy script;
 the nginx changes from D-030 and D-034 (`trailingSlash`, and the `^~ /data/`
-location aliasing `cve.data/pub/`), plus the Cloudflare cache rules honoring
+location serving `cve.pub/data/`, D-053), plus the Cloudflare cache rules honoring
 origin headers (D-039); a **bounded slice** of the
 corpus published there as a static file; SQLite/WASM in a Worker persisting to
 OPFS; one query rendered in the UI carrying the D-008 notice.
@@ -112,24 +112,71 @@ OPFS; one query rendered in the UI carrying the D-008 notice.
       fail closed on malformed records; published generations immutable;
       `PRAGMA query_only` on the Worker's query path (first defense — the
       structural authorizer is M3).
-- [ ] **Q-003 at full scale.** The slice is a tenth of the corpus. Needs the
-      full artifact: import wall-clock, peak memory, OPFS footprint, query
-      latency, and how many chunks to decompress concurrently (D-041) — and
-      from those numbers, **set the vision criterion 1 and 3 budgets**
-      (latency, memory, cold start) that M3's exit verifies against. Note the
-      Timings semantics: per-stage values are cumulative across concurrent
-      chunks; only the total is wall-clock (lib/protocol.ts).
-- [ ] **Q-004:** `opfs` vs `opfs-sahpool`. The `opfs` VFS works; the comparison
-      and multi-tab behaviour are unmeasured.
-- [ ] **Deploy.** nginx `^~ /data/` location, Cloudflare cache rules, first
-      rsync to `cve.meenan.dev`.
+- [x] **Q-003 at full scale (D-049).** The whole corpus: 73.3 s import
+      (66.1 s of it building indexes), 682–715 MB peak RSS, 441 MB in OPFS,
+      ~850 ms worst query and 4–190 ms for the rest. Vision criteria 1 and 3
+      now carry real numbers, with their caveats — resource ceilings for
+      memory and footprint, and a recorded baseline rather than a ceiling for
+      query latency (owner decision). D-041's open number is
+      settled at four chunks in flight — decided on throttled transport,
+      because loopback cannot tell the settings apart. The sweep is re-runnable
+      (`pnpm measure`, `tests/e2e/measure.spec.ts`) and writes
+      `measurements/measurement.md`.
+- [x] **D-050, found by that sweep.** SQLite's stock 2 MiB page cache made
+      eight of ten benchmark queries take over a second — one of them 92 s —
+      and index building 247 s; 256 MiB puts all ten under a second and cuts
+      index building to 69 s, for ~150 MB of peak memory. Every Q-003 number
+      depends on it.
+- [x] **Q-004 (D-051):** `opfs`, not `opfs-sahpool`. The pool builds indexes
+      faster and then freezes any second tab entirely, and its `importDb`
+      cannot express M2's resumable staged replacement. Both paths stay in the
+      Worker so the comparison can be re-run.
+- [ ] **Deploy.** *Partially done 2026-08-01 — two steps need credentials the
+      agent does not have.*
+      - [x] First generation published by the real pipeline (now at
+            `cve.pub/data/`, D-053):
+            372,322 records, 12 chunks, 62.7 MB, built from clone `d300c5fcc0`.
+      - [x] First `rsync` of `dist/` to the docroot. `https://cve.meenan.dev/`
+            serves the app with COOP/COEP and `no-cache` on HTML.
+      - [x] **Data layout settled** (D-053): published artifacts moved out of
+            `cve.data/` to their own peer `cve.pub/`, so nothing under
+            `cve.data/` is web-reachable.
+      - [x] **nginx `/data/` locations** (owner-applied; the block is in
+            [architecture.md](architecture.md)). Verified against the live
+            origin: manifest `no-cache`, chunks `immutable`, COOP/COEP/CORP on
+            both, **no** `Access-Control-Allow-Origin` even when an `Origin` is
+            sent, no directory listing (403), `.php` under `/data/` not
+            executed (404), and `cve.data/` unreachable by traversal — raw,
+            encoded, and via the parent — repeating D-018's canary check
+            against the new layout.
+      - [x] **`.mjs` MIME type** (owner-applied). The stock nginx `mime.types`
+            has no `.mjs`, so the Worker's runtime import of the SQLite
+            distribution was refused by the browser's module MIME check and the
+            database never opened. `scripts/serve.mjs` had masked it by being
+            more permissive than production — RE-012.
+      - [x] **Full-corpus import verified against the deployed origin**: 71.9 s
+            total, 64.8 s of it index building, 441.1 MB in OPFS, query
+            rendered, notice present, survives a reload. Elapsed transport
+            ~7.1 s — indistinguishable from loopback, because this client and
+            the origin share a fast path, so it neither confirms nor disturbs
+            the throttled numbers in D-049.
+      - [→] **Cloudflare cache rules** (D-039) — **moved to M5.** Measured
+            2026-08-01: `cve.meenan.dev` resolves straight to the origin and no
+            response carries a `cf-ray`, so the domain is not proxied through
+            Cloudflare at all and there is nothing to configure yet. Until it
+            is, D-039's premise that Cloudflare absorbs abuse does not hold and
+            D-034's origin rate limiting is already gone — so the origin is
+            currently unprotected. Tracked as an M5 scope item and exit
+            criterion.
 
-**Exit criteria:** the deployed site loads from `cve.meenan.dev`, fetches the
-published chunks, decompresses them itself, writes them into OPFS, and renders
-one real query result; Q-003 numbers recorded and vision criteria 1 and 3 given
-real budgets; Q-004 decided and recorded; checks run green in CI-equivalent
-form. **Locally green as of 2026-08-01**; what remains is full-scale
-measurement, Q-004, and the deploy.
+**Exit criteria — met 2026-08-01.** The deployed site loads from
+`cve.meenan.dev`, fetches the published chunks, decompresses them itself,
+writes them into OPFS, and renders one real query result — verified by running
+`tests/e2e/import.spec.ts` against the live origin, not just locally. Q-003 and
+Q-004 are answered (D-049 – D-051), vision criteria 1 and 3 carry real numbers,
+and `pnpm check` / `pnpm e2e` are green. The one item deliberately left open is
+Cloudflare (below): it is not in the request path at all, which is M5's problem
+rather than a gap in this milestone.
 
 ## M2 — Full-corpus Download and Sync  `pending`
 
@@ -168,12 +215,18 @@ everything downstream consumes them.
       failure during re-download leaves the prior database intact and usable;
       an interrupted sync rolls back and re-running is safe; a snapshot
       rotation mid-download does not strand the client.
+- [ ] **Stall detection** (D-052). Duration is never a failure, but a download
+      that has stopped advancing is: surface it as an error with a message
+      rather than a bar that never moves. The per-chunk progress already
+      landed in M1 is what this hangs off.
 - [ ] **Freshness.** The visible staleness indicator and the "N new CVEs
       since your last sync" summary.
 
 **Exit criteria:** a browser downloads all 372,092 records, decompresses them
 itself, builds its indexes, and queries the result — with one honest progress
-display across all three stages, and peak memory bounded by chunks in flight
+display across all three stages (every stage over a second names itself and
+shows progress where the work is countable, D-052), a stalled download reported
+as stalled rather than spinning, and peak memory bounded by chunks in flight
 rather than by the corpus; the database is verified identical to a freshly built
 one; a sync applies a real day of upstream changes; every failure-and-resume
 test above passes, including failure *during replacement* leaving the previous
@@ -187,16 +240,23 @@ v2/v3.x/v4, CWE, CNA, vendor/product, dates, state, and references *by host*
 (D-033; CPE was rejected there, and FTS never covers references — D-035);
 schema versioning exercised end to end: a bump invalidates and forces an
 announced full re-download, because the local database is a rebuildable cache
-(D-013) and there is no in-place migration; indexing tuned against the latency
-budgets set in M1; the raw SQL console, made structurally read-only here — a
-SQLite authorizer, not query-text inspection or the `query_only` pragma alone —
-row-capped and timed out (this is where D-044's tool-surface commitment starts
-being real code).
+(D-013) and there is no in-place migration; indexing tuned against the M1
+baseline, aiming at the shapes that are actually slow (the reference-host scan,
+and the cold first query after a reopen) rather than at a ceiling — D-049 sets
+none; the raw SQL console, made structurally read-only here — a SQLite
+authorizer, not query-text inspection or the `query_only` pragma alone — and
+row-capped (this is where D-044's tool-surface commitment starts being real
+code). Long-running queries are handled, not forbidden: progress, cancellation,
+and a responsive UI, since with no latency ceiling that is the only way
+slowness can hurt anyone. Any interrupt is a *safety* mechanism against runaway
+or hostile SQL, and must not be a stopwatch that kills a legitimate slow query.
 
-**Exit criteria:** every confirmed filter axis is queryable; query latency
-meets the M1 budgets; a schema-version bump triggers a correct, announced
-re-download; hostile SQL in the console (writes, pragma flips, runaway queries)
-is refused by structure, covered by tests.
+**Exit criteria:** every confirmed filter axis is queryable; no regression
+against the M1 baseline, with any deliberate trade recorded; a query past a
+second reports that it is running, can be cancelled, and does not freeze the
+tab (D-052, covered by a test that runs a slow one); a schema-version bump triggers a correct,
+announced re-download; hostile SQL in the console (writes, pragma flips,
+runaway queries) is refused by structure, covered by tests.
 
 ## M4 — Analysis and reporting  `pending`
 
@@ -223,8 +283,11 @@ and tables pass a keyboard-and-labels accessibility check.
 
 ## M5 — Resilience and public launch  `pending`
 
-Scope: storage quota and eviction handling, multi-tab behavior per the Q-004
-outcome, browser capability gating against the D-016 floor — with Playwright
+Scope: **putting `cve.meenan.dev` behind Cloudflare and applying D-039's cache
+rules** — carried over from M1, where it turned out the hostname resolves
+straight to the origin, so D-039's premise that Cloudflare absorbs abuse is
+currently false and D-034's origin rate limiting is already gone; storage quota
+and eviction handling, multi-tab behavior per the Q-004 outcome, browser capability gating against the D-016 floor — with Playwright
 runs on Firefox and WebKit added *before* the floor is claimed publicly
 (Chromium-only today, and rule 3 applies to support claims too); the
 diagnostics panel (the only support channel, given D-009), surfacing service
@@ -234,8 +297,9 @@ caching the shell, Worker, WASM, and brotli decoder — scoped to never touch
 `/data/` or model weights — so vision criterion 5 covers reopening the app
 offline, not just an already-open tab.
 
-**Exit criteria:** the app degrades honestly on an unsupported browser, under
-quota pressure, and in a second tab — each verified by a test, with the
+**Exit criteria:** the origin is behind Cloudflare with the D-039 cache rules
+applied and verified from a response header; the app degrades honestly on an
+unsupported browser, under quota pressure, and in a second tab — each verified by a test, with the
 capability gate exercised in real Firefox and WebKit runs; the diagnostics
 panel reports storage used, last sync, record counts, and schema version; the
 data plane survives an adversarial pass; an offline *reopen* e2e test passes —

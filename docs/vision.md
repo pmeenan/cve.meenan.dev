@@ -55,22 +55,52 @@ the app, never the only one — everything works with no model configured.
 
 ## Success criteria
 
-Each of these is falsifiable, and several need a measured budget attached during
-M1 rather than a hand-wave (D-029 moved the browser measurements there). That
-measurement is itself a milestone deliverable.
+Each of these is falsifiable, and several needed measurement during M1 rather
+than a hand-wave (D-029 moved the browser measurements there). That measurement
+is itself a milestone deliverable.
+
+**None of the measured numbers is a threshold** (D-052). Work takes as long as
+the data and the hardware make it take; what the app owes the user instead is
+honesty about it — anything over about a second says what it is doing and shows
+progress where the work is countable, and an operation that has *stopped*
+making progress is detectably broken rather than indistinguishable from a slow
+one. So the time-shaped criteria below are falsified by silence, by a frozen
+tab, or by a stall the app fails to notice — not by a stopwatch. The numbers
+are the M1 baseline (D-049): what normal looked like on real hardware, kept so
+a regression is visible.
 
 1. **A first-time visitor gets a real answer in their first session.** On a
    modern desktop browser, someone who arrives with a question reaches a
    correct result without a setup ritual — with visible progress for whatever
    data transfer it requires, and no loss of accumulated work if they close the
-   tab partway and come back.
+   tab partway and come back. The import is long enough that *how it is
+   presented* is the criterion: every stage over a second names itself and
+   shows progress, and a download that stalls says so instead of spinning.
+
+   **M1 baseline (D-049)**, one desktop-class machine, Chromium, server on
+   loopback: cold import 73.3 s, of which 66.1 s is building the search
+   indexes; 682–715 MB peak memory in the renderer process; 441 MB left in
+   OPFS. Reopening reports the local copy in 287 ms, though the first query
+   after a reopen costs ~9 s of page-cache warming.
 2. **Returning users update incrementally.** Catching up after days away
    transfers a small fraction of the corpus and completes in seconds to minutes,
    and does not discard data the user already has.
-3. **Core analytical queries run at interactive speed.** Filter-and-aggregate
-   over the whole corpus (e.g. group by CNA and year with a CVSS predicate)
-   returns within a latency budget set from M1 measurements on real data — not
-   an assumed one.
+3. **Core analytical queries run as fast as the machine allows, and never
+   pretend otherwise.** Filter-and-aggregate over the whole corpus (e.g. group
+   by CNA and year with a CVSS predicate) should be as fast as the data and the
+   hardware permit — **there is no latency ceiling** (D-052). A complicated
+   question over 372k records is allowed to take a while; what is not allowed
+   is a query that appears to have finished, freezes the tab, or cannot be
+   abandoned. So this criterion is falsifiable on *behaviour*, not on a number:
+   a query past a second says it is running, stays cancellable, and leaves the
+   UI responsive.
+
+   The M1 sweep is a recorded baseline for spotting regressions and choosing
+   what to index, not a gate. Over the ten shapes in `lib/queries.ts` against
+   the full corpus: 4–190 ms for nine of them, and 680–954 ms for a full scan
+   of the reference tables — which has no supporting index yet, and is M3's
+   work. These depend on the 256 MiB page cache (D-050); at SQLite's stock
+   2 MiB the same queries take up to 92 s.
 4. **What the server can learn is bounded and checkable.** With the network
    panel open, a user can confirm that the app makes exactly two kinds of
    request to this server: fetch the snapshot, and fetch deltas since a

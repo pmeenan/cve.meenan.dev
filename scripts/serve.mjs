@@ -11,6 +11,11 @@
  *     absence of CORS headers, not a header check (D-034)
  *   - .br served as opaque bytes with NO Content-Encoding, because the client
  *     decompresses in WASM (D-040)
+ *
+ * The type table below is the one place this server has been *wrong* by being
+ * generous: it mapped .mjs to JavaScript when nginx's stock mime.types did not,
+ * so a build that could not boot in production passed every local test
+ * (RE-012). When the two disagree, make this stricter — never production looser.
  */
 import { createServer } from 'node:http'
 import { createReadStream } from 'node:fs'
@@ -74,6 +79,11 @@ const server = createServer(async (req, res) => {
     headers['cache-control'] = file.endsWith('manifest.json')
       ? 'no-cache'
       : 'public, max-age=31536000, immutable'
+  } else if (url.pathname.startsWith('/sqlite/')) {
+    // D-054: unversioned files that must upgrade as a set, so they revalidate.
+    // Production says exactly this; omitting it here is how the last
+    // production-only cache bug stayed invisible locally (RE-012, RE-013).
+    headers['cache-control'] = 'no-cache'
   } else if (ext === '.html') {
     headers['cache-control'] = 'no-cache, must-revalidate'
   }

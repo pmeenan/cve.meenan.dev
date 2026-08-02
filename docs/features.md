@@ -63,7 +63,7 @@ the decision log, not by editing a row. The AI chat layer section was added
 | Per-record revision count | `rejected (D-020)` | No confirmed feature queries it, and it was the only consumer of git history. |
 | Schema versioning with invalidation and explicit re-download | `confirmed` | The manifest's `schema` field gates use (`assertUsable`); a bump forces an announced full re-download. The local database is a rebuildable cache (D-013) — there is no in-place migration, deliberately. |
 | Year-partitioned download with on-demand backfill | `rejected (D-038)` | Would have saved 24.6 MB on a first download in exchange for coverage becoming a thing the whole product reasons about. D-035 had already banked the larger saving. |
-| Client-side brotli decompression in WASM, streamed into OPFS | `confirmed` | D-040, D-041. Opaque `.br` chunks decoded and written positionally, so peak memory is one chunk and no intermediary can re-encode. |
+| Client-side brotli decompression in WASM, streamed into OPFS | `confirmed` | D-040, D-041. Opaque `.br` chunks decoded and written positionally, so peak memory is the four chunks in flight (D-049) and no intermediary can re-encode. |
 | Storage quota handling and `navigator.storage.persist()` | `confirmed` | A corpus this size runs into quota and eviction; silent eviction looks like data loss. |
 | Import/export of the whole local database | `rejected (D-013)` | The local database is a rebuildable cache, not a user asset. |
 
@@ -123,11 +123,14 @@ model drives the same report definitions the fixed UI renders.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Rsync deploy from `dist/` | `confirmed` | D-003. |
-| Multi-tab behavior | `confirmed` | Forced by D-004: `opfs-sahpool` does not support simultaneous connections, so a second tab needs defined behavior. |
+| Multi-tab behavior | `confirmed` | Forced by D-004; D-051 chose `opfs`, where a second tab opens and queries the same database. |
+| Activity feedback for anything over ~1 s | `confirmed` | D-052. No operation has a duration ceiling, so this is what stands in for one: past a second the app says what it is doing, with real progress where the work is countable. Import has it (M1); queries got it with D-052; sync is M2. |
+| Stall detection, distinct from slowness | `confirmed` | D-052. A long download is fine; one that has stopped advancing is a failure and must be reported as one, not left spinning. M2 owns it for the download path. |
+| Cancelling a running query | `confirmed` | D-052 makes long queries legitimate, which makes stopping one a requirement rather than a nicety. M3. |
 | Browser support floor and capability gating | `confirmed` | An unsupported browser should say so on arrival, not fail deep inside an import. |
 | Diagnostics panel (storage used, last sync, record counts, schema version) | `confirmed` | Makes "measure, don't assert" possible for users, and is the only support channel given D-009. |
-| Offline app shell (service worker) | `confirmed` | D-048, owner-confirmed 2026-08-01. Caches the shell, Worker, WASM and decoder so an offline *reopen* works — OPFS preserves the data, this preserves the app. Never caches `/data/` (the manifest is the freshness signal) or model weights. Lands in M5. |
-| Origin rate limiting and abuse metrics | `rejected (D-039)` | There is no endpoint to protect (D-032) and Cloudflare absorbs abuse; per-IP limits behind a proxy would have throttled everyone through a few edge IPs. |
+| Offline app shell (service worker) | `confirmed` | D-048, owner-confirmed 2026-08-01. Caches the shell, Worker, WASM and decoder so an offline *reopen* works — OPFS preserves the data, this preserves the app. **Network-first with cache fallback, never cache-first** (D-054). Never caches `/data/` (the manifest is the freshness signal) or model weights. Lands in M5. |
+| Origin rate limiting and abuse metrics | `rejected (D-039)` | There is no endpoint to protect (D-032) and Cloudflare is meant to absorb abuse; per-IP limits behind a proxy would have throttled everyone through a few edge IPs. **Not yet true in production:** `cve.meenan.dev` is not proxied through Cloudflare as of the first deploy, so neither control is in place. M5. |
 | Client-side telemetry | `rejected (D-009)` | No collection of any kind. |
 
 ## Open questions (answer during M0)
@@ -154,47 +157,75 @@ Ordered by how much rework a late answer would cause.
    by host interning — an amendment to D-011. The published artifact measures
    **95.4 MB at brotli -q10**, up 32% from the floor. D-035 then removed the
    shipped index, bringing the download to **62.6 MB**.
-**Q-003. What are the browser-side budgets?** **First real numbers, 2026-08-01**,
-   from the M1 end-to-end path against a 39,196-record slice (2026 only, 9.9 MB
-   compressed expanding to 51.9 MB), Chromium via Playwright:
+**Q-003. What are the browser-side budgets?** **Answered 2026-08-01 by D-049**
+   — as a measured baseline; D-052 declines to turn any of it into a ceiling —
+   at full scale: every record in the clone as of 2026-08-01 (372,322 of them;
+   the corpus grows daily), 62.7 MB across the wire in 12 chunks expanding to
+   376.7 MB, Chromium via Playwright on Linux, from a local server (so transport
+   is a floor, not a forecast). Reproduce with `pnpm measure`
+   (`tests/e2e/measure.spec.ts`).
 
-   | Stage | Time |
-   | --- | --- |
-   | Fetch (2 chunks) | 542 ms |
-   | Decompress (WASM brotli) | 353 ms |
-   | Write to OPFS | 301 ms |
-   | **Build FTS indexes** | **10,050 ms** |
-   | Total | 11.0 s |
+   | Stage | Time | Note |
+   | --- | --- | --- |
+   | Download, elapsed | 7.2 s | fetch + checksum + decompress + write, wall-clock |
+   | — of which fetch | 13.8 s | cumulative across four concurrent chunks, so larger |
+   | — checksum (SHA-256) | 0.1 s | likewise cumulative |
+   | — decompress (WASM brotli) | 1.9 s | likewise |
+   | — write to OPFS | 3.2 s | likewise |
+   | Open the database | 31 ms | wall-clock |
+   | **Build FTS indexes** | **66.1 s** | wall-clock, serial |
+   | **Total** | **73.3 s** | wall-clock |
 
-   Semantics caveat (lib/protocol.ts): the fetch/decompress/write rows are
-   per-chunk times summed across concurrently-running chunks — work, not
-   elapsed time — so they can exceed wall-clock; the total (and the serial
-   index stage) is wall-clock.
+   Semantics caveat (lib/protocol.ts): the indented per-chunk rows are times
+   summed across concurrently-running chunks — work, not elapsed time — so they
+   exceed the elapsed download they sit under. Only the un-indented rows are
+   wall-clock. Throttled to 50 Mbps / 40 ms, the elapsed download is 13.5 s.
 
-   Transport is a rounding error; **index building is 91% of import**. Native
-   SQLite built the description index for the *whole* corpus in 3 s, so WASM is
-   roughly two orders of magnitude slower per record here. Naive scaling to
-   372,322 records puts index building near 95 s — which is the number D-035's
-   "progress-bar concern rather than a gate" has to hold up against, and it was
-   ruled before any measurement existed.
+   Footprint and memory, same sweep: **441.1 MB in OPFS** (the 376.7 MB
+   database plus 64.4 MB of client-built FTS index), **272 MB** of SQLite WASM
+   linear memory after import rising to **392 MB** once queries run, and a
+   **682–715 MB** peak resident set for the renderer that hosts the Worker —
+   measured from the kernel's own high-water mark, because the standardized
+   in-page API does not work here (RE-011).
 
-   Still open: the same measurements against the full artifact, peak memory,
-   OPFS footprint, and query latency at full scale.
-**Q-004. Which OPFS VFS — `opfs` or `opfs-sahpool`?** *Deferred to M1 by D-029.*
-   Per SQLite's documentation the former needs COOP/COEP response headers and the
-   latter forbids simultaneous connections. **D-030 removed the server-config
-   half of this question**: `cve.meenan.dev` already serves COOP/COEP, so both
-   VFSes are available today and this is now purely a performance and multi-tab
-   trade — measured in M1, not argued here. (This also retires D-027's concern
-   that Next.js static export cannot emit headers: nginx already does.)
+   The slice measurement predicted index building near 95 s by naive scaling;
+   it came in at 66 s, and D-035's "progress-bar concern rather than a gate"
+   holds — but only because of the page cache (D-050). At SQLite's stock 2 MiB
+   the same index build takes **247 s** and the import 255 s.
+
+   Query latency at full scale, warm, over the ten shapes in `lib/queries.ts`:
+   **680–954 ms worst across runs (a full scan of the reference tables),
+   4–190 ms for everything else.** At the stock page cache the same set runs
+   13 ms – 92 s. Reopening with a local copy reports the corpus in 287 ms but
+   takes 9.2 s to render the first query, because the page cache starts cold.
+   D-049 records all of this as a **baseline, not a set of thresholds** —
+   D-052 removed the ceilings entirely. Work takes as long as it takes; what
+   the app owes the user is an operation over a second saying what it is doing,
+   and a *stalled* operation being distinguishable from a slow one.
+
+   Every cell is one run on one machine (12-core Linux desktop, Chromium 151,
+   server on loopback). Index-build time varied 20% across runs that should
+   have been identical, so differences smaller than that are not results —
+   D-049 says which conclusions clear that bar.
+**Q-004. Which OPFS VFS — `opfs` or `opfs-sahpool`?** **Answered 2026-08-01 by
+   D-051: `opfs`.** D-030 had already removed the server-config half —
+   `cve.meenan.dev` serves COOP/COEP, so both were available — leaving a
+   performance and multi-tab trade, measured rather than argued. `opfs-sahpool`
+   builds indexes faster (56.4 s vs 66.1 s) and queries indistinguishably, and
+   loses on the two things that matter more: a second tab on `opfs` opens the
+   existing database and queries it, while on `opfs-sahpool` it stops
+   responding entirely; and its only import path (`importDb`) truncates and
+   appends sequentially, which cannot express M2's staged, resumable
+   replacement. Full reasoning and numbers in D-051.
 **Q-005. How is the data plane locked down, and what else must nginx be configured
    to do?** Originally just hardening: `Sec-Fetch-Site` and `Origin` header
    checks, rate limiting, bounded responses — which combination is enforceable
    here, and what it does about non-browser callers that can forge headers
    freely. D-025 shrank it once; **D-032 shrank it again and changed its
    character**: there is no request handler left to harden. What remains is
-   nginx configuration over static files — the `alias` exposing `cve.data/pub/`
-   read-only, cache headers, and no CORS headers as the real same-origin control
+   nginx configuration over static files — one `root` location serving
+   `cve.pub/data/` read-only (D-053 moved it out of `cve.data/`, which is now
+   entirely private), cache headers, and no CORS headers as the same-origin control
    (D-034) — with abuse absorbed by Cloudflare rather than origin limits
    (D-039). KEV (D-010) is another static file under the same treatment.
    **Answered by D-034 and D-039.**

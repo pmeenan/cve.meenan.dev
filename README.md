@@ -15,8 +15,9 @@ query it locally from then on.
   request parameter.
 - **A real database, not a search box.** The corpus lands as a queryable
   relational store, so questions a keyword search cannot answer are in reach.
-- **Kept current.** The local copy updates incrementally rather than by
-  re-downloading the corpus.
+- **Kept current (planned).** The local copy will update incrementally rather
+  than by re-downloading the corpus — the delta protocol is designed and
+  measured (D-031), and lands in M2.
 - **AI-assisted (planned).** A chat layer will turn plain-language questions
   into local queries and drive the same charts and lists as the regular UI —
   by default with a model that also runs in your browser; optionally with your
@@ -28,11 +29,13 @@ The feature ledger is fully triaged — see
 
 ## Status
 
-**M1 in progress.** Milestone M0 ("plan the plan") closed with scope,
-architecture, schema, and the data-delivery protocol settled and measured
-against the real corpus. Scaffolding and the first end-to-end path — published
-chunks → SQLite/WASM on OPFS → a rendered query — run locally; full-scale
-measurement and the first deploy remain. Progress lives in
+**M1 closed 2026-08-01; M2 next.** The site is deployed: a browser downloads
+all 372,322 records from `https://cve.meenan.dev/`, decompresses them itself,
+builds its indexes, and queries them locally. M0 settled scope, architecture,
+schema, and the data-delivery protocol against the real corpus; M1 added the
+end-to-end path, the full-scale browser measurements (D-049 – D-051), and the
+first deploy. **Sync does not exist yet** — the local copy is a one-shot
+download until M2 lands the delta path. Progress lives in
 [docs/plan.md](docs/plan.md).
 
 ## How this project is built
@@ -41,6 +44,27 @@ Almost all code here is written by AI agents working from the documentation in
 `docs/`, directed and reviewed by a human who is the sole committer. The
 documentation is the project's long-term memory, which is why it is unusually
 explicit about what is decided, what is merely proposed, and what is still open.
+
+## Development
+
+```bash
+pnpm install && pnpm check   # typecheck, lint, format, unit + pipeline tests, license audit
+pnpm e2e                     # the browser path end to end, against the development slice
+```
+
+`pnpm e2e` serves `dist/` plus whatever is in `pipeline/pub/` — build both first
+(`pnpm build`, and see [pipeline/README.md](pipeline/README.md) for the slice).
+
+The full-scale sweep behind the Q-003/Q-004 numbers is separate, because it
+needs the **whole** published artifact rather than the slice and takes tens of
+minutes:
+
+```bash
+SERVE_DATA_ROOT=/path/to/full/pub pnpm measure
+```
+
+It writes `measurements/measurement.md`. Peak-memory numbers are Linux-only
+(RE-011); everything else is portable.
 
 ## Start here
 

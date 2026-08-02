@@ -23,7 +23,413 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
-## D-048: An offline app shell ships via service worker, scoped to the shell and never the data plane  (2026-08-01, status: accepted)
+## D-054: Cached assets revalidate — `no-cache` for the unversioned SQLite distribution, and the service worker is network-first  (2026-08-01, status: accepted, owner decision; refines D-048)
+
+**Decision.** Two halves of one rule: **a cached copy never wins over a
+reachable network**.
+
+1. **HTTP.** `/sqlite/` is served with `Cache-Control: no-cache` — revalidate,
+   not "do not store" — from a `^~ /sqlite/` location that outranks the
+   `\.(js|css|…)$` regex block.
+2. **Service worker (M5, D-048).** Network-first with cache fallback, never
+   cache-first. The cache exists so the app *opens* with no network (vision
+   criterion 5); it does not exist to serve yesterday's shell to someone online.
+   Owner decision, 2026-08-01.
+
+**Context.** The SQLite/WASM distribution is three files that resolve each other
+by relative URL — `index.mjs`, `sqlite3.wasm`, and
+`sqlite3-opfs-async-proxy.js` — copied verbatim to unversioned paths under
+`/sqlite/`. As deployed they had three *different* cache policies, none chosen:
+
+| File | Policy as deployed | Why |
+| --- | --- | --- |
+| `index.mjs` | none → heuristic freshness | no rule matched |
+| `sqlite3.wasm` | none → heuristic freshness | no rule matched |
+| `sqlite3-opfs-async-proxy.js` | `max-age=315360000` | matched the static-file regex |
+
+Both failure modes showed up for real on deploy day. Heuristic freshness pinned
+a *wrong* response in a browser: RE-012's `application/octet-stream` MIME type
+survived in the owner's cache after the server was fixed, so the app kept
+failing against a server that was already correct. And a ten-year `max-age` on
+one of three files that must move together means the next dependency bump ships
+a stale async proxy against a fresh `.wasm` — a mixed-version failure with no
+error message pointing anywhere near the cause.
+
+There is also no client-side remedy to fall back on: a hard reload does **not**
+bypass the cache for a dedicated Worker's dynamic import, which is how the
+SQLite distribution is loaded (RE-013, reproduced). A user holding a bad entry
+cannot clear it by the one action everybody knows. That moves this from tidiness
+to load-bearing — the server has to be right, because the client cannot recover.
+
+`no-cache` is the right policy for an unversioned asset. The alternative —
+content-versioned paths plus `immutable` — is strictly better caching and was
+not chosen now because it costs build plumbing to keep three mutually-resolving
+files consistent, and because the payload is ~1.6 MB behind a 304 that costs
+nothing. If the revalidation round trips ever matter, versioning the directory
+is the upgrade, not a longer `max-age`.
+
+**Verified in production 2026-08-01**, after the owner applied the block: all
+three files return `Cache-Control: no-cache` with correct types
+(`text/javascript`, `application/wasm`, `text/javascript`) and all three
+cross-origin headers, and the full-corpus import still completes against the
+deployed origin. The `^~` prefix does outrank the static-file regex, which is
+what the async proxy's ten-year `max-age` depended on.
+
+**Consequences.** M5 implements the service worker network-first, which also
+makes the SW cache incapable of reintroducing the staleness this entry exists to
+prevent — the two halves reinforce rather than duplicate each other. D-048's
+"cache the shell, Worker, WASM and brotli decoder" stands; only the strategy is
+pinned. The `/data/` policy is unaffected and stays immutable, because published
+generations genuinely are (D-041, D-047) and the manifest above them is
+`no-cache` already.
+
+**Reopen if.** Revalidation latency on the shell becomes measurable against the
+M1 baseline (D-049), in which case version the paths and go immutable; or the
+service worker's network-first path turns out to make offline *detection* slow
+enough to hurt, which is a timeout question inside the SW rather than a reason
+to prefer cache.
+
+## D-053: Published artifacts live in `cve.pub/`, a peer of both the document root and `cve.data/`  (2026-08-01, status: accepted, amends the layout in D-018 and D-034)
+
+**Decision.** The served data plane is
+`/var/www/meenan.dev/cve.pub/data/`, a third peer directory alongside `cve/`
+(the document root) and `cve.data/` (server-side state). nginx serves it with
+`root /var/www/meenan.dev/cve.pub;` under `location ^~ /data/`.
+
+This restores an invariant that can be stated without an asterisk: **nothing
+under `cve.data/` is web-reachable.** Its three subdirectories — the 4.0 GB
+clone, the 1.1 GB of working databases, and the KEV cache — have no path to the
+web at all.
+
+**Context.** D-018 established `cve.data/` as a peer of the document root and
+verified with a canary file that nothing under it was reachable. That held
+because a PHP handler read from `db/` and served the bytes. D-032 then removed
+the handler and D-034 made the data plane static files, which have to be
+reachable by URL — so D-034 added a fourth subdirectory, `cve.data/pub/`, and
+aliased it into the web. Nobody reconciled D-018's table, and the project owner
+read the docs during the first deploy and asked why a web-exposed directory was
+inside the one described as not being served. That confusion is the argument:
+a rule with an exception is a rule people get wrong.
+
+The security case is blast radius rather than a present hole. The alias form was
+safe — trailing slashes on both sides, and nginx normalizes `..` before matching
+— but it put a served path one directory level away from 5 GB of clone and
+working databases. Now a misconfigured `root` can only ever expose artifacts
+that are already public.
+
+**Two nginx specifics, both learned the expensive way during this deploy:**
+
+- **`root`, not `alias`.** The `cve.meenan.dev` server block defines `try_files`
+  at server level, which every location inherits, and `alias` + `try_files` is a
+  long-standing nginx defect: `$uri` is appended to the alias, producing
+  `<alias>/data/...` and a 404 for every artifact. Naming the directory `data`
+  so the URL maps straight through under `root` avoids the whole class.
+- **`add_header` does not merge.** A location that declares any `add_header`
+  drops every inherited one, so COOP/COEP have to be repeated in each block or
+  artifacts lose cross-origin isolation — which the `opfs` VFS requires (D-051).
+
+**Consequences.** `pipeline/publish.py` targets `cve.pub/data/`; the M2 crons
+(D-042) publish there. D-018's table is updated to three subdirectories, all
+private. D-034's snippet is superseded by the block in
+[architecture.md](architecture.md). The deploy story is unchanged — `rsync
+--delete` still mirrors `dist/` into `cve/` and touches neither peer.
+
+**Reopen if.** A second served surface appears (the KEV catalog is already
+planned for the same tree, which this handles) and wants a different lifecycle;
+or the host convention changes such that peer directories are no longer safe,
+which D-018's canary check exists to re-verify.
+
+## D-052: No duration ceilings anywhere; stalls are failures, and anything over a second reports itself  (2026-08-01, status: accepted, owner decision; replaces the ceilings in D-049)
+
+**Decision.** Owner decision, 2026-08-01, generalizing the query-latency call:
+
+1. **No operation has a pass/fail duration ceiling.** Not queries, not import,
+   not sync. Work takes as long as the data and the hardware make it take. A
+   measured number is a *baseline* — evidence for spotting regressions and
+   choosing what to optimize — never a gate.
+2. **A stall is a failure, and duration is not.** "Slow" and "stuck" are
+   different conditions and get different treatment: the app must be able to
+   tell that an operation has stopped making progress and say so. This is what
+   replaces the timeouts a ceiling would have justified — the signal is *no
+   forward progress*, not *elapsed time*.
+3. **Anything over roughly a second reports what it is doing**, and reports
+   real progress wherever the work is countable. Below a second, feedback is
+   noise; above it, silence is indistinguishable from a hang — which is exactly
+   the confusion rule 2 exists to prevent.
+4. **Resource numbers — peak memory, OPFS footprint — are tracked, not
+   gated**, on the same reasoning. They are still worth watching: a number that
+   moves sharply is a regression worth understanding, and running out of memory
+   or quota is a real failure. But it is the failure that fails, not the
+   number crossing a line someone picked.
+
+**Context.** D-049 originally attached ceilings to the M1 measurements — import
+under 3 minutes, peak memory under 1 GB, footprint under 600 MB, queries under
+1 s. Every one of them was a number chosen by an agent for having a comfortable
+margin over one machine's measurement, which is not what a success criterion
+should be made of. The owner removed the query ceiling first and then the rest.
+
+What makes this safe rather than lax is that the ceilings were never doing the
+work anyone imagined. A 3-minute import limit does not help a user on a slow
+laptop; it just relabels their slow-but-working import as a failure. What
+actually protects that user is the thing a ceiling was standing in for: knowing
+whether anything is still happening.
+
+**Consequences.**
+
+- **M1's cold first query after a reopen (~9 s) and the reference-host scan
+  (~850 ms) stop being violations** and become what they always were: known
+  costs, worth attacking on their merits (M3).
+- **The Worker reports activity for queries, not just imports.** Implemented
+  here: `Phase` gains `query`, single queries report that they are running, and
+  the benchmark reports `n / 10` as it goes — it is the one place in the
+  current code where countable progress was available and unused.
+- **M2 owns stall detection**, since it owns the download that can actually
+  hang: no forward progress for long enough is an error state with a message,
+  distinct from a slow link. The import path already has chunk-level progress
+  to hang that off.
+- **M3 owns query feedback and cancellation.** With no ceiling, a long query is
+  legitimate, so the user needs to see it running and be able to stop it.
+- **M5's diagnostics panel** is where a tracked-but-ungated resource number
+  becomes visible (D-009 leaves no other channel).
+- The e2e and measurement suites keep their timeouts. Those are stall detectors
+  for an unattended process, not product ceilings, and `tests/e2e/measure.spec.ts`
+  already says so.
+
+**Reopen if.** Tracking-without-gating lets a real regression land unnoticed —
+in which case the answer is a comparison against the recorded baseline that
+*reports*, not a threshold that *blocks*; or a platform limit (a quota, a
+browser's own watchdog) turns out to impose a ceiling whether we like it or
+not, which is a fact to document rather than a decision to revisit.
+
+## D-051: The `opfs` VFS, not `opfs-sahpool`  (2026-08-01, status: accepted, answers Q-004, constrains D-004)
+
+**Decision.** The database is stored through SQLite's **`opfs`** VFS. The
+`opfs-sahpool` path stays in the Worker behind an import option so the
+comparison can be re-run, but nothing selects it by default.
+
+**Context.** Q-004 was deferred to M1 by D-029 because it needs a running
+browser. D-030 had already retired its server-configuration half — COOP/COEP is
+served, so both VFSes were genuinely available — leaving performance and
+multi-tab behaviour. Measured at full scale (`pnpm measure`, 2026-08-01,
+Chromium/Linux):
+
+| | `opfs` | `opfs-sahpool` |
+| --- | --- | --- |
+| Import, wall-clock | 73.3 s | **64.6 s** |
+| of which index build | 66.1 s | **56.4 s** |
+| Peak renderer RSS | **682.0 MB** | 713.2 MB |
+| Query latency, 10 shapes | 6–954 ms | 2–868 ms |
+| **Second tab** | **opens the database and queries it** | **stops responding** |
+
+`opfs-sahpool` builds indexes faster — 56.4 s against 66.1 s — and queries
+indistinguishably. That gap is at the edge of what this sweep can resolve: the
+index stage varied 20% across runs that should have been identical (D-049), and
+56.4 s is below every `opfs` index time recorded, so the direction is probably
+real even if the size is not. It loses anyway, on two things that outrank
+seconds:
+
+- **A second tab.** SQLite's documentation for `installOpfsSAHPoolVfs`
+  ([sqlite.org/wasm/doc/trunk/persistence.md](https://sqlite.org/wasm/doc/trunk/persistence.md),
+  read 2026-08-01) says only one instance may use a pool directory at a time.
+  What that means in practice, measured: the second tab stops
+  responding entirely — no error, no verdict in 150 s, not even a page that can
+  answer a query about its own storage. (The first tab is unharmed and keeps
+  querying normally, so this is a hang, not corruption.) On `opfs` the second
+  tab opens the same database and queries it. Multi-tab behaviour is a
+  confirmed feature, and "one of my tabs is frozen" is the worst available
+  answer to it.
+- **It cannot express M2's download.** The pool's files are opaque; bytes get in
+  only through `importDb`, which truncates the target and appends strictly
+  sequentially. M2 requires a *staged* replacement with a per-chunk completion
+  bitmap, resumable after a kill, that never destroys the live copy until the
+  new one verifies. On `opfs` that is positional writes into a staging file. On
+  the pool it would mean writing 377 MB to a raw OPFS file and then copying it
+  through `importDb` — double the writes, and still not resumable.
+
+Whatever the gap is, it is entirely index-build time — the stage D-050 shows is
+dominated by page-cache behaviour rather than by the VFS — so it is also the
+part of the import most likely to move for reasons that have nothing to do with
+this choice.
+
+**Consequences.** M2 builds staged replacement on positional writes. M5's
+multi-tab work starts from "concurrent readers work" rather than from
+"serialize the tabs". COOP/COEP become load-bearing rather than incidental —
+without them the `opfs` VFS is unavailable and there is no fallback selected,
+so the capability gate (M5) must check for it explicitly. The sahpool code path
+is kept, and is the thing to reach for if COOP/COEP ever cannot be served.
+
+**Reopen if.** Multi-tab turns out to need serialization anyway for correctness
+(then the pool's exclusivity is a feature, not a cost); or a browser we intend
+to support cannot use the `opfs` VFS; or `importDb` gains a resumable form.
+
+## D-050: SQLite's page cache is set to 256 MiB  (2026-08-01, status: accepted)
+
+**Decision.** Every connection opens with `PRAGMA cache_size=-262144`
+(256 MiB) and `PRAGMA temp_store=MEMORY`.
+
+**Context.** SQLite's stock page cache is 2 MiB. The corpus is 377 MB, so at
+stock every aggregate re-reads most of the database through OPFS on every run.
+This was found by measuring query latency at full scale for the first time and
+getting numbers in *seconds*, which is not a tuning detail but a different
+product. Measured across the ten query shapes in `lib/queries.ts` (warm,
+`opfs`, full corpus, one run per row):
+
+| Page cache | Index build | Queries over 1 s | Slowest query | Range over the other nine | WASM heap after querying | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2 MiB (stock) | 247.4 s | 8 of 10 | 91.9 s | 13 ms – 42.8 s | 75.8 MB | 591.0 MB |
+| 64 MiB | 64.0 s | 4 of 10 | 20.7 s | 8 ms – 4.7 s | 157.4 MB | 558.0 MB |
+| **256 MiB** | **68.9 s** | **0 of 10** | **680 ms** | **4–161 ms** | 391.9 MB | 715.1 MB |
+| 512 MiB | 67.3 s | 0 of 10 | 784 ms | 5–171 ms | 470.3 MB | 746.2 MB |
+
+("Queries over 1 s" is a way of counting how bad each setting is, not a
+threshold anything has to clear — D-049 sets no latency ceiling.)
+
+Three things this measurement settles:
+
+- **It is not a linear knob.** 64 MiB is 32× the stock cache and still leaves
+  four queries over a second, one of them at 20.7 s — 30× slower than the same
+  query at 256 MiB. There is no useful middle setting.
+- **256 MiB is where the curve flattens.** 512 MiB is not faster — the ten
+  shapes come out within noise of each other, and the slowest is marginally
+  *worse*. It is not free either: SQLite genuinely claims the larger cache
+  (470 MB of WASM heap against 392 MB) and peak RSS rises 31 MB for it.
+- **Memory is bought, not saved.** Peak RSS climbs from 558 MB at 64 MiB to
+  715 MB at 256 MiB. The stock setting is not the cheap end of that trade — it
+  costs 591 MB *and* is unusably slow, because pages it will not cache it
+  re-reads through buffers that cost more than they save.
+
+It also cuts index building nearly fourfold (247 s → 69 s), which is what keeps
+D-035's "build the indexes on the client" defensible at all.
+
+**How the heap number was arrived at**, because the first attempt got it wrong:
+the WASM heap was originally sampled at the end of import, before any query ran,
+which showed 272 MB at *both* 256 and 512 MiB and supported a confident claim
+that the larger cache was never claimed at all. It is claimed — by the queries,
+which is where a page cache does its work. The benchmark now takes its own
+reading (`BenchResult`'s sibling `wasmHeapBytes`) and peak RSS is read after the
+benchmark rather than after the import.
+
+**Consequences.** Every number in D-049 is measured with this in place and none
+of them reproduce without it. The memory ceiling must accommodate a resident
+page cache — ~715 MB peak on a 377 MB corpus is the number to hold against, not
+the 62.7 MB download. M3's index tuning starts from these latencies, not from
+the stock-cache ones. If M5 needs a smaller footprint on constrained devices,
+64 MiB is the measured fallback and it costs roughly two orders of magnitude on
+the worst shapes — a tier, not a dial.
+
+Note this decision does not depend on a latency ceiling, which D-049 declines
+to set: the case for 256 MiB is a two-orders-of-magnitude difference against
+the stock setting, which is decisive under any framing.
+
+**Reopen if.** The mobile/low-memory story arrives (M5's quota and capability
+work) and 256 MiB is too much to claim on a small device — in which case this
+becomes a tier, measured per tier rather than lowered by guess; or the corpus
+grows enough that the working set outruns 256 MiB, which the same sweep will
+show as the slowest-query number climbing again; or M3's indexing makes the
+reference-host scan cheap enough that a smaller cache performs comparably.
+
+## D-049: The M1 browser baseline, measured at full scale  (2026-08-01, status: accepted, answers Q-003, settles the concurrency number D-041 deferred; its ceilings removed by D-052)
+
+**Decision.** These are the numbers the whole client is measured against from
+here. **None of them is a threshold** — D-052 removed the ceilings this entry
+originally attached, so what follows is a baseline: evidence for spotting a
+regression, for choosing what to optimize, and for telling a future agent what
+"normal" looked like on real hardware in August 2026.
+
+- **Cold import: 73.3 s** wall-clock, of which **66.1 s is building the search
+  indexes** and 7.2 s is everything else — fetch, checksum, decompress and
+  write, elapsed, over loopback. Throttled to 50 Mbps / 40 ms the non-index
+  part is 13.5 s.
+- **Peak memory: 682–715 MB** for the renderer process hosting the Worker,
+  after importing *and* running the benchmark.
+- **Local footprint: 441.1 MB** in OPFS — the 376.7 MB database plus 64.4 MB of
+  client-built FTS index.
+- **Query latency: 4–190 ms** for nine of the ten shapes in `lib/queries.ts`,
+  and **680–954 ms** for the tenth (a full scan of the reference tables).
+- **Reopening with a local copy: 287 ms** to report the corpus after a reload.
+  The first query then takes **9.2 s**, because the page cache starts empty and
+  the first aggregate re-reads from OPFS.
+
+Two of those are worth attacking on their merits and neither is a failure: the
+reference-host scan has no supporting index, and the ~9 s cold query is pure
+page-cache warming. Both are M3's.
+
+What replaces the ceilings is D-052: an operation over a second says what it is
+doing, one that stops making progress is detectably broken, and how long the
+work legitimately takes is not a verdict on it.
+
+It also settles the number D-041 left open: **four chunks in flight** — on the
+elapsed transport time, which is the only column concurrency can move.
+
+| Chunks in flight | Transport (loopback) | Transport (50 Mbps / 40 ms) | Peak RSS |
+| --- | --- | --- | --- |
+| 1 | 7.2 s | 18.5 s | 568.2 MB |
+| 2 | 7.5 s | — | 570.1 MB |
+| **4** | 6.9 s | **13.5 s** | 630.4 MB |
+| 8 | 6.6 s | 13.4 s | 696.0 MB |
+
+On loopback the four settings are indistinguishable — 6.6 to 7.5 s, with no
+ordering worth reading — which is why the throttled column exists: a decision
+made on the loopback numbers would have been a decision about the test rig.
+Throttled, concurrency does what it is for: 4 takes 5 s off an 18.5 s
+transport, and 8 adds nothing measurable while costing 66 MB of peak memory.
+Four was already the default; it is now the measured one. (CDP throttling was
+checked to actually reach the Worker's fetches rather than assumed to — the
+sweep compares elapsed transport against what 62.7 MB at 50 Mbps cannot beat,
+and records a note if a row came out at loopback speed.)
+
+**Context.** Q-003 was deferred to M1 by D-029 and measured on the slice first
+(39,196 records) on 2026-08-01. At full scale the slice's headline holds and
+its explanation does not: index building really is ~90% of import — 66.1 s of
+73.3 s — but only because D-050 raised the page cache. At SQLite's stock 2 MiB
+it is 247 s of 255 s, and the whole import is three and a half minutes. The
+sweep lives in `tests/e2e/measure.spec.ts`, is re-runnable (`pnpm measure`),
+and writes `measurements/measurement.md`; every number here is transcribed from
+that file.
+
+**How good these numbers are.** Every cell is a single run on one machine, and
+the sweep is noisy: across nine runs that differ only in download settings —
+which cannot affect index building — the index stage ranged 64.0 s to 79.8 s, a
+spread of 20%. So differences below about a fifth are not results, and none of
+the conclusions above rest on one: the concurrency call is made on transport
+(a 27% gap), the page-cache call on two orders of magnitude, and the VFS call
+(D-051) on a categorical multi-tab outcome.
+
+Read every number as "one machine, one run" — a 12-core Linux desktop,
+Chromium 151, server on loopback, hardware at the friendly end. Nothing here
+needs the slack a threshold would have needed, because nothing here is a
+threshold: a slower machine produces a slower baseline, not a failure.
+
+**The benchmark set is part of the decision.** A baseline means nothing without
+saying *what* was measured, so the ten shapes in `lib/queries.ts` are the
+yardstick: a point lookup, four indexed aggregates, two joins through the link
+tables, a full scan of the reference tables, and three FTS shapes. They
+were chosen by access-path shape rather than by feature checklist, they are
+literal single `SELECT`s with no parameters and no wall-clock dependence (a unit
+test enforces all three), and M3 tunes against them. Adding or removing one
+changes what the budget means and belongs here, not in a commit message.
+
+**What was left open.** Behaviour on a low-memory or mobile device (M5, with
+the capability gate); any browser other than Chromium (M5 again — Playwright
+runs Chromium-only today, and rule 3 applies to support claims); and the first
+query after a reopen, which is measured but not yet fast.
+
+**Consequences.** M3's exit criterion becomes "no regression against the
+recorded baseline, and slow queries behave well" rather than "queries are under
+N ms". M2's progress display has a shape to honour — a 73 s import whose last
+66 s is a single serial stage needs the index build to be its own visible
+phase, not a spinner after the download bar fills, and it is also the natural
+place to notice that nothing has advanced in a while (D-052).
+
+**Reopen if.** A repeat sweep with several runs per cell contradicts an
+ordering claimed here; the first real-network measurement disagrees with the
+throttled transport numbers; or the corpus grows enough that these numbers stop
+describing the product, in which case the sweep is re-run and this entry
+superseded rather than argued with. Note what would *not* reopen it: any
+individual measurement getting worse. That is a fact to explain, and possibly a
+regression to fix, but the baseline is not a promise anyone made.
+
+## D-048: An offline app shell ships via service worker, scoped to the shell and never the data plane  (2026-08-01, status: accepted; **fetch strategy pinned network-first by D-054**)
 
 **Decision.** The app registers a service worker that caches the app shell —
 the exported HTML/JS/CSS, the SQLite/WASM distribution under `/sqlite/`, and
@@ -383,7 +789,7 @@ small file, or someone actually needs sub-day freshness — in which case hourly
 ingest returns *and brings the rollup requirement back with it*, which is the
 real cost of that change.
 
-## D-041: The snapshot ships as independently-compressed 32 MB chunks  (2026-08-01, status: accepted, refines D-040)
+## D-041: The snapshot ships as independently-compressed 32 MB chunks  (2026-08-01, status: accepted, refines D-040; the concurrency it left open is settled by D-049)
 
 **Decision.** The snapshot is split into **32 MB slices of the uncompressed
 database**, each compressed separately at brotli -q10 into its own file of
@@ -497,7 +903,7 @@ decoder loaded, and it is the file that tells the client what to fetch.
 browser's native brotli path, in which case the tradeoff is control versus speed
 and wants a measurement, not an argument.
 
-## D-039: Cloudflare honors origin cache headers; there is no origin rate limiting  (2026-08-01, status: accepted, supersedes the rate-limiting half of D-034 and D-037)
+## D-039: Cloudflare honors origin cache headers; there is no origin rate limiting  (2026-08-01, status: accepted, supersedes the rate-limiting half of D-034 and D-037; **premise unverified in production** — as of the first deploy, 2026-08-01, `cve.meenan.dev` is not proxied through Cloudflare, so nothing is absorbing abuse and nothing is applying these rules. M5 owns closing that before launch.)
 
 **Decision.** No `limit_conn`, no `limit_req`, and no `limit_rate` at the origin.
 Cloudflare absorbs abuse if it ever materializes. Caching is driven entirely by
@@ -1640,8 +2046,13 @@ root, never inside it:
 | Path | Contents |
 | --- | --- |
 | `cve.data/git/` | The cvelistV5 clone |
-| `cve.data/db/` | Derived artifacts and databases served to clients |
+| `cve.data/db/` | Working databases the pipeline builds |
 | `cve.data/cache/` | Fetched upstream data such as the KEV catalog (D-010) |
+
+> **Amended by D-053 (2026-08-01).** The `db/` row read "derived artifacts and
+> databases *served to clients*", which was true when a PHP handler read from
+> it. D-032 removed the handler; published artifacts now live in a separate
+> peer, `cve.pub/`, and **nothing under `cve.data/` is web-reachable.**
 
 The deploy may therefore use `rsync --delete` safely.
 
