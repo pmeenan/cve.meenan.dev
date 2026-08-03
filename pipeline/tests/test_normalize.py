@@ -84,6 +84,44 @@ class CvssPriority(unittest.TestCase):
         self.assertEqual(vector, "")
 
 
+class ScoreRange(unittest.TestCase):
+    """Hostile numbers, which JSON permits and the wire format cannot carry."""
+
+    def test_infinity_is_dropped_rather_than_serialized(self):
+        """`1e400` parses to `inf`, which `json.dumps` writes as a bare
+        `Infinity` token that no browser's JSON parser accepts."""
+        cna = {"metrics": [{"cvssV3_1": {"baseScore": 1e400, "baseSeverity": "HIGH"}}]}
+        self.assertIsNone(normalize.cvss(cna, [])[1])
+
+    def test_an_integer_too_large_to_be_a_float_does_not_raise(self):
+        """`math.isfinite(10**1000)` raises rather than answering: JSON has no
+        integer ceiling, so the conversion has to be guarded, not the check."""
+        cna = {"metrics": [{"cvssV3_1": {"baseScore": 10**1000, "baseSeverity": "HIGH"}}]}
+        self.assertIsNone(normalize.cvss(cna, [])[1])
+
+    def test_a_boolean_is_not_a_score(self):
+        cna = {"metrics": [{"cvssV3_1": {"baseScore": True, "baseSeverity": "HIGH"}}]}
+        self.assertIsNone(normalize.cvss(cna, [])[1])
+
+
+class CveIdShape(unittest.TestCase):
+    """The id bound follows the official CVE Record Format's own `cveId`
+    pattern (`^CVE-[0-9]{4}-[0-9]{4,19}$`, read 2026-08-02). Tightening it
+    would mark valid records unusable and abort a whole ingest (D-047)."""
+
+    def test_accepts_the_full_official_serial_range(self):
+        self.assertTrue(normalize.valid_cve_id("CVE-2026-1234"))
+        self.assertTrue(normalize.valid_cve_id("CVE-1999-" + "9" * 19))
+
+    def test_rejects_what_the_wire_format_could_not_carry(self):
+        for bad in ("CVE-2026-123", "CVE-26-1234", "CVE-2026-" + "9" * 20, "../../etc/passwd", ""):
+            self.assertFalse(normalize.valid_cve_id(bad), bad)
+
+    def test_a_malformed_id_falls_back_to_the_file_name(self):
+        record = {"cveMetadata": {"cveId": "CVE-2026-" + "9" * 300, "state": "PUBLISHED"}}
+        self.assertEqual(normalize.projection(record, "CVE-2026-1001")["cve_id"], "CVE-2026-1001")
+
+
 class Notice(unittest.TestCase):
     """D-008 requires MITRE's copyright designation and the license clause in
     every copy; the canonical string lives in build.NOTICE (D-047)."""

@@ -11,3 +11,6 @@ __pycache__/
 .venv/
 public/sqlite/
 pipeline/pub/
+# The publication ledger sits beside the published directory by design, which
+# for a local `pipeline/pub` means here (pipeline/ledger.py).
+pipeline/published.json

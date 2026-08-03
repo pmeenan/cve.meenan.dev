@@ -178,27 +178,54 @@ and `pnpm check` / `pnpm e2e` are green. The one item deliberately left open is
 Cloudflare (below): it is not in the request path at all, which is M5's problem
 rather than a gap in this milestone.
 
-## M2 — Full-corpus Download and Sync  `pending`
+## M2 — Full-corpus Download and Sync  `in progress`
 
 Tasks in dependency order; the wire contract and stable IDs come first because
 everything downstream consumes them.
 
-- [ ] **The delta wire contract.** Finalize the delta format for the full
-      accepted schema — `host`/`url`/`vtype` lookups, reference and version
-      rows, tombstones (the architecture.md example is illustrative and
-      incomplete) — replace `Manifest.deltas: unknown[]` with real types in
-      `lib/protocol.ts`, and contract-test a pipeline-emitted delta against
-      them.
+- [x] **The delta wire contract** (D-055). Finalized for the full accepted
+      schema — all seven lookup tables, reference and version rows, tombstones
+      by CVE ID — typed in `lib/protocol.ts` (`Manifest.deltas: unknown[]` is
+      gone, and `snapshot.rev` joins the head `rev`), validated at runtime by
+      `lib/delta.ts`, emitted by `pipeline/delta.py` with the manifest writer
+      in `pipeline/manifest.py`. Contract-tested both ways: a pipeline-published
+      data plane validated by the browser's own code
+      (`tests/unit/contract.test.ts`), and a reference apply proving
+      *sufficiency* — snapshot N + delta reconstructs snapshot N+1 table by
+      table, idempotently (`pipeline/tests/`). Lookup rows are selected by
+      per-table id floors rather than a `rev` column, which is the same range
+      query D-031 specified for seven fewer columns.
 - [ ] **Stable interned IDs.** Implement Interner seeding from the previous
       build (promised by D-025 hazard 1, not yet implemented), proven by a
       snapshot N → delta → snapshot N+1 test: existing IDs never change, new
-      IDs append.
+      IDs append. Three things D-055 established about the shape of this:
+      it must cover **`cve.id` too** — that is a bare walk counter today, so
+      adding one record renumbers every record after it; **nothing guards
+      lookup-id drift** — the contract's tripwire compares `cve.id` against the
+      canonical CVE ID only, and a drifted vendor or product id silently
+      resolves to the wrong row, so seeding is the fix rather than a
+      mitigation; and the per-table floors `pipeline/delta.py` takes are what
+      seeding must record per build. Two independent reproductions of the
+      renumbering are in D-055.
 - [ ] **Daily ingest cron** under `flock`: fetch → hash → diff → tombstone
       guard (abort is the success case on a broken fetch) → delta file
-      (D-031, D-042). Fail closed on malformed records (D-047).
+      (D-031, D-042). Fail closed on malformed records (D-047). The changeset
+      it computes is what `pipeline/delta.py` already consumes — including the
+      per-table id floors, which it must persist per revision. Decide its
+      re-run semantics explicitly. Two constraints D-055 fixes for it: the
+      ingest must **pin `generated` per revision** rather than stamping the
+      clock on each attempt, since a published range may only ever be rewritten
+      with byte-identical content; and the per-table id floors it computes must
+      be recorded per revision, since the emitter cannot check them itself.
 - [ ] **Monthly snapshot cron**: rebuild, chunk, compress, publish by atomic
       rename; previous generation and its deltas retained; generations
-      immutable (D-041, D-042, D-047).
+      immutable (D-041, D-042, D-047). Two pieces D-055 left to this task:
+      **pruning** — retention deletes delta files, and `manifest.py` has no
+      way to drop their entries outside a full snapshot republish, so between a
+      retention run and the next rebuild the manifest can advertise a 404; and
+      the **bridging delta** from the old head to the new snapshot's revision,
+      without which a client a generation behind re-downloads rather than
+      catching up (it needs seeded interning, above).
 - [ ] **Download with staged replacement.** Chunks and catch-up deltas land in
       a *staging* OPFS file — never truncating the live database (the M1 path
       does, and must not survive into M2) — with a persisted per-chunk

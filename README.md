@@ -29,14 +29,14 @@ The feature ledger is fully triaged — see
 
 ## Status
 
-**M1 closed 2026-08-01; M2 next.** The site is deployed: a browser downloads
+**M1 closed 2026-08-01; M2 in progress.** The site is deployed: a browser downloads
 all 372,322 records from `https://cve.meenan.dev/`, decompresses them itself,
 builds its indexes, and queries them locally. M0 settled scope, architecture,
 schema, and the data-delivery protocol against the real corpus; M1 added the
 end-to-end path, the full-scale browser measurements (D-049 – D-051), and the
 first deploy. **Sync does not exist yet** — the local copy is a one-shot
-download until M2 lands the delta path. Progress lives in
-[docs/plan.md](docs/plan.md).
+download until M2 lands the delta path, whose wire contract is now final and
+contract-tested (D-055). Progress lives in [docs/plan.md](docs/plan.md).
 
 ## How this project is built
 
@@ -51,6 +51,10 @@ explicit about what is decided, what is merely proposed, and what is still open.
 pnpm install && pnpm check   # typecheck, lint, format, unit + pipeline tests, license audit
 pnpm e2e                     # the browser path end to end, against the development slice
 ```
+
+`pnpm check` needs **python3** and the **brotli** CLI on PATH as well as Node:
+the pipeline suite is Python (D-043), and one unit test runs the real pipeline
+and validates what it published with the browser's own code (D-055).
 
 `pnpm e2e` serves `dist/` plus whatever is in `pipeline/pub/` — build both first
 (`pnpm build`, and see [pipeline/README.md](pipeline/README.md) for the slice).

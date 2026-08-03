@@ -146,7 +146,9 @@ the full corpus from `https://cve.meenan.dev/` and queries it locally. The two
 measurements deferred by D-029 are answered — Q-003 by D-049 (a baseline, not
 budgets: D-052 sets no duration ceilings), Q-004 by D-051 (the `opfs` VFS) —
 with D-050 (a 256 MiB page cache) and D-053 (published artifacts in their own
-peer directory) falling out of the same work. **M2 is next**: full-corpus
-Download and Sync with staged replacement. M0 closed with scope, architecture,
-schema and the delivery protocol settled and measured (D-001 – D-043). Keep
-this paragraph current when plan.md milestone status changes (rule 6).
+peer directory) falling out of the same work. **M2 is in progress**:
+full-corpus Download and Sync with staged replacement. Its first task is done —
+the delta wire contract is final, typed, emitted and contract-tested (D-055) —
+and stable interned IDs are next. M0 closed with scope, architecture, schema
+and the delivery protocol settled and measured (D-001 – D-043). Keep this
+paragraph current when plan.md milestone status changes (rule 6).

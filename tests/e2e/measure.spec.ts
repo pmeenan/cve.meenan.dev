@@ -326,16 +326,20 @@ async function importOnce(
 
 /** What this particular run ran on, read from the artifact it just imported. */
 async function envFor(page: Page, timings: Timings): Promise<Env> {
+  // The *snapshot's* revision, not the manifest's head: an import fetches
+  // chunks and nothing else, so once deltas exist a head of N+k would label a
+  // snapshot-N measurement as something it never ran on (D-055). Older
+  // manifests have no `snapshot.rev`, and there the two are the same number.
   const manifest = (await page.evaluate(() =>
     fetch('/data/manifest.json', { cache: 'no-cache' }).then((r) => r.json())
-  )) as { rev: number }
+  )) as { rev: number; snapshot?: { rev?: number } }
   return {
     browser: page.context().browser()?.version() ?? 'unknown',
     platform: `${process.platform} ${release()}`,
     arch: process.arch,
     cpus: cpus().length,
     recorded: new Date().toISOString(),
-    rev: manifest.rev,
+    rev: manifest.snapshot?.rev ?? manifest.rev,
     records: timings.records,
   }
 }

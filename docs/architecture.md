@@ -87,12 +87,17 @@ every 40 minutes, so a day accumulates ~665 distinct changed records.
    concept at all, so a mass deletion means our fetch broke, not that the CVE
    Program withdrew 400 records.
 4. **Normalize.** Build the relational artifact (see [Schema](#schema)). 19 s.
-   New interned values get IDs from the server-owned, append-only ID space and
-   are stamped with the current revision.
+   New interned values get IDs from the server-owned, append-only ID space, and
+   the run must record each lookup table's high-water id — that is what makes
+   "the rows a client at rev N is missing" a range query rather than a per-row
+   revision column (D-055). *Recording it per revision is the ingest's job and
+   is not built yet*; today the emitter is handed floors by its caller.
 5. **Publish the delta.** If anything changed, increment the revision and write
-   `deltas/<rev-1>-<rev>.json.br`. One run per day means one file per day and
-   consecutive revisions, so the files tile the revision space by construction —
-   there is no rollup and no invariant to defend (D-042).
+   `deltas/<rev-1>-<rev>.json.br`, then register it in the manifest — file
+   first, so the manifest never names something that is not there. One run per
+   day means one file per day and consecutive revisions, so the files tile the
+   revision space by construction — there is no rollup and no invariant to
+   defend (D-042).
 6. **Snapshot, monthly.** Rebuild the database, split it into 32 MB slices of
    the uncompressed file, and compress each at brotli -q10 — 101 s across 24
    cores, against 351 s for a monolith (D-041). Only the compressed chunks are
@@ -100,7 +105,11 @@ every 40 minutes, so a day accumulates ~665 distinct changed records.
    built server-side because the client builds its own (D-035).
 7. **Retire, one generation behind.** Keep the previous snapshot and every delta
    back to it, so a client that read the manifest minutes ago and is mid-download
-   does not start seeing 404s. One spare generation costs 63 MB.
+   does not start seeing 404s. One spare generation costs 63 MB. Note what
+   retention does *not* buy today: the manifest only lists deltas that start at
+   or after its snapshot's revision, because nothing bridges the old revisions
+   to a rebuilt snapshot, so a client a generation behind re-downloads until a
+   bridging delta becomes possible (D-055, and it needs seeded interning).
 
 Publication into `pub/` is an atomic rename, so a half-written artifact is never
 reachable — and a published generation is immutable: same-rev republication is
@@ -180,43 +189,76 @@ Four things about it are load-bearing rather than stylistic:
   `.br` the client decodes itself and an added `Content-Encoding` would corrupt
   that path (D-040). No `limit_conn`/`limit_rate` (D-039).
 
-The manifest carries `format`, `schema`, the current `rev`, the snapshot, and
-the list of delta files, each with its byte length and SHA-256. The client reads
-it, compares its local schema version, and either re-downloads (on a schema bump
-— deltas cannot bridge one) or fetches a greedy longest-first chain of delta
-files from its watermark. It is the one file served uncompressed, because it has
-to be readable before the brotli decoder matters.
+The manifest carries `format`, `schema`, the head `rev`, the snapshot (with its
+own `rev`), and the list of delta files, each with its byte lengths and SHA-256.
+The client reads it, compares its local schema version, and either re-downloads
+(on a schema bump — deltas cannot bridge one) or fetches the fewest-files chain
+of delta files from its watermark, found breadth-first (`planSync`, D-055). It
+is the one file served uncompressed, because it has to be readable before the
+brotli decoder matters.
+
+`rev` is the **head** revision — the newest state the data plane can reach —
+while `snapshot.rev` is the snapshot's own; they are equal only until the first
+delta lands, and a client that conflated them would think a fresh snapshot was
+current (D-055). A delta entry is `{from, to, bytes, raw_bytes, sha256}` with no
+file name in it: the client derives the URL from the two integers, so no string
+out of the manifest ever reaches a request path.
 
 Delta files must tile the revision space contiguously, or a client at some
 watermark finds no covering chain and can never sync again. Daily ingest makes
 that automatic — one run, one revision, one file — which is why D-042's cadence
-choice removed the rollup machinery rather than just slowing it down.
+choice removed the rollup machinery rather than just slowing it down. A client
+that finds no chain re-downloads; a manifest that contradicts itself (a delta
+above head, an origin behind the local watermark) is an error, not a re-download.
 
 ### Delta format
 
 JSON at brotli -q5, whole records rather than field-level diffs, lookups ordered
-before the upserts that reference them, and the D-008 notice in-band (D-031).
+before the upserts that reference them, and the D-008 notice in-band (D-031),
+finalized for the accepted schema in D-055. Typed in
+[lib/protocol.ts](../lib/protocol.ts), validated by [lib/delta.ts](../lib/delta.ts),
+emitted by [pipeline/delta.py](../pipeline/delta.py).
 
 ```json
-{"format":1,"schema":1,"from":1204,"to":1236,
- "generated":"2026-07-31T23:12:13Z","notice":"CVE record content: Copyright © 1999-2026, The MITRE Corporation. …",
- "lookups":{"cna":[],"cwe":[[798,"CWE-1395","…"]],
-            "vendor":[[24421,"acme"]],"product":[[80149,24421,"widget"]]},
- "upsert":[{"id":"CVE-2026-14537","y":2026,"st":1,"cna":12,
-            "pub":"…","upd":"…","cvss":[31,7.5,"HIGH","CVSS:3.1/…"],
-            "cwe":[412],"prod":[80149],"descr":"…"}],
+{"format":1,"schema":1,"from":1,"to":2,"generated":1767225600,
+ "notice":"CVE record content: Copyright © 1999-2026, The MITRE Corporation. …",
+ "lookups":{"cna":[[2,"globex-cna"]],"cwe":[[2,"CWE-787","OOB write"]],
+            "vendor":[[2,"globex"]],"product":[[4,2,"sprocket"]],
+            "host":[[3,"newhost.example.org"]],
+            "url":[[3,"https://newhost.example.org/x",3]],"vtype":[[2,"custom"]]},
+ "upsert":[{"id":3,"cve":"CVE-2026-1003","y":2026,"st":1,"cna":2,
+            "pub":1772323200,"upd":1772323200,"cvss":[4,9.1,4,"CVSS:4.0/AV:N"],
+            "descr":"…","cwe":[1],"prod":[4],"ref":[3],
+            "ver":[[4,1,"0",null,"4.2",2]]}],
  "delete":[]}
 ```
 
-The example is illustrative, not the contract: it omits the `host`, `url`, and
-`vtype` lookups and the reference and version rows the accepted schema (D-033)
-requires. M2's first task finalizes the wire format for the full schema, types
-it in `lib/protocol.ts` (replacing the `deltas: unknown[]` placeholder), and
-contract-tests a pipeline-emitted delta against those types.
+That is a real published file, trimmed — `pipeline/tests/fixture_pub.py` writes
+it, and `tests/unit/contract.test.ts` validates it with the browser's own code.
+The rules that are not visible in the shape:
 
-A merged delta is not a merge operation: the server stores a revision per record
-and per lookup row, so "everything since `from`" is a range query that returns
-final state by construction.
+- `from` is exclusive, `to` inclusive; `generated` is unix seconds, as in the
+  manifest.
+- Lookup tuples are in schema column order, and the tables are emitted in apply
+  order (`vendor` before `product`, `host` before `url`), so apply is a
+  positional insert.
+- A record carries both `id` (the server-owned row id) and `cve` (the canonical
+  ID) because both are columns of the `cve` row. Apply must verify the pairing
+  against the local database and stop if it disagrees: that means the ID space
+  drifted, and replacing by id would silently overwrite the wrong record.
+- `cvss` is `[ver, score, sev, vector]` in stored codes — 31 and 4 are labels,
+  not magnitudes (D-047).
+- **Absent means absent, not unchanged.** Apply replaces a record wholesale, so
+  an omitted `cwe` deletes its CWE rows.
+- `delete` carries canonical CVE IDs, so a tombstone needs no ID-space
+  agreement to act on.
+
+A merged delta is not a merge operation: "everything since `from`" is a range
+query that returns final state by construction. For records that is the ingest's
+content-hash diff (D-031) — the schema carries no per-record revision column;
+for lookup rows it is one integer per table per revision, since the ID space is
+append-only and "what the client is missing" is "everything above the floor"
+(D-055).
 
 ## The client
 

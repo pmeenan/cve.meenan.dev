@@ -47,6 +47,11 @@ class Interner:
     build starts empty and assigns encounter-order IDs. Until seeding exists,
     two builds are only ID-compatible if built from the same input in the same
     order.
+
+    Note what is *not* interned: `cve.id` is the bare counter below, so it moves
+    whenever a record is added or removed anywhere before the end of the walk.
+    Deltas carry that id (D-055), so seeding has to cover the `cve` table too,
+    not only the seven lookups.
     """
 
     def __init__(self) -> None:
@@ -111,6 +116,14 @@ def build(clone: str, out: str, year_min: int | None, limit: int | None) -> dict
             continue
 
         proj = normalize.projection(record, os.path.basename(path)[:-5])
+        # A record we cannot name is a record we cannot publish: the id is the
+        # client's primary key, the delta's tombstone, and the thing every
+        # report shows. Neither the record's `cveId` nor its file name being
+        # well-formed is a corpus we understand, so fail closed (D-047) rather
+        # than store an id no downstream consumer will accept.
+        if not normalize.valid_cve_id(proj["cve_id"]):
+            skipped.append(path)
+            continue
         if year_min is not None and proj["year"] < year_min:
             continue
 
@@ -236,16 +249,17 @@ def main() -> int:
     # the 0.1% tombstone guard and undercount forever (vision criterion 7).
     if skipped:
         for path in skipped:
-            print(f"unparseable record: {path}", file=sys.stderr)
+            print(f"unusable record: {path}", file=sys.stderr)
         if not args.allow_skipped:
             os.remove(args.out)
             print(
-                f"error: {len(skipped)} unparseable records; artifact deleted "
-                "(--allow-skipped overrides for local debugging)",
+                f"error: {len(skipped)} unusable records (unparseable, or an id "
+                "that is neither a valid CVE ID nor a usable file name); artifact "
+                "deleted (--allow-skipped overrides for local debugging)",
                 file=sys.stderr,
             )
             return 1
-        print(f"warning: {len(skipped)} unparseable records skipped", file=sys.stderr)
+        print(f"warning: {len(skipped)} unusable records skipped", file=sys.stderr)
     return 0
 
 

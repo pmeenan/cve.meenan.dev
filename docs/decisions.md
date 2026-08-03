@@ -23,6 +23,266 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-055: The delta wire contract, finalized for the full schema  (2026-08-02, status: accepted, completes D-031 for the accepted schema D-033)
+
+**Decision.** D-031 settled the delta *protocol* against a schema that has since
+grown, and left an illustrative example that omitted three lookup tables and two
+row types. This is the contract as built, typed in `lib/protocol.ts`, validated
+by `lib/delta.ts`, emitted by `pipeline/delta.py`, and tested across both
+languages.
+
+**1. The envelope**, JSON at brotli -q5, published as
+`deltas/<from>-<to>.json.br`:
+
+```json
+{"format":1,"schema":1,"from":1,"to":2,"generated":1767225600,
+ "notice":"CVE record content: Copyright © 1999-2026, The MITRE Corporation. …",
+ "lookups":{"cna":[[2,"globex-cna"]],"cwe":[[2,"CWE-787","OOB write"]],
+            "vendor":[[2,"globex"]],"product":[[4,2,"sprocket"]],
+            "host":[[3,"newhost.example.org"]],
+            "url":[[3,"https://newhost.example.org/x",3]],"vtype":[[2,"custom"]]},
+ "upsert":[{"id":3,"cve":"CVE-2026-1003","y":2026,"st":1,"cna":2,
+            "pub":1772323200,"upd":1772323200,"cvss":[4,9.1,4,"CVSS:4.0/AV:N"],
+            "descr":"…","cwe":[1],"prod":[4],"ref":[3],
+            "ver":[[4,1,"0",null,"4.2",2]]}],
+ "delete":[]}
+```
+
+That is a real file, trimmed — `pipeline/tests/fixture_pub.py` publishes it.
+
+- `from` is **exclusive**, `to` **inclusive**: the file applies to a database
+  whose watermark is exactly `from` and leaves it at `to`.
+- `generated` is **unix seconds**, matching the manifest. D-031's example used
+  an ISO string; two time formats in one contract is one too many.
+- Every lookup tuple is **the schema's column order**, so apply is a positional
+  insert: `cna [id,name]`, `cwe [id,cwe,descr]`, `vendor [id,name]`,
+  `product [id,vendor_id,name]`, `host [id,name]`, `url [id,url,host_id]`,
+  `vtype [id,name]`. They are emitted in that order too, which puts `vendor`
+  before `product` and `host` before `url` — the only ordering apply needs.
+- A record carries `[id, cve]` — both, because both are columns of the `cve`
+  row — plus `y`, `st`, and optional `cna`, `pub`, `upd`, `cvss`, `descr`,
+  `cwe`, `prod`, `ref`, `ver`. `cvss` is `[ver, score, sev, vector]` in
+  **stored codes** (D-047: 31 and 4 are labels, not magnitudes). `ver` is
+  `[product_id, status, version, lt, lte, vtype_id]`.
+- **Absent means absent**, never "unchanged": apply is a replacement, so an
+  omitted `cwe` deletes the record's CWE rows. An empty `descr` is refused
+  rather than treated as absent — a record with no English description has no
+  `cve_text` row at all (D-023), and an empty string would insert one.
+- `delete` carries canonical CVE IDs, not row ids: a tombstone should be
+  readable in a published file and should not depend on ID-space agreement.
+
+**2. The manifest** gains typed `deltas`, and `snapshot.rev`. Top-level `rev` is
+now the **head** revision — the newest state the data plane can reach, which is
+the last delta's `to` — while `snapshot.rev` is the snapshot's own. They are
+equal only until the first delta lands, and a client that conflated them would
+believe a fresh snapshot was current. A delta entry is
+`{from, to, bytes, raw_bytes, sha256}` and **carries no file name**: the client
+derives the URL from the two integers (`deltaUrl`), so no string out of the
+manifest ever reaches a request path. `bytes`/`sha256` describe the compressed
+file as they do for a chunk; `raw_bytes` is checked after decompression.
+
+**3. Lookup rows are selected by floor, not by a revision column.** The ID space
+is append-only and never renumbered (D-025 hazard 1), so "the lookup rows a
+client at rev N does not have" is exactly "the rows above rev N's maximum id per
+table" — seven integers per revision instead of a `rev` column on seven tables.
+D-031's range query is unchanged in effect; only its implementation gets
+cheaper. An explicit `extra` id list covers the one case a floor cannot see: a
+row whose content changed under an existing id.
+
+**4. Validation is strict, in both directions.** The client refuses an unknown
+key, a tuple of the wrong arity, a non-integer id, a delta whose `from`/`to`
+disagree with the manifest entry that named it, or a payload with no notice
+(D-008 is a condition of the grant, not decoration). The consequence is
+deliberate: **adding a field to the format is a `FORMAT_VERSION` bump**, because
+an old client refuses rather than half-understands. The pipeline fails closed
+too (D-047): an upsert naming a record the artifact does not contain, a
+reference to a lookup row the client will never receive, or a dangling id all
+abort the build rather than publish.
+
+**5. The client's bounds are the server's bounds.** The client refuses the
+*file*, not the record, so anything it will not accept has to be caught where it
+can still be fixed — a published delta cannot be withdrawn. The emitter
+therefore validates the whole payload the way the client will, field for field
+and sign for sign: CVE IDs non-empty and at most 64 characters (tombstones
+included); every integer — envelope, record scalars, nested id lists, version
+tuples, CVSS tuples, lookup row ids — inside JavaScript's safe range; row ids at
+1 or above, counts and codes non-negative, and only the two timestamps signed.
+Size checks alone were not parity: a `generated` of -1, a CVSS version of 2^60
+and a row id of 0 all passed the emitter and would each have been refused on
+arrival, taking the whole file with them. `build.py` additionally requires a
+well-formed CVE ID, using the official Record Format's own pattern
+(`^CVE-[0-9]{4}-[0-9]{4,19}$`, read from CVEProject/cve-schema on 2026-08-02 —
+a home-made narrower cap would mark valid records unusable and abort a whole
+ingest), falling back to the record's file name and refusing the record if
+neither is usable. Normalization drops a CVSS score that is not a finite float,
+converting defensively first because `math.isfinite(10**1000)` raises rather
+than answering.
+
+Each of those was a real hole, found by review and reproduced: a 300-character
+`cveId` and a 2^53+1 year both built and shipped cleanly; `"baseScore": 1e400`
+serialized as a bare `Infinity` token that `JSON.parse` rejects outright; and an
+empty tombstone was published that the client would refuse on arrival.
+
+**5a. A delta carries the revision *and* the schema its artifact is stamped
+with.** `extract` requires `meta.rev == to_rev`: without it an artifact at rev 2
+emitted a 1→999 delta, so rev-2 rows would install while the client's watermark
+jumped to 999, after which it asks for deltas that do not exist and never syncs
+again. It equally requires `meta.schema` to be present and to equal the schema
+this pipeline build produces — a schema bump cannot be bridged by a delta at all
+(the client refuses one whose schema is not its own and re-downloads, D-025), so
+emitting from an artifact built by a different pipeline version would ship rows
+in the wrong shape inside a file nobody can apply. Defaulting a missing key to 1,
+which the first version did, is a guess about the one thing that must not be
+guessed. The
+floors map is likewise all-or-nothing — every table, or an empty map from rev 0
+to bootstrap — and an `extra` id the artifact does not hold is refused rather
+than dropped, because dropping it leaves the client with stale content and no
+way to notice.
+
+**6. Delta files must tile the revision space, and the advertised head must be
+the one they reach.** architecture.md has stated the tiling invariant since M0 —
+a client at a watermark with no covering chain can never sync again — and
+nothing enforced it. One ingest run that mints a revision without publishing its
+delta would leave every client re-downloading the corpus, landing back where it
+started, and doing it again the next day. `manifest.py` now refuses to write
+such a manifest: reachability in both directions (every revision a client can
+hold has a chain to head, and every delta starts from a revision a client can be
+at), plus `rev` equal to the head those files actually reach — a manifest
+claiming rev 999 over a 1→2 chain, or over no deltas at all, tells every client
+to get somewhere nothing can take it.
+
+**7. What has been published is recorded in a ledger, not inferred.** D-047's
+immutability was enforced by `os.path.exists`, then by the manifest. Both are
+too weak, and each weakness was found by reproducing it: the filesystem forgets
+when retention deletes a file, and the manifest only ever describes the
+*current* generation, so a rotated-away delta range looked unpublished and its
+URL was freely re-cuttable with different bytes. A manifest predating
+`snapshot.rev` could not even say which revision was live.
+
+So `pipeline/ledger.py` keeps an append-only record of every published artifact
+— snapshot revisions, and each delta range with the SHA-256 of the bytes served
+at its URL. It lives **beside** the published directory (`cve.pub/published.json`,
+a peer of `cve.pub/data/`), because it is pipeline state rather than part of the
+contract and no nginx location reaches it (D-053). It seeds itself from the
+current manifest, so an origin published before it existed is covered from its
+next run rather than from a clean slate. The rules it enforces:
+
+- A snapshot revision that was ever published, or that is below the highest one,
+  is refused: a rotated-away generation was otherwise re-cuttable, rolling the
+  manifest backwards under clients that had already synced past it. `rev == head`
+  stays legal — that is the monthly rebuild landing where the deltas already are.
+- A delta range may be rewritten only with **byte-identical** content. That
+  includes `generated`: apply writes it to the client's `meta.generated`, so two
+  payloads differing only there are genuinely different content at a URL caches
+  hold for a year. Which makes one thing a requirement on the ingest rather than
+  a nicety — **`generated` must be pinned per revision**, not stamped from the
+  clock on each attempt, or no retry can ever reproduce its own bytes.
+- With that, a run that died between writing and registering is recoverable by
+  re-running the same changeset: the bytes match, the write is a no-op, and
+  `--force` is not needed. `--force` stays what it says on the tin, local
+  iteration, rather than a production recovery mechanism.
+
+**Context.** The one thing worth measuring here was whether the format is
+*sufficient* — a format can type cleanly and still lose a column. So the tests
+build snapshot N, emit the delta, apply it with a reference applier
+(`pipeline/tests/apply.py`), and compare against a freshly built snapshot N+1
+table by table: 72 pipeline tests, 88 unit tests, all green. The applier is
+test-only and the client's lands with Sync, but it is what proves the wire
+carries enough — and it pins the apply semantics in executable form, including
+the id/CVE-ID tripwire below.
+
+Sufficiency has to be tested in the *removal* direction too, which the first
+draft did not do. Every fixture change was additive, and an applier that clears
+only the sections a delta happens to carry — precisely what "absent means
+absent" forbids — passed the entire suite. It now fails: one fixture build
+strips a record's description, CWE, reference, CVSS and version rows, and the
+applied database must lose them. Assertions were checked the same way rather
+than assumed, by mutating the code they cover: dropping `cvss`, `ref` and `ver`
+from the emitter and shifting every row id used to pass the cross-language
+contract test untouched, because all of those are legitimately optional.
+
+Two findings came out of building it:
+
+- **A rebuild renumbers, and it is easy to trip.** The fixture originally added
+  a product named `gadget` to an existing record; because
+  `normalize.projection` sorts each record's products, `gadget` interned ahead
+  of the existing `gizmo`, which moved from id 2 to 3 — and delta apply then
+  wrote the new record's rows against the wrong product. Renaming it `zephyr`
+  fixed the fixture. It happened a second time while adding the removal-direction
+  test: stripping the *first* record's sections moved CWE-79 behind CWE-787,
+  because the next record to use a value inherits the id when the first one
+  stops. Nothing catches either case — the id/CVE-ID tripwire covers `cve` rows
+  only, and a drifted *lookup* id silently resolves to the wrong vendor or
+  product. Seeding (M2's next task) is the fix, not a mitigation, and it must
+  cover `cve.id` as well as the seven lookups: `cve.id` is a bare walk counter
+  today, so adding one record renumbers every record after it.
+- **`INSERT OR REPLACE` would hide that silently**, so apply must not use it for
+  `cve` rows. If a delta says CVE-X is row 7 and the local database says row 4,
+  the ID space has drifted and the only safe move is to stop and rebuild. The
+  contract therefore *requires* apply to verify the id/CVE-ID pairing **in both
+  directions** before writing. One direction is not enough, and review found the
+  gap: checking only CVE→id let an upsert for a CVE the client had never seen,
+  at a row id it had already given to a different record, delete that record
+  with no error and no orphan to notice it by — a silent undercount, which is
+  what vision criterion 7 exists to prevent.
+- **A delta is a step from one revision, not a patch that fits anywhere.** Apply
+  must refuse a file whose `from` is not the local watermark; without that,
+  replaying an old delta rewinds `meta.rev` and writes rows against a state they
+  were never computed from. Row-level idempotence (D-031) is about *retrying the
+  same step*, which a rolled-back transaction leaves safe.
+
+**Consequences.** `Manifest.deltas: unknown[]` is gone; `planSync` picks the
+chain — `[]` when current, `null` when no chain exists and only a re-download is
+honest, a throw when the manifest contradicts itself. The search is
+breadth-first rather than greedy longest-first: greedy fails the very case that
+motivated it (given 1→3, 1→2 and 2→4 with head 4 it takes the long hop,
+dead-ends, and reports a 63 MB re-download while a two-file chain exists), so
+the rollup claim below is only true because the search is complete.
+
+`publish.py` now writes `snapshot.rev`, and keeps a previous generation's delta
+entries only when they start **at or after** the new snapshot's revision.
+Keeping every entry whose file existed — the first attempt — helped nobody: a
+delta below the new snapshot belongs to the generation being replaced, no chain
+reaches head through it, and in one configuration it left a *freshly downloaded*
+client with no chain out of its own snapshot, re-downloading forever. Retention
+across a rotation therefore needs a bridging delta from the old head to the new
+snapshot's revision, which needs seeded interning; until then a client one
+generation back re-downloads, and the manifest says so honestly.
+
+`snapshot.rev` is typed optional, because the generation live today does not
+have it: `assertUsable` deliberately does not require it, so a client can still
+download from an origin that has not republished. Reading it goes through
+`snapshotRev`, which names that as the problem instead of reporting an
+undefined watermark. `chunkUrl` now validates the snapshot path and chunk name
+against the shapes `publish.py` writes, so "no string out of the manifest
+reaches a request path" is true of the whole data plane rather than of deltas
+alone.
+
+Nothing in the client fetches or applies a delta yet — that is M2's
+Download/Sync work, which this contract exists to unblock.
+
+One correction to an earlier entry: D-047 says a `--force` republish "swaps via
+rename so there is still no window". There is a window — Linux has no portable
+atomic directory swap — so a client fetching a chunk in that instant gets a 404
+and retries. `--force` remains local-iteration only, and the comment in
+`publish.py` now says what actually happens.
+
+**Reopen if.** Deltas grow large enough that whole-record replacement stops
+paying (D-031's reopen condition, unchanged), a schema addition needs a new row
+type (that is a `FORMAT_VERSION` bump by construction), or rollup files become
+worth publishing — `planSync` searches for a chain rather than assuming one, so
+the format would not have to change, only the pipeline.
+
+One addition is worth deciding *before* anything is deployed against
+`FORMAT_VERSION` 1, because strict validation makes every later field a bump:
+an **ID-space generation marker** in the envelope and in `DeltaEntry`. Today a
+delta built against a renumbered ID space is caught deep inside apply, by the
+tripwire, and only for `cve` rows; a generation marker would make "this delta is
+not for your copy" a first-class refusal before a single row is written. It is
+not added here because the value depends on how the ingest ends up recording
+generations (M2's next two tasks), and guessing that shape now would be the
+kind of speculative field this format is deliberately strict about.
+
 ## D-054: Cached assets revalidate — `no-cache` for the unversioned SQLite distribution, and the service worker is network-first  (2026-08-01, status: accepted, owner decision; refines D-048)
 
 **Decision.** Two halves of one rule: **a cached copy never wins over a

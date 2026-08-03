@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from datetime import datetime
 from typing import Any
@@ -28,6 +29,25 @@ VERSION_STATUS = {"affected": 1, "unaffected": 2, "unknown": 3}
 CVSS_KEYS = (("cvssV4_0", 4), ("cvssV3_1", 31), ("cvssV3_0", 30), ("cvssV2_0", 2))
 
 _HOST = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://([^/?#]*)")
+
+# The canonical CVE ID shape, copied from the official CVE Record Format's own
+# `cveId` pattern -- `^CVE-[0-9]{4}-[0-9]{4,19}$`, read from
+# CVEProject/cve-schema on 2026-08-02. Do not tighten it: a home-made 12-digit
+# cap would mark valid 13-19 digit records unusable and abort a whole ingest
+# (D-047 fails the build closed).
+#
+# It is a *bound* rather than pedantry: `cveId` is publisher-supplied text
+# (rule 5), and an unbounded one flows into the published database, every delta
+# that touches the record, and the client's wire validator -- which caps it, so
+# one 300-character id would make every client reject every delta carrying it,
+# forever. Measured, not predicted: a record with a 300-digit id built and
+# shipped cleanly before this existed. At the schema's maximum an id is 28
+# characters, comfortably inside the wire format's 64.
+_CVE_ID = re.compile(r"^CVE-[0-9]{4}-[0-9]{4,19}$")
+
+
+def valid_cve_id(value: Any) -> bool:
+    return isinstance(value, str) and _CVE_ID.match(value) is not None
 
 
 def _dicts(value: Any) -> list[dict]:
@@ -61,6 +81,24 @@ def containers(record: dict) -> tuple[dict, list[dict]]:
     return (cna if isinstance(cna, dict) else {}), _dicts(node.get("adp"))
 
 
+def _score(value: Any) -> float | None:
+    """A CVSS base score we can store and serialize, or None.
+
+    Two ways this goes wrong, both reachable from a hostile record (rule 5):
+    `1e400` parses to `inf`, which `json.dumps` writes as a bare `Infinity`
+    token no browser's JSON parser accepts; and `10**1000` is a perfectly legal
+    JSON integer that cannot become a float at all, so even asking
+    `math.isfinite` about it raises. Convert first, defensively, then check.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
 def cvss(cna: dict, adp: list[dict]) -> tuple[int, float | None, int | None, str] | None:
     """Highest-priority CVSS across cna and adp, or None.
 
@@ -76,12 +114,11 @@ def cvss(cna: dict, adp: list[dict]) -> tuple[int, float | None, int | None, str
                 if not isinstance(block, dict):
                     continue
                 if best is None or preference < best[0]:
-                    score = block.get("baseScore")
                     best = (
                         preference,
                         (
                             version,
-                            float(score) if isinstance(score, (int, float)) else None,
+                            _score(block.get("baseScore")),
                             SEVERITY.get(_text(block.get("baseSeverity")).upper()),
                             _text(block.get("vectorString")),
                         ),
@@ -151,7 +188,12 @@ def projection(record: dict, fallback_id: str) -> dict:
     meta = meta if isinstance(meta, dict) else {}
     cna, adp = containers(record)
 
-    cve_id = _text(meta.get("cveId")) or fallback_id
+    # The record's own id when it is well-formed, otherwise the file name it
+    # was read from — which `build.record_paths` already constrained to
+    # `CVE-*.json`. A record that satisfies neither is refused by `build.py`
+    # rather than stored under a name we cannot trust.
+    claimed = _text(meta.get("cveId"))
+    cve_id = claimed if valid_cve_id(claimed) else fallback_id
     try:
         year = int(cve_id.split("-")[1])
     except (IndexError, ValueError):

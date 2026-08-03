@@ -18,6 +18,7 @@ function manifest(overrides: Partial<Manifest> = {}): Manifest {
     notice: 'CVE® is a trademark of The MITRE Corporation.',
     snapshot: {
       path: 'snapshot-1',
+      rev: 1,
       raw_bytes: 51_871_744,
       chunk_bytes: 33_554_432,
       chunks: [
