@@ -27,17 +27,19 @@ On top of that database sits an AI analyst. A free-form chat box turns
 plain-language questions — *"stacked count of CVEs by severity over time, for
 this vendor"* — into local queries and drives the same charts, clickable lists,
 and drill-downs the deterministic UI offers; every answer is backed by queries
-you can inspect, edit, and re-run without the model (D-044). By default the
-model itself runs in your browser, downloaded once like the corpus, so even the
-AI never leaves your machine and works offline. Optionally, a user-supplied API
-key routes chat to a hosted model instead — Gemini (whose Pro/Ultra
-subscription quota rides the ordinary API key), OpenRouter, Anthropic, or
-OpenAI, each adapter shipping only after its browser-direct path is verified
-(D-045). That is the one explicit, opt-in
-exception to "never sent anywhere": your question and the query results behind
-it go directly from your browser to that provider, on your own account and key,
-and still never through this server (D-045). Chat is an additional way to drive
-the app, never the only one — everything works with no model configured.
+you can inspect, edit, and re-run without the model (D-044). The first model
+tier is one we host: a model on our own hardware, reached through a restricted
+same-origin endpoint — no key, no setup, and the one tier where your question
+and the query results behind it transit this server, disclosed before first
+use and stored nowhere (D-057). The later tiers restore the stronger claims: a
+model that runs in your browser, downloaded once like the corpus, so even the
+AI never leaves your machine and works offline; and a user-supplied API key
+routing chat to a hosted model — Gemini (whose Pro/Ultra subscription quota
+rides the ordinary API key), OpenRouter, Anthropic, or OpenAI, each adapter
+shipping only after its browser-direct path is verified, your question going
+straight from your browser to that provider on your own account and key, never
+through this server (D-045). Chat is an additional way to drive the app, never
+the only one — everything works with no model configured.
 
 ## Who it's for
 
@@ -109,15 +111,18 @@ a regression is visible.
    asked. Analysis — filtering, aggregation, ranking, search — runs entirely on
    the client. D-014 permits requests to name fields and partitions; D-025
    removed even that, so the server learns nothing about the query at all.
-   The AI layer adds two further request kinds, both user-initiated and both
-   bypassing this server entirely: model-weight downloads from Hugging Face,
-   and — only when the user supplies a key — chat traffic direct to their
-   chosen provider (D-045). Neither ever reaches cve.meenan.dev.
+   The AI layer adds further request kinds, all user-initiated. One is
+   same-origin: chat on the site-hosted tier posts the question and its tool
+   results to this server's chat relay, which forwards them to our own model
+   and stores nothing — disclosed before first use, and still visible in the
+   network panel (D-057). The rest bypass this server entirely: model-weight
+   downloads from Hugging Face, and — only when the user supplies a key —
+   chat traffic direct to their chosen provider (D-045).
 5. **It works offline, fully.** Once downloaded, the client holds the entire
    corpus (D-025), so search, analysis, and reporting all work with the network
    disconnected. Only Download, Sync, and the optional model-weight download
-   need it — hosted-model chat is the one feature that inherently requires the
-   network (D-045).
+   need it — chat on the site-hosted or BYO-key tiers is the one feature that
+   inherently requires the network (D-045, D-057).
 6. **Reports are shareable without the data being shareable.** A user can hand
    someone a query or report definition that reproduces the analysis on their
    own local copy, and separately export result sets in a standard format —
@@ -157,11 +162,13 @@ a regression is visible.
   NVD enrichment were rejected (D-010): each adds a fetch path, a license
   question, and a recurring sync problem to a tool whose pitch is not needing
   the network.
-- **Not a hosted AI service.** No inference runs on this server, no model
-  traffic is proxied through it, and no shared or bundled API key exists.
-  Hosted models are the user's own key and account, called browser-direct
-  (D-045) — and consumer-subscription OAuth passthrough is out permanently
-  where providers forbid it.
+- **Not a third-party AI gateway.** The one inference path this project
+  operates is its own model on its own hardware, behind a same-origin endpoint
+  pinned to that single model, storing nothing (D-057). No third-party model
+  traffic is proxied through this server and no shared or bundled API key
+  exists. Hosted providers are the user's own key and account, called
+  browser-direct (D-045) — and consumer-subscription OAuth passthrough is out
+  permanently where providers forbid it.
 - **Nothing is collected from users.** No telemetry, no analytics, no error
   reporting, not even opt-in (D-009). The tradeoff is accepted knowingly: we are
   blind to production failures, and the diagnostics panel exists so users can

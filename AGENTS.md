@@ -6,12 +6,15 @@ records and growing — with a planned AI chat layer (M7/M8) that turns
 plain-language questions into local queries (D-044). The entire data plane runs
 in the browser: the corpus is normalized server-side into a ~63 MB compressed
 SQLite database, downloaded on demand into OPFS, and queried locally — so no
-search or report ever leaves the client. By default the model runs in the
-browser too; the one opt-in exception is a user-supplied hosted-model key,
-which sends chat traffic browser-direct to that provider (D-045). The server
-serves the snapshot and its deltas as static files and performs no analysis and
-no inference. Almost all code is written by AI agents working from the project
-documentation, directed and reviewed by a human.
+search or report ever leaves the client. Chat is the opt-in exception: the
+first model tier is an Ollama instance we host, reached through a restricted
+same-origin relay (D-057), with in-browser models and user-supplied hosted-model
+keys (chat traffic browser-direct to that provider, D-045) following. The
+server serves the snapshot and its deltas as static files and performs no
+analysis — the D-057 chat relay is its one dynamic endpoint, and it forwards
+chat to our own model without storing anything. Almost all code is written by
+AI agents working from the project documentation, directed and reviewed by a
+human.
 
 **Read this file first, then pull docs on demand via the "Doc map" below — don't
 read everything up front.** This file is long-term project memory and the
@@ -35,10 +38,13 @@ affected docs. Until then, these govern.
   D-032)
 - **The AI tool surface is read-only and render-only, permanently.** CVE text
   flows into LLM prompts, so injection is assumed: no tool may fetch a URL,
-  write data, or reach the network. Hosted models are the user's own key —
-  stored client-side, called browser-direct, never proxied; no bundled key, and
-  no consumer-subscription OAuth where providers forbid it (none is sanctioned
-  today). (D-044, D-045)
+  write data, or reach the network. The first model tier is site-hosted: our
+  own Ollama on the private `llm` box, relayed through a restricted
+  same-origin endpoint that pins the model, stores nothing, and logs no bodies
+  (D-057). Third-party hosted models are the user's own key — stored
+  client-side, called browser-direct, never proxied; no bundled key, and no
+  consumer-subscription OAuth where providers forbid it (none is sanctioned
+  today). (D-044, D-045, D-057)
 - **Nothing is collected from users — no telemetry, ever.** Not analytics, not
   error reporting, not opt-in. This makes the privacy claim verifiable in a
   network panel rather than a promise. Do not add a reporting channel; improve
@@ -46,11 +52,12 @@ affected docs. Until then, these govern.
 - **The data plane is static files, and no request handler stands in it.** The
   snapshot, manifest, deltas, and KEV catalog are pre-built files served by
   nginx from `cve.pub/data/`, a peer of the document root — nothing under
-  `cve.data/` is web-reachable (D-053); the client sends no parameters. Adding a dynamic
-  endpoint is a constraint change: it must serve derived CVE data and nothing
-  else, must never accept a caller-supplied URL, path, or ref that reaches the
-  filesystem or network, and must be same-origin-restricted and rate-limited.
-  (D-006, D-032)
+  `cve.data/` is web-reachable (D-053); the client sends no parameters. The
+  one dynamic endpoint is D-057's chat relay, which sits outside the data
+  plane and follows D-006's rules: it never accepts a caller-supplied URL,
+  path, or ref that reaches the filesystem or network, and it is
+  same-origin-restricted and rate-limited. Adding any other dynamic endpoint
+  is a constraint change. (D-006, D-032, D-057)
 - **The git clone lives on the server, never in the browser.** cvelistV5 is
   ~2.4 GB and every GitHub bulk-download path is CORS-blocked, so in-browser git
   is out. The server maintains the clone and derives baselines and deltas from
@@ -151,6 +158,9 @@ full-corpus Download and Sync with staged replacement. Two tasks are done — th
 delta wire contract is final, typed, emitted and contract-tested (D-055), and
 the interned ID space is now stable across rebuilds, with retirement, recorded
 high-water marks and a named lineage the publishers check (D-056) — and the
-daily ingest cron is next. M0 closed with scope, architecture, schema
+daily ingest cron is next. A 2026-08-03 owner decision re-ordered the AI
+ladder: the first model tier is a site-hosted Ollama behind a restricted
+same-origin chat relay, re-scoping M7 and M8 (D-057). M0 closed with scope,
+architecture, schema
 and the delivery protocol settled and measured (D-001 – D-043). Keep this
 paragraph current when plan.md milestone status changes (rule 6).

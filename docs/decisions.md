@@ -23,6 +23,100 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-057: The first AI tier is a model we host — Ollama behind a restricted same-origin endpoint  (2026-08-03, status: accepted, owner decision; re-orders D-045's ladder and narrows its "never proxied" to third-party traffic; adds the first dynamic endpoint, outside the data plane, under D-006's rules)
+
+**Decision.** The first model tier to ship is self-hosted: an Ollama instance
+on the project's private network at `http://llm:11434/`. The `llm` hostname is
+configured in hosts on both the dev and production machines, so it can be named
+in the repo without per-machine configuration; the box is not publicly
+routable. Browsers reach it through a new **same-origin API endpoint** on
+`cve.meenan.dev` that exposes only the operations the chat loop needs — chat
+completion against a server-pinned model, streamed — and none of the rest of
+Ollama's API: no model management, no pull, no embeddings, and no
+caller-supplied model name, URL, host, or path. Which model is pinned is server
+configuration, not client input; today it is `gemma4:e4b` (8.0B parameters,
+Q4_K_M — verified 2026-08-03 by `GET http://llm:11434/api/tags` from the dev
+machine, reporting the `tools` and `thinking` capabilities the D-044 chat loop
+needs).
+
+The rest of D-044 is untouched: tools still execute in the browser against
+local SQLite, the model orchestrates through tool calls that round-trip through
+the browser, and the tool surface stays read-only and render-only. The server
+relays inference; it gains no query capability and holds no chat state. The
+corpus data plane is exactly as static as D-032 left it.
+
+The other tiers ship later, not never — D-045's ladder is re-ordered, not
+replaced. In-browser local models and BYO-key hosted adapters (each still
+browser-direct, keys client-side, never proxied) follow once the chat layer is
+proven against this endpoint.
+
+**Context.** Owner decision (2026-08-03). D-045 ordered the ladder local-first
+and rejected server-side inference and proxying entirely; features.md carried
+"server-side inference or model proxying — rejected." But building against
+that ladder means every early chat-layer test rides either a multi-gigabyte
+WebGPU download or a user-supplied key with per-provider CORS quirks (RE-010).
+A model we host gives development and the D-046 benchmark one consistent,
+always-available endpoint with minimal client requirements — no key, no
+WebGPU, no weight download — and gives every visitor a working chat tier on
+hardware we control.
+
+The plan previously argued for proving the chat loop against strong hosted
+models first, so tool-surface bugs are never mistaken for model-quality
+problems. An 8B quant is not that, and the conflation risk is accepted
+knowingly: the D-046 benchmark exists precisely to separate the two (scoring is
+data comparison against ground truth, not impressions), and a BYO-key frontier
+model can be exercised during development for disambiguation before its adapter
+ships.
+
+**Consequences.**
+
+- **The privacy story changes shape and must be told honestly.** With this
+  tier selected, the user's question and the tool results the model asks for
+  transit our server and our LLM box — the first feature where
+  analysis-related content reaches infrastructure we operate. It is bounded
+  the same way D-045 bounded hosted keys: opt-in per tier, with a first-use
+  disclosure that now names us; nothing is sent until the user asks a question
+  with this tier chosen; the deterministic UI — and later the local tier —
+  keep the full never-leaves-your-machine claim. This is user-initiated
+  feature traffic, not telemetry, so D-009 is untouched — and the endpoint
+  keeps nothing: no chat storage, no request-body logging; access logs record
+  that the endpoint was hit, not what was asked. Vision criterion 4's
+  network-panel check gains one more user-initiated request kind and stays
+  checkable.
+- **The first dynamic endpoint, under D-006's rules.** AGENTS.md's data-plane
+  constraint said a dynamic endpoint must serve derived CVE data and nothing
+  else; this one serves none, so that clause is amended by this entry — the
+  deliberate change the constraint demands. What survives in full: no
+  caller-supplied URL, path, or ref reaches the filesystem or network — the
+  upstream target and model are fixed server-side; same-origin restricted in
+  the D-034 style (no CORS headers); POST-only with a capped body; and
+  rate-limited and concurrency-capped, because the GPU box serves one small
+  model and an unauthenticated relay to free inference is an attractive
+  target. Absence-of-CORS stops cross-site browsers, not `curl`, so nginx
+  `limit_req`/`limit_conn` on this location are a ship requirement, not a
+  nicety — and the origin is not behind Cloudflare until M5, which lands
+  before this endpoint does.
+- **Plan re-scope.** M7 becomes: chat surface, tool surface, this endpoint,
+  and the D-046 benchmark against the pinned model. BYO-key adapters join the
+  in-browser local tier in M8. The `gemma4:e4b` scorecard is what sets honest
+  expectations for this tier and what tool-surface iteration is measured
+  against.
+- **Implementation shape lands in M7, not here.** PHP 8.4 is the stack's
+  sanctioned dynamic path (D-003 routes `.php`), and streaming a response
+  through php-fpm's output buffering is a known sharp edge to verify before
+  committing to it. If PHP cannot stream cleanly, the alternative is a
+  decision entry, not drift.
+- **The box and its model are operational configuration.** Swapping the pinned
+  model (say, after a D-046 result) or moving the box is not a new decision so
+  long as the endpoint's restrictions hold and the hostname stays private.
+
+**Reopen if.** Abuse of the public endpoint outruns the nginx limits (the
+options, in order: Cloudflare rules in front, a lightweight same-origin token,
+gating the tier); the D-046 scorecard shows the pinned model cannot drive the
+tool surface (a stronger model on the same box is configuration; conceding the
+tier is a decision); or operating the box stops being worth it once the local
+and BYO-key tiers exist.
+
 ## D-056: Stable interned IDs — seeded builds, retirement, recorded high-water marks, and a named ID space  (2026-08-02, status: accepted, implements D-025 hazard 1; makes D-055's floors sound)
 
 **Decision.** Every build continues the previous build's ID space or explicitly
@@ -1142,7 +1236,7 @@ is supposed to handle.
 external tool schemas and corpora, at which point running ours there might
 avoid duplicate harness maintenance.
 
-## D-045: Model providers — a local-first ladder with user-supplied keys, and no subscription OAuth  (2026-08-01, status: accepted, amends the consequences of D-009 and D-016)
+## D-045: Model providers — a local-first ladder with user-supplied keys, and no subscription OAuth  (2026-08-01, status: accepted, amends the consequences of D-009 and D-016; ladder re-ordered by D-057 — a site-hosted Ollama tier ships first, and "never proxied" now scopes to third-party traffic)
 
 **Decision.** The chat layer (D-044) offers providers as an explicit ladder,
 best-default first:
@@ -1890,7 +1984,7 @@ one of the excluded sections; or browser measurement (Q-003) shows 95 MB is over
 budget, in which case the cheapest 23 MB to give back is references, and the
 D-024 hybrid — structured first, text later — is the next lever after that.
 
-## D-032: The whole data plane is static files — the sync path has no dynamic endpoint  (2026-07-31, status: accepted, amends D-006)
+## D-032: The whole data plane is static files — the sync path has no dynamic endpoint  (2026-07-31, status: accepted, amends D-006; D-057 later adds the first dynamic endpoint *outside* the data plane — the chat relay — while the sync path stays static)
 
 **Decision.** Everything the browser fetches is a static file served by nginx: the
 snapshot, the manifest, every delta, and the KEV catalog. The client sends no

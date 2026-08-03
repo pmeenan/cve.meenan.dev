@@ -374,56 +374,75 @@ researched in D-010.
 travels with the data; KEV status is a queryable, filterable attribute; its
 staleness is surfaced separately from the corpus's.
 
-## M7 — AI chat layer: tool surface, hosted providers, benchmark  `pending`
+## M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `pending`
 
-The chat loop proven with strong models first, so tool-surface problems are
-never mistaken for model-quality problems. Depends on M4's report definitions
-and, for the KEV tool, on M6.
+The chat loop proven against one consistent, always-available tier first — the
+Ollama instance we host (D-057) — so the tool surface can be developed and
+benchmarked with minimal client requirements: no key, no WebGPU, no weight
+download. Depends on M4's report definitions and, for the KEV tool, on M6. The
+risk this ordering accepts — an 8B model's failures being mistaken for
+tool-surface bugs — is recorded in D-057; the D-046 benchmark and a dev-only
+frontier-key spot check are the mitigations.
 
 Scope: the chat surface; the read-only tool surface over report definitions —
-curated high-level tools plus the `SELECT`-only SQL tool (D-044); provider
-adapters for user-supplied keys — Gemini, OpenRouter, Anthropic, OpenAI — with
-keys stored client-side only and in-browser CORS verified per provider
-(D-045, RE-010); the consent surface: a first-use, per-provider disclosure of
-exactly what leaves the browser (the question and the tool results it
-triggers), key storage with a visible clear action, and CSP `connect-src`
-pinned to the enabled providers so the network boundary is enforced by the
-platform, not by discipline; the D-046 benchmark harness with ground-truth
-questions, the owner's severity-over-time question first.
+curated high-level tools plus the `SELECT`-only SQL tool (D-044); the
+**same-origin chat endpoint** relaying to Ollama at `http://llm:11434/` —
+server-pinned model (`gemma4:e4b` today), chat completion as the only exposed
+operation, streamed, POST-only with a capped body, nginx rate and concurrency
+limits, no chat storage and no request-body logging (D-057), with the
+php-fpm streaming question settled by experiment before the implementation is
+committed; the consent surface: a first-use disclosure that on this tier the
+question and its tool results transit `cve.meenan.dev` and our model host, and
+that nothing is stored; CSP `connect-src` pinned — for this tier, to the
+origin itself; the D-046 benchmark harness with ground-truth questions, the
+owner's severity-over-time question first, scored against the pinned model.
 
-**Exit criteria:** with a hosted key, the founding question — stacked CVE
-counts by severity over time, all products and per-product (D-046 benchmark
-item #1) — is answered end-to-end through chat, rendering via the fixed UI
-with the backing queries inspectable; the benchmark runs against at least two
-hosted providers and produces a scorecard; every provider adapter that ships
-passes an in-browser key round-trip and CORS check (adapters that fail
-verification are cut from the release, not shipped hopeful); a network-panel
-check confirms chat traffic goes only browser → provider and keys never reach
-`cve.meenan.dev`;
-and an adversarial pass feeds hostile records — markup, injection payloads,
-hostile URLs — through the chat path and shows containment: nothing beyond
-the read-only tool surface is reachable, and no record-supplied markup or URL
-renders outside the fixed UI's existing treatment.
+**Exit criteria:** the founding question — stacked CVE counts by severity over
+time, all products and per-product (D-046 benchmark item #1) — is answered
+end-to-end through chat on the site-hosted tier, rendering via the fixed UI
+with the backing queries inspectable; the benchmark runs against the pinned
+model and produces a scorecard; a network-panel check confirms chat traffic
+goes only browser → `cve.meenan.dev` → `llm`, and nothing else leaves the
+browser; the endpoint refuses cross-origin browser callers, oversized bodies,
+and any operation but its one, with its rate and concurrency limits verified
+against the live origin; and an adversarial pass feeds hostile records —
+markup, injection payloads, hostile URLs — through the chat path and shows
+containment: nothing beyond the read-only tool surface is reachable, and no
+record-supplied markup or URL renders outside the fixed UI's existing
+treatment.
 
-## M8 — Local model tier  `pending`
+## M8 — Other model tiers: BYO keys and in-browser local  `pending`
 
-The differentiator: AI analysis that never leaves the machine. Gated on M7's
-benchmark, which is what selects the model.
+The differentiator ships here — AI analysis that never leaves the machine —
+plus hosted models on the user's own key (both moved after the site-hosted
+tier by D-057). Gated on M7's benchmark harness, which is what selects the
+local model and sets per-tier expectations.
 
-Scope: in-browser inference (WASM/WebGPU) with weights downloaded from Hugging
-Face into OPFS on explicit user action, lifting webai's acquisition and runtime
-plumbing as prior art; Chrome built-in Gemini Nano via the Prompt API as the
-zero-setup tier; capability gating for the local tier above the D-016 base
-floor; benchmark-driven model shortlist with weight licenses checked
-deliberately (D-045, D-046); and the storage story for multi-gigabyte weights —
-quota, eviction, and the guarantee that a weight download can never evict the
-corpus (weights are D-013-style rebuildable cache).
+Scope: provider adapters for user-supplied keys — Gemini, OpenRouter,
+Anthropic, OpenAI — keys stored client-side only, traffic browser-direct and
+never proxied, in-browser CORS verified per provider before an adapter ships
+(D-045, RE-010), each with the first-use per-provider disclosure, key storage
+with a visible clear action, and CSP `connect-src` widened only to enabled
+providers; in-browser inference (WASM/WebGPU) with weights downloaded from
+Hugging Face into OPFS on explicit user action, lifting webai's acquisition
+and runtime plumbing as prior art; Chrome built-in Gemini Nano via the Prompt
+API as the zero-setup tier; capability gating for the local tier above the
+D-016 base floor; benchmark-driven model shortlist with weight licenses
+checked deliberately (D-045, D-046); and the storage story for multi-gigabyte
+weights — quota, eviction, and the guarantee that a weight download can never
+evict the corpus (weights are D-013-style rebuildable cache).
 
-**Exit criteria:** a shortlisted local model answers the benchmark's core
-questions correctly with the network disconnected (corpus and weights already
-local); Gemini Nano works where Chrome offers it and degrades honestly where
-it does not; an unsupported browser is told at the gate, not mid-download; the
-benchmark scorecard for local candidates is recorded and the default model
-choice is justified from it; and the storage guarantee is tested, not assumed —
-a weight download into a nearly-full quota fails cleanly with the corpus
-intact (weights are D-013-style rebuildable cache, D-045).
+**Exit criteria:** with a hosted key, benchmark item #1 is answered end-to-end
+through at least two hosted providers, each producing a scorecard; every
+provider adapter that ships passes an in-browser key round-trip and CORS check
+(adapters that fail verification are cut from the release, not shipped
+hopeful); a network-panel check confirms BYO-key chat traffic goes only
+browser → provider and keys never reach `cve.meenan.dev`; a shortlisted local
+model answers the benchmark's core questions correctly with the network
+disconnected (corpus and weights already local); Gemini Nano works where
+Chrome offers it and degrades honestly where it does not; an unsupported
+browser is told at the gate, not mid-download; the benchmark scorecard for
+local candidates is recorded and the default model choice is justified from
+it; and the storage guarantee is tested, not assumed — a weight download into
+a nearly-full quota fails cleanly with the corpus intact (weights are
+D-013-style rebuildable cache, D-045).

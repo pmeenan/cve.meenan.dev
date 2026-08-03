@@ -90,9 +90,10 @@ as of the 2026-07-30 triage** — additions go through the decision log.
 
 ## AI chat layer
 
-Added 2026-08-01 (D-044, D-045, D-046). Chat augments the deterministic UI and
-never replaces it: every surface below works with no model configured, and the
-model drives the same report definitions the fixed UI renders.
+Added 2026-08-01 (D-044, D-045, D-046); tier order revised 2026-08-03 (D-057).
+Chat augments the deterministic UI and never replaces it: every surface below
+works with no model configured, and the model drives the same report
+definitions the fixed UI renders.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
@@ -101,14 +102,15 @@ model drives the same report definitions the fixed UI renders.
 | Model orchestrates, never transcribes | `confirmed` | D-044. Aggregates may enter model context; row sets travel as handles rendered straight from SQLite. Numbers come from queries, never token sampling. |
 | Curated high-level query tools (search, aggregate, CVE detail, KEV) | `confirmed` | D-044. Tight schemas sized for small local models. |
 | `SELECT`-only SQL tool for capable models | `confirmed` | D-044. Row-capped, timed out; schema documented in the system prompt. |
-| Local in-browser model as the default (WASM/WebGPU, weights in OPFS) | `confirmed` | D-045. Explicit download, like the corpus; private and offline. Selection gated on the D-046 benchmark. |
-| Chrome built-in Gemini Nano tier (Prompt API) | `confirmed` | D-045. Zero setup — no key, no multi-GB download. Integrated and verified in webai (checked 2026-08-01). |
-| BYO API key: Gemini, OpenRouter, Anthropic, OpenAI | `confirmed` | D-045. Keys client-side only; traffic browser → provider, never via this server. Each adapter ships only after in-browser CORS verification (RE-010); Gemini's subscription quota rides the ordinary key. |
+| Site-hosted model tier — Ollama behind a restricted same-origin endpoint | `confirmed` | D-057. **First tier to ship (M7).** Server-pinned model (`gemma4:e4b` today), chat completion only, rate- and concurrency-limited, nothing stored, no body logging. The question and tool results transit our server — disclosed at first use. |
+| Local in-browser model as the intended default (WASM/WebGPU, weights in OPFS) | `confirmed` | D-045. Explicit download, like the corpus; private and offline. Selection gated on the D-046 benchmark; ships in M8, after the site-hosted tier (D-057). |
+| Chrome built-in Gemini Nano tier (Prompt API) | `confirmed` | D-045. Zero setup — no key, no multi-GB download. Integrated and verified in webai (checked 2026-08-01). M8. |
+| BYO API key: Gemini, OpenRouter, Anthropic, OpenAI | `confirmed` | D-045. Keys client-side only; traffic browser → provider, never via this server. Each adapter ships only after in-browser CORS verification (RE-010); Gemini's subscription quota rides the ordinary key. M8. |
 | Capability tiering above the D-016 floor | `confirmed` | D-045. Base app keeps the D-016 floor; local tier gated on WebGPU/memory, feature-detected. |
 | Tool-calling benchmark and per-model scorecard | `confirmed` | D-046. Ground-truth questions scored by data comparison in Playwright against the real corpus; no LLM judge. |
 | Network, write, or URL-fetch tools for the model | `rejected (D-044)` | CVE text is attacker-influenced input to the prompt; the tool surface is read-only and render-only, permanently. |
 | Consumer-subscription OAuth passthrough | `rejected (D-045)` | Anthropic bans it outright (2026-04-04); risks users' accounts. Google needs no passthrough — quota attaches to the ordinary key. |
-| Server-side inference or model proxying | `rejected (D-045)` | Would forfeit the privacy claim and add the first dynamic endpoint (D-032). |
+| Third-party model proxying, or a bundled provider key | `rejected (D-045)` | Hosted-provider traffic is browser-direct on the user's own key, never via this server. The blanket "no server-side inference" rejection was narrowed by D-057: the site-hosted tier relays to our own model on our own hardware, and nothing else. |
 
 ## Enrichment overlays
 

@@ -59,7 +59,9 @@ Each is backed by a decision entry and is not up for casual revision.
   which is what makes same-origin enforcement meaningful. The AI layer's two
   cross-origin exceptions — model-weight downloads and user-keyed hosted-model
   calls — are explicit user actions that never carry corpus requests and never
-  touch this origin's data plane. (D-003, D-006, D-045)
+  touch this origin's data plane; its one same-origin addition, the D-057 chat
+  relay, sits outside the data plane and never serves corpus data. (D-003,
+  D-006, D-045, D-057)
 - **Record content is untrusted input.** CVE text is attacker-influenced and
   crosses a trust boundary at parse time, at SQL time, and at render time.
   (AGENTS.md rule 5)
@@ -327,11 +329,11 @@ hand its id to a different value (D-056).
   what keeps results honest — it replaces the coverage tracking that bulk import
   made unnecessary.
 
-## The AI layer (planned — M7/M8, D-044 – D-046)
+## The AI layer (planned — M7/M8, D-044 – D-046, D-057)
 
 Sits entirely above the client described previously; the data plane below it is
 unchanged, and the two Fixed points it touches — one origin, upstream sources —
-carry their D-045 annotations above. Detail lands here when the layer is
+carry their D-045/D-057 annotations above. Detail lands here when the layer is
 built — these are the structural commitments:
 
 - **Chat drives the fixed UI through report definitions.** The model's
@@ -351,11 +353,18 @@ built — these are the structural commitments:
   model-authored HTML, markdown, or URLs; chat prose renders as plain text,
   and record URLs appear only through the fixed UI's existing
   never-auto-fetched treatment.
-- **Provider ladder (D-045):** local WASM/WebGPU model (default; weights from
-  Hugging Face into OPFS on explicit action) → Chrome built-in Gemini Nano →
-  user-supplied keys for Gemini / OpenRouter / Anthropic / OpenAI, called
-  browser-direct. Keys live client-side only. `cve.meenan.dev` serves no
-  inference and proxies no model traffic.
+- **Provider ladder (D-045, re-ordered by D-057):** first to ship is the
+  **site-hosted tier** — Ollama on the private `llm` box (`http://llm:11434/`,
+  hostname in hosts on dev and prod, not publicly routable), relayed through a
+  restricted same-origin endpoint: server-pinned model (`gemma4:e4b` today),
+  chat completion as the only exposed operation, POST-only, body-capped, nginx
+  rate- and concurrency-limited, nothing stored, no body logging. On this tier
+  the question and its tool results transit this server — disclosed at first
+  use. The M8 tiers follow: local WASM/WebGPU model (the intended default;
+  weights from Hugging Face into OPFS on explicit action), Chrome built-in
+  Gemini Nano, and user-supplied keys for Gemini / OpenRouter / Anthropic /
+  OpenAI, called browser-direct with keys client-side only. `cve.meenan.dev`
+  proxies no third-party model traffic and bundles no key.
 - **Model selection is benchmarked, not assumed (D-046).** Ground-truth analyst
   questions scored by data comparison against the real corpus, run through the
   actual integration.
@@ -431,6 +440,7 @@ Indexes: `cve(year)`, `cve(cna_id)`, `cve(cvss_score)`, `cve(published)`,
 | Database → UI | Record text | Never injected as HTML; URLs from records are never auto-fetched |
 | Database → model prompt | Attacker-influenced record text entering LLM context | Prompt injection is assumed; the tool surface is read-only and render-only with no network reach, and model output carries no markup or minted URLs — a successful injection yields wrong-but-inspectable presentation, nothing more (D-044) |
 | Browser → hosted model provider | The user's question and its tool results — only when the user supplies a key | Explicit opt-in per provider; key stored client-side only; called browser-direct, never proxied, never touching this server (D-045) |
+| Browser → chat relay → `llm` | The user's question and its tool results — only when the site-hosted tier is selected | Opt-in, disclosed at first use; the relay is same-origin, POST-only, body-capped, rate- and concurrency-limited, pinned to one model and one operation with no caller-supplied URL, host, or model; nothing stored, bodies never logged (D-057) |
 
 Same-origin enforcement is **the absence of `Access-Control-Allow-Origin`**, not
 a `Sec-Fetch-Site` check. Header sniffing stops nobody who matters — any
