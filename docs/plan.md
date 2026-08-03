@@ -214,25 +214,39 @@ everything downstream consumes them.
       inserted ahead of every existing one — without one moving. The cost of
       seeding is memory, not time; the numbers and their caveats are in D-056,
       and they are dev-VM measurements on synthetic text, not production ones.
-- [ ] **Daily ingest cron** under `flock`: fetch → hash → diff → tombstone
-      guard (abort is the success case on a broken fetch) → delta file
-      (D-031, D-042). Fail closed on malformed records (D-047). The changeset
-      it computes is what `pipeline/delta.py` already consumes. Decide its
-      re-run semantics explicitly. Three constraints its inputs now fix: the
-      ingest must **pin `generated` per revision** rather than stamping the
-      clock on each attempt, since a published range may only ever be rewritten
-      with byte-identical content (D-055); it must **seed each build from the
-      most recent one, not from the last published snapshot**, or a rebuild
-      re-mints ids a daily delta already gave away — which `seed_rev` now
-      refuses rather than merely documents (D-056); and the per-revision floors
-      it records come from the artifact's own `meta` (`build.id_space`),
-      alongside the `extra` ids the build reports for content that moved under
-      an existing id. Its first production run also has to cross the D-056
-      migration: the live origin records no ID space, so one build seeded from
-      the live artifact must be published with `--adopt-id-space` before any
-      delta can be — a delta never establishes a lineage. That publish is a new
-      generation, so every client that has already downloaded re-downloads once;
-      the sequence is rehearsed in D-056.
+- [x] **Daily ingest cron** (D-058). `pipeline/ingest.py run` under `flock`:
+      fetch → hash → diff → tombstone guard → build → one delta, with
+      `pipeline/state.py` holding the hash state the diff needs. The guard runs
+      before the **build**, not merely before publication, because seeding
+      retires permanently and a half-fetched tree would cost a new ID space —
+      which is why the run pays for a second walk of the corpus (16.9 s) and
+      then checks the two walks against each other. That check found and fixed a
+      real defect: `build.retired_records` counted every newly minted record as
+      a retirement. Re-run semantics are decided and tested at all three crash
+      windows, and turn on one question — was anything ever published at this
+      range? If nothing was, the pending run is abandoned and the revision
+      re-minted (which is what keeps a deterministic refusal from being replayed
+      forever); if something was, the pinned changeset is republished byte for
+      byte. Each test moves the tree on *and* advances the clock before
+      retrying, because otherwise the two behaviours are indistinguishable. A
+      missed day needs no handling; a no-change run mints no revision. Measured on `plex` against the real corpus, in scratch: one run
+      is 54.9 s and 1.22 GB peak RSS, and the real 69.5-hour window M1 left
+      behind produced a 204 KB delta (843 records) that the reference applier
+      turned into a database **identical to the rebuild across 3,778,313 rows**,
+      holding exactly the 15 products and 2 urls the rebuild retired. The D-056
+      migration is rehearsed at full scale and written up as the first
+      production run in `pipeline/README.md`; the seeded rebuild of the live
+      artifact minted zero ids, which is what makes `--adopt-id-space` honest.
+      D-056's deferred question is answered with it: the ID-space marker stays
+      **off** the wire, because the one path that looked like it could bypass
+      the ledger fails closed. **Run in production 2026-08-03** with the owner's
+      go-ahead (nothing is live yet, so the adoption's re-download cost was
+      zero): the origin was rebuilt onto a recorded ID space as snapshot rev 2,
+      the first delta carried 881 upserts in 218 KB, and the cron is installed
+      and advancing the head daily. Verified over HTTPS from outside the machine — immutable and
+      `no-cache` policies, COOP/COEP, no `Access-Control-Allow-Origin`, the
+      ledger unreachable — and end to end by a real browser importing the new
+      generation from `https://cve.meenan.dev/`.
 - [ ] **Monthly snapshot cron**: rebuild, chunk, compress, publish by atomic
       rename; previous generation and its deltas retained; generations
       immutable (D-041, D-042, D-047). Two pieces D-055 left to this task:

@@ -478,6 +478,7 @@ def write(
     quality: int = QUALITY,
     force: bool = False,
     space: dict | None = None,
+    on_written=None,
 ) -> dict:
     """Compress and publish the delta; return its manifest entry.
 
@@ -552,6 +553,23 @@ def write(
                     "same changeset, or --force for local iteration"
                 )
 
+        entry = {
+            "from": int(delta["from"]),
+            "to": int(delta["to"]),
+            "bytes": os.path.getsize(compressed_path),
+            "raw_bytes": len(payload),
+            "sha256": digest,
+        }
+        # The bytes are decided here and become visible on the next line. A
+        # caller that must survive a crash in between — the ingest, whose whole
+        # re-run story is "reproduce exactly these bytes" — gets one chance to
+        # write the entry down *before* anything can observe it. Recording it
+        # afterwards leaves a window in which the file exists and nothing knows
+        # its digest, and the only way out of that window is recompressing,
+        # which a brotli upgrade can silently change.
+        if on_written is not None:
+            on_written(dict(entry), dict(space) if space else None)
+
         # brotli inherits the temp file's restrictive mode; nginx has to be able
         # to read what we publish regardless of who ran the pipeline.
         os.chmod(compressed_path, 0o644)
@@ -560,13 +578,6 @@ def write(
         if os.path.exists(compressed_path):
             os.unlink(compressed_path)
 
-    entry = {
-        "from": int(delta["from"]),
-        "to": int(delta["to"]),
-        "bytes": os.path.getsize(final),
-        "raw_bytes": len(payload),
-        "sha256": digest,
-    }
     ledger.record_delta(pub_dir, entry, space)
     return entry
 
@@ -577,6 +588,7 @@ def publish(
     changeset: dict,
     quality: int = QUALITY,
     force: bool = False,
+    on_written=None,
 ) -> dict:
     """Extract, write, and register in the manifest -- in that order, so the
     manifest never names a file that is not on disk."""
@@ -653,6 +665,7 @@ def publish(
         quality=quality,
         force=force,
         space=candidate,
+        on_written=on_written,
     )
     # The manifest last, because it is what exposes the new head. Recording the
     # bytes and the ID space the delta lands on in the same ledger write, before

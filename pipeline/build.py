@@ -21,6 +21,7 @@ import json
 import os
 import secrets
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -271,6 +272,10 @@ def id_space(db_path: str) -> dict:
             "seed_marks": None if seed_marks is None else json.loads(seed_marks),
             "seed_fingerprint": seed_fingerprint,
             "schema": meta.get("schema"),
+            # Provenance rather than ID space, but this is the one place that
+            # already has `meta` open: the tree the artifact was built from,
+            # which `ingest.py init` checks a clone against.
+            "commit": str(meta.get("commit") or ""),
             "inferred": sorted(fallbacks),
         }
     finally:
@@ -359,6 +364,37 @@ def _seed_from(db_path: str, interners: dict) -> dict:
     return space
 
 
+def clone_commit(clone: str) -> str:
+    """The commit the clone is sitting at, or `""` if it is not a git tree.
+
+    Recorded in the artifact so "which tree is this?" is answerable from the
+    artifact alone. The ingest's `init` reads it back: it re-derives the content
+    hashes from a working tree, and a tree that has moved past the artifact
+    records post-artifact content as if it were the artifact's — which drops
+    those edits from every future delta, silently. Comparing commits turns a
+    documented instruction ("do not fetch in between") into a checked one.
+
+    Never a change signal: a shallow clone reports every advance as a forced
+    update (RE-006). Soft-failing to `""` because the fixtures build from plain
+    directories, and because a missing provenance note must not stop a build.
+
+    `git -C` walks *up* to an enclosing repository, so a corpus directory nested
+    inside an unrelated checkout stamps that checkout's commit. Harmless as used
+    — `init` compares this function's output against itself on the same
+    directory — but it is why the value is provenance rather than an identity.
+    """
+    try:
+        done = subprocess.run(
+            ["git", "-C", clone, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return done.stdout.strip()
+
+
 def record_paths(clone: str):
     """Yield record files, skipping the publishing pipeline's own churn files.
 
@@ -434,6 +470,12 @@ def build(
     interners = {table: Interner() for table in LOOKUP_COLUMNS}
     seeded = _seed_from(seed, interners) if seed else None
     cve_ids: dict = seeded["cve_ids"] if seeded else {}
+    # Measured *before* the walk, because the walk adds every newly minted
+    # record to this same map — it is the seed's map, not a copy of it, since
+    # copying 372k entries to preserve a count is not a trade worth making. The
+    # count is what `retired_records` is derived from, and reading it afterwards
+    # silently reported `minted` retirements that never happened.
+    seed_records = len(cve_ids)
     cve_hwm = seeded["cve_hwm"] if seeded else 0
     # A bootstrap mints a lineage token; a seeded build inherits the seed's. An
     # artifact from before D-056 has none, so seeding from it adopts its ids
@@ -614,6 +656,10 @@ def build(
                 ("schema", SCHEMA_VERSION),
                 ("rev", int(rev)),
                 ("generated", int(time.time())),
+                # Which tree this was built from, for `ingest.py init` to check
+                # a clone against. Not part of the ID space, and not hashed into
+                # the fingerprint — provenance, not identity.
+                ("commit", clone_commit(clone)),
                 ("notice", NOTICE),
                 *space_record,
             ],
@@ -659,9 +705,7 @@ def build(
         # The record side of retirement, which the ingest's tombstone guard
         # (D-042) is what turns into a decision: records the seed had and this
         # build does not.
-        "retired_records": max(0, len(seeded["cve_ids"]) - (records - minted_records))
-        if seeded
-        else 0,
+        "retired_records": max(0, seed_records - (records - minted_records)) if seeded else 0,
         "minted": {table: interners[table].minted for table in LOOKUP_COLUMNS},
         "retired": {
             table: interners[table].retired

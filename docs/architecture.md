@@ -72,23 +72,46 @@ Each is backed by a decision entry and is not up for casual revision.
 
 ## The server pipeline
 
-Two cron jobs under `flock`, no daemon (D-042). **Daily** ingest, ~40 s of work
-for ~87 KB of output; **monthly** snapshot rebuild. Upstream publishes about
-every 40 minutes, so a day accumulates ~665 distinct changed records.
+Two cron jobs under `flock`, no daemon (D-042). **Daily** ingest —
+`pipeline/ingest.py run`, 54.9 s of work per run (D-058) — and a **monthly**
+snapshot rebuild. Upstream publishes about every 40 minutes. How much a day
+accumulates depends on the day: D-031's 21.4 weekday hours implied ~665 changed
+records and ~87 KB, while D-058's 69.5-hour window across a weekend worked out
+at ~291 records and ~70 KB per day. Both are single windows and neither is a rate;
+what they agree on is that a day's delta is one small file.
 
 1. **Fetch.** `git fetch --depth 1 origin main` into `cve.data/git/cvelistV5`,
    then reset. Measured at 1.8 s. A shallow clone reports every advance as a
    forced update, so git's output is not a usable change signal (RE-006) — the
-   pipeline ignores it.
+   pipeline ignores it. Every argument is a constant: nothing a record, a
+   manifest or a caller supplies ever reaches a git ref or a URL (D-006).
 2. **Hash.** Walk the working tree, compute a hash over each record's normalized
    projection — exactly the fields we store — and diff against the previous
-   run's hashes. 15–18 s for all 372k records. Records changed or added become
-   upserts; records present before and absent now become tombstones.
+   run's hashes. 16.9 s and 93.8 MB for all 372k records, measured on `plex`.
+   Records changed or added become upserts; records present before and absent
+   now become tombstones. The previous run's hashes live in
+   `cve.data/state/ingest.sqlite` alongside the revision each record last
+   changed at, the tombstone log and the artifact the next build seeds from
+   (D-058) — 28.8 MB, and rebuildable from the clone by `ingest.py init`.
 3. **Guard.** If the run would tombstone more than 0.1% of the corpus (~370
-   records), abort and alert rather than publish. Upstream has no deletion
-   concept at all, so a mass deletion means our fetch broke, not that the CVE
-   Program withdrew 400 records.
-4. **Normalize.** Build the relational artifact (see [Schema](#schema)). 19 s.
+   records), abort rather than publish, and make the abort *findable*. Upstream
+   has no deletion concept at all, so a mass deletion means our fetch broke, not
+   that the CVE Program withdrew 400 records. "Alert" is deliberately not mail:
+   `plex` has no MTA, so cron's mail is a no-op, and D-009 rules out a telemetry
+   channel. Instead the run records its outcome in the state and `ingest.py
+   status` reports it, so one command answers "is the ingest healthy?" and a job
+   that has been failing since Tuesday says so (D-058). The user-visible half is
+   unchanged: a stalled pipeline stops advancing `manifest.json`'s `generated`,
+   which the client already surfaces as staleness (D-042). **This runs before the build, not merely
+   before publication** — seeding retires every value the tree no longer
+   mentions and never reissues its id (D-056), so a build from a half-fetched
+   corpus is already unrecoverable. That ordering is what the second walk of
+   the corpus buys, and the build's own counts are checked against the hash
+   pass afterwards so the two walks cannot disagree about which records exist
+   (D-058).
+4. **Normalize.** Build the relational artifact (see [Schema](#schema)). 24.2 s
+   seeded, measured on `plex` 2026-08-03 (D-058); the 19 s in D-023 was the
+   M0 spike, against a smaller schema and unseeded.
    The build **seeds its ID space from the previous artifact** — `--seed`, or an
    explicit `--bootstrap`, never a default (D-056) — so every id it already
    issued means what it meant, and new values append above the recorded
@@ -104,7 +127,15 @@ every 40 minutes, so a day accumulates ~665 distinct changed records.
    first, so the manifest never names something that is not there. One run per
    day means one file per day and consecutive revisions, so the files tile the
    revision space by construction — there is no rollup and no invariant to
-   defend (D-042).
+   defend (D-042). A run that changed nothing mints no revision at all.
+
+   The changeset, the artifact it was built from and `generated` are written to
+   the state file *before* any of this and cleared only after the manifest names
+   the delta, so a crash anywhere in between is resumed with the pinned bytes
+   rather than a changeset recomputed against a tree that has moved — which is
+   what makes an immutable URL survivable (D-058). A missed day needs no
+   handling: `from` is always the published head and the changeset is the whole
+   diff of the state against the tree.
 6. **Snapshot, monthly.** Rebuild the database, split it into 32 MB slices of
    the uncompressed file, and compress each at brotli -q10 — 101 s across 24
    cores, against 351 s for a monolith (D-041). Only the compressed chunks are
@@ -126,7 +157,22 @@ Publication into `pub/` is an atomic rename, so a half-written artifact is never
 reachable — and a published generation is immutable: same-rev republication is
 refused, because its URLs carry an immutable cache policy (D-047). The clone,
 working databases, and hash state live in sibling directories under `cve.data/`
-and are never under the served root (D-018, D-034).
+and are never under the served root (D-018, D-034):
+
+| Path | What |
+| --- | --- |
+| `cve.data/git/cvelistV5` | The shallow clone (D-021). |
+| `cve.data/db/` | Working databases, including `snapshot.sqlite` — the artifact rev 1 was published from. |
+| `cve.data/cache/` | The KEV cache (D-010), empty until M6. |
+| `cve.data/state/ingest.sqlite` | The ingest's hash state, seed pointer and pending run (D-058). |
+| `cve.data/state/pipeline.lock` | The `flock` both crons take (D-042). |
+| `cve.data/state/artifacts/rev-N.sqlite` | Daily builds, ~377 MB each; the newest three are kept. |
+| `cve.pub/published.json` | The append-only ledger of everything ever published (D-056). |
+| `cve.pub/data/` | The published artifacts — the only web-reachable path here (D-053). |
+| `~/src/meenan.dev/cve/pipeline/` | Where the crons run from — rsynced, not a git checkout, and never the docroot (D-058). |
+
+`cve.data/state/` is new in D-058; D-018 and D-053 describe the three
+directories that preceded it.
 
 ## The published contract
 

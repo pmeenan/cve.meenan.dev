@@ -86,7 +86,7 @@ affected docs. Until then, these govern.
 | `app/`       | Next.js App Router pages and styles |
 | `lib/`       | Shared types — notably the published contract in `protocol.ts` |
 | `workers/`   | The Worker that owns SQLite/WASM on OPFS |
-| `pipeline/`  | Python ingest and publish (D-043). **Never deployed** |
+| `pipeline/`  | Python ingest and publish (D-043). **Never in the docroot** — the crons run it from `~/src/meenan.dev/cve/pipeline/` on `plex`, rsynced there, not git-managed (D-058) |
 | `scripts/`   | Build, serve, deploy, license audit |
 | `tests/`     | `unit/` (Vitest) and `e2e/` (Playwright) |
 | `public/`    | Static passthrough into the export root |
@@ -158,7 +158,13 @@ full-corpus Download and Sync with staged replacement. Two tasks are done — th
 delta wire contract is final, typed, emitted and contract-tested (D-055), and
 the interned ID space is now stable across rebuilds, with retirement, recorded
 high-water marks and a named lineage the publishers check (D-056) — and the
-daily ingest cron is next. A 2026-08-03 owner decision re-ordered the AI
+daily ingest cron runs the whole cycle under `flock`, with the tombstone guard
+ahead of the *build* (seeding retires permanently) and a revision's bytes pinned
+before any of it is published, so a crashed run resumes rather than rewriting an
+immutable URL (D-058) — and it is **running in production**: the D-056
+migration was applied, the origin serves a snapshot on a recorded ID space, and
+the daily cron is installed on `plex` and advancing the head. The monthly snapshot cron is
+next. A 2026-08-03 owner decision re-ordered the AI
 ladder: the first model tier is a site-hosted Ollama behind a restricted
 same-origin chat relay, re-scoping M7 and M8 (D-057). M0 closed with scope,
 architecture, schema

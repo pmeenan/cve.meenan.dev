@@ -22,7 +22,7 @@ Newest first. RE-numbers are never reused.
 
 ---
 
-## RE-015: A lone surrogate in a CVE description is legal JSON that SQLite cannot store  (2026-08-02, status: open)
+## RE-015: A lone surrogate in a CVE description is legal JSON that SQLite cannot store  (2026-08-02, status: worked-around for the daily ingest 2026-08-03; still open for a direct `build.py` run)
 
 **Environment.** Python 3.12.3 `sqlite3` (SQLite 3.45.1) on Linux; reachable
 from any record in cvelistV5, which is attacker-influenced input (AGENTS.md
@@ -55,6 +55,19 @@ one hostile record halts the daily ingest with an undiagnosable error. The fix
 is a projection-level check, whose cost has to be measured against the whole
 corpus first — every string of every record, per build — which is why it is
 recorded rather than guessed at.
+
+**Worked around for the ingest (2026-08-03, D-058).** The cost question is
+answered by not paying it twice: `normalize.content_hash` already encodes the
+whole projection to UTF-8, and the daily ingest's hash pass runs it over every
+record *before* the build (16.9 s for 372k records, measured — the same walk the
+tombstone guard needs anyway). So `ingest.scan` catches the `UnicodeEncodeError`
+and routes the record through the `skipped` channel, naming the file; the run
+then aborts before building, as it does for any unpublishable record.
+
+Still open for `build.py` invoked directly, which computes no content hash and
+would need a scan of its own to get one. That is the path the migration's step 1
+uses, so it is not hypothetical — but it is operator-run and one traceback away
+from `ingest.scan`, which will name the file.
 
 ## RE-014: `FileSystemSyncAccessHandle.write()` may write fewer bytes than asked  (2026-08-01, status: worked-around)
 

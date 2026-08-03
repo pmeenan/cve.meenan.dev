@@ -23,6 +23,410 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-058: The daily ingest — the guard runs before the build, and a revision's bytes are pinned before any of it is published  (2026-08-03, status: accepted, implements D-042; settles the ID-space-on-the-wire question D-056 deferred to this task)
+
+**Decision.** `pipeline/ingest.py` is one cycle under `flock`: fetch, hash,
+diff, guard, rebuild, publish one delta, advance state. Six things it decides
+that D-042 left open.
+
+**1. The guard runs before the *build*, not merely before publication.** D-042
+only requires that nothing is published before the tombstone guard, and a build
+publishes nothing — so building first and hashing out of the same walk looked
+free. It is not, because seeding is destructive in one direction: a build
+retires every value the tree no longer mentions, permanently (D-056). A
+half-fetched corpus that got as far as `build` would retire several hundred
+thousand ids, and the repair is a new ID space and a full re-download for every
+client. The run therefore pays for a **second walk of the corpus** — 16.9 s and
+93.8 MB peak RSS, measured below — to keep the guard upstream of anything
+irreversible. That is the single most expensive decision here and it buys
+exactly one property: a broken fetch cannot damage the ID space.
+
+Two walks then have to be checked against each other, or they are two opinions
+about which records exist. The build's own counts are compared against the hash
+pass — records walked, records minted against records the diff calls new, and
+records retired against tombstones — and any disagreement aborts before
+publishing. That check earned itself immediately: `build.retired_records` was
+computed from `len(seeded["cve_ids"])` *after* the walk, and the walk fills the
+seed's own map rather than a copy, so every newly minted record was also counted
+as a retirement. Nothing else read the number, so it had gone unnoticed; the
+ingest reads it, and would have aborted every run on a day upstream added a
+record — which is every day. Fixed here, with a regression test in
+`test_interning.py`.
+
+**2. The ingest keeps its own state**, `cve.data/state/ingest.sqlite`, never
+under the served root (D-018): a content hash per record (D-031), the revision
+each record last changed at, a tombstone log, the artifact the next build seeds
+from, and the pending run. 28.8 MB at corpus scale.
+
+It is rebuildable by `ingest.py init`, but only under a precondition worth
+stating rather than implying: `init` re-derives the hashes from a working tree,
+so it recovers the state *at the moment a run finishes*, not at an arbitrary
+later one. Fetch past the head and it refuses — on the record set if one was
+added or removed, and on the artifact's recorded commit otherwise, which is the
+case that would otherwise be silent. Both the state and the artifact record the
+commit their revision was computed from, and `ingest.py status` prints it, so
+the shape of a recovery is "get the clone back to that commit, then `init`" —
+not written up as a procedure because it has not been tested against a
+`--depth 1` clone (rule 4). And the artifact at head is as load-bearing as the
+state file itself: without it there is nothing to seed from, and the repair is a
+bootstrap plus `--new-id-space`, which is a lineage rather than a scan. It
+currently lives *inside* the state directory, so one `rm -rf` takes both.
+
+The per-record revision has **no reader today**. It is written because the only
+place that number exists is the run that produced it, and the monthly rebuild's
+bridging delta (M2's next task) spans revisions rather than stepping one. Same
+for the tombstone log. Recording them costs a column; reconstructing them later
+is impossible.
+
+Which is also why a record that comes back after a tombstone **keeps its
+tombstone**. Both facts are true of a client that has not synced since — the row
+it holds at the retired id is gone, and the record exists again at a new one
+(D-056 never reissues an id) — and a bridging delta that spans both events needs
+both. Clearing it, which the first version did, would leave that delta shipping
+only the upsert, which every client below the deletion then refuses on apply,
+after the bytes are at an immutable URL. Kept, the two facts collide in
+`delta.extract`'s refusal to name one record in `upsert` and `delete` at once —
+on the server, where D-047 says failures belong. Expressing "drop row 2, insert
+row 3" is a gap in the wire format (`delete` is by CVE ID, D-055) and the
+monthly rebuild inherits it; losing the evidence for it here would have been
+ours. `initialize` still clears the log, and that is correct in the same terms:
+after an `init` nothing here knows what happened before `rev`, so the only sound
+delta from that state is a step from `rev` — a constraint the monthly task
+inherits rather than a bug.
+
+**3. Re-run semantics: a revision is minted once, and everything that decides
+its bytes is written down before any of it is published.** The changeset, the
+artifact path and `generated` land in the state file first and are cleared only
+after the manifest names the delta. What the next run does with that record
+turns on one question, asked of all three authorities — the ledger, the manifest
+and the file on disk: **was anything ever published at this range?**
+
+- **Nothing was.** The pending run is *abandoned* and the fresh cycle re-mints
+  the revision against the tree as it now stands. Nothing can have reached a
+  client, so this is the same rule that lets `delta.write` re-cut an unpublished
+  range (D-047). Resuming unconditionally instead was the first design, and it
+  was wrong in a way only a review caught: `begin_run` lands before
+  `delta.publish`, which performs six validations that raise *before* writing
+  anything and raise identically on every retry — a wrong seed, a floors
+  mismatch, a manifest that cannot hold the entry. Any of them would have been
+  replayed forever with the data plane frozen behind it, and the only escape was
+  a method with no caller.
+- **Something was.** The pinned changeset is republished byte for byte, or
+  simply committed when the manifest already names it. Recomputing here would
+  put *different* bytes at a URL that can never be corrected — which is exactly
+  why `generated` is pinned rather than restamped, the constraint D-055 named:
+  the client writes it to `meta.generated` on apply, so two payloads differing
+  only there are different content.
+- Either way the run then **continues into a fresh cycle**, so one invocation
+  heals and catches up instead of costing another day of staleness.
+
+The three crash windows — before the file, between the file and the ledger,
+between the ledger and the manifest — each have a test that kills the run there,
+and each moves the tree on *and* advances the clock a day before retrying.
+Without both, "resumed the pinned changeset" and "recomputed a new one" produce
+identical output and every assertion passes either way; that is how the first
+version of these tests passed while a restamping `generated` survived.
+
+The middle window is the one that makes the third authority load-bearing: the
+file is renamed into place before the ledger records it, so between those two
+the bytes are served and *nothing has written them down*. Treating "not
+recorded" as "never published" there abandons a range a client can already have
+fetched, and the re-minted payload is then refused by `delta.write` at a URL it
+can neither reuse nor correct. That window had no test until a second review
+round; the file check survived mutation until it got one.
+
+One case stops for a human: a pending run whose artifact is gone *after* its
+bytes were published. Those bytes cannot be reproduced, and discarding the
+record would lose the only evidence of what is at that URL.
+
+A missed day needs no handling at all: `from` is always the published head and
+the changeset is the whole diff of the state against the tree, so a run that
+never happened is absorbed by the next one as a larger delta. Consecutive
+revisions still tile by construction (D-042).
+
+**4. A run that changes nothing mints no revision and does not touch the
+manifest.** The consequence is deliberate and worth naming: `generated` does not
+advance, so the staleness the client shows keeps growing on a day the data plane
+genuinely did not change. That is honest — the manifest describes what was
+published — and in practice upstream changes every day, so a no-change run is
+itself the signal that the fetch is not advancing.
+
+**5. The state must describe the published head, and the run refuses when it
+does not.** `state.rev` is compared against both the manifest and the ledger
+before any changeset is computed — `published_head` also asserts those two agree
+with each other, so one comparison covers all three. This is the seam the
+monthly snapshot task needs: a rebuild advances the head without going through
+the ingest, and it owns re-pointing the state at what it published. Failing
+closed here is what keeps that from being a silent wrong-`from` delta.
+
+One ordering exception, and it is deliberate: a *pending* run is resumed before
+this check, because its `from` was fixed when the revision was minted and
+re-deriving it is exactly what a resume must not do. A rebuild that moved the
+head under a pending run is still caught, by whichever of two paths applies —
+both verified by running them. If the pending range was published, the resume
+republishes it and `manifest.assert_tiling` refuses the manifest that would
+result (`deltas starting at [1] are unreachable from snapshot rev 3`), leaving
+the pending intact. If it was not, the resume abandons it and the run then hits
+this check with its own message. Neither publishes anything.
+
+**6. The ID-space marker stays off the wire.** D-056 deferred this and named the
+daily-ingest task as the last comfortable place to revisit it, since nothing is
+deployed against the format until Sync ships. Having built the ingest, the
+answer is still no, for a reason that is now checkable rather than asserted: the
+failure it would catch — a delta from a foreign lineage — is refused by
+`ledger.assert_idspace` before publication, and the one path that looked like it
+could bypass the ledger *fails closed*. A lost `published.json` re-seeds from
+the manifest, which carries no lineage, so `idspace()` is empty while
+`anything_published()` is true, and that combination raises rather than adopting
+whatever arrives; a delta may never adopt at all. Adding the field would move an
+unfixable server mistake into an unfixable client symptom, and it is not free to
+carry. `FORMAT_VERSION` stays 1. If a lineage break ever shows up that the
+token, `seed_rev` and the fingerprint cannot see, the field is cheap to add
+later *and the client already holds the value it would compare against* — the
+snapshot carries `idspace` in `meta` — so only the delta side would be new.
+
+**Context.** Rehearsed and measured end to end on `plex` against the real
+corpus, in a scratch directory: a copy of the live clone (re-pointed at GitHub),
+a copy of the live artifact, and a copy of the published generation — the live
+data plane was read and never written. The window is the real one M1's
+publication left behind: `d300c5fcc0` (committed 2026-07-31T23:12:13Z) →
+`62a1030538` (2026-08-03T20:41:50Z), **69.5 hours**, Friday evening through
+Monday afternoon. The rehearsal was run twice — once before the review pass and
+once after; these are the second run's numbers, from the code as it stands.
+
+| Step | Wall | Peak RSS |
+| --- | --- | --- |
+| Hash pass alone, 372,322 records | **16.9 s** | 93.8 MB |
+| Rebuild seeded from the live artifact | 24.2 s | 1,157.5 MB |
+| `init` (scan, then verify against the artifact) | 17.8 s | 147.8 MB |
+| **One daily run** — fetch, hash, diff, guard, build, delta | **54.9 s** | **1,219.2 MB** |
+| A run with nothing new (no fetch) | ~18 s | — |
+
+The last row is from the rehearsal's step timestamps at one-second resolution
+rather than from `time`, which is why it lands so close to the hash pass it
+contains; the two are the same measurement inside that granularity, not evidence
+that skipping the diff is free. The first rehearsal's run was 62.5 s with a cold
+page cache on the copied clone, so treat the spread — not either number — as the
+scale.
+
+The delta itself: 446 records added, 397 updated, 0 removed — 925,846 bytes of
+JSON, **208,540 bytes at brotli -q5**. It minted 1 CWE, 22 vendors, 153
+products, 9 hosts and 1,164 urls, and **retired 15 products and 2 urls**, so
+retirement is an ordinary daily event rather than a theoretical one.
+
+The rate does *not* reproduce D-031's, and the honest reading is that neither
+window is a rate. D-031 measured 665 records and 87 KB over 21.4 weekday hours
+(31.1 records/h, 4.07 KB/h); this one is 843 records and 204 KB over 69.5 hours
+spanning a weekend (12.1 records/h, 2.93 KB/h) — **~291 records and ~70 KB per
+day**, well under D-042's ~665/day and 87 KB/day planning figures. Bytes per
+changed record nearly doubled, 134 → 247, so the two windows differ in shape as
+well as volume. The weekend is the obvious hypothesis and this measurement
+cannot confirm it. What both windows agree on is the only thing D-042 needs: a
+day's delta is one small file. The run is 54.9 s against D-042's "~40 s of
+work" — the difference is the second walk this entry buys.
+
+Two results are worth separating from the timings.
+
+*The seeded rebuild of the live artifact minted zero ids and retired zero.* That
+is what makes `--adopt-id-space` honest rather than hopeful: the artifact the
+migration publishes is the live ID space, re-derived. The build also reported
+all eight marks as `seed_inferred_floors`, confirming the live generation
+predates D-056 exactly as that entry describes.
+
+*The published delta was applied to the rev-2 artifact with the reference
+applier and compared with the rebuild at full scale* — M2's exit criterion in
+miniature. Apply took **0.25 s**. All six record tables are identical over
+3,778,313 rows (`cve` 372,768, `cve_text` 354,963, `cve_cwe` 190,390,
+`cve_prod` 524,356, `cve_ref` 1,217,771, `cve_ver` 1,118,065), and the synced
+copy holds exactly the 15 products and 2 urls the rebuild retired and is missing
+nothing — which is the difference between a synced and a downloaded client that
+D-056 predicted, observed rather than argued.
+
+**Consequences.** The cron line, once the migration below has been run — one
+physical line, because `crontab(5)` has no backslash continuation and would run
+the fragment before the break:
+
+```cron
+17 4 * * * cd /var/www/meenan.dev && python3 <repo>/pipeline/ingest.py run cve.data/git/cvelistV5 cve.pub/data --state cve.data/state >> cve.data/state/ingest.log 2>&1
+```
+
+Exit codes are 0 for published / nothing to do / lock held, 1 for an abort
+(and for an unhandled exception, which a traceback in the log distinguishes),
+and 3 for the tombstone guard specifically, so a wrapper can route the one that
+means "the fetch broke" differently from the rest. `--tombstone-limit` exists
+for a withdrawal confirmed upstream and for the fixture corpora; raising it to
+get past a broken fetch is the mistake it is shaped to make obvious, and it is
+range-checked to `(0, 1]` because the two ways of getting it wrong both disable
+the guard *silently* — `nan` makes every comparison false, and `1`, the obvious
+misreading of a help text that says 0.1%, makes the threshold the whole corpus.
+`--dry-run` does everything through the build and reports the changeset without
+publishing or touching state, which is what the first production run should be.
+
+`init` is the other place a mistake is unrecoverable, so it refuses five things
+rather than trusting the README: an artifact recording no ID space, one from
+another lineage, one stamped at a revision that is not the head, one that is a
+*sibling* of the artifact published there (same lineage, same revision,
+different ids — separated only by the ledger's fingerprint, D-056), and a clone
+whose record set differs from the artifact's. The fifth needed a sixth: id sets
+can match while a record's *content* has moved, and recording that as the
+artifact's content drops the edit from every future delta, silently. So
+`build.py` now stamps the commit it read into the artifact's `meta` — provenance,
+not identity, and not hashed into the fingerprint — and `init` compares it
+against the clone. The README's one uncheckable instruction, "do not fetch
+between steps 1 and 3", is now checked. A pending run blocks `init` outright,
+`--force` included: `initialize` clears that record, and it is the only evidence
+that a revision was minted.
+
+RE-015 is worked around here as a side effect worth naming. A lone surrogate is
+legal JSON with no UTF-8 encoding, and that finding asked for a projection-level
+check whose cost was measured first. The hash pass *is* one, already paid for:
+`content_hash` encodes the whole projection, so catching the `UnicodeEncodeError`
+costs nothing beyond the walk the guard already requires, and the record is named
+instead of the codec. A direct `build.py` run still gets the raw traceback.
+
+Builds are ~377 MB each and cannot accumulate: `--keep` (default 3) prunes older
+ones, never the artifact the state seeds from. The lock lives in `state.py`
+because the monthly cron has to take the same one.
+
+**Run in production 2026-08-03**, with the owner's explicit go-ahead — nothing
+is live, published or in use yet, so the "every client re-downloads once" cost
+the adoption carries was zero. The migration went exactly as rehearsed:
+
+| Step | Result |
+| --- | --- |
+| Rebuild seeded from `cve.data/db/snapshot.sqlite`, stamped rev 2 | 24.2 s, 1,153.5 MB peak — **0 ids minted, 0 retired** |
+| `publish.py --adopt-id-space` | 12 chunks, **62,732,082 bytes** (ratio 6.0) in 96.5 s |
+| `ingest.py init` | 18.0 s, 372,322 records, ID space `a46cc2797a9aa338` |
+| First daily run (fetch → delta) | 43.7 s, 1,223.0 MB peak |
+
+The first published delta covers `d300c5fcc0` → `743b3b8534` (70.8 hours):
+**881 upserts, 0 tombstones, 965,238 bytes of JSON → 218,140 compressed**,
+shipping 1 CWE, 26 vendors, 160 products, 9 hosts and 1,249 urls. The data plane
+is now `snapshot-2/` (rev 2) plus `deltas/2-3.json.br`, head rev 3, with
+`snapshot-1/` retained per D-042 and still serving.
+
+Verified from outside the machine, over HTTPS, because the local server
+reproduces production headers but not nginx: `manifest.json` is `no-cache` and
+the delta is `immutable`, both carry COOP/COEP/CORP, **neither carries
+`Access-Control-Allow-Origin` even when an `Origin` is sent** (D-034's actual
+same-origin control), and no `Content-Encoding` is added to the `.br` (D-040).
+The delta's byte length and SHA-256 match the manifest exactly. `published.json`
+is unreachable — raw, encoded, and via the parent — and `/data/deltas/` gives no
+listing, repeating D-018's canary check against the first served delta. Then the
+whole thing end to end: a real Chromium against `https://cve.meenan.dev/`
+downloaded the new generation, built its indexes, ran a query and survived a
+reload (`BASE_URL=https://cve.meenan.dev pnpm e2e import`, 1.4 minutes) — the
+config now takes that override rather than needing an ad-hoc edit.
+
+The cron is installed in `pmeenan`'s crontab on `plex` and its command line was
+executed verbatim to prove it works (exit 0, correct log line, "nothing
+changed"). It runs at 04:17 and appends to `cve.data/state/ingest.log`. Two
+comment lines above it say how to remove it.
+
+**Where the pipeline lives on the server.** `plex:/home/pmeenan/src/meenan.dev/cve/pipeline/`,
+alongside the other projects on that machine — but as a plain directory, not a
+git checkout. It is emphatically not in the docroot (D-018, D-053) and
+`scripts/deploy.sh` does not touch it. `scripts/deploy-pipeline.sh` rsyncs it,
+and that is the deployment model rather than a stopgap: agents never commit
+(rule 7), so a pipeline change cannot reach the server through git until the
+human gate closes, and the first production run necessarily happened with the
+change still in the working tree. Making the destination a real checkout and
+pulling into it is a possible future change, not something to describe as
+current. That is worth knowing when reading the ledger: the generations now
+serving were published by code that is not yet in git history.
+
+The migration D-056 rehearsed is now the documented first run, in
+`pipeline/README.md`: build seeded from the live artifact at a revision above
+head, `publish.py --adopt-id-space`, `ingest.py init` against that artifact
+*without fetching in between* — `init` verifies the tree and the artifact hold
+the same record set, which catches a tree that moved but cannot catch an edit to
+a record that kept its id. Every client re-downloads once, which is cheap today
+and gets less so.
+
+Every guard in this entry was checked by mutation rather than by inspection —
+the guard removed, the suite re-run, a named test required to fail, and the
+*right* test required to be the one that fails. That method is what the first
+version of these tests failed: a review's 56-mutation sweep found 22 survivors,
+including the headline decision (moving `_guard` after the build changed
+nothing), the whole of `_check_build_agrees`, and the `generated` pinning —
+whose assertion was correct but vacuous, because the crash and the retry both
+landed inside one wall-clock second. A second review round found one more, the
+file-on-disk authority in `_nothing_was_published`, and it is the one whose
+absence would have wedged the data plane rather than merely gone unnoticed. The
+suite now kills **26 of 26**, with the tree moved on and the clock a day ahead
+in every re-run test, and a blocking `flock` *fails* it instead of hanging it.
+
+**What a third review round changed**, all of it reproduced before it was
+fixed:
+
+- **The corpus is now the tree git says we fetched.** `reset --hard` restores
+  tracked files and deletes nothing untracked, so a stray `CVE-*.json` — a
+  half-finished operation, a hand edit — was walked, hashed and would have been
+  published as though upstream had said it. `fetch` now ends with
+  `git clean -fdq -- cves`, and `init` refuses a corpus with uncommitted
+  changes, because the commit is only half the question: a modified record
+  leaves `HEAD` alone while changing what `scan` hashes, and the id sets still
+  match. The commit check also failed *open* when the artifact named a commit
+  and the clone reported none; that asymmetry is the state in which the check
+  cannot be made, so it now fails closed. **Every run** makes the same check,
+  not just `init`: `--no-fetch` skips the clean, and a review reproduced a
+  modified record publishing cleanly through it. After a fetch the check is a
+  cheap assertion (0.17 s over the real tree); with `--no-fetch` it is the only
+  thing there is.
+- **Recovery no longer reproduces the bytes; it verifies them.** The first fix
+  pinned the brotli quality into the pending record, which closed the reproduced
+  case — publish at quality 1, crash, retry at 5 — but left recovery depending
+  on the *compressor* being unchanged, so a brotli upgrade turned a resumable
+  run into a stopped one. `delta.write` now takes an `on_written` hook and calls
+  it between deciding the digest and renaming the file into place, so the
+  pending record holds the entry (length, digest, and the ID space the ledger
+  needs) before those bytes can be observed by anything. A retry with the file
+  present registers *that file* and recompresses nothing, which is what makes
+  "byte for byte" true rather than conditional. A file whose digest does not
+  match the record stops for a human — those are not the bytes clients may have
+  fetched — and only a run with neither the file nor its artifact is
+  unrecoverable. A third round found the classification that undid half of
+  this: with the entry pinned but the file since deleted, all three authorities
+  read clear and the run was *abandoned*, re-minting the same range from a moved
+  tree at a different digest. Reproduced. A pinned entry is now never abandoned,
+  because the hook fires just before the rename and so cannot distinguish
+  "crashed a microsecond early" from "served for a day, then deleted" — the
+  run rebuilds and compares instead, and the same hook stops it if the
+  compressor has moved. The deterministic-failure escape is untouched: every
+  validation raises before `delta.write` pins anything. One consequence worth naming: finishing a publication no longer
+  needs the artifact at all, so losing it now costs the *next* build rather than
+  the current one.
+- **`--tombstone-limit 1` is refused.** The first version of the range check
+  named 1 as the dangerous percent-versus-fraction mistake and then accepted it:
+  at `limit == 1` the threshold is the whole corpus and the comparison is
+  `deleted > corpus`, which a corpus that vanished entirely cannot satisfy. The
+  guard is not loosened by 1, it is switched off, so the interval is `[0, 1)`.
+- **"Abort and alert" is amended rather than pretended.** There is no MTA on
+  `plex`, so the cron line's redirect was not hiding an alert — there was none
+  to hide. The run now records its outcome in the state and `status` reports it;
+  see the architecture note above for why that is the channel and not mail.
+- **`deploy-pipeline.sh` validates its destination.** It runs `rsync --delete`
+  against a caller-supplied target, so a wrong one does not fail, it empties
+  something and fills it with Python — and the docroot and `cve.pub/` are both
+  a typo away. The destination must now match
+  `/home/pmeenan/src/<project>/pipeline/`, checked before anything is created.
+  A lexical prefix test is only sound on a path with no `..` in it —
+  `/home/pmeenan/src/../../var/www/meenan.dev/cve/` matches the pattern and
+  resolves to the docroot — and the destination is remote, so there is no local
+  `realpath` to canonicalise with; the component is refused outright instead,
+  which is stricter than resolving it. Its header also no longer describes
+  production as git-managed: the destination is a plain directory, rsync is the
+  model, and turning it into a checkout is a possible future change rather than
+  something already true. The same claim was corrected in `AGENTS.md`,
+  `architecture.md` and this entry.
+
+**Reopen if.** The second walk stops being affordable (it is 31% of the run
+today), upstream volume makes a day's delta stop being one small file, a run
+needs to be safe to interrupt at a granularity smaller than one revision, or the
+per-record revision column turns out not to be what the bridging delta needs —
+in which case it should be removed rather than kept for a reader that never
+arrived.
+
 ## D-057: The first AI tier is a model we host — Ollama behind a restricted same-origin endpoint  (2026-08-03, status: accepted, owner decision; re-orders D-045's ladder and narrows its "never proxied" to third-party traffic; adds the first dynamic endpoint, outside the data plane, under D-006's rules)
 
 **Decision.** The first model tier to ship is self-hosted: an Ollama instance
@@ -768,7 +1172,7 @@ service worker's network-first path turns out to make offline *detection* slow
 enough to hurt, which is a timeout question inside the SW rather than a reason
 to prefer cache.
 
-## D-053: Published artifacts live in `cve.pub/`, a peer of both the document root and `cve.data/`  (2026-08-01, status: accepted, amends the layout in D-018 and D-034)
+## D-053: Published artifacts live in `cve.pub/`, a peer of both the document root and `cve.data/`  (2026-08-01, status: accepted, amends the layout in D-018 and D-034; the "three subdirectories" below became four when D-058 added `cve.data/state/`)
 
 **Decision.** The served data plane is
 `/var/www/meenan.dev/cve.pub/data/`, a third peer directory alongside `cve/`
@@ -1411,7 +1815,7 @@ docroot, and the pipeline has no business being web-reachable.
 **Reopen if.** The pipeline grows a dependency that Python makes awkward, or the
 schema starts drifting between the two languages despite the single DDL file.
 
-## D-042: The pipeline is a daily cron ingest with a monthly snapshot  (2026-08-01, status: accepted, supersedes the cadence half of D-026)
+## D-042: The pipeline is a daily cron ingest with a monthly snapshot  (2026-08-01, status: accepted, supersedes the cadence half of D-026; the daily job's timing and output size are re-measured in D-058 — 54.9 s per run, and ~291 records/~70 KB per day over a weekend window rather than the ~665/87 KB estimated here)
 
 **Decision.** Two scheduled jobs under `flock`, no daemon:
 
@@ -2051,7 +2455,7 @@ returns to D-006's rules in full.
 which point the question is whether it can be pre-built into a named file
 instead, and only then whether it needs a handler.
 
-## D-031: The delta protocol — content-hash revisions, whole records, merged by range  (2026-07-31, status: accepted, answers Q-001)
+## D-031: The delta protocol — content-hash revisions, whole records, merged by range  (2026-07-31, status: accepted, answers Q-001; **the hash pass is no longer "effectively free"** — D-058 makes it a *second* walk, ahead of the build rather than inside it, measured at 16.9 s and about a third of a run)
 
 **Decision.** Six parts, each measured against a real 21.4-hour upstream window
 on 2026-07-31 (`a42a2eb6c2` → `d300c5fcc0`).
@@ -2716,7 +3120,7 @@ fetch` retrieves new commits, trees, and blobs incrementally, whereas repeated
 and should be adopted — or disk pressure on `plex` makes 316 MB matter, which at
 1.1 TB free it does not.
 
-## D-018: Server-side state lives in `cve.data/`, a peer of the document root  (2026-07-30, status: accepted)
+## D-018: Server-side state lives in `cve.data/`, a peer of the document root  (2026-07-30, status: accepted; published artifacts moved out to `cve.pub/` by D-053, and a fourth subdirectory — `state/`, the ingest's hash state, lock and daily builds — was added by D-058)
 
 **Decision.** All server-side state lives under
 `/var/www/meenan.dev/cve.data/` on `plex` — a sibling of the `cve/` document

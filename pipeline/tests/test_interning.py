@@ -302,6 +302,34 @@ class Retirement(unittest.TestCase):
         grown = fixtures.build_artifact(self.root, corpus, "two", seed=pruned)
         self.assertEqual(record_ids(grown)["CVE-2026-1004"], 3)
 
+    def test_records_the_build_mints_are_not_counted_as_retirements(self):
+        """The count is derived from the seed's record count, and the walk fills
+        the seed's *own* id map rather than a copy of it — so reading its length
+        afterwards counted every newly minted record as a retirement as well.
+
+        Found by the ingest, which cross-checks the build's counts against its
+        own hash pass (D-042): an inflated count aborts every run on a day
+        upstream added a record, which is every day.
+        """
+        later = {
+            "cveMetadata": {"cveId": "CVE-2026-1004", "state": "PUBLISHED"},
+            "containers": {"cna": {"descriptions": [{"lang": "en", "value": "Later."}]}},
+        }
+        added = fixtures.corpus_v1() | {"CVE-2026-1004": later}
+        _grown, stats = fixtures.build_artifact_with_stats(
+            self.root, added, "added", seed=self.v1
+        )
+        self.assertEqual(stats["new_records"], 1)
+        self.assertEqual(stats["retired_records"], 0)
+
+        # And the two together, which is the shape a real day has.
+        both = {k: v for k, v in added.items() if k != "CVE-2026-1002"}
+        _churned, stats = fixtures.build_artifact_with_stats(
+            self.root, both, "churned", seed=self.v1
+        )
+        self.assertEqual(stats["new_records"], 1)
+        self.assertEqual(stats["retired_records"], 1)
+
 
 class Recorded(unittest.TestCase):
     """What the artifact records about its own ID space, and who reads it."""
