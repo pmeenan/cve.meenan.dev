@@ -146,13 +146,15 @@ def lists_delta(pub_dir: str, entry: dict) -> bool:
     )
 
 
-def register_delta(pub_dir: str, entry: dict, generated: int) -> dict:
-    """Add a published delta to the manifest and advance the head revision.
+def plan_delta(pub_dir: str, entry: dict, generated: int) -> dict:
+    """The manifest this data plane *would* have if `entry` were registered.
 
-    Called after the file itself is in place, so the manifest never names a
-    file that is not there. Re-registering the same range replaces its entry
-    rather than duplicating it, which is what makes a re-run of an interrupted
-    ingest converge instead of corrupting the list.
+    Split out from `register_delta` so the emitter can ask "would this be
+    publishable?" before it publishes anything. It has to be answerable early:
+    the file lands first (so the manifest never names something absent) and the
+    ledger records it, and both are irreversible — a delta refused at
+    registration has already burned its immutable URL. The bridging delta M2's
+    monthly rebuild needs is exactly such a case today.
     """
     manifest = load(pub_dir)
     if manifest is None:
@@ -174,5 +176,17 @@ def register_delta(pub_dir: str, entry: dict, generated: int) -> dict:
     # indicator exists to show. `max` because re-registering an older delta
     # must not make the origin look staler than it is.
     manifest["generated"] = max(int(manifest.get("generated", 0)), int(generated))
+    return manifest
+
+
+def register_delta(pub_dir: str, entry: dict, generated: int) -> dict:
+    """Add a published delta to the manifest and advance the head revision.
+
+    Called after the file itself is in place, so the manifest never names a
+    file that is not there. Re-registering the same range replaces its entry
+    rather than duplicating it, which is what makes a re-run of an interrupted
+    ingest converge instead of corrupting the list.
+    """
+    manifest = plan_delta(pub_dir, entry, generated)
     save(pub_dir, manifest)
     return manifest

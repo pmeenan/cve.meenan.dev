@@ -23,6 +23,331 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-056: Stable interned IDs — seeded builds, retirement, recorded high-water marks, and a named ID space  (2026-08-02, status: accepted, implements D-025 hazard 1; makes D-055's floors sound)
+
+**Decision.** Every build continues the previous build's ID space or explicitly
+starts a new one. There is no third option and no default: `pipeline/build.py`
+now requires `--seed <prev.sqlite>` or `--bootstrap`, and `build()` raises
+without one of them.
+
+**1. Seeding covers `cve.id`, not only the seven lookups.** `cve.id` was a bare
+walk counter, and the walk is sorted by file name, so one record added at the
+front renumbered every record behind it — and the delta then carried each of
+them at its neighbour's id. Since D-055 the client's applier refuses that in
+both directions, so the symptom is not silent corruption but a wedged sync and a
+63 MB re-download; for *lookup* ids there is no tripwire at all, which is why
+seeding is the fix rather than the tripwire. `cve.id` is interned like
+everything else now.
+
+**2. A value the corpus stops using is retired, not carried forward.** Its row
+leaves the artifact; its id is never issued again. The alternative — keep every
+row ever interned so that "id ≤ floor" literally means "the client has it" — is
+tidier to reason about and costs the largest table in the corpus: `url` only
+ever grows, with no upper bound and no way to reclaim any of it.
+
+Retirement is safe because an id can only be *referenced* by a build while its
+value has been interned continuously since it was minted: seeding is what
+preserves a key→id mapping, so a value that is dropped is absent from the next
+seed and mints a **new** id if it comes back. Therefore any id an artifact still
+references was in every artifact since it was minted — including whichever
+snapshot each client downloaded — so "at or below the floor" still implies "the
+client has it", which is exactly what `_check_closure` assumes.
+
+A synced client keeps the rows a rebuild retired, and that is visible in one
+place: the client builds FTS indexes over `vendor` and `product` themselves
+(D-035), so its type-ahead can offer a name the corpus no longer contains, while
+a freshly downloaded client at the same revision cannot. Accepted deliberately —
+the alternative is unbounded growth in every download — but it is a real
+difference between two clients at one watermark, and it is why M2's exit
+criterion is a claim about the *downloaded* database. Aggregates are unaffected:
+nothing joins to a row no record references.
+
+**3. The high-water mark is recorded, never recomputed as `max(id)`.** With
+retirement those two differ, and the difference is the sharpest bug in this
+area: retire the *highest* row and a rebuild that trusted `max(id)` hands that
+id to a different value, while clients hold the old meaning and no delta can
+correct them — the id is below their floor, so nothing ships it. The artifact
+therefore carries its own ID-space record in `meta`: `hwm` (a JSON object in
+exactly the changeset's `floors` shape), `cve_hwm`, `idspace`, and — on a seeded
+build — `seed_rev`, `seed_marks` and `seed_fingerprint`.
+In `meta` rather than a sidecar file because the artifact *is* the seed for the
+next build and the source of the next delta's floors, and a second file to keep
+beside it is a second file to lose. The client reads `meta` by key and ignores
+the rest.
+
+`build.id_space()` reads it back, and is where `floors` now comes from. An
+artifact built before this existed — the generation live on 2026-08-02 — has
+none of the keys, and is recognised by having no `idspace`: its `max(id)` *is*
+its high-water mark, because an unseeded build never retires anything, so
+adopting it is exact rather than a guess, and the build reports what it inferred
+(`cve` included). An artifact that records a lineage but not the rest of it is
+**damaged, not old**, and is refused; so is one holding ids above its own
+recorded marks. That last one is not fastidiousness: the same number is a *mint*
+floor for the next build, where the safe repair is the higher value, and a
+*delta* floor for the next changeset, where it is the lower one. One number
+cannot be conservative in both directions, so it is an error rather than a
+choice.
+
+**4. The ID space has a name, and the checks are the publisher's.** A lineage
+token is minted by `--bootstrap` and inherited by every seeded build — including
+a build seeded from a pre-D-056 artifact, which *mints* one for the ids it
+adopts, since the seed has none to pass on. `ledger.py` records the token the
+data plane was published from, in the same write as the snapshot it came with,
+and both publishers refuse a mismatch: `publish.py` on a snapshot,
+`delta.publish` on a delta.
+
+Four rules make that guarantee hold rather than merely exist:
+
+- **An empty ledger means *unknown*, not *unconstrained*.** The manifest carries
+  no lineage, so a ledger seeded from one — the state of the live origin — has
+  no token, and adopting whatever arrives next would bless exactly the unseeded
+  rebuild this entry exists to prevent. Adoption over a data plane that has
+  already published anything is therefore an explicit act,
+  `publish.py --adopt-id-space`, correct only for a build seeded from the live
+  artifact. Over an empty directory there is nothing to contradict, so it is
+  automatic. **A delta never adopts**: it cannot prove which ID space the
+  snapshot its clients downloaded belongs to, and the asymmetry is the reason —
+  a wrongly adopted *snapshot* is self-healing, because the clients it renumbers
+  re-download and discard their old ids, while a wrongly adopted *delta* writes
+  drifted ids into databases that keep them.
+
+  That has a price, and it is the migration's: adopting requires publishing a
+  snapshot, and a client at the old revision has no chain to it, so everyone
+  re-downloads once. Rehearsed end to end against a simulated live origin —
+  chunks published by the old code, an artifact recording none of this, no
+  ledger file — and the sequence works: seed from the live artifact, publish
+  with `--adopt-id-space`, then deltas from there. Cheap today (the site is a
+  day old); if it ever is not, the thing to revisit is whether a delta may adopt
+  under an explicit flag, not whether adoption should be silent.
+- **What an id means at a published revision is immutable**, like the bytes at
+  its URL and for the same reason: clients hold it. The ledger pins each
+  revision's fingerprint on first publication and refuses to overwrite it, and
+  `publish.py` refuses an artifact whose ID space differs from the one already
+  recorded there — the *whole* record, marks and fingerprint together, built
+  once and handed to the ledger unchanged. Comparing part of it while the ledger
+  compared all of it was worse than not checking early at all: an artifact whose
+  recorded extent differed but whose rows did not passed, was renamed into
+  place, and was then rejected by the ledger, leaving the immutable URL occupied
+  by bytes nothing had registered — which blocked the correct artifact from ever
+  being published there. Deltas carry the same check for the revision they land
+  on, since a chain can reach a revision another delta already published. Without that pin the
+  `rev == published_head` exception below was a hole rather than a convenience:
+  a sibling published at head *redefined* the revision's ids, and its own
+  descendants were then accepted because the value the check compares against
+  had moved with it.
+
+- **Retiring *or adopting* an ID space needs a revision above the published
+  head.** "Every
+  client re-downloads" is only true if the manifest stops offering them a no-op,
+  and `planSync` reports "already current" whenever the watermark equals head —
+  so `--new-id-space` at head, which is the *legal* monthly-rebuild landing,
+  left every synced client on the old ids and then applied the next delta to
+  them. Above head, no chain reaches the new snapshot and the re-download is
+  real. Adoption is bound by the same rule for a different reason: a legacy data
+  plane has no recorded fingerprint to compare against — that is *why* it is
+  adoption rather than a check — so landing above head is what makes being wrong
+  survivable instead of silent. A bootstrap may never adopt at any revision:
+  adoption asserts that these ids continue what was published, and a bootstrap
+  continues nothing. That is also what retires the old deltas: no entry can start at or above
+  a revision higher than every revision they reach.
+- **The token cannot see a build seeded from the wrong ancestor**, because two
+  children of one artifact inherit the same token while minting the same ids for
+  different values. So the artifact also records `seed_rev`, the revision whose
+  ID space it continued, and that is checkable: a snapshot must continue the
+  published head, and a delta must continue exactly its own `from`. The second
+  also closes `extra` (below): a payload spanning a revision its source was not
+  built from would silently omit the content that moved in the revision it
+  skipped. It settles the floors too — they describe the ID space at `from`, and
+  the artifact records the extent it grew from, so `extract` can now refuse
+  floors that are not that revision's instead of trusting its caller. A floor
+  that is too high under-ships lookup rows, and `_check_closure` reads the gap
+  as "the client already has it".
+
+  `seed_rev` names a *revision*, though, and two builds can be stamped at one —
+  a re-run after a failed attempt, a local iteration — sharing a token and a
+  revision while disagreeing about what an id means. Neither their extent
+  separates them (two siblings can mint the same number of rows), so the
+  artifact records a **fingerprint** of the ID space it grew from: a SHA-256
+  over every interned row and every `(id, cve_id)` pair, in id order. The ledger
+  records the same fingerprint for the artifact it publishes at each revision,
+  and the publishers compare. It costs one pass — 1.3 s over the full-cardinality
+  synthetic artifact, and nothing during a build, because the seed's is folded
+  into the pass that loads it. Hashing uses `surrogatepass`, because record text
+  is attacker-influenced and need not be encodable UTF-8 (RE-015): a fingerprint
+  that raised on a legal record would be worse than none.
+
+  Provenance is **all-or-nothing**, and it is not the artifact's word alone.
+  Each part of it feeds a different check, so a half-set silently disables one:
+  `build.id_space` refuses an artifact carrying some of `seed_rev`,
+  `seed_marks` and `seed_fingerprint` but not all. The floors are compared
+  against **the ledger's** record of the revision they claim, not only against
+  the artifact's copy — editing that copy upward otherwise raised the floor the
+  emitter trusted, and the delta then referenced a lookup row it did not ship
+  while `_check_closure` read the gap as "the client already has it". And the
+  record has to exist: a missing one fails closed once this data plane records
+  any, because a run that died between exposing a revision and recording its ID
+  space left a gap that read as "nothing to check" — which is exactly the state
+  a wrong sibling's descendant needs. Deltas therefore write their bytes and
+  their ID space in one ledger write *before* the manifest exposes the new head,
+  the same ordering snapshots use.
+
+- **The exception both a retry and the monthly rebuild need.** A snapshot may
+  also be published when it *is* the head rather than continuing it —
+  `rev == published_head` — because the artifact the last delta was cut from is
+  stamped at head and was seeded from head-1. Without that exception the rule
+  refused the one artifact clients are synced to (D-055 calls that landing legal)
+  and made every publish unrepeatable: `published_head` is read from the
+  manifest, which a failed attempt has already advanced, so the retry was
+  refused by a guard the failure created. The ledger is now written *before* the
+  manifest for the same reason — the chunks are already served by then, so a
+  crash between them leaves the ledger knowing about a revision the manifest has
+  not yet advertised, rather than the reverse. The retry is an ordinary
+  operation now, too: the generation directory lands before either write, so a
+  crash leaves published bytes nothing has registered, and re-cutting *the same
+  bytes* completes the run without `--force` — byte identity is checkable, and
+  `--force` is documented as local iteration precisely because it can replace
+  bytes that are not identical. Same rule a delta has had since D-055.
+
+This is deliberately *not* on the wire. D-055 left an ID-space marker out of
+`FORMAT_VERSION` 1 pending this task's shape, and having built it the value is
+lower than it looked: every failure it would catch is caught here, before
+publication, where it is still fixable — a client-side refusal would only turn
+an unfixable server mistake into an unfixable client symptom. Deferring stays
+safe only while nothing is deployed against the format, which is true until M2's
+Sync ships; the daily-ingest task comes first, and is the last comfortable place
+to revisit it.
+
+**5. Two things the seeded artifact hands the ingest**, which owns the changeset
+(M2's next task): `floors`, and `extra` — the ids whose *content* moved under an
+id the client already holds. Only `cwe.descr` can do that. It is the one lookup
+column that is neither part of its own interning key nor derived from it:
+`url.host_id` is also a non-key column, but it is a function of the url text and
+host ids are themselves seeded, so it cannot move while the url stays interned.
+Any eighth lookup table has to be checked against that test, not against the
+shorter claim that columns are keys.
+
+The seeding discipline — **seed from the most recent build, not from the last
+published snapshot** — is what `seed_rev` enforces. Ids minted by a daily delta
+exist only in that day's artifact, and a monthly rebuild seeded from the older
+snapshot would mint them again for different values.
+
+**A schema bump breaks the ID space by construction**, and the chain is worth
+stating once: seeding across one is refused (ids only mean something against the
+shape that assigned them, and a bump makes every client re-download anyway,
+D-025 hazard 4), so the rebuild must `--bootstrap`, which mints a new lineage,
+which needs `publish.py --new-id-space` at a revision above head. Three
+deliberate steps, none of them defaultable.
+
+**Context.** Measured on a synthetic corpus built to the real corpus's *ID-space
+cardinalities* rather than its text, so the interner is exercised at full scale
+without 2.9 GB of JSON. As measured: 372,292 records, 24,421 vendors, 79,406
+products, 756,522 urls, 18,987 hosts, 797 CWEs, 372 CNAs — against a real corpus
+of 372,092 records, 24,420 vendors, 80,063 products, 18,986 hosts, 797 CWEs and
+479 CNAs (D-024, D-033; the extra 200 records are the churn run below, which ran
+between the two timing pairs). Records, vendors, hosts and CWEs are therefore at
+real cardinality, products within 1%, CNAs at 78% of it — and the url count is a
+*lower bound*, because the real corpus's distinct-URL count is not recorded
+anywhere in these docs, only that 95.1% of records carry references (D-033). Run
+on the dev VM (12 cores), not on `plex`, and with short descriptions, so the
+absolute numbers are not comparable with a production run or with D-033's
+artifact sizes; the comparison between the two rows is the result:
+
+| Build | Time (two runs) | Peak RSS | Artifact |
+| --- | --- | --- | --- |
+| Bootstrap | 57.9 s, 59.0 s | 762.3 MB, 762.6 MB | 263.9 MB |
+| Seeded, same corpus | 60.2 s, 58.5 s | 896.9 MB, 896.7 MB | 263.9 MB |
+
+So seeding costs **+134 MB of peak RSS and no measurable time** — the two time
+ranges overlap, and each build won one of the two pairs, so the honest statement
+is "inside run-to-run noise on this machine", not a percentage. It costs nothing
+in the published artifact either: the two files are the same size to the byte,
+and the seeded rebuild minted zero ids. The memory is the seed maps and scales
+with lookup rows, so the real corpus's URL count — not recorded, but above the
+synthetic one — puts it higher. It is spent on the
+server rather than in the browser, which is where this project's memory
+constraints are (D-049); if it ever stops being affordable there,
+`Interner._unused` can shrink to a used-bitmap plus full columns for `cwe`
+alone, at the cost of specializing the code on which table's columns happen to
+be its key.
+
+Then a day's churn on top, in the arrangement that used to renumber everything:
+200 records added *ahead* of every existing one in walk order, and 665 existing
+records gaining a reference. The rebuild took 59.7 s, minted 200 record ids and
+665 urls and retired nothing — and **1,252,797 pre-existing ids were compared
+before and after, none of which moved**, with every new record id above the
+previous high-water mark.
+
+The fixture corpora went the other way. They had been arranged to *avoid*
+renumbering — D-055 renamed a product to `zephyr` so it would sort after `gizmo`
+— and that one is now a regression test: `gadget` is back, and `corpus_drift`
+adds the second reproduction D-055 described but could not use (stripping the
+*first* record's CWE and references). `test_interning.py` builds each of them
+twice, unseeded and seeded, so the drift is reproduced rather than asserted
+away.
+
+Every guard here was checked by mutation rather than by inspection — the fix
+removed, the suite re-run, the named test required to fail. Against the suite as
+it stands (116 tests): recomputing the lookup high-water marks as `max(id)`
+fails 4; a `SEED_KEY` that recovers the wrong key from a stored `product` row
+fails 15; disabling seeding fails 74. Those counts move whenever a test is
+added, so what matters is the method rather than the number — every guard listed
+in this entry has at least one test that fails when it is removed, and that is
+what was checked, one guard at a time.
+
+`SEED_KEY` deserves the note, because getting one wrong does not raise — seeding
+would store a row under one key while the build looks it up under another, and
+the miss silently mints a duplicate id. What catches it is rebuilding an
+unchanged corpus and requiring that *nothing* is minted, which covers every
+table at once.
+
+One bound that has nothing to do with ids and everything to do with the
+contract: a revision is refused unless it fits in `0..2^53-1`, at build time and
+at publication. `isRevision` in `lib/protocol.ts` caps it there and the client
+refuses the *whole manifest* carrying a larger one, while SQLite stores an int64
+without complaint — so `rev = 2^53` built and published cleanly into a data
+plane no browser could read.
+
+One more thing the second review round moved: `published_head` now comes from
+every revision the ledger has *published*, deltas included, not from snapshot
+revisions alone. A missing manifest used to lower it, which made
+`--new-id-space` legal again at a revision clients were sitting at.
+
+**Consequences.** `LOOKUP_COLUMNS` now has one definition, in `build.py`;
+`delta.py` binds to it, because a column order two modules use positionally is
+not a thing to write down twice. `fixtures.floors()` reads the artifact's record
+instead of `max(id)`. `build()` takes the revision to stamp, so the ingest sets
+it rather than editing the `meta` table that now holds the ID-space record. Four
+hazards outside the ID space were found while hardening it and fixed here rather
+than filed: a build could seed from the file it was writing (and lose the ID
+space entirely if it then failed), a bounded `--year-min`/`--limit` build could
+be seeded (retiring everything outside the slice, permanently), two files
+claiming one CVE ID crashed the insert instead of failing closed through
+`skipped`, and a failed build left a partial artifact a later run could seed
+from or publish. `delta.publish` now asks whether the manifest could *hold* an
+entry before writing the file: registration already refused a delta that would
+strand a client, but by then the immutable URL was burned and the ledger had
+recorded its bytes — which is exactly the shape of the bridging delta below.
+
+The ID-space obstacle to that bridging delta is gone: an old head and a rebuilt
+snapshot now share an ID space. The manifest still refuses one, because
+`assert_tiling` requires every delta to start at or above the snapshot's
+revision — so M2's monthly-rebuild task owns relaxing that walk as well as
+emitting the file.
+
+**Reopen if.** Retirement turns out to churn enough rows to matter (it should
+not: a value leaves only when no record in the corpus uses it), the server's
+build memory becomes a constraint, the fingerprint pass stops being cheap at
+corpus scale, or a lineage break shows up that none of the token, `seed_rev` and
+the fingerprint can see — the last one is what would put the ID-space marker on
+the wire, and the daily-ingest task is where that is still cheap.
+
+One thing this entry does **not** settle, surfaced by the same review: a
+snapshot published at `rev == published_head` with *different content* is
+accepted, and every client already at that watermark is told it is current, so
+it never sees the change. That is D-055's rule, not a new one, and it is the
+monthly rebuild's problem — which is why the plan's monthly-snapshot task now
+names it.
+
 ## D-055: The delta wire contract, finalized for the full schema  (2026-08-02, status: accepted, completes D-031 for the accepted schema D-033)
 
 **Decision.** D-031 settled the delta *protocol* against a schema that has since

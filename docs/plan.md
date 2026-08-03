@@ -36,7 +36,7 @@ evidence.
       measured alongside: median day 0.17 MB.
 - [x] **Settle the data-delivery architecture.** Bulk import with explicit
       Download and Sync, snapshot rebuilt weekly with catch-up deltas
-      (D-025, D-026).
+      (D-025, D-026 — the cadence became monthly in D-042).
 - [x] **Research: corpus redistribution terms.** Permissive grant, single notice
       obligation (D-008).
 - [x] **Research: browser support floor.** Chrome/Edge 108+, Firefox 111+,
@@ -195,28 +195,44 @@ everything downstream consumes them.
       table, idempotently (`pipeline/tests/`). Lookup rows are selected by
       per-table id floors rather than a `rev` column, which is the same range
       query D-031 specified for seven fewer columns.
-- [ ] **Stable interned IDs.** Implement Interner seeding from the previous
-      build (promised by D-025 hazard 1, not yet implemented), proven by a
-      snapshot N → delta → snapshot N+1 test: existing IDs never change, new
-      IDs append. Three things D-055 established about the shape of this:
-      it must cover **`cve.id` too** — that is a bare walk counter today, so
-      adding one record renumbers every record after it; **nothing guards
-      lookup-id drift** — the contract's tripwire compares `cve.id` against the
-      canonical CVE ID only, and a drifted vendor or product id silently
-      resolves to the wrong row, so seeding is the fix rather than a
-      mitigation; and the per-table floors `pipeline/delta.py` takes are what
-      seeding must record per build. Two independent reproductions of the
-      renumbering are in D-055.
+- [x] **Stable interned IDs** (D-056). Builds seed from the previous artifact
+      or explicitly bootstrap — there is no default — and seeding covers
+      `cve.id` as well as the seven lookups. A value the corpus stops using is
+      retired rather than carried forward, which is safe only because its id is
+      never reissued: the high-water marks are recorded in the artifact's
+      `meta` (`hwm`, `cve_hwm`) instead of being recomputed as `max(id)`, and
+      that record is now where a delta's `floors` come from. The ID space also
+      has a name (`idspace`) and each artifact records the revision it
+      continued (`seed_rev`); `ledger.py` remembers the name the data plane was
+      published from, and both publishers refuse an artifact that contradicts
+      either — a different lineage, or the same lineage grown from the wrong
+      ancestor, which a fingerprint of the ID space separates even when two
+      builds share a revision. Proven at both scales: the fixture corpora are built twice,
+      unseeded and seeded, so D-055's renumbering reproductions are regression
+      tests; and on a synthetic corpus at the real corpus's ID-space
+      cardinalities, 1,252,797 ids survived a day's churn — 200 records
+      inserted ahead of every existing one — without one moving. The cost of
+      seeding is memory, not time; the numbers and their caveats are in D-056,
+      and they are dev-VM measurements on synthetic text, not production ones.
 - [ ] **Daily ingest cron** under `flock`: fetch → hash → diff → tombstone
       guard (abort is the success case on a broken fetch) → delta file
       (D-031, D-042). Fail closed on malformed records (D-047). The changeset
-      it computes is what `pipeline/delta.py` already consumes — including the
-      per-table id floors, which it must persist per revision. Decide its
-      re-run semantics explicitly. Two constraints D-055 fixes for it: the
+      it computes is what `pipeline/delta.py` already consumes. Decide its
+      re-run semantics explicitly. Three constraints its inputs now fix: the
       ingest must **pin `generated` per revision** rather than stamping the
       clock on each attempt, since a published range may only ever be rewritten
-      with byte-identical content; and the per-table id floors it computes must
-      be recorded per revision, since the emitter cannot check them itself.
+      with byte-identical content (D-055); it must **seed each build from the
+      most recent one, not from the last published snapshot**, or a rebuild
+      re-mints ids a daily delta already gave away — which `seed_rev` now
+      refuses rather than merely documents (D-056); and the per-revision floors
+      it records come from the artifact's own `meta` (`build.id_space`),
+      alongside the `extra` ids the build reports for content that moved under
+      an existing id. Its first production run also has to cross the D-056
+      migration: the live origin records no ID space, so one build seeded from
+      the live artifact must be published with `--adopt-id-space` before any
+      delta can be — a delta never establishes a lineage. That publish is a new
+      generation, so every client that has already downloaded re-downloads once;
+      the sequence is rehearsed in D-056.
 - [ ] **Monthly snapshot cron**: rebuild, chunk, compress, publish by atomic
       rename; previous generation and its deltas retained; generations
       immutable (D-041, D-042, D-047). Two pieces D-055 left to this task:
@@ -225,7 +241,16 @@ everything downstream consumes them.
       retention run and the next rebuild the manifest can advertise a 404; and
       the **bridging delta** from the old head to the new snapshot's revision,
       without which a client a generation behind re-downloads rather than
-      catching up (it needs seeded interning, above).
+      catching up. D-056 unblocked the ID-space half of that — a rebuilt
+      snapshot and the old head now share an ID space — but `assert_tiling`
+      still refuses a delta starting below the snapshot's revision, so this
+      task owns relaxing that walk as well as emitting the file. (The emitter
+      now checks tiling *before* writing, so the attempt fails without burning
+      the immutable URL.) It also owns an open question D-056 surfaced but did
+      not settle: a rebuild published at `rev == published_head` — the legal
+      landing — with *different content* leaves every client at that watermark
+      believing it is current, so decide deliberately whether the monthly
+      rebuild must advance the revision or must be content-equivalent to head.
 - [ ] **Download with staged replacement.** Chunks and catch-up deltas land in
       a *staging* OPFS file — never truncating the live database (the M1 path
       does, and must not survive into M2) — with a persisted per-chunk
@@ -254,8 +279,10 @@ itself, builds its indexes, and queries the result — with one honest progress
 display across all three stages (every stage over a second names itself and
 shows progress where the work is countable, D-052), a stalled download reported
 as stalled rather than spinning, and peak memory bounded by chunks in flight
-rather than by the corpus; the database is verified identical to a freshly built
-one; a sync applies a real day of upstream changes; every failure-and-resume
+rather than by the corpus; the *downloaded* database is verified identical to a
+freshly built one, and a *synced* one matches it record for record while
+holding, by design, the lookup rows a rebuild retired (D-056); a sync applies a
+real day of upstream changes; every failure-and-resume
 test above passes, including failure *during replacement* leaving the previous
 copy usable.
 

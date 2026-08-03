@@ -60,7 +60,12 @@ class Corpus(unittest.TestCase):
         cls.root = tempfile.mkdtemp(prefix="cve-delta-")
         cls.addClassCleanup(shutil.rmtree, cls.root, True)
         cls.v1 = fixtures.build_artifact(cls.root, fixtures.corpus_v1(), "v1", rev=1)
-        cls.v2 = fixtures.build_artifact(cls.root, fixtures.corpus_v2(), "v2", rev=2)
+        # Seeded, as every rebuild of a published corpus is (D-056): v2 renames
+        # a product ahead of an existing one, so an unseeded rebuild renumbers
+        # and every sufficiency test below would be comparing two ID spaces.
+        cls.v2 = fixtures.build_artifact(
+            cls.root, fixtures.corpus_v2(), "v2", rev=2, seed=cls.v1
+        )
         cls.floors_v1 = fixtures.floors(cls.v1)
 
     def delta_v1_to_v2(self) -> dict:
@@ -313,7 +318,7 @@ class Guards(Corpus):
         hostile["CVE-2026-1001"]["cveMetadata"]["cveId"] = "CVE-2026-" + "9" * 300
         clone = fixtures.write_corpus(os.path.join(self.root, "long-id"), hostile)
         out = os.path.join(self.root, "long-id.sqlite")
-        stats = build.build(clone, out, None, None)
+        stats = build.build(clone, out, None, None, bootstrap=True)
         # Falls back to the file name, which is well-formed — so the record is
         # kept under a name the wire can carry rather than lost.
         self.assertEqual(stats["skipped"], [])
@@ -330,7 +335,9 @@ class Guards(Corpus):
         with open(os.path.join(clone, "CVE-not-an-id.json"), "w", encoding="utf-8") as handle:
             json.dump({"cveMetadata": {"cveId": "../../etc/passwd", "state": "PUBLISHED"}}, handle)
         out = os.path.join(self.root, "nameless.sqlite")
-        stats = build.build(os.path.join(self.root, "nameless"), out, None, None)
+        stats = build.build(
+            os.path.join(self.root, "nameless"), out, None, None, bootstrap=True
+        )
         self.assertEqual(len(stats["skipped"]), 1)
         self.assertEqual(stats["records"], 0)
 
@@ -569,7 +576,9 @@ class Sufficiency(Corpus):
         """The removal direction of "absent means absent" (D-055): CVE-2026-1003
         drops its description, CWE, reference, CVSS and version rows, and a
         client that applies the delta must end up without them."""
-        without = fixtures.build_artifact(self.root, fixtures.corpus_v3(), "v3b", rev=3)
+        without = fixtures.build_artifact(
+            self.root, fixtures.corpus_v3(), "v3b", rev=3, seed=self.v2
+        )
         # Emitted from the *new* build, as the ingest does — the artifact that
         # no longer holds those rows is the one that can describe their absence.
         payload = delta.extract(
@@ -619,10 +628,11 @@ class Sufficiency(Corpus):
             )
 
     def test_a_tombstone_removes_the_record_and_everything_under_it(self):
-        # v3 is v2 without its last record, which is the one arrangement that
-        # does not renumber under encounter-order ids.
+        # v2 without its last record: a rebuild that retires the values only
+        # that record used (globex, sprocket, its url and host, and the custom
+        # version type), which the seeded ID space keeps reserved.
         remaining = {k: v for k, v in fixtures.corpus_v2().items() if k != "CVE-2026-1003"}
-        without = fixtures.build_artifact(self.root, remaining, "v3", rev=3)
+        without = fixtures.build_artifact(self.root, remaining, "v3", rev=3, seed=self.v2)
         # From the rev-3 artifact: a delta describes the state of the build it
         # was emitted from, and that is the build the record is gone from.
         payload = delta.extract(
@@ -641,9 +651,10 @@ class Sufficiency(Corpus):
                 fixtures.table_rows(without, table),
                 f"{table} diverged",
             )
-        # Lookups are append-only and never garbage-collected (schema.sql), so
-        # the applied database keeps rows the rebuild no longer interns. That is
-        # the design, not a leak: ids must never be reused.
+        # The rebuild retired the rows only that record used, and the client
+        # keeps them: a delta never deletes a lookup row. That is the design
+        # (D-056) — the ids stay reserved, so nothing can make the stale rows
+        # resolve to something else.
         for table in LOOKUP_TABLES:
             applied_rows = set(fixtures.table_rows(applied, table))
             self.assertTrue(set(fixtures.table_rows(without, table)) <= applied_rows)
@@ -849,7 +860,12 @@ class Publication(unittest.TestCase):
         this one replaces: no chain reaches head through it, so listing it only
         advertises a catch-up path that does not exist."""
         rebuilt = fixtures.build_artifact(
-            self.root, fixtures.corpus_v2(), "v4", rev=4, generated=fixtures.FIXED_GENERATED + 1
+            self.root,
+            fixtures.corpus_v2(),
+            "v4",
+            rev=4,
+            generated=fixtures.FIXED_GENERATED + 1,
+            seed=self.published["next"],
         )
         publish_module.publish(rebuilt, self.pub, quality=5, jobs=2)
         published = manifest_module.load(self.pub)
@@ -864,7 +880,12 @@ class Publication(unittest.TestCase):
         synced past it — and reused its `snapshot-<rev>` URLs for different
         bytes under an immutable cache policy."""
         newer = fixtures.build_artifact(
-            self.root, fixtures.corpus_v2(), "r2", rev=2, generated=fixtures.FIXED_GENERATED + 1
+            self.root,
+            fixtures.corpus_v2(),
+            "r2",
+            rev=2,
+            generated=fixtures.FIXED_GENERATED + 1,
+            seed=self.published["next"],
         )
         publish_module.publish(newer, self.pub, quality=5, jobs=2)
         shutil.rmtree(os.path.join(self.pub, "snapshot-1"), ignore_errors=True)
@@ -888,8 +909,28 @@ class Publication(unittest.TestCase):
         os.unlink(ledger.path(self.pub))  # as if this data plane predates it
         shutil.rmtree(os.path.join(self.pub, "snapshot-1"))
 
-        with self.assertRaisesRegex(SystemExit, "immutable|roll it backwards"):
-            publish_module.publish(self.published["snapshot"], self.pub, quality=5, jobs=2)
+        # A rebuild seeded from the live snapshot, which is what the D-056
+        # migration requires: a ledger-less data plane has no recorded lineage,
+        # and only an artifact that *continues* the published ids may adopt it
+        # (a bootstrap is refused). This test is about the revision rules
+        # underneath that — the re-seeded ledger still knows rev 1 was published.
+        rebuilt = fixtures.build_artifact(
+            self.root,
+            fixtures.corpus_v1(),
+            "legacy-rebuild",
+            rev=1,
+            generated=fixtures.FIXED_GENERATED,
+            seed=self.published["snapshot"],
+        )
+        # Refused, and on a data plane with no recorded lineage the ID-space
+        # rules are what catch it first: adopting one has to land above the head
+        # a client could be at, which rev 1 is not (D-056). The revision rules
+        # underneath are unchanged — either way the generation is not re-cut.
+        with self.assertRaisesRegex(
+            SystemExit, "immutable|roll it backwards|above the published head"
+        ):
+            publish_module.publish(rebuilt, self.pub, quality=5, jobs=2, adopt_id_space=True)
+        self.assertEqual(manifest_module.load(self.pub)["snapshot"].get("rev"), None)
 
     def test_an_orphaned_delta_file_is_only_reusable_for_the_same_payload(self):
         """Its URL is deterministic, so anyone who guessed it holds those bytes

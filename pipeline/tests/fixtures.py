@@ -5,15 +5,18 @@ carry markup, quotes, control characters and non-ASCII text, one reference is a
 `javascript:` URL with no host at all, and one record has no English
 description. All of that is data the wire format has to carry unchanged.
 
-The second corpus is the first plus one record that sorts *after* every
-existing one, plus a modification to the last existing record whose new names
-also sort last. That is not cosmetic: `build.py` still assigns ids in encounter
-order (Interner seeding is M2's next task), and encounter order runs through
-`normalize.projection`, which sorts each record's products and CWEs. Naming the
-added product "gadget" rather than "zephyr" was enough to renumber `gizmo` from
-2 to 3 in the rebuild and to break delta apply outright — measured, not
-predicted. Needing to arrange the fixture around that is the argument for
-seeding.
+The corpora are built as a chain — v2 seeded from v1, v3 from v2 — because that
+is what the pipeline does (D-056), and because the ids the delta carries are
+only stable if it is.
+
+They are also deliberately arranged to *provoke* renumbering, which is the
+opposite of how they started. Encounter order runs through
+`normalize.projection`, which sorts each record's products and CWEs, so a value
+inserted alphabetically ahead of an existing one used to take its id: adding the
+product "gadget" moved `gizmo` from 2 to 3 and broke delta apply outright, and
+the fixture was renamed "zephyr" to dodge it. Seeding is what fixes that, so the
+name is back — and `test_interning.py` rebuilds these same corpora unseeded to
+show the drift is real rather than hypothetical.
 """
 
 from __future__ import annotations
@@ -126,9 +129,11 @@ def corpus_v2() -> dict:
                 "descriptions": [{"lang": "en", "value": "Now described, and no longer rejected."}],
                 "affected": [
                     {"vendor": "acme", "product": "gizmo"},
+                    # Sorts *before* `gizmo`, which is the point: without
+                    # seeding it takes gizmo's id (D-055, D-056).
                     {
                         "vendor": "acme",
-                        "product": "zephyr",
+                        "product": "gadget",
                         "versions": [{"status": "affected", "version": "3.1"}],
                     },
                 ],
@@ -181,13 +186,6 @@ def corpus_v3() -> dict:
     fixture change is additive, and an applier that only clears the sections a
     delta happens to carry — the exact bug the rule forbids — passes the whole
     suite.
-
-    It has to be the *last* record that loses them, for the same reason the
-    additions had to sort last: interning follows encounter order, so if an
-    earlier record stops interning a value, the next record to use it takes its
-    id and the rebuild renumbers. Stripping CVE-2026-1001 instead was tried
-    first and swapped CWE-79 and CWE-787 — a second reproduction of exactly
-    what M2's seeding task is for.
     """
     records = corpus_v2()
     records["CVE-2026-1003"] = {
@@ -210,6 +208,24 @@ def corpus_v3() -> dict:
     return records
 
 
+def corpus_drift() -> dict:
+    """v2 with the *first* record dropping the CWE and references it interned.
+
+    The other way encounter order renumbers: when the record that first
+    interned a value stops using it, the next record to use it inherits the id.
+    Rebuilt unseeded this swaps CWE-79 with CWE-787 and moves two urls and two
+    hosts — all of them silently, because the `cve` tripwire only covers record
+    ids. Seeded, nothing moves. (D-055 hit this while writing `corpus_v3`;
+    `test_interning.py` asserts both directions.)
+    """
+    records = corpus_v2()
+    records["CVE-2026-1001"]["cveMetadata"]["dateUpdated"] = "2026-03-05T00:00:00Z"
+    container = records["CVE-2026-1001"]["containers"]["cna"]
+    del container["problemTypes"]
+    del container["references"]
+    return records
+
+
 def write_corpus(root: str, records: dict) -> str:
     """Write the records as a cvelistV5-shaped clone; return the clone path."""
     clone = os.path.join(root, "clone")
@@ -221,44 +237,61 @@ def write_corpus(root: str, records: dict) -> str:
     return clone
 
 
-def build_artifact(
-    root: str, records: dict, name: str, rev: int = 1, generated: int | None = None
-) -> str:
+def build_artifact_with_stats(
+    root: str,
+    records: dict,
+    name: str,
+    rev: int = 1,
+    generated: int | None = None,
+    seed: str | None = None,
+) -> tuple[str, dict]:
     """Build one artifact from a fixture corpus, stamped at `rev`.
 
     `generated` is settable because the fixtures need a *coherent* timeline —
     a snapshot published before the delta that follows it — and `build.py`
-    stamps wall-clock time.
+    stamps wall-clock time. `seed` is the previous artifact: pass it for every
+    rebuild of a corpus that has already been published, exactly as the pipeline
+    does (D-056). Omitting it bootstraps a fresh ID space, which is what the
+    drift tests want and what nothing else should.
+
+    The stats come back because they are half of what a build promises — what it
+    minted, retired, and had to infer — and a fixture that threw them away left
+    those unassertable.
     """
     workspace = os.path.join(root, name)
     os.makedirs(workspace, exist_ok=True)
     clone = write_corpus(workspace, records)
     out = os.path.join(workspace, f"{name}.sqlite")
-    stats = build.build(clone, out, None, None)
+    stats = build.build(clone, out, None, None, seed=seed, bootstrap=seed is None, rev=rev)
     if stats["skipped"]:
         raise AssertionError(f"fixture corpus failed to parse: {stats['skipped']}")
-    db = sqlite3.connect(out)
-    try:
-        db.execute("UPDATE meta SET v = ? WHERE k = 'rev'", (rev,))
-        if generated is not None:
+    if generated is not None:
+        db = sqlite3.connect(out)
+        try:
             db.execute("UPDATE meta SET v = ? WHERE k = 'generated'", (generated,))
-        db.commit()
-    finally:
-        db.close()
-    return out
+            db.commit()
+        finally:
+            db.close()
+    return out, stats
+
+
+def build_artifact(
+    root: str,
+    records: dict,
+    name: str,
+    rev: int = 1,
+    generated: int | None = None,
+    seed: str | None = None,
+) -> str:
+    return build_artifact_with_stats(root, records, name, rev, generated, seed)[0]
 
 
 def floors(db_path: str) -> dict:
-    """The highest id each lookup table holds — what a client at this revision
-    already has, and therefore what the next delta does *not* need to ship."""
-    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        return {
-            table: db.execute(f"SELECT coalesce(max(id), 0) FROM {table}").fetchone()[0]
-            for table in delta.LOOKUP_COLUMNS
-        }
-    finally:
-        db.close()
+    """The highest id each lookup table had *issued* at this revision — what a
+    client at it already has, and therefore what the next delta does not need to
+    ship. Read from the artifact's own record rather than recomputed, because
+    retirement puts the two apart (D-056)."""
+    return build.id_space(db_path)["floors"]
 
 
 def publish_fixture(root: str) -> dict:
@@ -272,7 +305,9 @@ def publish_fixture(root: str) -> dict:
     # A day apart, so the manifest's freshness genuinely advances when the
     # delta lands rather than being back-dated by it.
     snapshot = build_artifact(root, corpus_v1(), "v1", rev=1, generated=FIXED_GENERATED - 86_400)
-    following = build_artifact(root, corpus_v2(), "v2", rev=2, generated=FIXED_GENERATED)
+    following = build_artifact(
+        root, corpus_v2(), "v2", rev=2, generated=FIXED_GENERATED, seed=snapshot
+    )
 
     pub_dir = os.path.join(root, "pub")
     os.makedirs(pub_dir, exist_ok=True)

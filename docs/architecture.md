@@ -87,11 +87,16 @@ every 40 minutes, so a day accumulates ~665 distinct changed records.
    concept at all, so a mass deletion means our fetch broke, not that the CVE
    Program withdrew 400 records.
 4. **Normalize.** Build the relational artifact (see [Schema](#schema)). 19 s.
-   New interned values get IDs from the server-owned, append-only ID space, and
-   the run must record each lookup table's high-water id — that is what makes
-   "the rows a client at rev N is missing" a range query rather than a per-row
-   revision column (D-055). *Recording it per revision is the ingest's job and
-   is not built yet*; today the emitter is handed floors by its caller.
+   The build **seeds its ID space from the previous artifact** — `--seed`, or an
+   explicit `--bootstrap`, never a default (D-056) — so every id it already
+   issued means what it meant, and new values append above the recorded
+   high-water mark. That mark, per lookup table, is what makes "the rows a
+   client at rev N is missing" a range query rather than a per-row revision
+   column (D-055); the artifact carries its own in `meta`, which is where the
+   next delta's floors come from. Seed from the *most recent* build rather than
+   the last published snapshot — ids minted by a daily delta exist only there —
+   which the artifact's recorded `seed_rev` and its fingerprint of the ID space
+   it grew from let both publishers enforce rather than assume.
 5. **Publish the delta.** If anything changed, increment the revision and write
    `deltas/<rev-1>-<rev>.json.br`, then register it in the manifest — file
    first, so the manifest never names something that is not there. One run per
@@ -108,8 +113,12 @@ every 40 minutes, so a day accumulates ~665 distinct changed records.
    does not start seeing 404s. One spare generation costs 63 MB. Note what
    retention does *not* buy today: the manifest only lists deltas that start at
    or after its snapshot's revision, because nothing bridges the old revisions
-   to a rebuilt snapshot, so a client a generation behind re-downloads until a
-   bridging delta becomes possible (D-055, and it needs seeded interning).
+   to a rebuilt snapshot, so a client a generation behind re-downloads until the
+   bridging delta lands with the monthly cron. Seeded interning removed the
+   ID-space half of that blocker — a rebuilt snapshot and the old head share an
+   ID space now — and the remaining half is the manifest's own tiling rule,
+   which still requires a delta to start at or above the snapshot's revision
+   (D-055, D-056).
 
 Publication into `pub/` is an atomic rename, so a half-written artifact is never
 reachable — and a published generation is immutable: same-rev republication is
@@ -258,7 +267,9 @@ query that returns final state by construction. For records that is the ingest's
 content-hash diff (D-031) — the schema carries no per-record revision column;
 for lookup rows it is one integer per table per revision, since the ID space is
 append-only and "what the client is missing" is "everything above the floor"
-(D-055).
+(D-055). That integer is the high-water id the build *recorded*, not the highest
+id still present: a retired row can be the highest one, and recomputing would
+hand its id to a different value (D-056).
 
 ## The client
 
@@ -356,7 +367,10 @@ D-033 after pricing every candidate. Interning is server-side, so the published
 artifact carries no `UNIQUE` constraints that exist only to support it.
 
 ```sql
--- interned lookups: server-owned ID space, append-only, never renumbered
+-- interned lookups: server-owned ID space, append-only, never renumbered.
+-- Each build seeds from the previous artifact, so an id means the same value in
+-- every artifact and every delta; a value the corpus drops is retired and its
+-- id never reissued (D-056).
 CREATE TABLE cna(id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE cwe(id INTEGER PRIMARY KEY, cwe TEXT, descr TEXT);
 CREATE TABLE vendor(id INTEGER PRIMARY KEY, name TEXT);
@@ -376,7 +390,10 @@ CREATE TABLE cve_ref (cve_id INT, url_id     INT, PRIMARY KEY(cve_id,url_id))   
 CREATE TABLE cve_ver(cve_id INT, product_id INT, status INT,
   version TEXT, lt TEXT, lte TEXT, vtype INT);
 
-CREATE TABLE meta(k TEXT PRIMARY KEY, v);   -- rev, schema, earliest_year, notice
+-- rev, schema, generated, notice — plus the ID space's own record, which the
+-- client ignores and the next build and delta read: hwm, cve_hwm, idspace,
+-- seed_rev, seed_marks, seed_fingerprint (D-056)
+CREATE TABLE meta(k TEXT PRIMARY KEY, v);
 
 -- built by the client after import, never shipped (D-035)
 CREATE VIRTUAL TABLE fts         USING fts5(descr, content='cve_text', content_rowid='cve_id');

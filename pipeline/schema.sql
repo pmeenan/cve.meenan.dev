@@ -16,8 +16,10 @@
 
 PRAGMA page_size = 4096;
 
--- Interned lookups. The server owns this ID space: append-only, never
--- renumbered, never garbage-collected (D-025 hazard 1).
+-- Interned lookups. The server owns this ID space: append-only and never
+-- renumbered (D-025 hazard 1). Each build seeds from the previous artifact, so
+-- an id means the same value in every artifact and every delta; a value the
+-- corpus stops using loses its row but keeps its id reserved forever (D-056).
 CREATE TABLE cna(id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE cwe(id INTEGER PRIMARY KEY, cwe TEXT, descr TEXT);
 CREATE TABLE vendor(id INTEGER PRIMARY KEY, name TEXT);
@@ -66,7 +68,10 @@ CREATE TABLE cve_ver(
 
 -- Sync state lives in the database and advances in the same transaction as the
 -- rows it describes, so a crash cannot leave the two disagreeing (D-031).
--- Keys: rev, schema, generated, notice.
+-- Keys: rev, schema, generated, notice — plus the ID space's own record, which
+-- the client ignores and the next build and delta read: hwm (the per-table
+-- high-water ids, in the changeset's `floors` shape), cve_hwm, idspace, and
+-- (on a seeded build) seed_rev, seed_marks, seed_fingerprint (D-056).
 CREATE TABLE meta(k TEXT PRIMARY KEY, v);
 
 CREATE INDEX i_cve_year    ON cve(year);

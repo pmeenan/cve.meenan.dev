@@ -22,6 +22,40 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-015: A lone surrogate in a CVE description is legal JSON that SQLite cannot store  (2026-08-02, status: open)
+
+**Environment.** Python 3.12.3 `sqlite3` (SQLite 3.45.1) on Linux; reachable
+from any record in cvelistV5, which is attacker-influenced input (AGENTS.md
+rule 5).
+
+**Repro.**
+
+```python
+text = json.loads('"\\ud800"')          # legal JSON, parses to '\ud800'
+sqlite3.connect(":memory:").execute("CREATE TABLE t(x TEXT)").execute(
+    "INSERT INTO t VALUES(?)", (text,))
+# UnicodeEncodeError: 'utf-8' codec can't encode character '\ud800'
+# in position 0: surrogates not allowed
+```
+
+**Observed.** `json.loads` accepts an unpaired surrogate escape and produces a
+`str` that has no UTF-8 encoding, so the failure surfaces at *insert* time — a
+`UnicodeEncodeError` raised from inside `executemany`, naming a codec rather
+than a record.
+
+**Expected.** Not that it stores — the string genuinely is not encodable — but
+that `pipeline/build.py` refuses the record through the `skipped` channel D-047
+built for records that cannot be published, with the file name in the message.
+Today it is a traceback with no idea which of 372,092 records caused it.
+
+**Impact.** Fail-*stopped* rather than fail-closed: nothing wrong is published,
+and D-056's cleanup means no partial artifact is left behind
+(`test_a_failed_build_leaves_no_artifact_behind` uses this as its trigger). But
+one hostile record halts the daily ingest with an undiagnosable error. The fix
+is a projection-level check, whose cost has to be measured against the whole
+corpus first — every string of every record, per build — which is why it is
+recorded rather than guessed at.
+
 ## RE-014: `FileSystemSyncAccessHandle.write()` may write fewer bytes than asked  (2026-08-01, status: worked-around)
 
 **Environment.** The File System Standard, `write()` on

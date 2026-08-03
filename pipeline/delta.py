@@ -12,12 +12,18 @@ serializes:
                 "host": 9145, "url": 1204882, "vtype": 6},
      "extra":  {"cwe": [798]}}
 
-`floors` is the highest id each lookup table held at revision `from`. Because
-the ID space is server-owned, append-only and never renumbered (D-025 hazard 1),
-"the lookup rows a client at `from` does not have" is exactly "the rows above
-those floors" -- so D-031's range query needs no per-row revision column, only
-one integer per table per revision. `extra` covers the case floors cannot see:
-a row whose *content* changed under an id the client already holds.
+The numbers in that example are illustrative, not measured -- the real
+cardinalities are in D-024 and D-033, and the floors a run actually uses come
+from `build.id_space(artifact)["floors"]`.
+
+`floors` is the highest id each lookup table had *issued* at revision `from` --
+which is not the highest it still holds, because a value the corpus stops using
+is retired while its id stays reserved (D-056). Because the ID space is
+server-owned, append-only and never renumbered (D-025 hazard 1), "the lookup
+rows a client at `from` does not have" is exactly "the rows above those floors"
+-- so D-031's range query needs no per-row revision column, only one integer per
+table per revision. `extra` covers the case floors cannot see: a row whose
+*content* changed under an id the client already holds.
 
 Every table must appear: a missing floor would default to 0 and quietly ship
 the entire table (measured at 164x the compressed bytes on a 20,000-record
@@ -61,16 +67,10 @@ MAX_CVE_ID = 64
 MAX_SAFE_INT = 2**53 - 1
 
 # Apply order, and the order the tables are emitted in: `vendor` before
-# `product` and `host` before `url`, because those reference them (D-055).
-LOOKUP_COLUMNS = {
-    "cna": ("id", "name"),
-    "cwe": ("id", "cwe", "descr"),
-    "vendor": ("id", "name"),
-    "product": ("id", "vendor_id", "name"),
-    "host": ("id", "name"),
-    "url": ("id", "url", "host_id"),
-    "vtype": ("id", "name"),
-}
+# `product` and `host` before `url`, because those reference them (D-055). One
+# definition, in the module that owns the ID space — two copies of a column
+# order that has to agree positionally is a bug waiting for a schema change.
+LOOKUP_COLUMNS = build.LOOKUP_COLUMNS
 
 # SQLite 3.32+ defaults to 32,766 bound parameters (999 before that, and a
 # build can still lower it), so batching is compatibility rather than necessity
@@ -341,11 +341,13 @@ def extract(
     example produced a 191 KB delta where the correct floors produce 1.2 KB —
     so neither mistake announces itself.
 
-    What this function *cannot* check is whether the floors are the right ones:
-    it only opens the `to` artifact, and floors describe the `from` one. The
-    ingest that records them per revision owns that (M2), and passing floors
-    from the wrong build ships too few lookup rows without tripping anything
-    here.
+    The floors *are* checked, in two places and against two authorities: here,
+    against the extent the artifact recorded when it was seeded from `from`
+    (which catches a caller passing the wrong revision's), and in
+    `publish` against what the ledger recorded when it published that revision
+    (which catches an artifact whose own record was edited). What neither can
+    check is a data plane that has no record of `from` at all — a generation
+    published before D-056 — where the caller is still trusted.
     """
     if from_rev < 0 or to_rev <= from_rev:
         raise ValueError(f"delta range {from_rev}-{to_rev} is not increasing")
@@ -399,6 +401,42 @@ def extract(
         # produce rows in the wrong shape and a file nobody can apply. The key
         # has to be *present*: defaulting a missing one to 1 is a guess about
         # the most important thing here.
+        # And it must be a *step* from the revision it claims to start at. The
+        # artifact records which revision's ID space it continued (D-056), and
+        # that has to be `from`: a build seeded from an older ancestor mints the
+        # same ids as its sibling for different values — sharing the lineage
+        # token, so nothing else can see it — and `extra` is computed against
+        # the seed, so a payload spanning two revisions silently omits content
+        # that moved in the one it skipped. Both are invisible to
+        # `_check_closure`, whose view is one self-consistent artifact.
+        if int(from_rev) > 0:
+            seeded_from = meta.get("seed_rev")
+            if seeded_from is None:
+                raise ValueError(
+                    f"{db_path} records no seed revision, so it cannot be the source of a "
+                    f"delta from rev {from_rev}; only a build that continued that revision is"
+                )
+            if int(seeded_from) != int(from_rev):
+                raise ValueError(
+                    f"{db_path} continues rev {seeded_from} but the changeset starts at "
+                    f"{from_rev}; a delta is a step from the revision its source was seeded "
+                    "from, not a patch that spans several"
+                )
+            # Which also settles the floors. They describe the ID space at
+            # `from`, the artifact was seeded from exactly that revision, and it
+            # recorded the extent it grew from — so "are these the right floors"
+            # stops being a question this module cannot answer. A floor that is
+            # too high under-ships lookup rows and `_check_closure` reads the
+            # gap as "the client already has it".
+            seed_marks = meta.get("seed_marks")
+            if seed_marks is not None:
+                expected = json.loads(seed_marks)["floors"]
+                if {t: int(v) for t, v in floors.items()} != expected:
+                    raise ValueError(
+                        f"changeset floors {floors} are not the ID space at rev {from_rev}, "
+                        f"which this artifact was seeded from ({expected})"
+                    )
+
         stamped_schema = meta.get("schema")
         if stamped_schema is None or int(stamped_schema) != build.SCHEMA_VERSION:
             raise ValueError(
@@ -434,7 +472,13 @@ def _digest(path: str) -> str:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
-def write(delta: dict, pub_dir: str, quality: int = QUALITY, force: bool = False) -> dict:
+def write(
+    delta: dict,
+    pub_dir: str,
+    quality: int = QUALITY,
+    force: bool = False,
+    space: dict | None = None,
+) -> dict:
     """Compress and publish the delta; return its manifest entry.
 
     The file lands by atomic rename, and a published delta is immutable for the
@@ -523,7 +567,7 @@ def write(delta: dict, pub_dir: str, quality: int = QUALITY, force: bool = False
         "raw_bytes": len(payload),
         "sha256": digest,
     }
-    ledger.record_delta(pub_dir, entry)
+    ledger.record_delta(pub_dir, entry, space)
     return entry
 
 
@@ -536,6 +580,52 @@ def publish(
 ) -> dict:
     """Extract, write, and register in the manifest -- in that order, so the
     manifest never names a file that is not on disk."""
+    # Every id in this payload is only meaningful inside the ID space that
+    # minted it (D-056). A delta cut from an artifact built off a different
+    # lineage — an unseeded rebuild being the easy mistake — would install rows
+    # under ids that mean something else on every client, and neither the
+    # client's `cve` tripwire nor `_check_closure` can see it: both check
+    # against the artifact, which is self-consistent. The ledger is the only
+    # thing that remembers what was published, so it is where this is caught.
+    #
+    # A delta never *establishes* a lineage, even on a data plane that records
+    # none: it cannot prove what ID space the snapshot clients downloaded
+    # belongs to, and adopting on its say-so would bless whatever arrived first.
+    # That adoption is `publish.py --adopt-id-space`, on the artifact that can.
+    space = build.id_space(db_path)
+    ledger.assert_idspace(pub_dir, space["idspace"])
+    # And that it grew from the artifact this data plane actually published at
+    # the revision it continues — not merely from *an* artifact stamped there.
+    ledger.assert_continues(pub_dir, space)
+
+    # The floors, checked against what this data plane recorded at `from` rather
+    # than against the artifact's own copy of it. `extract` compares the two
+    # locally, which catches a caller's mistake; only the ledger catches an
+    # artifact whose recorded marks were edited, and a floor that is too high
+    # ships fewer lookup rows while `_check_closure` reads the gap as "the
+    # client already has it".
+    # The same whole-record comparison for the revision this delta *lands* on:
+    # identical bytes at a URL do not imply identical ID spaces behind them, and
+    # the ledger's own refusal comes after the file is in place.
+    candidate = {"marks": build.id_marks(space), "fingerprint": build.fingerprint(db_path)}
+    landing = ledger.space_at(pub_dir, int(changeset["to"]))
+    if landing is not None and landing != candidate:
+        raise SystemExit(
+            f"error: rev {changeset['to']} was published with a different ID space; this "
+            "delta would leave clients at a revision whose ids mean something else"
+        )
+
+    from_rev = int(changeset["from"])
+    published_space = ledger.space_at(pub_dir, from_rev)
+    if published_space is not None:
+        expected = published_space.get("marks", {}).get("floors")
+        given = {table: int(value) for table, value in dict(changeset.get("floors", {})).items()}
+        if expected is not None and given != expected:
+            raise SystemExit(
+                f"error: changeset floors {given} are not the ID space this data plane "
+                f"published at rev {from_rev} ({expected})"
+            )
+
     delta = extract(
         db_path,
         from_rev=int(changeset["from"]),
@@ -546,7 +636,29 @@ def publish(
         extra=dict(changeset.get("extra", {})),
         generated=changeset.get("generated"),
     )
-    entry = write(delta, pub_dir, quality=quality, force=force)
+    # Whether the manifest can *hold* this entry, asked before the file exists.
+    # `register_delta` refuses a delta that would strand a client (D-055), and
+    # by then the bytes are published and recorded in the ledger — so the URL is
+    # burned, and even a corrected payload for that range is refused afterwards.
+    # Reproduced with a bridging delta, which is exactly the case M2's monthly
+    # rebuild needs: emitted from a rebuilt snapshot, refused by the tiling
+    # check, file already served.
+    prospective = {"from": int(delta["from"]), "to": int(delta["to"])}
+    manifest_module.assert_tiling(
+        manifest_module.plan_delta(pub_dir, prospective, delta["generated"])
+    )
+    entry = write(
+        delta,
+        pub_dir,
+        quality=quality,
+        force=force,
+        space=candidate,
+    )
+    # The manifest last, because it is what exposes the new head. Recording the
+    # bytes and the ID space the delta lands on in the same ledger write, before
+    # that, is what stops a crash in between leaving a revision clients can
+    # reach whose ID space nothing wrote down — a gap `assert_continues` then
+    # had to either fail open on or refuse forever.
     manifest_module.register_delta(pub_dir, entry, delta["generated"])
     # The manifest entry is kept separate from the run's counts on purpose: it
     # is the published contract, and merging the two would let a caller hand a
