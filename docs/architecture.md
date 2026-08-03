@@ -169,7 +169,7 @@ and are never under the served root (D-018, D-034):
 | `cve.data/state/artifacts/rev-N.sqlite` | Daily builds, ~377 MB each; the newest three are kept. |
 | `cve.pub/published.json` | The append-only ledger of everything ever published (D-056). |
 | `cve.pub/data/` | The published artifacts — the only web-reachable path here (D-053). |
-| `~/src/meenan.dev/cve/pipeline/` | Where the crons run from — rsynced, not a git checkout, and never the docroot (D-058). |
+| `~/src/meenan.dev/cve/` | A checkout of this repo; the crons run `pipeline/` from it, updated by `git pull` (D-059). Never the docroot. |
 
 `cve.data/state/` is new in D-058; D-018 and D-053 describe the three
 directories that preceded it.

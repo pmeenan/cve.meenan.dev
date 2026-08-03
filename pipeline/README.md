@@ -1,13 +1,15 @@
 # Pipeline
 
 Server-side ingest and publish. Python 3.12, standard library only (D-043).
-Runs on `plex` from `/home/pmeenan/src/meenan.dev/cve/pipeline/`; **never in the
-docroot** — `scripts/deploy.sh` mirrors `dist/`, and this has no business being
-web-reachable. `scripts/deploy-pipeline.sh` rsyncs it there, and that is the
-deployment model today — the destination is a plain directory, not a checkout,
-because agents never commit (rule 7) and the first production run happened with
-the change still in the working tree. Making it a real checkout and using
-`git pull` is a deliberate future step, not the current state.
+Runs on `plex` from a checkout of this repo at `/home/pmeenan/src/meenan.dev/cve/`;
+**never in the docroot** — `scripts/deploy.sh` mirrors `dist/`, and this has no
+business being web-reachable. `scripts/deploy-pipeline.sh` updates it with
+`git pull --ff-only` and prints the commit production is running, so that is a
+fact rather than an assertion (D-059). Nothing is built: this is
+standard-library Python, so the committed tree is the deployable artifact.
+`PIPELINE_RSYNC=1` pushes the *working* tree instead, for the loop before a
+commit — it leaves the checkout dirty on purpose, and
+`git checkout -- pipeline` clears it.
 
     # build the artifact from a cvelistV5 clone, continuing the previous
     # build's ID space (--bootstrap only for the very first one, D-056)

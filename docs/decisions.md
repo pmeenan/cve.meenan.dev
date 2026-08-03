@@ -23,7 +23,57 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
-## D-058: The daily ingest — the guard runs before the build, and a revision's bytes are pinned before any of it is published  (2026-08-03, status: accepted, implements D-042; settles the ID-space-on-the-wire question D-056 deferred to this task)
+## D-059: The pipeline runs from a git checkout on the server, so what production runs is checkable  (2026-08-03, status: accepted, owner decision; supersedes the deployment half of D-058)
+
+**Decision.** `plex:/home/pmeenan/src/meenan.dev/cve/` is a clone of this
+repository, and the crons run `pipeline/` out of it. Updating production is
+`git pull --ff-only`; `scripts/deploy-pipeline.sh` does that and prints the
+resulting commit. There is nothing to build — the pipeline is standard-library
+Python (D-043) — so the committed tree *is* the deployable artifact, which is
+what makes this cheaper than the docroot's build-and-rsync (D-003).
+
+**Context.** D-058 recorded the opposite, and recorded it accurately at the
+time: agents never commit (rule 7), so the first production ingest necessarily
+ran from an rsynced working tree, and that entry was careful to say the server
+was not git-managed rather than describing an intention as a state. Three review
+rounds later the work was committed and pushed as `80b9ea3`, which removed the
+reason.
+
+The gain is not convenience, it is **provenance**. Under rsync, "production is
+running the reviewed code" was an assertion — the bytes matched because I had
+just pushed them, and nothing on the machine recorded which revision they came
+from. Now `git -C <repo> rev-parse HEAD` answers it, and a dirty `git status`
+is a standing signal that something unreviewed is in place.
+
+The swap was made a behavioural no-op before it was made: the fresh clone's
+`pipeline/` was diffed against the running directory and was identical, so
+replacing one with the other could not change what the cron does. Verified
+afterwards by running the suite on the server (191 tests), executing the cron's
+command line verbatim (exit 0, correct log line), and confirming head, state and
+`last_run.ok` unchanged. The cron line did not change at all — the checkout was
+placed at the path it already named.
+
+**Consequences.** `scripts/deploy-pipeline.sh` keeps its rsync mode behind
+`PIPELINE_RSYNC=1`, because the loop it served has not gone away: an agent
+iterating on the pipeline still cannot commit, and a production rehearsal before
+the human gate still needs the working tree on the box. It now says so loudly
+and leaves the checkout dirty on purpose — that dirt is the signal, and
+`git checkout -- pipeline` clears it. Its destination guards (no `..`, and the
+`/home/pmeenan/src/<project>/pipeline/` prefix) are unchanged, since
+`rsync --delete` is still what they protect against.
+
+Two things this does *not* change. The docroot deploy is still D-003's rsync of
+`dist/`, and the pipeline is still never in the docroot (D-018, D-053) — a
+checkout under `/home/pmeenan/src/` is not web-reachable by any path. And the
+server pulls; nothing pushes to it, so a bad commit reaches production only when
+someone runs the pull.
+
+**Reopen if.** The pipeline ever grows a build step, in which case the
+"committed tree is the artifact" premise goes with it; or the server needs to
+run a revision that is not on `origin/main`, which today means rsync and a dirty
+checkout rather than a detached HEAD.
+
+## D-058: The daily ingest — the guard runs before the build, and a revision's bytes are pinned before any of it is published  (2026-08-03, status: accepted, implements D-042; settles the ID-space-on-the-wire question D-056 deferred to this task; its deployment half — rsync to a plain directory — is superseded by D-059 now that the work is committed)
 
 **Decision.** `pipeline/ingest.py` is one cycle under `flock`: fetch, hash,
 diff, guard, rebuild, publish one delta, advance state. Six things it decides

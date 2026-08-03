@@ -86,7 +86,7 @@ affected docs. Until then, these govern.
 | `app/`       | Next.js App Router pages and styles |
 | `lib/`       | Shared types — notably the published contract in `protocol.ts` |
 | `workers/`   | The Worker that owns SQLite/WASM on OPFS |
-| `pipeline/`  | Python ingest and publish (D-043). **Never in the docroot** — the crons run it from `~/src/meenan.dev/cve/pipeline/` on `plex`, rsynced there, not git-managed (D-058) |
+| `pipeline/`  | Python ingest and publish (D-043). **Never in the docroot** — the crons run it from a git checkout at `~/src/meenan.dev/cve/` on `plex`, updated with `git pull` (D-059) |
 | `scripts/`   | Build, serve, deploy, license audit |
 | `tests/`     | `unit/` (Vitest) and `e2e/` (Playwright) |
 | `public/`    | Static passthrough into the export root |
