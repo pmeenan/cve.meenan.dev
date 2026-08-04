@@ -154,17 +154,22 @@ measurements deferred by D-029 are answered — Q-003 by D-049 (a baseline, not
 budgets: D-052 sets no duration ceilings), Q-004 by D-051 (the `opfs` VFS) —
 with D-050 (a 256 MiB page cache) and D-053 (published artifacts in their own
 peer directory) falling out of the same work. **M2 is in progress**:
-full-corpus Download and Sync with staged replacement. Two tasks are done — the
-delta wire contract is final, typed, emitted and contract-tested (D-055), and
-the interned ID space is now stable across rebuilds, with retirement, recorded
-high-water marks and a named lineage the publishers check (D-056) — and the
-daily ingest cron runs the whole cycle under `flock`, with the tombstone guard
-ahead of the *build* (seeding retires permanently) and a revision's bytes pinned
-before any of it is published, so a crashed run resumes rather than rewriting an
-immutable URL (D-058) — and it is **running in production**: the D-056
-migration was applied, the origin serves a snapshot on a recorded ID space, and
-the daily cron is installed on `plex` and advancing the head. The monthly snapshot cron is
-next. A 2026-08-03 owner decision re-ordered the AI
+full-corpus Download and Sync with staged replacement. The server half is done.
+The delta wire contract is final, typed, emitted and contract-tested (D-055);
+the interned ID space is stable across rebuilds, with retirement, recorded
+high-water marks and a named lineage the publishers check (D-056); the daily
+ingest runs the whole cycle under `flock`, with the tombstone guard ahead of the
+*build* (seeding retires permanently) and a revision's bytes pinned before any
+of it is published, so a crashed run resumes rather than rewriting an immutable
+URL (D-058); and the monthly job rotates the generation onto the artifact that
+daily last built rather than rebuilding, landing *at* the published head —
+checked against an artifact digest the ledger now records, which settles D-056's
+open question — while retaining the previous generation and its deltas (D-060).
+The daily is **running in production** on `plex` and advancing the head; the
+monthly is built and measured (~90 s on the real corpus) but its cron entry is
+not installed, which needs a commit and one daily delta. The client half —
+Download with staged replacement — is next. A 2026-08-03 owner
+decision re-ordered the AI
 ladder: the first model tier is a site-hosted Ollama behind a restricted
 same-origin chat relay, re-scoping M7 and M8 (D-057). M0 closed with scope,
 architecture, schema

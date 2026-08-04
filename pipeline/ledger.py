@@ -60,6 +60,19 @@ def load(pub_dir: str) -> dict:
     return ledger
 
 
+def artifact_at(pub_dir: str, rev: int) -> str | None:
+    """The digest of the artifact a revision's content came from, if recorded.
+
+    Kept out of the `space` record on purpose, even though both describe the
+    same artifact: `space` is compared as a whole, so adding a key to it would
+    make every pre-existing record mismatch every new candidate — a ledger
+    migration in exchange for a check. This is additive, and a revision that
+    predates it is recognisable by getting `None` (D-060).
+    """
+    value = load(pub_dir).get("artifacts", {}).get(str(int(rev)))
+    return None if value is None else str(value)
+
+
 def save(pub_dir: str, ledger: dict) -> None:
     target = path(pub_dir)
     scratch = f"{target}.{os.getpid()}.tmp"
@@ -229,7 +242,42 @@ def _record_space(ledger: dict, rev: int, space: dict) -> None:
     ledger["space"][str(int(rev))] = space
 
 
-def record_snapshot(pub_dir: str, rev: int, chunks: int, token: str, space: dict) -> None:
+def _record_artifact(ledger: dict, rev: int, artifact: str) -> None:
+    """Pin which artifact a revision's content came from, once and for all.
+
+    Same rule as the ID space, for a narrower reason: a snapshot may be
+    published *at* the head revision (D-055's legal monthly landing), and the
+    only thing that makes that safe is that its content is the content clients
+    at that watermark already hold — which they are never told to re-fetch.
+    Recording the artifact's digest is what turns that from a convention into a
+    check (D-060). Overwriting it would erase the evidence.
+    """
+    recorded = ledger.setdefault("artifacts", {}).get(str(int(rev)))
+    if recorded is not None and recorded != artifact:
+        raise SystemExit(
+            f"error: rev {rev} was published from artifact {recorded}, not {artifact}; what a "
+            "revision's content *is* cannot be rewritten, because clients already hold it"
+        )
+    ledger["artifacts"][str(int(rev))] = str(artifact)
+
+
+def record_artifact(pub_dir: str, rev: int, artifact: str) -> None:
+    """Record a revision's artifact on its own, for the one case that needs it.
+
+    Normally this rides along with the event that published the revision, which
+    is what keeps the two from separating. The exception is a resume that finds
+    its publication already complete: there is no event left to attach to, and
+    the alternative is a gap that blocks every rotation forever (D-060). Same
+    refusal to overwrite applies.
+    """
+    ledger = load(pub_dir)
+    _record_artifact(ledger, rev, artifact)
+    save(pub_dir, ledger)
+
+
+def record_snapshot(
+    pub_dir: str, rev: int, chunks: int, token: str, space: dict, artifact: str | None = None
+) -> None:
     """One write, because it is one event.
 
     The lineage used to land in a second `save` after this one, and a crash in
@@ -241,13 +289,24 @@ def record_snapshot(pub_dir: str, rev: int, chunks: int, token: str, space: dict
     ledger["snapshots"][str(int(rev))] = {"chunks": int(chunks)}
     ledger["idspace"] = str(token)
     _record_space(ledger, rev, space)
+    if artifact is not None:
+        _record_artifact(ledger, rev, artifact)
     save(pub_dir, ledger)
 
 
-def record_delta(pub_dir: str, entry: dict, space: dict | None = None) -> None:
+def record_delta(
+    pub_dir: str, entry: dict, space: dict | None = None, artifact: str | None = None
+) -> None:
     """Deltas record what they published, and the ID-space extent at the
     revision they reach — but never the lineage: a delta cannot prove which ID
-    space the snapshot its clients downloaded belongs to (`assert_idspace`)."""
+    space the snapshot its clients downloaded belongs to (`assert_idspace`).
+
+    `artifact` is the digest of the file the payload was cut from, which is
+    what a later snapshot published at that revision is checked against
+    (D-060). In the same write as the bytes, for the same reason the ID space
+    is: a crash between two writes leaves a revision clients can reach whose
+    content nothing wrote down.
+    """
     ledger = load(pub_dir)
     ledger["deltas"][manifest_module.delta_name(entry)] = {
         "sha256": entry["sha256"],
@@ -255,4 +314,6 @@ def record_delta(pub_dir: str, entry: dict, space: dict | None = None) -> None:
     }
     if space is not None:
         _record_space(ledger, int(entry["to"]), space)
+    if artifact is not None:
+        _record_artifact(ledger, int(entry["to"]), artifact)
     save(pub_dir, ledger)

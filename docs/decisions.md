@@ -23,6 +23,342 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-060: The monthly snapshot publishes the artifact head was cut from — it rotates the generation without minting a revision  (2026-08-03, status: accepted, implements the monthly half of D-042; settles the "different content at head" question D-056 left open; relaxes D-055's tiling rule)
+
+**Decision.** `pipeline/snapshot.py` is the monthly cron: take D-042's `flock`,
+finish any crashed ingest, and publish **the artifact the ingest state points
+at**, at the revision it is stamped with, which must be the published head.
+Then retention: keep this generation and the one it replaces, keep every delta
+back to the older of the two, delete what falls out the far end. No fetch, no
+build, no new revision.
+
+**1. The rebuild already happened.** D-042 describes this job as "rebuild the
+database, chunk it, compress the chunks in parallel, publish, then retire the
+previous generation", and that was written before the daily ingest existed. The
+daily walks the whole corpus and writes a *complete* artifact every time it
+runs (D-058) — the delta is only the wire file it emits afterwards — so a fresh
+full rebuild is already sitting in `cve.data/state/artifacts/`. Building a
+second one here would spend another 24.2 s (D-058's seeded-rebuild measurement)
+producing a different file with the same content, and it is the *difference*
+that is dangerous (§2). So this job is the
+other four verbs, and D-042's word "rebuild" is satisfied by the build that
+already ran rather than by a second one.
+
+Not fetching is deliberate too. A monthly job that fetched could abort on the
+tombstone guard, and a month would then pass with no rotation — a failure in
+the freshness path taking out the rotation path with it. Its output is exactly
+as fresh as head is, which is what the manifest already advertises.
+
+**2. A snapshot at head must be the artifact head's content came from, and that
+is now checked.** D-056 recorded the hole and left it: a snapshot published at
+`rev == published_head` — the legal monthly landing — with *different* content
+is invisible to everyone who has already synced, because `planSync` tells a
+client at head it is current and it never fetches one byte of the new
+generation. So the change would reach new arrivals only, silently and forever.
+
+Publishing the ingest's own artifact cannot do that, but "cannot" was a
+property of one caller rather than of the pipeline, so the ledger now records
+the SHA-256 of the artifact behind each published revision — written in the
+same ledger write as the delta's bytes and the revision's ID space, for the
+same reason those are (a crash between two writes leaves a revision clients can
+reach whose content nothing wrote down). `publish.py` refuses a snapshot at
+head whose artifact digest is not the recorded one, and refuses one where
+nothing was recorded at all: a gap reads as "nothing to check", which is
+exactly what a wrong artifact needs (D-056's rule about gaps, applied again).
+
+Nothing weaker would do, and that is testable rather than arguable: the
+reproduction is a *sibling* build of the same corpus from the same ancestor. It
+shares the lineage token, the `seed_rev`, the high-water marks and the ID-space
+fingerprint — every existing guard passes it, and the digest is what does not.
+It is stored beside the `space` record rather than inside it, because that
+record is compared as a whole and adding a key to it would make every existing
+entry mismatch every new candidate: a ledger migration in exchange for a check.
+
+Four placement rules the first implementations got wrong, all found by review and
+all reproduced:
+
+- **The mismatch is refused before anything moves, and `--force` does not skip
+  it.** `ledger._record_artifact` refuses a second artifact at one revision, but
+  it runs *after* `os.rename(staging, final)` — so with `--force` the failure
+  landed with the new chunks on disk and the old digests still in the manifest,
+  a client-visible corruption produced by the flag documented as local
+  iteration. The comparison is mirrored ahead of staging and ungated by
+  `--force`, exactly as D-056 argues for the ID-space check. The cost is
+  deliberate: `--force` can no longer replace what a recorded revision's content
+  *is*. Publish at a new revision, or remove the ledger of a throwaway `pub`
+  directory. The delta emitter carries the same mirror, because a bridging delta
+  may now land on a revision a rebuilt snapshot already defines — two files on
+  one `to`, from two artifacts.
+- **The *absence* half is ungated too, and absence is a gap rather than a free
+  revision.** Both were wrong in the first round. Leaving the missing-record
+  refusal gated on `--force` meant a forced publish could put any content at all
+  at head on a data plane whose record was missing — which is every data plane
+  published before this entry. And `--force` cannot make that safe, because the
+  hazard is not the bytes at a URL but that *nobody at head is told to
+  re-fetch them*. On the delta side the same absence was read as permission: a
+  bridge landing on an already-published revision with no artifact record was
+  accepted, so fresh clients downloaded one content while bridged clients
+  applied another, both calling it rev N. `ledger.space_at` is what tells a
+  published revision from a new one, and a published one with no digest now
+  fails closed. One shape stays uncovered and is left deliberately: a revision
+  recorded in `snapshots` with *neither* a `space` record nor an artifact digest
+  is indistinguishable here from a new landing. That is a pre-D-056 data plane,
+  and there is none — the live origin was migrated onto a recorded ID space
+  before this work started (D-058), so nothing in production can present it.
+- **A digest names a path, and both publishers reopen that path afterwards.**
+  Chunks are compressed from the file the digest was taken of, and `extract`
+  re-reads it — so a file replaced in between would have the ledger record one
+  artifact while the published bytes came from another, with every manifest
+  digest agreeing so nothing downstream notices. Reproduced by swapping a
+  sibling in mid-compression. Both paths re-read the source before any of it
+  becomes visible, at 0.18 s each.
+- **A resumed ingest records the digest too, pins it rather than recomputing
+  it, and refuses to run against a file that no longer matches.** `ingest._publish_pending`'s reuse path finishes a
+  publication from bytes already on disk, and registered everything about them
+  except their content — after which the rotation refused to land at that head,
+  for a month. It records it now, from a digest pinned into the pending run when
+  the artifact was built: the pending record pins a *path*, and a recovery
+  rebuild at that path would otherwise have the resume pin a digest that is not
+  the revision's content, permanently, since the ledger will not correct it.
+  Same reason `generated` and `quality` are pinned. And the reuse path asks
+  before it writes, because `_record_artifact` raises `SystemExit` — which
+  repeats identically on every later run and freezes the pending forever, the
+  mode `resume`'s abandon path exists to prevent and which a pinned entry
+  withdraws the proof for. It aborts with the diagnosis instead.
+
+  The pinned digest is also *checked* against the file on both recovery
+  branches, not merely read. `_pin` compares the compressed delta bytes, and a
+  change **outside** the pinned upsert set reproduces those exactly while making
+  the artifact a different one — so a republish recorded the replacement as the
+  revision's content, and even the reuse branch left the state seeding from it.
+  A mismatch stops the run and keeps the pending record; restoring the artifact
+  is the whole recovery. The check runs before **every path that commits**, not
+  only the ones that publish — the branch that finds its publication already
+  complete republishes nothing and was missed on the first attempt, which left
+  the pipeline committing a seed it could not build on. Everything downstream
+  failed closed, which is the right direction and still stuck.
+
+  That branch also backfills the artifact record before clearing the pending
+  run, because it has no publication event left to attach one to: the reachable
+  window is a crash between `ledger.record_delta` and the manifest write, and
+  committing over it leaves a gap that only a later delta could fill — which a
+  quiet corpus never cuts, blocking every rotation indefinitely. It backfills
+  from the pinned digest alone. An *older* pending record, written before that
+  field existed, carries nothing to backfill from and is left for a human;
+  claiming this covered a pre-D-060 migration was wrong, and there is no such
+  record in production to migrate.
+
+The consequence for a *content-changing* rebuild — a normalization change, a
+schema bump — is that it cannot land at head at all. It lands above, where
+clients are told to re-download, which is honest: if the projection changed
+then every record changed, and a delta carrying them is the corpus.
+
+**3. The tiling rule is relaxed to "nothing this manifest names is a dead
+end".** `assert_tiling` used to require every delta's `from` to be reachable
+*forward from the snapshot's revision* as well. That is what refused the
+bridging delta D-055 and D-056 both left to this task — and, more to the point,
+it made retention express nothing: after a rotation every retained delta starts
+**below** the new snapshot's revision, and nothing forward of a fresh snapshot
+ever reaches them. The forward check was answering "could a client be sitting
+at this revision?", which the manifest cannot know; `ledger.py` is what
+remembers what was published. What the manifest can guarantee is that every
+revision it names — the snapshot's, and both ends of every delta — has a chain
+to the head it advertises, and that is what is checked now. The holes D-055
+listed are all still refused: a missing delta strands the revisions below it, a
+delta into a dead end strands its own `from`, and an advertised `rev` that is
+not the reachable head is refused as before.
+
+The bridging delta falls out of that relaxation and is now publishable — proven
+by a test that carries a client from an old head to a rebuilt snapshot
+published above it. **The monthly cron does not use one**, because landing at
+head makes it the identity: there is nothing between the old head and the new
+snapshot. It exists for the manual rebuild in §2.
+
+**4. Retention is part of publishing a generation, never a separate job.** The
+plan flagged the gap: a standalone pruner deletes files the live manifest still
+lists, and `manifest.py` has no way to drop an entry outside a republish, so
+the window between the two advertises 404s. Doing both in `publish.py` closes
+it by construction — the manifest is rewritten first and the files go after, so
+nothing is ever named and missing.
+
+What is kept: this generation and the previous one (D-042), and every delta
+starting at or above the previous one's revision that can still reach the new
+head. What is deleted: older generation directories, and the deltas that only
+served clients below the oldest generation just removed — one full rotation
+*after* the manifest stopped listing them. That extra grace is the same
+argument D-042 makes for keeping a spare generation, applied to deltas: a
+client that read the previous manifest ten minutes ago is still fetching from
+what it named. A day's delta is ~70–90 KB (D-042, D-058), so the grace costs a
+couple of megabytes against the 63 MB generation it protects.
+
+**The retention floor is what the previous manifest advertised**, and getting
+that from anywhere else was wrong in two different ways, each reproduced:
+
+- from the *directory listing*, a generation that was never advertised — a
+  rotation or a manual rebuild killed between the rename and the manifest write
+  leaves one — pushed the delta cut above the floor, and the sweep deleted delta
+  files the manifest had just been rewritten to keep. The manifest then
+  advertised 404s to exactly the clients retention exists to protect. Deleting
+  only generations strictly *below* the floor makes the cut lower than every
+  retained entry by construction, which is what the code had merely asserted.
+  A directory *above* this revision is now reported rather than deleted: its
+  bytes are the byte-identical resume evidence its own retry needs (D-047).
+- from the *ledger*, the same never-advertised generation counts as the previous
+  one, and the deltas that carry clients out of the generation they actually
+  downloaded drop out of the manifest.
+
+The remaining case is a republish of the generation already being served — a
+resume, or a hand re-run at the same revision — where `snapshot.rev` *is* this
+revision. Reading the floor from it collapsed retention to a single generation:
+every retained delta dropped and the previous generation deleted in one
+operation. The previous manifest's own delta list is where its floor is
+recorded, so that is where it comes from in that case, and for a manifest
+written before `snapshot.rev` existed.
+
+The invariant is **nothing the previous manifest named is ever deleted**, and a
+second review round found that stating it was not the same as enforcing it. The
+delete set was right; the *cut* was still taken from the generations being
+removed, so an unadvertised generation between the two floors moved it past the
+previous manifest's own — one rotation later than the case above, which is
+exactly where the first regression test stopped. The cut is bounded by the
+previous manifest's delta floor now, and two smaller readings of the same
+mistake went with it: `retire` never deletes the generation just published
+(unreachable today, but the argument for it lived three modules away in
+`assert_continues`), and a publish with **no** previous manifest retires nothing
+at all, because retention is defined by evidence about what was advertised and
+there is none — the old fallback deleted both generations and the whole
+catch-up chain at the moment the pipeline knew least, which is a plausible
+recovery step away.
+
+Deleting a file does not un-publish it: the ledger keeps every URL ever served,
+which is what stops a rotated-away range being re-cut with different bytes
+(D-055 §7). Verified after a rotation by attempting the re-cut, not by reading
+the record.
+
+**4a. One revision has one `generated`.** The build stamps the artifact's
+`meta.generated` and the ingest was stamping the delta from a second clock
+reading taken after it — a gap of the build's own duration, ~25 s on the real
+corpus, because the stamp goes in before `VACUUM`. Apply writes that value into
+the client's `meta`, and the worker surfaces it as freshness, so a synced client
+and a freshly downloaded one reported different staleness at the same revision.
+The delta now carries the artifact's stamp. `generated` was already revision
+content rather than decoration (D-055); this makes it one value rather than two.
+
+**5. Each cron records its own outcome, and the monthly waits for the lock.**
+`ingest.py status` now reports `last_run` and `last_snapshot` separately. A
+monthly failure hidden under this morning's daily success is a month of no
+rotation and no way to notice, and on this machine `status` is the only alerting
+there is (D-058: no MTA, and D-009 forbids telemetry). `status` also reports
+`snapshot_rev` and the delta count, so "the generation is a month old and head
+has moved 30 revisions past it" is a subtraction rather than a log grep.
+
+The lock is where the two jobs are genuinely asymmetric. D-042's `flock` is
+non-blocking, which is right for the daily — a daily that finds the monthly
+running has nothing to wait for, because the rotation moves the head it would
+have built against, and tomorrow covers it. The monthly is the opposite: a daily
+finishing under it invalidates nothing, it just moves the head the rotation will
+land on, while skipping costs a *month* and is the one outcome this job cannot
+record, because recording needs the lock. So `state.lock` takes a bounded
+`wait`, defaulting to 0 (the daily is unchanged) and set to 15 minutes for the
+rotation. Bounded, because a cron job that blocks forever on a wedged process is
+worse than one that gives up — and a lock held that long is a problem the
+*daily's* own outcome record already reports.
+
+**Context.** Measured on `plex` against the real corpus, in a scratch copy of
+the live data plane (the production origin was not touched, and the checkout
+D-059 runs from stayed clean):
+
+| | |
+| --- | --- |
+| Rotation, end to end | **85–101 s** wall over four runs (85.0 / 91.3 / 93.2 / 100.5), almost all of it compression across 24 cores. The spread is a shared machine's, not a code change — every run published the same 12 chunks and the same 62,894,840 bytes |
+| Peak RSS | **391 MB** (the daily ingest's is 1.22 GB, D-058) |
+| Published | 12 chunks, 377,294,848 raw → **62.9 MB** compressed, ratio 6.0 |
+| Deltas retained | 3 — the whole 2→5 chain, every one of them starting below the snapshot's revision |
+| Generations retired | `snapshot-1`, the pre-D-056 one; no delta files yet, since none end below rev 1 |
+| Artifact digest, the new per-daily cost | **0.18 s** over 377 MB (one pass per daily delta; the rotation pays a second) |
+
+That brackets D-041's 101 s for the same work, which is the point: the rotation
+costs what compressing a generation costs and nothing else. Measured four times,
+after each round of review fixes to this very path — the last is the code as it
+stands, and every run published the same 12 chunks and 62,894,840 bytes,
+retained the same three deltas and retired the same generation. The two extra
+digest passes the last round added (0.18 s each) are inside that noise.
+
+Two checks at full scale rather than at fixture scale, repeated on each run. The
+12 published chunks were fetched, verified against their manifest digests,
+decompressed and written at their own offsets exactly as the client does — and
+the result is **byte-for-byte the artifact**, same SHA-256 over all 377 MB. And
+re-running the job reports "snapshot already at head" and rewrites nothing,
+which is what a quiet month looks like.
+
+The fail-closed path in §2 was exercised against the live ledger first, twice:
+it has no artifact records, so the rotation was refused with the message that
+names the fix. That is a **deployment consequence** rather than a hypothetical —
+the first rotation after this ships is refused until one daily run *mints a
+revision*, since a quiet day records nothing. Both runs were made in a scratch
+copy: the live origin was never touched and the checkout D-059 runs from stayed
+clean, checked afterwards.
+
+Every new guard was checked by mutation, the method D-056 established — each one
+removed, the suite re-run, and a *named* test required to fail. Restoring the
+forward-orphan tiling check fails 16 (15 errors and a failure; the count is
+sensitive to how the walk is put back). Removing the artifact-digest comparison
+fails 3, including the sibling reproduction that nothing else catches; the
+snapshot anchor in `assert_tiling`, the `_record_artifact` overwrite refusal, the
+resumed ingest's digest, the rotation's own pre-flight check, the retained-delta
+file-existence filter and the uninitialized-state guard fail 1 each; reverting
+the retention floor fails 4, and deleting generations by a keep-set instead of by
+the floor fails 2. **242 pipeline tests and 94 unit tests green** — 31 of those
+pipeline tests written across three review rounds, because six of the guards
+above had no failing test at all when a reviewer first deleted them, and each
+later round found more: five fixes from an adversarial pass over the first
+round's fixes, eight from a pass that reproduced recovery and migration
+paths nothing had exercised, and one more from the verification of those — the
+same check, missing from the one resume branch that commits without
+publishing. Two of the tests written in the last round were
+themselves vacuous on first try — one compared two timestamps that landed in the
+same wall-clock second, the other never reached the branch it named — which is
+the argument for checking a test by breaking the thing it covers rather than by
+watching it pass.
+
+The cross-language contract test now consumes a **twice-rotated** data plane as
+well as a fresh one: `fixture_pub.py` publishes a plane, runs deltas through it,
+rotates, runs another, and rotates again — the second rotation being the first
+that retires anything. `tests/unit/contract.test.ts` validates the result with
+the browser's own `planSync`: a client one generation behind finds the chain and
+the generation it downloaded is still on disk, a fresh download is told it is
+current, and **a client below the retention floor gets `null`** rather than half
+a path. One rotation would not have shown the last of those, and the first draft
+of this block asserted three things that passed against a plane that had never
+rotated at all. Whether the client accepts the shape this job produces is not a
+question the pipeline's own tests can answer.
+
+**Consequences.** The monthly cron is one line, `snapshot.py`, and it is
+idempotent: run it twice, run it after a crash, run it while a daily is running
+(it waits), and the outcomes are "published", "already at head", "resumed then
+published", or — only if the lock is held for a quarter of an hour — "skipped".
+`state.py` grows a second outcome record, `record_outcome` takes the job's name,
+and `lock` takes a bounded wait.
+
+`delta.publish` costs one extra pass over the artifact (0.18 s) to record the
+digest. `--force` loses one power it had: it can no longer republish different
+content at a revision whose artifact is recorded, because that refusal now has
+to land before the bytes move. `snapshot.rev` and head now genuinely diverge in
+production — up to a month of deltas between them — which is the shape D-055
+typed the manifest for and the client already handles.
+
+What this does **not** do: emit a bridging delta from the cron (§3), rebuild
+(§1), or advance the revision. And `state.record.rev` — the per-record
+revision the bridging delta was going to need — is still written and still
+unread; a content-changing rebuild is the one thing that would want it, and
+that is a manual operation.
+
+**Reopen if.** Upstream volume grows enough that a month of retained deltas
+stops being a couple of megabytes; a rebuild that changes content but not the
+ID space becomes routine rather than exceptional (in which case the thing to
+build is the bridging delta path, not a weaker check at head); or the rotation
+cadence changes, which would move the retention window with it.
+
 ## D-059: The pipeline runs from a git checkout on the server, so what production runs is checkable  (2026-08-03, status: accepted, owner decision; supersedes the deployment half of D-058)
 
 **Decision.** `plex:/home/pmeenan/src/meenan.dev/cve/` is a clone of this
@@ -215,8 +551,10 @@ re-deriving it is exactly what a resume must not do. A rebuild that moved the
 head under a pending run is still caught, by whichever of two paths applies —
 both verified by running them. If the pending range was published, the resume
 republishes it and `manifest.assert_tiling` refuses the manifest that would
-result (`deltas starting at [1] are unreachable from snapshot rev 3`), leaving
-the pending intact. If it was not, the resume abandons it and the run then hits
+result (`deltas starting at [1] are unreachable from snapshot rev 3` — the
+behaviour is unchanged but that message is not: D-060 replaced the orphan walk
+that produced it, and the same shape is now refused as `a client at rev [1, 2]
+has no chain to head 3`), leaving the pending intact. If it was not, the resume abandons it and the run then hits
 this check with its own message. Neither publishes anything.
 
 **6. The ID-space marker stays off the wire.** D-056 deferred this and named the
@@ -571,7 +909,7 @@ tool surface (a stronger model on the same box is configuration; conceding the
 tier is a decision); or operating the box stops being worth it once the local
 and BYO-key tiers exist.
 
-## D-056: Stable interned IDs — seeded builds, retirement, recorded high-water marks, and a named ID space  (2026-08-02, status: accepted, implements D-025 hazard 1; makes D-055's floors sound)
+## D-056: Stable interned IDs — seeded builds, retirement, recorded high-water marks, and a named ID space  (2026-08-02, status: accepted, implements D-025 hazard 1; makes D-055's floors sound; **two things it leaves open are settled by D-060** — the "different content at `rev == published_head`" question it closes with, and the manifest half of the bridging-delta blocker below, which D-060 relaxes)
 
 **Decision.** Every build continues the previous build's ID space or explicitly
 starts a new one. There is no third option and no default: `pipeline/build.py`
@@ -880,7 +1218,9 @@ The ID-space obstacle to that bridging delta is gone: an old head and a rebuilt
 snapshot now share an ID space. The manifest still refuses one, because
 `assert_tiling` requires every delta to start at or above the snapshot's
 revision — so M2's monthly-rebuild task owns relaxing that walk as well as
-emitting the file.
+emitting the file. *[D-060 did: the walk now requires only that nothing the
+manifest names is a dead end, and a bridging delta publishes. The monthly cron
+does not need one, because it lands at head.]*
 
 **Reopen if.** Retirement turns out to churn enough rows to matter (it should
 not: a value leaves only when no record in the corpus uses it), the server's
@@ -896,7 +1236,7 @@ it never sees the change. That is D-055's rule, not a new one, and it is the
 monthly rebuild's problem — which is why the plan's monthly-snapshot task now
 names it.
 
-## D-055: The delta wire contract, finalized for the full schema  (2026-08-02, status: accepted, completes D-031 for the accepted schema D-033)
+## D-055: The delta wire contract, finalized for the full schema  (2026-08-02, status: accepted, completes D-031 for the accepted schema D-033; its tiling rule is relaxed by D-060, which is what unblocks the bridging delta and retention)
 
 **Decision.** D-031 settled the delta *protocol* against a schema that has since
 grown, and left an illustrative example that omitted three lookup tables and two
@@ -1865,7 +2205,7 @@ docroot, and the pipeline has no business being web-reachable.
 **Reopen if.** The pipeline grows a dependency that Python makes awkward, or the
 schema starts drifting between the two languages despite the single DDL file.
 
-## D-042: The pipeline is a daily cron ingest with a monthly snapshot  (2026-08-01, status: accepted, supersedes the cadence half of D-026; the daily job's timing and output size are re-measured in D-058 — 54.9 s per run, and ~291 records/~70 KB per day over a weekend window rather than the ~665/87 KB estimated here)
+## D-042: The pipeline is a daily cron ingest with a monthly snapshot  (2026-08-01, status: accepted, supersedes the cadence half of D-026; the daily job's timing and output size are re-measured in D-058 — 54.9 s per run, and ~291 records/~70 KB per day over a weekend window rather than the ~665/87 KB estimated here; the monthly job and its retention are implemented and measured in D-060, where "rebuild" turns out to be the build the daily already did)
 
 **Decision.** Two scheduled jobs under `flock`, no daemon:
 

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { brotliDecompressSync } from 'node:zlib'
@@ -34,12 +34,23 @@ import {
  */
 let root: string
 let manifest: Manifest
-let published: { delta: { from: number; to: number }; hostile_text: string }
+let rotated: Manifest
+let published: {
+  delta: { from: number; to: number }
+  hostile_text: string
+  rotated: {
+    pub: string
+    snapshot_rev: number
+    deltas_kept: number
+    retired: { generations: string[]; deltas: string[] }
+    previous_generation: string
+  }
+}
 
 /** Where the local static server would serve a `/data/...` URL from. */
-function dataFile(url: string): string {
+function dataFile(url: string, pub = join(root, 'pub')): string {
   expect(url.startsWith(`${DATA_ROOT}/`)).toBe(true)
-  return join(root, 'pub', url.slice(DATA_ROOT.length + 1))
+  return join(pub, url.slice(DATA_ROOT.length + 1))
 }
 
 beforeAll(() => {
@@ -51,6 +62,9 @@ beforeAll(() => {
   expect(run.status, `fixture_pub.py failed:\n${run.stderr}`).toBe(0)
   published = JSON.parse(run.stdout)
   manifest = JSON.parse(readFileSync(join(root, 'pub', 'manifest.json'), 'utf-8')) as Manifest
+  rotated = JSON.parse(
+    readFileSync(join(published.rotated.pub, 'manifest.json'), 'utf-8')
+  ) as Manifest
 }, 120_000)
 
 afterAll(() => {
@@ -208,5 +222,64 @@ describe('planning a sync against it', () => {
   it('reports that the published delta is the one it planned for', () => {
     expect(published.delta.from).toBe(1)
     expect(published.delta.to).toBe(2)
+  })
+})
+
+/**
+ * The monthly rotation (D-060), validated by the client's own code. The
+ * pipeline's tests can prove the manifest is internally consistent; only this
+ * can prove the browser still finds a chain through it — and the shape is new,
+ * because every retained delta starts *below* the snapshot's revision, which
+ * the manifest writer refused before this milestone.
+ */
+describe('a data plane that has rotated twice', () => {
+  it('is one this build can consume', () => {
+    expect(() => assertUsable(rotated)).not.toThrow()
+    expect(snapshotRev(rotated)).toBe(published.rotated.snapshot_rev)
+    expect(rotated.rev).toBe(snapshotRev(rotated))
+  })
+
+  it('keeps deltas that start below the generation being served', () => {
+    // The shape the manifest writer refused before D-060: after a rotation the
+    // retained deltas chain *into* the snapshot from underneath it.
+    expect(rotated.deltas.length).toBe(published.rotated.deltas_kept)
+    expect(rotated.deltas.length).toBeGreaterThan(0)
+    for (const entry of rotated.deltas) {
+      expect(entry.from).toBeLessThan(snapshotRev(rotated))
+      expect(() => readFileSync(dataFile(deltaUrl(entry), published.rotated.pub))).not.toThrow()
+    }
+  })
+
+  it('lets a client one generation behind catch up instead of re-downloading', () => {
+    // This client downloaded the generation the rotation replaced, and its
+    // chunks are still served — which is what retention buys (D-042).
+    const behind = Math.min(...rotated.deltas.map((entry) => entry.from))
+    const chain = planSync(rotated, behind)
+    expect(chain?.map((entry) => [entry.from, entry.to])).toEqual(
+      rotated.deltas.map((entry) => [entry.from, entry.to])
+    )
+    const previous = join(published.rotated.pub, published.rotated.previous_generation)
+    expect(readdirSync(previous).some((name) => name.endsWith('.br'))).toBe(true)
+  })
+
+  it('tells a client below the retention floor to re-download, rather than a chain', () => {
+    // The other half of retention, and the half only a *twice*-rotated plane
+    // has: this generation is gone (its directory was deleted), so `planSync`
+    // must return null rather than half a path.
+    expect(published.rotated.retired.generations.length).toBeGreaterThan(0)
+    const gone = Number(published.rotated.retired.generations[0]!.split('-')[1])
+    expect(planSync(rotated, gone)).toBeNull()
+  })
+
+  it('tells a freshly downloaded client it is already current', () => {
+    expect(planSync(rotated, snapshotRev(rotated))).toEqual([])
+  })
+
+  it('serves the rotated generation at the URLs the client derives', () => {
+    for (const chunk of rotated.snapshot.chunks) {
+      const url = chunkUrl(rotated, chunk)
+      expect(url).toContain(`/snapshot-${snapshotRev(rotated)}/`)
+      expect(() => readFileSync(dataFile(url, published.rotated.pub))).not.toThrow()
+    }
   })
 })

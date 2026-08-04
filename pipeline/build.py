@@ -274,8 +274,11 @@ def id_space(db_path: str) -> dict:
             "schema": meta.get("schema"),
             # Provenance rather than ID space, but this is the one place that
             # already has `meta` open: the tree the artifact was built from,
-            # which `ingest.py init` checks a clone against.
+            # which `ingest.py init` checks a clone against, and when it was
+            # built, which the delta cut from it carries so that one revision
+            # has one freshness rather than two (D-060).
             "commit": str(meta.get("commit") or ""),
+            "generated": None if meta.get("generated") is None else int(meta["generated"]),
             "inferred": sorted(fallbacks),
         }
     finally:
@@ -302,6 +305,21 @@ def _digest_rows(digest, db: sqlite3.Connection) -> None:
     digest.update(b"cve")
     for row in db.execute("SELECT id, cve_id FROM cve ORDER BY id"):
         digest.update(repr(row).encode("utf-8", "surrogatepass"))
+
+
+def digest_file(path: str) -> str:
+    """SHA-256 of a file's bytes, in blocks — an artifact is ~377 MB.
+
+    Not the same question as `fingerprint`, which is about what the ids *mean*
+    and is reproducible from a rebuild. This is "is this the same file", which
+    is what a revision's content is pinned by (D-060): two builds of one corpus
+    differ here (`meta.generated` alone would do it) and that is the point.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def fingerprint(db_path: str) -> str:

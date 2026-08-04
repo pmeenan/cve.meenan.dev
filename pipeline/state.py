@@ -7,10 +7,13 @@ cannot:
 
   * **a content hash per record** (D-031), because "changed" is a diff against
     the previous run and nothing in the artifact records it;
-  * **the revision each record last changed at**, which is what a delta spanning
-    more than one revision needs — the monthly rebuild's bridging delta, M2's
-    next task. A daily run never reads it back; it is written now because the
-    only place the number exists is the run that produced it;
+  * **the revision each record last changed at**, which is what a delta
+    spanning more than one revision would need. Nothing reads it back today:
+    the monthly snapshot publishes the artifact the head was cut from rather
+    than a fresh build, so it lands *at* head and needs no bridging delta
+    (D-060). It is written because the only place the number exists is the run
+    that produced it, and a rebuild that ever does change content is the one
+    thing that would want it;
   * **the pending run**, which is what makes a crashed run re-runnable instead
     of a rewritten immutable URL (D-047, D-055).
 
@@ -24,8 +27,9 @@ clone (D-058).
 The lock lives here too, because both crons have to take it and both end up
 opening this file: D-042 requires a monthly snapshot and a daily ingest never to
 overlap, and the daily's `flock` is worth nothing if the monthly forgets it.
-Only the daily job exists today, so that is an obligation on the next one rather
-than something already true.
+Both jobs take it now — `ingest.py run` and `snapshot.py` — and both record
+their outcome here, separately, so a monthly failure is not hidden by a daily
+success (D-060).
 """
 
 from __future__ import annotations
@@ -44,6 +48,18 @@ STATE_VERSION = 1
 
 LOCK_NAME = "pipeline.lock"
 STATE_NAME = "ingest.sqlite"
+
+# How often a waiting job re-tries the lock. Only the monthly waits, and what
+# it is waiting for is a ~55 s daily run, so this is coarse on purpose.
+LOCK_POLL = 5.0
+
+# One outcome record per scheduled job. The daily's keys keep their original
+# names because a deployed state file already holds them, and renaming them
+# would report a healthy ingest as one that has never run.
+OUTCOME_KEYS = {
+    "run": ("last_run", "last_ok", "last_error"),
+    "snapshot": ("last_snapshot", "last_snapshot_ok", "last_snapshot_error"),
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v);
@@ -66,13 +82,25 @@ class Busy(Exception):
 
 
 @contextlib.contextmanager
-def lock(state_dir: str):
+def lock(state_dir: str, wait: float = 0.0):
     """Hold the pipeline lock for the duration, or raise `Busy` (D-042).
 
-    Non-blocking on purpose. A daily run that finds the monthly snapshot in
-    progress has nothing useful to wait for — the snapshot moves the head it
-    would have built its delta from — so the honest outcome is to skip today and
-    let tomorrow's run cover two days, which the changeset does by construction.
+    Non-blocking by default, and that default is the daily's. A daily run that
+    finds the monthly snapshot in progress has nothing useful to wait for — the
+    snapshot moves the head it would have built its delta from — so the honest
+    outcome is to skip today and let tomorrow's run cover two days, which the
+    changeset does by construction.
+
+    **The monthly is the opposite case, which is what `wait` is for.** A daily
+    finishing under it does not invalidate anything the rotation is about to do;
+    it just moves the head the rotation will land on. Skipping instead costs a
+    whole month — that is when the job next runs — and leaves no record, because
+    a job that never got the lock cannot write its outcome. So the monthly waits
+    a bounded while and turns a collision into a delay.
+
+    Polling rather than a blocking `flock`: the wait has to be bounded (a cron
+    job that blocks forever on a wedged process is worse than one that gives
+    up), and `LOCK_NB` in a loop is the portable way to bound it.
 
     The lock is released by closing the descriptor, which the `finally` does on
     every exit path including a crash inside the body; a killed process releases
@@ -82,10 +110,15 @@ def lock(state_dir: str):
     path = os.path.join(state_dir, LOCK_NAME)
     handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            raise Busy(f"another pipeline job holds {path}") from error
+        deadline = time.monotonic() + max(0.0, float(wait))
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise Busy(f"another pipeline job holds {path}") from error
+                time.sleep(min(LOCK_POLL, max(0.0, deadline - time.monotonic())))
         yield path
     finally:
         os.close(handle)
@@ -275,9 +308,9 @@ class State:
             db.execute("DROP TABLE IF EXISTS temp.scan")
         return {"added": added, "changed": changed, "delete": deleted}
 
-    def record_outcome(self, ok: bool, message: str) -> None:
-        """What the last run did, so a failure is discoverable without reading
-        a log file.
+    def record_outcome(self, ok: bool, message: str, kind: str = "run") -> None:
+        """What the last run of one job did, so a failure is discoverable
+        without reading a log file.
 
         D-042 asks the ingest to "abort and alert", and on this machine there is
         no channel to alert *through*: no MTA is installed, so cron's mail is a
@@ -286,26 +319,36 @@ class State:
         the question — `ingest.py status` reports this, so "is the ingest
         healthy?" is one command rather than a log grep, and a run that has been
         failing since Tuesday says so.
+
+        The two jobs record separately, because a monthly job that has failed
+        since May is invisible under a daily one that succeeded this morning —
+        and a monthly failure is the more expensive of the two to miss, since
+        the next attempt is a month away rather than a day (D-060).
         """
+        keys = OUTCOME_KEYS[kind]
         with self._db:
             self._write_meta(
                 {
-                    "last_run": int(time.time()),
-                    "last_ok": 1 if ok else 0,
-                    "last_error": "" if ok else str(message)[:2000],
+                    keys[0]: int(time.time()),
+                    keys[1]: 1 if ok else 0,
+                    keys[2]: "" if ok else str(message)[:2000],
                 }
             )
 
-    @property
-    def last_run(self) -> dict | None:
-        when = self._meta("last_run")
+    def outcome(self, kind: str = "run") -> dict | None:
+        keys = OUTCOME_KEYS[kind]
+        when = self._meta(keys[0])
         if when is None:
             return None
         return {
             "at": int(when),
-            "ok": bool(int(self._meta("last_ok") or 0)),
-            "error": str(self._meta("last_error") or "") or None,
+            "ok": bool(int(self._meta(keys[1]) or 0)),
+            "error": str(self._meta(keys[2]) or "") or None,
         }
+
+    @property
+    def last_run(self) -> dict | None:
+        return self.outcome("run")
 
     def begin_run(self, pending: dict) -> None:
         """Pin the run before anything of it is published.

@@ -336,6 +336,94 @@ def publish_fixture(root: str) -> dict:
     }
 
 
+def publish_rotated_fixture(root: str) -> dict:
+    """The same path, carried through a **monthly rotation** (D-060).
+
+    Snapshot at rev 1, two days of deltas, the generation rotated onto the
+    artifact rev 3 was cut from — which lands *at* head, so the deltas that
+    carried clients there are retained and start below the new snapshot's
+    revision — then a third day and a second rotation, which is the first one
+    that retires anything.
+
+    That shape is the one `assert_tiling` refused before D-060, and the reason
+    the contract test consumes it: whether the browser's own `planSync` still
+    finds a chain across a rotation, and correctly refuses to find one for a
+    client below the retention floor, are not questions the pipeline's own tests
+    can answer.
+    """
+    workspace = os.path.join(root, "rotated")
+    os.makedirs(workspace, exist_ok=True)
+    day = 86_400
+    v1 = build_artifact(workspace, corpus_v1(), "v1", rev=1, generated=FIXED_GENERATED - day)
+    v2 = build_artifact(workspace, corpus_v2(), "v2", rev=2, generated=FIXED_GENERATED, seed=v1)
+    v3 = build_artifact(
+        workspace, corpus_v3(), "v3", rev=3, generated=FIXED_GENERATED + day, seed=v2
+    )
+
+    pub_dir = os.path.join(workspace, "pub")
+    os.makedirs(pub_dir, exist_ok=True)
+    publish.publish(v1, pub_dir, quality=5, jobs=2)
+    delta.publish(
+        v2,
+        pub_dir,
+        {
+            "from": 1,
+            "to": 2,
+            "upsert": ["CVE-2026-1001", "CVE-2026-1002", "CVE-2026-1003"],
+            "delete": [],
+            "floors": floors(v1),
+            "generated": FIXED_GENERATED,
+        },
+        quality=5,
+    )
+    delta.publish(
+        v3,
+        pub_dir,
+        {
+            "from": 2,
+            "to": 3,
+            "upsert": ["CVE-2026-1003"],
+            "delete": [],
+            "floors": floors(v2),
+            "generated": FIXED_GENERATED + day,
+        },
+        quality=5,
+    )
+    # The rotation itself: the artifact the head was cut from, republished as a
+    # generation. No revision is minted and no client at head is asked for
+    # anything (D-060).
+    first = publish.publish(v3, pub_dir, quality=5, jobs=2)
+
+    # And a second month, because one rotation retires nothing: the generation
+    # this one replaces is the *first* snapshot, so it is the second rotation
+    # that first deletes anything, and a plane the contract test can use to ask
+    # what happens to a client below the retention floor.
+    v4 = build_artifact(
+        workspace, corpus_drift(), "v4", rev=4, generated=FIXED_GENERATED + 2 * day, seed=v3
+    )
+    delta.publish(
+        v4,
+        pub_dir,
+        {
+            "from": 3,
+            "to": 4,
+            "upsert": ["CVE-2026-1001"],
+            "delete": [],
+            "floors": floors(v3),
+            "generated": FIXED_GENERATED + 2 * day,
+        },
+        quality=5,
+    )
+    second = publish.publish(v4, pub_dir, quality=5, jobs=2)
+    return {
+        "pub": pub_dir,
+        "snapshot": v4,
+        "rotation": second,
+        "first_rotation": first,
+        "retired": second["retired"],
+    }
+
+
 def table_rows(db_path: str, table: str) -> list:
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:

@@ -137,6 +137,14 @@ def rows(db_path: str, table: str) -> list:
     return fixtures.table_rows(db_path, table)
 
 
+def artifact_meta(db_path: str) -> dict:
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return dict(db.execute("SELECT k, v FROM meta"))
+    finally:
+        db.close()
+
+
 def state_meta(state_dir: str, key: str):
     db = sqlite3.connect(os.path.join(state_dir, state_module.STATE_NAME))
     try:
@@ -227,6 +235,13 @@ class Plane(unittest.TestCase):
             # rebuild is a subset rather than an equal — which is exactly M2's
             # exit criterion for a *synced* database.
             self.assertLessEqual(set(rows(rebuilt, table)), set(rows(synced, table)), table)
+        # And the two keys apply writes into `meta`. Comparing record tables
+        # alone let a synced client and a downloaded one disagree about what
+        # revision they were at and how fresh it was — `generated` is revision
+        # content (D-055), and the worker surfaces it as staleness (D-060).
+        synced_meta, rebuilt_meta = artifact_meta(synced), artifact_meta(rebuilt)
+        for key in ("rev", "generated"):
+            self.assertEqual(str(synced_meta[key]), str(rebuilt_meta[key]), f"meta.{key}")
 
 
 class Cycle(Plane):

@@ -14,15 +14,21 @@ single-threaded.
 
 Publication is an atomic rename, so a half-written generation is never
 reachable (D-042).
+
+It is also where **retention** happens, because retention is a decision about
+generations and the manifest is rewritten here anyway: the previous generation
+and every delta back to it are kept, and what falls out the far end is deleted
+after the manifest has stopped naming it (D-060). The monthly cron that drives
+this is `snapshot.py`.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sqlite3
@@ -39,13 +45,15 @@ FORMAT_VERSION = 1
 # carries the same bound for the same reason).
 MAX_SAFE_INT = 2**53 - 1
 
+# The two published file shapes, matched rather than parsed loosely: retention
+# deletes, and a regex that matched `.staging-3` or a hand-dropped file would
+# delete something else. Both mirror what this module and `manifest.py` write.
+GENERATION_DIR = re.compile(r"^snapshot-(\d+)$")
+DELTA_FILE = re.compile(r"^(\d+)-(\d+)\.json\.br$")
+
 
 def sha256_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return build.digest_file(path)
 
 
 def read_meta(db_path: str) -> dict:
@@ -66,6 +74,159 @@ def _same_bytes(final: str, chunks: list) -> bool:
     return all(
         sha256_file(os.path.join(final, chunk["name"])) == chunk["sha256"] for chunk in chunks
     )
+
+
+def retained_deltas(previous: dict, pub_dir: str, rev: int, floor: int) -> list:
+    """Which of the previous manifest's deltas survive into the new one.
+
+    An entry has to clear three things. It starts at or above the retention
+    floor — the *previous* snapshot's revision, the oldest watermark D-042
+    promises to carry forward — and its file is still on disk; and then the two
+    walks below, which between them are the manifest's tiling invariant applied
+    before the manifest is written rather than after.
+
+    The walks exist because a snapshot lands in two different places. The
+    monthly rotation lands **at** head, so the deltas worth keeping run *up to*
+    it from below. A republish of the generation already being served lands
+    **behind** head, so the deltas worth keeping run *forward* from it. So:
+    first find where a client that downloads this snapshot ends up (forward
+    from `rev`, which is head itself in the rotation case), then keep every
+    delta that can still reach there.
+
+    The same walk is what retires an old ID space without a second rule for it:
+    `--new-id-space` lands above every revision the old deltas can carry a
+    client to, so nothing is forward-reachable, the head is the snapshot's own
+    revision, and the whole list drops. Same for a rebuild published above head
+    — until a bridging delta for that range is published, a client below it has
+    no chain, and the manifest says so honestly instead of advertising a path
+    `planSync` would refuse.
+    """
+    candidates = [
+        entry
+        for entry in previous.get("deltas", [])
+        if int(entry["from"]) >= floor
+        and os.path.exists(os.path.join(pub_dir, "deltas", manifest_module.delta_name(entry)))
+    ]
+
+    def walk(seed: set, edge) -> set:
+        reached = set(seed)
+        changed = True
+        while changed:
+            changed = False
+            for entry in candidates:
+                start, end = edge(entry)
+                if start in reached and end not in reached:
+                    reached.add(end)
+                    changed = True
+        return reached
+
+    forward = walk({int(rev)}, lambda e: (int(e["from"]), int(e["to"])))
+    reaches = walk({max(forward)}, lambda e: (int(e["to"]), int(e["from"])))
+    return [entry for entry in candidates if int(entry["to"]) in reaches]
+
+
+def retire(pub_dir: str, rev: int, floor: int, previous_floor: int | None) -> dict:
+    """Delete what retention no longer covers — **after** the manifest is saved.
+
+    D-042 keeps two generations: this one and the one it replaces. Everything
+    older goes, and with it the deltas that only ever served clients below the
+    oldest generation being removed — one full rotation *after* the manifest
+    stopped listing them. That grace period is the whole point of retention: a
+    client that read the previous manifest ten minutes ago is still fetching
+    from a generation that is still here, and from deltas that are still here.
+    A day's delta is ~70–90 KB (D-042, D-058), so a month of extra grace costs
+    a couple of megabytes against the 63 MB generation it protects.
+
+    The invariant is **nothing either manifest named is deleted** — not the one
+    just written, and not the one that was live a moment ago. The first half is
+    ordering: the manifest is rewritten before any of this runs. The second half
+    is that what gets deleted is defined by the two floors rather than by what
+    happens to be on disk, and both halves were learned the same way.
+
+    A generation directory can exist that was never advertised — a publish
+    killed between `os.rename(staging, final)` and the manifest write leaves
+    exactly that. Deriving the delta cut from the newest directory being removed
+    put it *above* this manifest's floor, sweeping up files the manifest had
+    just been rewritten to keep (reproduced from a crashed rotation and from a
+    crashed manual rebuild above head). Deleting only generations strictly below
+    the floor fixed that half — and left the other: one rotation later the same
+    orphan is retired, and the cut taken from it landed above the *previous*
+    manifest's floor, deleting a delta a client had been offered sixty seconds
+    earlier. Hence `previous_floor`, which is the grace period itself rather
+    than a refinement of it.
+
+    A directory *above* this revision is reported rather than deleted: it is a
+    crashed publish, and its bytes are the byte-identical resume evidence its
+    retry needs (D-047).
+
+    Retention is deliberately not a separate job. A standalone pruner would
+    delete files the live manifest still lists, and `manifest.py` has no way to
+    drop an entry outside a republish, so the window between the two would
+    advertise 404s. Doing it here means the entries and the files go in one
+    operation, in the safe order.
+
+    Nothing here raises. The publication is already complete and correct by the
+    time this runs, so a directory that cannot be removed is reported — a green
+    publish reported as a failed one would be the wrong direction to fail in,
+    given `ingest.py status` is the only alerting this machine has (D-058).
+    """
+    removed: dict = {"generations": [], "deltas": [], "unplaced": [], "unremovable": []}
+    retired_revs = []
+    for name in sorted(os.listdir(pub_dir)):
+        match = GENERATION_DIR.match(name)
+        if not match:
+            continue
+        found = int(match.group(1))
+        # Never the generation just published, whatever the floor says. Nothing
+        # reachable can put `floor` above `rev` today — `assert_continues`
+        # refuses a publish behind the advertised generation even under
+        # `--force` — but this function deletes directories, and "safe because
+        # of a check three modules away" is not the guarantee to rest that on.
+        if found == int(rev):
+            continue
+        if found >= int(floor):
+            if found > int(rev):
+                removed["unplaced"].append(name)
+            continue
+        try:
+            shutil.rmtree(os.path.join(pub_dir, name))
+        except OSError as error:
+            removed["unremovable"].append(f"{name}: {error}")
+            continue
+        retired_revs.append(found)
+        removed["generations"].append(name)
+
+    # Nothing retired means nothing to cut: a data plane on its first rotation
+    # keeps every delta it has, which is what lets a client sitting at the
+    # original snapshot still catch up.
+    #
+    # Bounded by the **previous manifest's own floor**, which is the whole grace
+    # period. Every retired revision is below this manifest's floor, so a cut
+    # taken from them alone is already below every *retained* entry — but that
+    # is the weaker claim. The one that matters is that a file the manifest
+    # live sixty seconds ago named is not deleted in the operation that stops
+    # naming it, and an unadvertised generation between the two floors (a
+    # rotation killed before its manifest write leaves one) pushed the cut past
+    # exactly that. Reproduced: crash, rotate, a day, rotate again, and the
+    # delta a client at rev 1 had just been offered was gone.
+    cut = max(retired_revs, default=0)
+    if previous_floor is not None:
+        cut = min(cut, int(previous_floor))
+    deltas = os.path.join(pub_dir, "deltas")
+    if cut and os.path.isdir(deltas):
+        for name in sorted(os.listdir(deltas)):
+            match = DELTA_FILE.match(name)
+            # `to <= cut` — entirely below the oldest generation just removed.
+            # A pending run's file ends above head and cannot match, so a
+            # crashed ingest's pinned bytes are never swept up here.
+            if match and int(match.group(2)) <= cut:
+                try:
+                    os.remove(os.path.join(deltas, name))
+                except OSError as error:
+                    removed["unremovable"].append(f"{name}: {error}")
+                    continue
+                removed["deltas"].append(name)
+    return removed
 
 
 def compress_chunk(job: tuple[str, str, int]) -> dict:
@@ -202,6 +363,56 @@ def publish(
             "new revision."
         )
 
+    # A snapshot published *at* the head revision is the monthly landing (D-042,
+    # D-055), and it is the one publication that asks nothing of anyone: every
+    # synced client is already at that watermark, `planSync` reports "already
+    # current", and not one byte of it is ever re-fetched. So different content
+    # there is invisible and permanent — the hole D-056 named and left for this
+    # task. The rule (D-060): a snapshot at head must be *the artifact head's
+    # content came from*, by digest. The monthly cron satisfies it by
+    # construction, because it publishes the artifact the ingest state points at
+    # rather than a fresh build; a rebuild that genuinely changes content has to
+    # land above head, where clients are told to re-download.
+    #
+    # Fails closed on a missing record, for the reason D-056 gives about gaps: a
+    # revision whose artifact was never written down cannot be compared, and
+    # "nothing to check" is exactly what a wrong artifact needs. Waiting for the
+    # next delta is the cheap fix, and the message says so.
+    #
+    # The *mismatch* half is checked here and ungated by `--force`, for the same
+    # reason the ID-space comparison above is: `ledger._record_artifact` refuses
+    # it too, but that runs after the generation directory has been renamed into
+    # place, so the failure would land with new chunks on disk and the old
+    # digests still in the manifest. Reproduced with `--force` and a sibling
+    # build. The cost is real and deliberate: `--force` can no longer replace
+    # what a recorded revision's content *is*. Publish at a new revision, or —
+    # in a throwaway `pub` directory — remove its ledger, which is the local
+    # iteration `--force` is documented for.
+    artifact_digest = build.digest_file(db_path)
+    recorded_artifact = ledger.artifact_at(pub_dir, rev)
+    if recorded_artifact is not None and recorded_artifact != artifact_digest:
+        raise SystemExit(
+            f"error: rev {rev}'s content came from artifact {recorded_artifact}, but this is "
+            f"{artifact_digest}; what a published revision *is* cannot be rewritten, because "
+            "clients already hold it. Publish this at a new revision."
+        )
+    # Ungated by `--force` as well, and for a reason `--force` cannot address.
+    # The flag says "replace the bytes at these URLs deliberately"; the hazard
+    # here is not the bytes but that **nobody at head is ever told to re-fetch
+    # them**, so a forced publish reaches new arrivals only and leaves every
+    # synced client on the old content, silently and permanently. Gating this
+    # half on `force` let exactly that through — remove the ledger's record (or
+    # publish onto a data plane that predates it) and any content at all could
+    # land at head.
+    if published_head and rev == published_head and recorded_artifact is None:
+        raise SystemExit(
+            f"error: rev {rev} is the published head, but this data plane has no record of "
+            "the artifact its content came from — so nothing here can confirm that "
+            "publishing this one leaves every synced client holding what it already has, "
+            "and none of them will be told to re-fetch it. Publish at a revision above "
+            "head, or ingest one delta first (which records it) and snapshot that."
+        )
+
     if published_head and not new_id_space:
         # The lineage token cannot see a build seeded from the wrong ancestor —
         # two children of one artifact share it, and both mint the same ids for
@@ -253,6 +464,23 @@ def publish(
     for index, chunk in enumerate(chunks):
         chunk["name"] = f"{index:03d}.br"
 
+    # The digest above named a *path*, and the workers reopened that path to
+    # read the bytes now staged. Anything that replaced the file in between —
+    # a hand-run `build.py` during recovery, which `pipeline/README.md` documents
+    # as a real operation and which takes no lock — would have the ledger record
+    # one artifact while the chunks reconstruct another, with every manifest
+    # digest agreeing so no integrity check notices. Re-read before any of it
+    # becomes visible; the staged bytes came from this file, so if the file is
+    # still the one that was hashed, so are they. 0.18 s over 377 MB.
+    if build.digest_file(db_path) != artifact_digest:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            f"error: {db_path} changed while it was being published — it hashed as "
+            f"{artifact_digest} before compression and differs now, so the staged chunks "
+            "describe bytes this run cannot vouch for. Nothing was published; re-run against "
+            "a source nothing else is writing."
+        )
+
     # D-047: a published generation is immutable — its URLs carry an immutable
     # cache policy (D-034), so rewriting one serves stale-vs-new mixes from
     # caches. Same-rev republish is therefore refused; --force (local iteration
@@ -301,28 +529,52 @@ def publish(
     if retired is not None:
         shutil.rmtree(retired)
 
-    # Which deltas survive into the new manifest: those that still have a file
-    # *and* start at or after this snapshot's revision.
+    # Which deltas survive into the new manifest, and therefore which files
+    # retention may delete. The floor is the *previous* snapshot's revision:
+    # D-042 keeps every delta back to the older of the two generations it
+    # retains, so a client one generation behind catches up instead of
+    # re-downloading. `retained_deltas` then drops anything that cannot reach
+    # this snapshot's revision, which is what keeps a kept entry from being a
+    # path `planSync` would refuse.
     #
-    # The second half is the one that was missing. A delta below the new
-    # snapshot's revision belongs to the generation this one replaces, and no
-    # client can use it: a chain has to reach head, and nothing bridges the old
-    # revisions to the new snapshot. Keeping such entries left clients with a
-    # manifest advertising a catch-up path that `planSync` correctly refuses —
-    # and, when one of their files had been retired, a *freshly downloaded*
-    # client with no chain out of its own snapshot, re-downloading forever.
+    # Before D-060 the floor was `rev` itself, which dropped *every* delta on
+    # every rotation — the honest answer while nothing could bridge the old
+    # revisions to a rebuilt snapshot, but it made retention buy nothing.
     #
-    # That is also what retires the old ID space's deltas, and why there is no
-    # second condition here: `--new-id-space` requires a revision above the
-    # published head, so every existing delta ends at or below it and starts
-    # below that — no entry can satisfy `from >= rev`. Dropping them leaves
-    # clients with no chain, which is the honest answer: re-download.
-    kept = [
-        entry
-        for entry in previous.get("deltas", [])
-        if int(entry["from"]) >= rev
-        and os.path.exists(os.path.join(pub_dir, "deltas", manifest_module.delta_name(entry)))
-    ]
+    # The floor is what the **previous manifest advertised**, because that is
+    # what retention protects: a client reading it ten minutes ago is fetching
+    # from that generation and those delta files. Not the ledger — it remembers
+    # generations that were published but never advertised (a rotation killed
+    # between the rename and the manifest write leaves one), and treating such a
+    # generation as the previous one drops the deltas that carry clients out of
+    # the generation they actually downloaded.
+    #
+    # The exception is a republish of the generation *already* being served, a
+    # resume among them: `snapshot.rev` is then this revision, and reading the
+    # floor from it collapsed retention to one generation — every retained delta
+    # dropped and the previous generation deleted in the same operation. The
+    # previous manifest's own delta list is where its floor is recorded, so that
+    # is where it comes from in that case, and for a manifest written before
+    # `snapshot.rev` existed (D-055).
+    starts = [int(entry["from"]) for entry in previous.get("deltas", ())]
+    previous_floor = min(starts) if starts else None
+    advertised = (previous.get("snapshot") or {}).get("rev")
+    if advertised is None and previous_floor is None:
+        # A manifest written before `snapshot.rev` existed (D-055). It carries no
+        # deltas either — that field went in with the same entry — so its
+        # top-level `rev` *is* its snapshot's, which is the fallback `head_rev`
+        # and `ledger._seed` already use. Without it the floor became this
+        # revision and the rotation deleted the generation the live manifest was
+        # still naming, on the one publish where that manifest is the only thing
+        # a mid-download client has.
+        advertised = previous.get("rev")
+    if advertised is not None and int(advertised) != int(rev):
+        floor = int(advertised)
+    elif previous_floor is not None:
+        floor = previous_floor
+    else:
+        floor = int(rev)
+    kept = retained_deltas(previous, pub_dir, rev, floor)
 
     manifest = {
         "format": FORMAT_VERSION,
@@ -352,8 +604,24 @@ def publish(
     # written first and this is not, the data plane advertises a revision the
     # ledger has never heard of, which is a state the guards above cannot tell
     # from a wrong-ancestor publish.
-    ledger.record_snapshot(pub_dir, rev, len(chunks), token, candidate)
+    ledger.record_snapshot(pub_dir, rev, len(chunks), token, candidate, artifact_digest)
     manifest_module.save(pub_dir, manifest)
+
+    # Retention runs last, and only after the manifest no longer names any of
+    # it (D-042). What goes is every generation below the floor — one nobody
+    # has been offered since the last rotation — together with the deltas that
+    # only served clients older than the oldest of them.
+    #
+    # With **no previous manifest there is no evidence about what was
+    # advertised**, and retention is defined by that evidence, so it retires
+    # nothing rather than falling back to the most destructive reading. A lost
+    # `manifest.json` is a plausible recovery step; treating it as "everything
+    # below this revision is unreachable" deleted both generations and the whole
+    # catch-up chain at the moment the pipeline knew least.
+    if previous:
+        removed = retire(pub_dir, rev, floor, previous_floor)
+    else:
+        removed = {"generations": [], "deltas": [], "unplaced": [], "unremovable": []}
 
     compressed = sum(c["bytes"] for c in chunks)
     return {
@@ -363,6 +631,8 @@ def publish(
         "compressed_bytes": compressed,
         "ratio": round(total / compressed, 2) if compressed else 0,
         "seconds": round(elapsed, 1),
+        "deltas_kept": len(kept),
+        "retired": removed,
     }
 
 

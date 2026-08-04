@@ -479,6 +479,7 @@ def write(
     force: bool = False,
     space: dict | None = None,
     on_written=None,
+    artifact: str | None = None,
 ) -> dict:
     """Compress and publish the delta; return its manifest entry.
 
@@ -578,7 +579,7 @@ def write(
         if os.path.exists(compressed_path):
             os.unlink(compressed_path)
 
-    ledger.record_delta(pub_dir, entry, space)
+    ledger.record_delta(pub_dir, entry, space, artifact)
     return entry
 
 
@@ -638,6 +639,36 @@ def publish(
                 f"published at rev {from_rev} ({expected})"
             )
 
+    # And the same question about the revision this delta *lands* on, but about
+    # its content rather than its ids: `ledger._record_artifact` refuses a second
+    # artifact at one revision too, and that runs after `os.replace` has put the
+    # file at its public URL. Two deltas can land on one `to` from different
+    # artifacts — newly reachable, because a bridging delta may now be published
+    # into a revision a rebuilt snapshot already defines (D-060). Ordered after
+    # the floors comparison so that a *tampered* artifact is still reported as
+    # the floors problem it is, rather than as the digest mismatch it also is.
+    artifact_digest = build.digest_file(db_path)
+    landing_artifact = ledger.artifact_at(pub_dir, int(changeset["to"]))
+    if landing_artifact is not None:
+        if landing_artifact != artifact_digest:
+            raise SystemExit(
+                f"error: rev {changeset['to']}'s content came from artifact {landing_artifact}, "
+                f"but this delta is cut from {artifact_digest}; it would leave clients at a "
+                "revision holding something other than what was published there"
+            )
+    elif landing is not None:
+        # No digest, but the revision *was* published — `space_at` only records
+        # what this data plane put at a revision. Absence is then a gap rather
+        # than a free revision, and the gap is exactly what a second artifact
+        # needs: land a bridge here from a sibling and clients arriving fresh
+        # download one content while clients applying the bridge get another,
+        # both calling it rev N. Fail closed, as D-056 does for the same shape.
+        raise SystemExit(
+            f"error: rev {changeset['to']} was already published, but nothing records which "
+            "artifact its content came from — so this delta cannot be shown to land clients "
+            "on what is already there. Publish this at a new revision."
+        )
+
     delta = extract(
         db_path,
         from_rev=int(changeset["from"]),
@@ -652,13 +683,24 @@ def publish(
     # `register_delta` refuses a delta that would strand a client (D-055), and
     # by then the bytes are published and recorded in the ledger — so the URL is
     # burned, and even a corrected payload for that range is refused afterwards.
-    # Reproduced with a bridging delta, which is exactly the case M2's monthly
-    # rebuild needs: emitted from a rebuilt snapshot, refused by the tiling
-    # check, file already served.
+    # A well-formed bridge into a rebuilt snapshot registers fine since D-060;
+    # what is reproduced now is a bridge to the *wrong* revision, which leaves
+    # the client at a dead end the manifest will not advertise.
     prospective = {"from": int(delta["from"]), "to": int(delta["to"])}
     manifest_module.assert_tiling(
         manifest_module.plan_delta(pub_dir, prospective, delta["generated"])
     )
+    # `extract` reopened the path this was digested from, so the same
+    # hash-then-reopen window the snapshot path has applies here: a file
+    # replaced in between would have the ledger record one artifact while the
+    # payload came from another. Re-read before the bytes become public.
+    if build.digest_file(db_path) != artifact_digest:
+        raise SystemExit(
+            f"error: {db_path} changed while this delta was being extracted — it hashed as "
+            f"{artifact_digest} before and differs now, so the payload describes bytes this "
+            "run cannot vouch for. Nothing was published."
+        )
+
     entry = write(
         delta,
         pub_dir,
@@ -666,6 +708,12 @@ def publish(
         force=force,
         space=candidate,
         on_written=on_written,
+        # Which file this revision's content came from. The monthly snapshot
+        # lands *at* the head revision and tells no client to re-fetch, so
+        # "the same content clients already hold" has to be checkable rather
+        # than conventional — and the only moment it is knowable is here
+        # (D-060). One pass over the artifact, ~377 MB, already spent above.
+        artifact=artifact_digest,
     )
     # The manifest last, because it is what exposes the new head. Recording the
     # bytes and the ID space the delta lands on in the same ledger write, before

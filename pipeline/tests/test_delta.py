@@ -873,21 +873,42 @@ class Publication(unittest.TestCase):
         self.assertEqual(published["rev"], 4)
         self.assertEqual(published["deltas"], [])
 
+    def test_a_snapshot_at_head_must_be_the_artifact_head_came_from(self):
+        """The hole D-056 recorded and D-060 closes. A snapshot at the head
+        revision is the monthly landing, and it is the one publication nobody
+        already synced ever fetches — `planSync` tells them they are current —
+        so different content there reaches new arrivals only, silently and
+        permanently. This sibling is a legitimate build of the same corpus with
+        the same ids, so neither the lineage token, nor `seed_rev`, nor the ID
+        space's fingerprint can see it; the artifact digest the ledger recorded
+        when rev 2 was cut can."""
+        sibling = fixtures.build_artifact(
+            self.root,
+            fixtures.corpus_v2(),
+            "sibling",
+            rev=2,
+            generated=fixtures.FIXED_GENERATED + 1,
+            seed=self.published["snapshot"],
+        )
+        self.assertEqual(
+            build.fingerprint(sibling),
+            build.fingerprint(self.published["next"]),
+            "the ids are identical — this is only visible as content",
+        )
+        with self.assertRaisesRegex(SystemExit, "content came from artifact"):
+            publish_module.publish(sibling, self.pub, quality=5, jobs=2)
+        self.assertFalse(os.path.exists(os.path.join(self.pub, "snapshot-2")))
+        self.assertEqual(manifest_module.load(self.pub)["snapshot"]["rev"], 1)
+
     def test_publishing_an_older_revision_is_refused(self):
         """Revisions only move forward. Deleting a retired generation's
         directory used to be enough to let an older artifact be republished,
         which rolled the manifest backwards under clients that had already
         synced past it — and reused its `snapshot-<rev>` URLs for different
         bytes under an immutable cache policy."""
-        newer = fixtures.build_artifact(
-            self.root,
-            fixtures.corpus_v2(),
-            "r2",
-            rev=2,
-            generated=fixtures.FIXED_GENERATED + 1,
-            seed=self.published["next"],
-        )
-        publish_module.publish(newer, self.pub, quality=5, jobs=2)
+        # The artifact rev 2 was cut from, which is the only one publishable at
+        # head (D-060) and exactly what the monthly rotation publishes.
+        publish_module.publish(self.published["next"], self.pub, quality=5, jobs=2)
         shutil.rmtree(os.path.join(self.pub, "snapshot-1"), ignore_errors=True)
         with self.assertRaisesRegex(SystemExit, "roll it backwards"):
             publish_module.publish(self.published["snapshot"], self.pub, quality=5, jobs=2)
@@ -973,7 +994,24 @@ class Publication(unittest.TestCase):
             {**self.published["delta"], "from": 3, "to": 4},
         ]
         manifest["rev"] = 4
-        with self.assertRaisesRegex(SystemExit, "unreachable|do not tile"):
+        with self.assertRaisesRegex(SystemExit, "do not tile"):
+            manifest_module.save(self.pub, manifest)
+
+    def test_a_manifest_a_fresh_download_could_not_leave_is_refused(self):
+        """The anchor that matters most, and the one the stranding test above
+        covers only by accident: it uses a snapshot revision that happens to be
+        a delta's `from` as well. Here it is neither, so nothing but the
+        snapshot anchor itself notices that every client which downloads this
+        generation is stranded at it forever."""
+        manifest = manifest_module.load(self.pub)
+        manifest["snapshot"] = {**manifest["snapshot"], "rev": 4}
+        manifest["deltas"] = [
+            {**self.published["delta"], "from": 2, "to": 3},
+            {**self.published["delta"], "from": 3, "to": 4},
+            {**self.published["delta"], "from": 5, "to": 6},
+        ]
+        manifest["rev"] = 6
+        with self.assertRaisesRegex(SystemExit, "do not tile"):
             manifest_module.save(self.pub, manifest)
 
     def test_a_snapshot_with_no_notice_is_refused(self):

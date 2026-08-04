@@ -43,13 +43,26 @@ def assert_tiling(manifest: dict) -> None:
     plausible way) leaves a hole, and every client re-downloads the corpus,
     lands back where it started, and does it again tomorrow.
 
-    The property checked is reachability in both directions: every revision a
-    client can be sitting at — the snapshot's, and every delta's `to` — must
-    have a chain forward to head, and every delta must start from a revision a
-    client can actually be at. The advertised `rev` must also *be* that head:
-    a manifest claiming rev 999 over a 1→2 chain (or over no deltas at all)
+    The property checked is **one direction only: everything this manifest
+    names must be able to reach head.** The anchors are the snapshot's
+    revision and both ends of every delta — each of them is a revision some
+    client can be sitting at, and each must have a chain forward to the head
+    the manifest advertises. The advertised `rev` must also *be* that head: a
+    manifest claiming rev 999 over a 1→2 chain (or over no deltas at all)
     tells every client to reach a revision nothing can deliver. Fail closed
     (D-047): the manifest is not written.
+
+    It used to also require every delta's `from` to be reachable *forward from
+    the snapshot*, which made retention impossible to express and is what
+    refused the bridging delta D-055 and D-056 both left to the monthly
+    rebuild. After a rotation the retained deltas start **below** the new
+    snapshot's revision by construction (D-042 keeps every delta back to the
+    previous generation, so a client one generation behind catches up instead
+    of re-downloading), and nothing forward of a fresh snapshot ever reaches
+    them. That check was answering "could a client be at this revision?", which
+    this file cannot know — `ledger.py` is what remembers what was published.
+    What the manifest can and must guarantee is that nothing it names is a dead
+    end, and that is what is checked here (D-060).
     """
     deltas = manifest.get("deltas") or []
     head = head_rev(manifest)
@@ -63,39 +76,25 @@ def assert_tiling(manifest: dict) -> None:
         return
 
     snapshot_rev = int((manifest.get("snapshot") or {}).get("rev", manifest.get("rev", 1)))
+    anchors = {snapshot_rev}
     edges: dict[int, set[int]] = {}
     for entry in deltas:
         start, end = int(entry["from"]), int(entry["to"])
         if end <= start:
             raise SystemExit(f"error: delta {start}-{end} does not advance the revision")
         edges.setdefault(start, set()).add(end)
+        anchors.update((start, end))
 
-    forward = {snapshot_rev}
-    queue = [snapshot_rev]
-    while queue:
-        at = queue.pop()
-        for nxt in edges.get(at, ()):
-            if nxt not in forward:
-                forward.add(nxt)
-                queue.append(nxt)
-
-    orphans = sorted({int(e["from"]) for e in deltas} - forward)
-    if orphans:
-        raise SystemExit(
-            f"error: deltas starting at {orphans} are unreachable from snapshot rev "
-            f"{snapshot_rev}; a client can never use them"
-        )
     # Walk backwards from head to find every revision that can still get there.
     reaches_head = {head}
     changed = True
     while changed:
         changed = False
-        for entry in deltas:
-            start, end = int(entry["from"]), int(entry["to"])
-            if end in reaches_head and start not in reaches_head:
+        for start, ends in edges.items():
+            if start not in reaches_head and not ends.isdisjoint(reaches_head):
                 reaches_head.add(start)
                 changed = True
-    stranded = sorted(forward - reaches_head)
+    stranded = sorted(anchors - reaches_head)
     if stranded:
         raise SystemExit(
             f"error: a client at rev {stranded} has no chain to head {head}; the delta "
@@ -153,8 +152,9 @@ def plan_delta(pub_dir: str, entry: dict, generated: int) -> dict:
     publishable?" before it publishes anything. It has to be answerable early:
     the file lands first (so the manifest never names something absent) and the
     ledger records it, and both are irreversible — a delta refused at
-    registration has already burned its immutable URL. The bridging delta M2's
-    monthly rebuild needs is exactly such a case today.
+    registration has already burned its immutable URL. The reproduction is a
+    bridge to the *wrong* revision: one that would leave a client at a dead end
+    (D-060 relaxed the rule that used to refuse every bridge, not this one).
     """
     manifest = load(pub_dir)
     if manifest is None:

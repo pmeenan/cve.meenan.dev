@@ -247,24 +247,64 @@ everything downstream consumes them.
       `no-cache` policies, COOP/COEP, no `Access-Control-Allow-Origin`, the
       ledger unreachable — and end to end by a real browser importing the new
       generation from `https://cve.meenan.dev/`.
-- [ ] **Monthly snapshot cron**: rebuild, chunk, compress, publish by atomic
-      rename; previous generation and its deltas retained; generations
-      immutable (D-041, D-042, D-047). Two pieces D-055 left to this task:
-      **pruning** — retention deletes delta files, and `manifest.py` has no
-      way to drop their entries outside a full snapshot republish, so between a
-      retention run and the next rebuild the manifest can advertise a 404; and
-      the **bridging delta** from the old head to the new snapshot's revision,
-      without which a client a generation behind re-downloads rather than
-      catching up. D-056 unblocked the ID-space half of that — a rebuilt
-      snapshot and the old head now share an ID space — but `assert_tiling`
-      still refuses a delta starting below the snapshot's revision, so this
-      task owns relaxing that walk as well as emitting the file. (The emitter
-      now checks tiling *before* writing, so the attempt fails without burning
-      the immutable URL.) It also owns an open question D-056 surfaced but did
-      not settle: a rebuild published at `rev == published_head` — the legal
-      landing — with *different content* leaves every client at that watermark
-      believing it is current, so decide deliberately whether the monthly
-      rebuild must advance the revision or must be content-equivalent to head.
+- [ ] **Monthly snapshot cron** (D-060). *Built, reviewed and measured
+      2026-08-03; the cron entry itself needs a commit and one daily delta,
+      neither of which an agent can do (rule 7).*
+      - [x] **`pipeline/snapshot.py`.** Take D-042's `flock`, finish any crashed
+            ingest, publish **the artifact the ingest state points at** at the
+            revision it is stamped with — which must be the published head —
+            then retain and retire. It does not rebuild, because the daily
+            already does: every daily run writes a complete artifact and the
+            delta is only the wire file it emits afterwards, so the rotation is
+            the other four verbs and costs what compressing a generation costs.
+            It does not fetch either — a monthly job that could abort on the
+            tombstone guard would take out the rotation path with the freshness
+            path. Measured on `plex` against the real corpus in a scratch copy
+            of the live plane, three times: **85–101 s** and 391 MB peak RSS, 12 chunks and
+            62.9 MB published, 3 deltas retained, the pre-D-056 generation
+            retired — and the published chunks, fetched and decompressed the
+            way the client does, reassemble to the artifact **byte for byte
+            across all 377 MB**.
+      - [x] **The open question D-056 left**, settled the strong way: a snapshot
+            at head is the one publication nobody already synced ever fetches,
+            so it must be *the artifact that revision's content came from*,
+            checked against a digest the ledger now records. The reproduction is
+            a sibling build sharing the lineage, the `seed_rev`, the marks and
+            the ID-space fingerprint — invisible to every other guard. The
+            refusal lands before the generation directory moves, and `--force`
+            does not skip it.
+      - [x] **Pruning**, and it is not a separate job: retention happens inside
+            the snapshot publish, so the manifest stops naming a file in the
+            same operation that deletes it. What is retained is defined by what
+            the *previous manifest advertised* — deriving it from the directory
+            listing or from the ledger each deleted files a live manifest still
+            named, three reproductions across two review rounds — and a delta
+            file outlives its manifest entry by one full rotation, for the same
+            reason a generation does.
+      - [x] **The bridging delta**, unblocked: `assert_tiling` now requires only
+            that nothing the manifest names is a dead end, which is also what
+            makes retention expressible. Deliberately unused by the cron, which
+            lands *at* head where the bridge is the identity; it exists for a
+            content-changing rebuild, which must land above head and cost a
+            re-download.
+      - [x] **Adversarial review**, three rounds — four reviewers over the
+            diff, an adversarial pass over their fixes, and a pass that
+            reproduced recovery and migration paths nothing had exercised, plus
+            a verification round that caught one fix applied to two of its three
+            paths. Twenty-one defects, of which five would have corrupted the live data
+            plane (a retention sweep deleting delta files the manifest still
+            named; a `--force` refusal landing after the chunk swap; `--force`
+            landing any content at head where the record was missing; a bridge
+            redefining a published revision through the same gap; an artifact
+            swapped between digest and publication) and two would have blocked
+            the rotation for a month. Six guards had no failing test when first
+            deleted; every guard has one now, and each was checked by removing
+            it rather than by watching the suite pass.
+      - [ ] **Install the cron on `plex`.** Needs the change committed and
+            pulled (D-059), and one daily run that mints a revision — a
+            rotation at a head with no recorded artifact digest is refused,
+            which was verified against the live ledger rather than assumed.
+
 - [ ] **Download with staged replacement.** Chunks and catch-up deltas land in
       a *staging* OPFS file — never truncating the live database (the M1 path
       does, and must not survive into M2) — with a persisted per-chunk

@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1190,12 +1191,14 @@ class Sufficiency(unittest.TestCase):
                 set(fixtures.table_rows(v3, table)), set(fixtures.table_rows(applied, table))
             )
 
-    def test_a_delta_the_manifest_could_not_hold_is_never_written(self):
-        """The bridging delta M2's monthly rebuild needs: emitted from a rebuilt
-        snapshot, it starts below that snapshot's revision, and `assert_tiling`
-        refuses it. Asked after publication that is unrecoverable — the file is
-        served and the ledger has recorded its bytes, so even a corrected
-        payload for the range is refused."""
+    def _plane_with_a_rebuild_above_head(self, rebuilt_rev: int, corpus: dict):
+        """A data plane at head 2, plus a rebuilt snapshot published above it.
+
+        Which is the shape a content-changing rebuild has to take (D-060): it
+        cannot land at head, because a snapshot at head reaches nobody who has
+        already synced, so it lands above and the deltas that chained to the old
+        head drop out of the manifest with it.
+        """
         root = self.root
         v1 = fixtures.build_artifact(root, fixtures.corpus_v1(), "v1", rev=1)
         v2 = fixtures.build_artifact(root, fixtures.corpus_v2(), "v2", rev=2, seed=v1)
@@ -1216,20 +1219,106 @@ class Sufficiency(unittest.TestCase):
             quality=5,
         )
         rebuilt = fixtures.build_artifact(
-            root, fixtures.corpus_v2(), "v3", rev=3, generated=fixtures.FIXED_GENERATED + 1, seed=v2
+            root,
+            corpus,
+            "rebuilt",
+            rev=rebuilt_rev,
+            generated=fixtures.FIXED_GENERATED + 1,
+            seed=v2,
         )
         publish_module.publish(rebuilt, pub, quality=5, jobs=2)
+        published = manifest_module.load(pub)
+        self.assertEqual(published["snapshot"]["rev"], rebuilt_rev)
+        self.assertEqual(published["deltas"], [], "nothing bridges the old head to it yet")
+        return pub, v2, rebuilt
 
+    def test_a_bridging_delta_carries_a_client_across_a_rebuild(self):
+        """The file D-055 and D-056 both left to this task. It starts *below*
+        the snapshot's revision, which `assert_tiling` used to refuse outright
+        — the manifest required every delta to be reachable forward from the
+        snapshot, which no delta into a fresh generation ever is. Relaxed to
+        "nothing this manifest names may be a dead end" (D-060), the bridge
+        publishes, and a client at the old head catches up instead of
+        re-downloading."""
+        pub, v2, rebuilt = self._plane_with_a_rebuild_above_head(3, fixtures.corpus_v3())
+        entry = delta.publish(
+            rebuilt,
+            pub,
+            {
+                "from": 2,
+                "to": 3,
+                "upsert": ["CVE-2026-1003"],
+                "delete": [],
+                "floors": fixtures.floors(v2),
+                "generated": fixtures.FIXED_GENERATED + 1,
+            },
+            quality=5,
+        )["entry"]
+
+        published = manifest_module.load(pub)
+        self.assertEqual([(d["from"], d["to"]) for d in published["deltas"]], [(2, 3)])
+        self.assertEqual(published["rev"], 3)
+        self.assertEqual(published["snapshot"]["rev"], 3)
+        self.assertEqual((entry["from"], entry["to"]), (2, 3))
+
+        # And it is a real bridge, not merely a registrable entry: a client at
+        # the old head ends up with the rebuilt snapshot's records. Read back
+        # from the *published* file rather than re-extracted, because "the bytes
+        # at that URL bridge" is the claim, not "an extraction with these
+        # arguments would have".
+        path = os.path.join(pub, "deltas", "2-3.json.br")
+        payload = json.loads(
+            subprocess.run(["brotli", "-d", "-c", path], capture_output=True, check=True).stdout
+        )
+        self.assertEqual((payload["from"], payload["to"]), (2, 3))
+        applied = os.path.join(self.root, "bridged.sqlite")
+        shutil.copy(v2, applied)
+        db = sqlite3.connect(applied)
+        try:
+            apply_module.apply(db, payload)
+        finally:
+            db.close()
+        for table in RECORD_TABLES:
+            self.assertEqual(
+                fixtures.table_rows(applied, table),
+                fixtures.table_rows(rebuilt, table),
+                f"{table} diverged",
+            )
+        for table in LOOKUP_TABLES:
+            # Containment, as everywhere else: the bridged client keeps the rows
+            # this rebuild retired (D-056).
+            self.assertLessEqual(
+                set(fixtures.table_rows(rebuilt, table)), set(fixtures.table_rows(applied, table))
+            )
+
+    def test_a_delta_the_manifest_could_not_hold_is_never_written(self):
+        """Asked before publication, because asking afterwards is
+        unrecoverable: the file is served and the ledger has recorded its
+        bytes, so even a corrected payload for the range is refused.
+
+        The reproduction is a bridge to the *wrong* revision — the snapshot is
+        at rev 4 and this one would leave a client at rev 3, which nothing can
+        carry any further. A dead end is what the relaxed tiling rule still
+        refuses (D-060)."""
+        pub, v2, _rebuilt = self._plane_with_a_rebuild_above_head(4, fixtures.corpus_v2())
+        stranding = fixtures.build_artifact(
+            self.root,
+            fixtures.corpus_v3(),
+            "stranding",
+            rev=3,
+            generated=fixtures.FIXED_GENERATED + 2,
+            seed=v2,
+        )
         bridging = {
             "from": 2,
             "to": 3,
-            "upsert": [],
+            "upsert": ["CVE-2026-1003"],
             "delete": [],
             "floors": fixtures.floors(v2),
-            "generated": fixtures.FIXED_GENERATED + 1,
+            "generated": fixtures.FIXED_GENERATED + 2,
         }
-        with self.assertRaisesRegex(SystemExit, "unreachable|do not tile"):
-            delta.publish(rebuilt, pub, bridging, quality=5)
+        with self.assertRaisesRegex(SystemExit, "do not tile"):
+            delta.publish(stranding, pub, bridging, quality=5)
         self.assertFalse(os.path.exists(os.path.join(pub, "deltas", "2-3.json.br")))
         self.assertNotIn("2-3.json.br", ledger.load(pub)["deltas"])
 

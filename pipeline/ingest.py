@@ -252,6 +252,41 @@ def _changeset(pending: dict) -> dict:
     }
 
 
+def _assert_pinned_artifact(pending: dict) -> None:
+    """Refuse to finish a pending run against a file that is no longer the one
+    it was cut from.
+
+    The pending run pins a *path*. That file is what a republish re-extracts
+    from, what the revision's content is recorded from, and — on every branch,
+    including the one that publishes nothing — what `commit_run` records as the
+    next build's seed. Anything that rewrote it in between (a recovery rebuild
+    is the realistic one) is invisible to every other check: `_pin` compares the
+    compressed delta digest, and a change *outside* the pinned upsert set
+    reproduces those bytes exactly while making the artifact a different one.
+
+    So this runs before **every path that commits**, not just before the ones
+    that publish. The manifest-listed branch republishes nothing and was
+    therefore missed the first time, which left the pipeline committing a seed
+    it could not build on — everything downstream failed closed, which is the
+    right direction but leaves it stuck. It deliberately does *not* gate
+    abandoning: a run that published nothing is re-minted from a fresh build,
+    which overwrites that path anyway.
+    """
+    pinned = pending.get("artifact_sha")
+    artifact = pending.get("artifact")
+    if not (pinned and artifact and os.path.exists(artifact)):
+        return
+    actual = build.digest_file(artifact)
+    if actual != pinned:
+        raise Abort(
+            f"rev {pending['rev']} was cut from an artifact that hashed {pinned}, but "
+            f"{artifact} is now {actual}. That file is what this revision's content is "
+            "recorded from and what the next build seeds from, so the run cannot be "
+            "finished against it. Restore the artifact this revision was built from; the "
+            "pending record is left intact."
+        )
+
+
 def _publish_pending(pending: dict, pub_dir: str, quality: int, on_written=None) -> dict:
     """Publish the pinned run, at the *pinned* compression setting.
 
@@ -269,6 +304,9 @@ def _publish_pending(pending: dict, pub_dir: str, quality: int, on_written=None)
     and against the file already on disk when the ledger has no entry — so the
     outcome is a stopped run and a message, not a corrupted URL.
     """
+    _assert_pinned_artifact(pending)
+    pinned = pending.get("artifact_sha")
+
     entry = pending.get("entry")
     stub = {"from": int(pending["from"]), "to": int(pending["rev"])}
     published = os.path.join(pub_dir, "deltas", manifest_module.delta_name(stub))
@@ -285,7 +323,38 @@ def _publish_pending(pending: dict, pub_dir: str, quality: int, on_written=None)
                 f"published as {entry['sha256']}; those bytes are not the ones clients may "
                 "already have fetched, and this needs a human before anything else happens"
             )
-        ledger.record_delta(pub_dir, entry, pending.get("space"))
+        # Including which artifact this revision's content came from — the one
+        # thing this path used to leave out. Without it the revision is
+        # published with bytes and an ID space but no content record, and the
+        # monthly rotation then refuses to land at that head (D-060) — for a
+        # month, since that is when it next runs.
+        #
+        # Read from the pending record rather than recomputed from the path.
+        # The path is all the pending run pins, and anything that rewrote that
+        # file between the crash and the retry — a hand-run `build.py` during
+        # recovery is the realistic one — would otherwise pin a digest that is
+        # not this revision's content, permanently, since the ledger refuses to
+        # correct it. Same reason `generated` and `quality` are pinned. A record
+        # written before this was pinned has no digest, and the file is the only
+        # thing left to ask.
+        digest = pinned
+        artifact = pending.get("artifact")
+        if digest is None and artifact and os.path.exists(artifact):
+            digest = build.digest_file(artifact)
+        # Asked before the ledger write, because `_record_artifact` raises
+        # `SystemExit` — which leaves `main` without the diagnosis and repeats
+        # on every subsequent run, freezing the pending forever. That is the
+        # failure mode `resume`'s abandon path exists to prevent, and a pinned
+        # entry withdraws the proof that would allow abandoning.
+        recorded = ledger.artifact_at(pub_dir, int(pending["rev"]))
+        if digest is not None and recorded is not None and recorded != digest:
+            raise Abort(
+                f"rev {pending['rev']} was published from artifact {recorded}, but this pending "
+                f"run was cut from {digest} — something else (a snapshot published at this "
+                "revision, most likely) has already defined what this revision's content is. "
+                "The pinned delta cannot be registered against it; this needs a human"
+            )
+        ledger.record_delta(pub_dir, entry, pending.get("space"), digest)
         manifest_module.register_delta(pub_dir, entry, int(pending["generated"]))
         return {"entry": entry, "reused": True}
 
@@ -364,7 +433,26 @@ def resume(state: state_module.State, pub_dir: str, quality: int) -> dict:
     entry = {"from": int(pending["from"]), "to": int(pending["rev"])}
     if manifest_module.lists_delta(pub_dir, entry):
         # The manifest already names it, so publication completed and only the
-        # state write was lost. Nothing to republish.
+        # state write was lost. Nothing to republish — but this branch still
+        # *commits*, so it owes the same two things the publishing ones do.
+        #
+        # First, that the artifact is still the one this revision was cut from:
+        # `commit_run` records it as the next build's seed, and this path used
+        # to reach it without the check (it does not call `_publish_pending`).
+        _assert_pinned_artifact(pending)
+        # And second, that the revision's content is on record. It may not be:
+        # a crash between `ledger.record_delta` and the manifest write is the
+        # reachable window. Committing over that leaves the gap permanently,
+        # because only a delta writes the record and a corpus that stops
+        # changing never cuts another — and every monthly rotation is blocked on
+        # it, forever. Backfilled from the pinned digest, which is the only
+        # trustworthy source: the file at that path may have moved on, which is
+        # exactly what the check above is about. A record with no pinned digest
+        # cannot be backfilled at all, and the rotation says so rather than
+        # guessing.
+        recorded = ledger.artifact_at(pub_dir, int(pending["rev"]))
+        if recorded is None and pending.get("artifact_sha"):
+            ledger.record_artifact(pub_dir, int(pending["rev"]), pending["artifact_sha"])
         state.commit_run(pending)
         action = "committed"
     elif pending.get("entry") is None and _nothing_was_published(pub_dir, entry):
@@ -622,6 +710,13 @@ def _cycle(
     os.makedirs(artifacts_dir, mode=0o755, exist_ok=True)
     started = time.time()
     stats = build.build(clone, artifact, None, None, seed=seed, rev=to_rev)
+    # The artifact's own build time, which the delta carries rather than
+    # stamping a second clock reading. Apply writes `generated` into the
+    # client's `meta`, so two values for one revision means a synced client and
+    # a freshly downloaded one report different freshness while reporting the
+    # same revision — and the gap is the build's own duration, ~25 s on the real
+    # corpus, because the stamp goes in before `VACUUM` (D-060).
+    built_at = build.id_space(artifact)["generated"]
     # Both refusals drop the artifact, for `build`'s own reason: a
     # complete file nothing published is 377 MB that a later run has to
     # reason about, and `prune_artifacts` counts it against `--keep`.
@@ -647,14 +742,20 @@ def _cycle(
         "from": head,
         # Pinned here and never restamped: the client writes it to
         # `meta.generated` on apply, so a retry that moved it would be
-        # different content at an immutable URL (D-055).
-        "generated": int(time.time()),
+        # different content at an immutable URL (D-055). It is the *artifact's*
+        # stamp, so the two publications of one revision agree.
+        "generated": int(built_at if built_at is not None else time.time()),
         # Pinned for the same reason and with the same force: the
         # changeset decides the JSON, this decides the bytes, and the
         # bytes are what the URL promises never to change.
         "quality": int(quality),
         "commit": commit,
         "artifact": os.path.abspath(artifact),
+        # And what is *in* that file, pinned here where it was just built.
+        # The path alone is not the artifact: a resume days later would hash
+        # whatever is at it, and the ledger's record of a revision's content
+        # cannot be corrected once written (D-060).
+        "artifact_sha": build.digest_file(artifact),
         "upsert": upsert,
         "delete": deleted,
         # The ID space at `from`, out of the artifact's own record
@@ -855,6 +956,11 @@ def status(pub_dir: str, state_dir: str) -> dict:
         "action": "status",
         "state": path,
         "head": manifest_module.head_rev(manifest) if manifest else None,
+        # The generation being served, which the monthly job rotates and the
+        # daily one leaves alone — so "head" and this drifting apart across a
+        # month is the normal picture, not a fault (D-060).
+        "snapshot_rev": (manifest.get("snapshot") or {}).get("rev") if manifest else None,
+        "deltas": len(manifest.get("deltas") or []) if manifest else None,
         "ledger_head": ledger.highest_published(pub_dir),
         "ledger_idspace": ledger.idspace(pub_dir) or None,
     }
@@ -876,8 +982,12 @@ def status(pub_dir: str, state_dir: str) -> dict:
                 "commit": state.commit or None,
                 "records": state.count(),
                 "tombstones": state.tombstones(),
-                # The closest thing to an alert this machine has (D-058).
+                # The closest thing to an alert this machine has (D-058), for
+                # each scheduled job: a monthly failure hides under a daily
+                # success if they share one record, and it is the one that costs
+                # a month to notice (D-060).
                 "last_run": state.last_run,
+                "last_snapshot": state.outcome("snapshot"),
                 "pending": None
                 if pending is None
                 else {

@@ -26,6 +26,11 @@ def main() -> int:
     root = sys.argv[1]
     os.makedirs(root, exist_ok=True)
     published = fixtures.publish_fixture(root)
+    # And the same data plane after a monthly rotation, published beside it
+    # rather than over it: the rotated manifest is a different shape (deltas
+    # starting below the snapshot's revision, D-060) and the contract test has
+    # to see both.
+    rotated = fixtures.publish_rotated_fixture(root)
     print(
         json.dumps(
             {
@@ -38,6 +43,17 @@ def main() -> int:
                     "deletes": published["summary"]["deletes"],
                 },
                 "hostile_text": fixtures.HOSTILE_TEXT,
+                # Read out of the rotation's own report rather than written
+                # down here: a hardcoded constant is a claim nothing checks, and
+                # the point of a cross-language fixture is to tie what the
+                # pipeline says to what the client parses.
+                "rotated": {
+                    "pub": rotated["pub"],
+                    "snapshot_rev": rotated["rotation"]["rev"],
+                    "deltas_kept": rotated["rotation"]["deltas_kept"],
+                    "retired": rotated["retired"],
+                    "previous_generation": f"snapshot-{rotated['first_rotation']['rev']}",
+                },
             },
             indent=2,
         )

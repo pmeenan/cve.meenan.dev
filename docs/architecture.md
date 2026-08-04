@@ -74,7 +74,11 @@ Each is backed by a decision entry and is not up for casual revision.
 
 Two cron jobs under `flock`, no daemon (D-042). **Daily** ingest —
 `pipeline/ingest.py run`, 54.9 s of work per run (D-058) — and a **monthly**
-snapshot rebuild. Upstream publishes about every 40 minutes. How much a day
+generation rotation — `pipeline/snapshot.py`, ~90 s (D-060). Each records its
+own outcome in the ingest state and `ingest.py status` reports both, because on
+this machine that is the only alerting there is (D-058).
+
+Upstream publishes about every 40 minutes. How much a day
 accumulates depends on the day: D-031's 21.4 weekday hours implied ~665 changed
 records and ~87 KB, while D-058's 69.5-hour window across a weekend worked out
 at ~291 records and ~70 KB per day. Both are single windows and neither is a rate;
@@ -136,22 +140,45 @@ what they agree on is that a day's delta is one small file.
    what makes an immutable URL survivable (D-058). A missed day needs no
    handling: `from` is always the published head and the changeset is the whole
    diff of the state against the tree.
-6. **Snapshot, monthly.** Rebuild the database, split it into 32 MB slices of
-   the uncompressed file, and compress each at brotli -q10 — 101 s across 24
-   cores, against 351 s for a monolith (D-041). Only the compressed chunks are
-   published; the client decompresses in WASM (D-040), and no full-text index is
-   built server-side because the client builds its own (D-035).
-7. **Retire, one generation behind.** Keep the previous snapshot and every delta
-   back to it, so a client that read the manifest minutes ago and is mid-download
-   does not start seeing 404s. One spare generation costs 63 MB. Note what
-   retention does *not* buy today: the manifest only lists deltas that start at
-   or after its snapshot's revision, because nothing bridges the old revisions
-   to a rebuilt snapshot, so a client a generation behind re-downloads until the
-   bridging delta lands with the monthly cron. Seeded interning removed the
-   ID-space half of that blocker — a rebuilt snapshot and the old head share an
-   ID space now — and the remaining half is the manifest's own tiling rule,
-   which still requires a delta to start at or above the snapshot's revision
-   (D-055, D-056).
+6. **Snapshot, monthly** — `pipeline/snapshot.py`, 85–101 s and 391 MB peak RSS
+   on the real corpus (D-060). It publishes the artifact the *daily* last built,
+   at the revision that artifact is stamped with, which must be the published
+   head: the daily walks the whole corpus and writes a complete database every
+   run, so the rebuild has already happened and building a second one would only
+   produce a different file with the same content. The artifact is split into
+   32 MB slices of the uncompressed file and each is compressed at brotli -q10 —
+   which is nearly all of that time, against 351 s for a monolith (D-041). Only the
+   compressed chunks are published; the client decompresses in WASM (D-040), and
+   no full-text index is built server-side because the client builds its own
+   (D-035). No revision is minted: a rotation changes which generation is served,
+   not what the data plane says.
+
+   **A snapshot at head must be the artifact head's content came from**, and the
+   ledger records each revision's artifact digest so that is checked rather than
+   trusted (D-060). It is the one publication nobody already synced ever fetches
+   — `planSync` tells a client at head it is current — so different content there
+   would reach new arrivals only. A rebuild that genuinely changes content lands
+   *above* head and costs every client a re-download, like a schema bump.
+7. **Retire, one generation behind.** Keep the current generation and the
+   previous one, and every delta back to the older of the two, so a client that
+   read the manifest minutes ago and is mid-download does not start seeing 404s
+   — and so a client one generation behind catches up from the chunks it already
+   has instead of re-downloading. One spare generation costs 63 MB; the deltas
+   are ~70–90 KB a day. **What is retained is defined by what the previous
+   manifest advertised**, not by what is on disk and not by the ledger: a
+   generation can exist that was never advertised (a rotation killed between the
+   rename and the manifest write leaves one), and deleting by revision
+   arithmetic over the directory listing removed delta files the manifest still
+   named — the new one in the first version of this, the *previous* one a
+   rotation later. Nothing the previous manifest named is deleted, and with no
+   previous manifest nothing is retired at all. Retention runs *inside* the snapshot publish, never as a
+   separate job: the manifest is rewritten first and the files are deleted after,
+   so nothing is ever named and missing, and a delta file outlives its manifest
+   entry by one full rotation for the same reason a generation does. Deleting a
+   file does not un-publish it — the ledger keeps every URL ever served (D-055
+   §7). This is what the manifest's tiling rule was relaxed for: every retained
+   delta starts *below* the snapshot's revision, and what is required now is only
+   that nothing the manifest names is a dead end (D-060).
 
 Publication into `pub/` is an atomic rename, so a half-written artifact is never
 reachable — and a published generation is immutable: same-rev republication is
@@ -184,7 +211,7 @@ document root and of `cve.data/`, so nothing under `cve.data/` is web-reachable
 | --- | --- | --- |
 | `manifest.json` | `no-cache` | The only mutable file. Lists everything else with byte length and SHA-256. |
 | `snapshot-<rev>/NNN.br` | immutable | 12 chunks, ~5.2 MB each, **62.7 MB** total, each expanding to a 32 MB slice of the 376.7 MB database (D-041). Measured on the first published generation, 2026-08-01. |
-| `deltas/<from>-<to>.json.br` | immutable | One per day; consecutive revisions tile the space by construction (D-042). |
+| `deltas/<from>-<to>.json.br` | immutable | One per day; consecutive revisions tile the space by construction (D-042). Retained back to the previous generation, so most of them start below `snapshot.rev` (D-060). |
 | `kev.json` | short | CISA KEV, its own freshness (D-010). |
 
 ### Assets the export ships but never loads
@@ -502,11 +529,12 @@ addresses — are simply absent (D-039).
 | Failure | What happens | Why it is acceptable |
 | --- | --- | --- |
 | Interrupted download | Refetch the missing chunks | Each chunk is independently compressed and verified, so resume is a bitmap (D-041) |
+| Interrupted rotation | The next run finishes it | The chunks land by rename before the manifest names them; re-cutting the same bytes completes the publication without `--force` (D-047, D-060) |
 | Corrupted chunk | Refetch that chunk | Per-chunk SHA-256 in the manifest; costs 5 MB, not 63 |
-| Snapshot rotates mid-download | Old generation still served | One previous generation is retained (D-042) |
+| Snapshot rotates mid-download | Old generation still served | One previous generation is retained, and its deltas one rotation longer still (D-042, D-060) |
 | Interrupted sync | Transaction rolls back; watermark unchanged; retry is safe | Apply is idempotent, measured |
 | Schema version bump | Full re-download, announced in the UI | The local database is a rebuildable cache (D-013), but it must not be a surprise |
-| Client older than the oldest delta | Full re-download | Delta retention is bounded to the current snapshot (D-026) |
+| Client older than the oldest delta | Full re-download | Delta retention is bounded to the previous generation, and `planSync` returns `null` rather than a chain that does not exist (D-042, D-060) |
 | Upstream force-push | Nothing special | The pipeline diffs content hashes, never git history (RE-006) |
 | Broken fetch drops records | Pipeline aborts before publishing | The 0.1% tombstone guard |
 | Malformed record in the clone | Build aborts, artifact deleted | Fail closed (D-047): silent skips would undercount below the tombstone guard's radar, forever |
@@ -641,7 +669,11 @@ via `deltaLog.json`: median day 1,312 events / 0.17 MB gzipped, busiest observed
 
 At these rates a month of catch-up costs a new user ~2.6 MB against a 62.6 MB
 snapshot — about 4%, which is why the monthly rebuild cadence (D-042) is
-comfortable: daily ingest bounds the delta file count at ~31.
+comfortable: daily ingest bounds the delta file count at ~31. That cost is
+proportional to *time since the last rotation*, not to the age of the corpus —
+a new user arriving the day after a rotation pays almost nothing, and one
+arriving the day before pays the whole month. It is the same ~2.6 MB a client
+one generation behind applies instead of re-downloading (D-060).
 
 ### Traps worth knowing before writing any corpus scan
 
