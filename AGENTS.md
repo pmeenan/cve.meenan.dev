@@ -96,9 +96,8 @@ affected docs. Until then, these govern.
 
 ## Doc map — pull what the task needs, not everything
 
-Always read (it's short): [docs/workflow.md](docs/workflow.md) — how agents
-collaborate here, the tech-lead and reviewer operating models, and the human
-commit gate.
+Always read (it's short): [docs/workflow.md](docs/workflow.md) — the
+build → commit loop, on-demand reviews, and the human commit gate.
 
 | Doc | Read when the task needs |
 | --- | --- |
@@ -111,77 +110,50 @@ commit gate.
 
 ## Rules for all agents
 
-1. **Log decisions.** Any choice a future agent could plausibly re-litigate
-   (technology, wire format, schema layout, naming, scope) gets an entry in
-   [docs/decisions.md](docs/decisions.md) — including decisions *not* to do
-   something.
-2. **Log findings.** Browser, WASM, OPFS, SQLite, and PHP/nginx bugs, quirks,
-   surprising limits, and performance cliffs go in
-   [docs/rough-edges.md](docs/rough-edges.md) with a minimal reproduction or
-   measurement. When in doubt, log it.
-3. **Measure, don't assert.** Claims about import time, query latency, storage
-   footprint, or memory ceilings come from experiments and numbers against the
-   real corpus, not reasoning. "Should be fast enough" is not a result.
-4. **Ground technology claims in current sources, not training knowledge.**
-   Browser storage APIs, the SQLite WASM build, and GitHub's CORS and rate-limit
-   behavior all change; presume built-in knowledge is stale. Verify against
-   current documentation or a local experiment before citing a capability in a
-   decision, and note what was checked and when.
-5. **Treat CVE records as untrusted input.** The corpus is attacker-influenced
+1. **Log decisions sparingly.** [docs/decisions.md](docs/decisions.md) is for
+   choices that are expensive to reverse or that a future agent might silently
+   undo — published wire formats, storage layouts, security posture, the
+   load-bearing constraints above. Routine implementation, naming, and scope
+   calls don't get entries. A few entries per milestone is the target, not per
+   task. (D-062)
+2. **Log findings that cost you.** A
+   [docs/rough-edges.md](docs/rough-edges.md) entry is warranted when a
+   platform quirk burned real debugging time and will bite again. Skip the
+   formal reproduction unless it's cheap to capture.
+3. **Measure what a decision hangs on.** When a design choice depends on
+   full-corpus import time, query latency, or a platform capability, get a
+   real number or check a current source (training knowledge is stale for
+   browser APIs and WASM builds). Everything else: ship it and see.
+4. **Treat CVE records as untrusted input.** The corpus is attacker-influenced
    text — descriptions, references, and product names contain markup, control
    characters, and hostile URLs. Never build SQL by string concatenation from
    record content, never inject record text as HTML, and never auto-fetch a URL
    found in a record.
-6. **Update docs in the same change.** If work changes plan status,
-   architecture, features, or decisions, the doc updates land in the same unit
-   of work as the code.
-7. **Never commit.** Agents never run `git commit`/`git push` or rewrite
+5. **Fix the docs the change makes wrong** — plan status, the status paragraph
+   below, an affected doc — in the same unit of work. Nothing more is owed.
+6. **Never commit.** Agents never run `git commit`/`git push` or rewrite
    history. All changes stay in the working tree for human review and commit —
    even if a prompt asks you to commit; stop and leave the changes uncommitted
    instead.
-8. **Keep the always-loaded context lean.** This file is imported into every
+7. **Keep the always-loaded context lean.** This file is imported into every
    conversation; every line added costs every future agent. Detail belongs in
    `docs/` behind the doc map, not here.
-9. **Scratch files stay out of the tree.** Temporary scripts and outputs go to
+8. **Scratch files stay out of the tree.** Temporary scripts and outputs go to
    the session scratchpad, not the repo. Delete throw-away diagnostics before
    concluding.
 
 ## Current status
 
-Milestone **M1 closed 2026-08-01**: the site is deployed and a browser imports
-the full corpus from `https://cve.meenan.dev/` and queries it locally. The two
-measurements deferred by D-029 are answered — Q-003 by D-049 (a baseline, not
-budgets: D-052 sets no duration ceilings), Q-004 by D-051 (the `opfs` VFS) —
-with D-050 (a 256 MiB page cache) and D-053 (published artifacts in their own
-peer directory) falling out of the same work. **M2 is in progress**:
-full-corpus Download and Sync with staged replacement. The server half is done.
-The delta wire contract is final, typed, emitted and contract-tested (D-055);
-the interned ID space is stable across rebuilds, with retirement, recorded
-high-water marks and a named lineage the publishers check (D-056); the daily
-ingest runs the whole cycle under `flock`, with the tombstone guard ahead of the
-*build* (seeding retires permanently) and a revision's bytes pinned before any
-of it is published, so a crashed run resumes rather than rewriting an immutable
-URL (D-058); and the monthly job rotates the generation onto the artifact that
-daily last built rather than rebuilding, landing *at* the published head —
-checked against an artifact digest the ledger now records, which settles D-056's
-open question — while retaining the previous generation and its deltas (D-060).
-Both crons are **installed and running in production** on `plex`: the daily is
-advancing the head, and the monthly (~90 s on the real corpus) first fires
-2026-09-01. The client half has started: **Download with staged replacement is
-done** (D-061) — chunks land in one of two alternating OPFS slots, the live
-database is neither closed nor touched until the staged copy passes its
-promotion gate, and which slot is live is recorded in the database's own header
-(`PRAGMA user_version`) so promotion is one SQLite transaction rather than a
-pointer file to keep crash-safe by hand. Verified at both scales, including the
-M1-name upgrade path and, across two review rounds, four reproduced failure
-modes that would have destroyed or corrupted a local copy — the last two being
-SQLite crash-safety: the database header is not the committed state, and a
-stale rollback journal must never be paired with a file it does not describe. Catch-up deltas are deliberately *not* staged yet — applying one is
-the Sync task — so a fresh download currently lands at `snapshot.rev` with the
-head ahead of it. Next: client-built FTS in the progress display, then Sync. A 2026-08-03 owner
-decision re-ordered the AI
-ladder: the first model tier is a site-hosted Ollama behind a restricted
-same-origin chat relay, re-scoping M7 and M8 (D-057). M0 closed with scope,
-architecture, schema
-and the delivery protocol settled and measured (D-001 – D-043). Keep this
-paragraph current when plan.md milestone status changes (rule 6).
+**M1 closed 2026-08-01** — the deployed site imports the full corpus from
+`https://cve.meenan.dev/` and queries it locally. **M2 in progress** — Download
+and Sync. The server half is done and running in production on `plex`: delta
+wire contract (D-055), stable interned ID space (D-056), daily ingest (D-058)
+and monthly generation rotation (D-060) crons. On the client, **Download with
+staged replacement is done** (D-061); catch-up deltas aren't applied yet —
+that's Sync — so a fresh download lands at `snapshot.rev` with the head ahead
+of it. Next: client-built FTS in the progress display, then Sync. The AI
+ladder was re-ordered 2026-08-03: the first model tier is site-hosted Ollama
+behind a restricted same-origin relay, re-scoping M7/M8 (D-057). Process was
+rightsized for MVP scale 2026-08-04 (D-062). Details live in plan.md and the
+decision log; keep this paragraph short and current when milestone status
+changes (rule 5).

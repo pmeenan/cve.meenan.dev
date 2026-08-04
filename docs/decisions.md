@@ -3,9 +3,13 @@
 Newest first. Every entry: what was decided, why, and what would reopen it.
 Existing entries are never edited into a different decision — reversing or
 amending one gets a *new* entry that supersedes it (a status-line annotation on
-the old entry is fine). Entries that rest on claims about current technology
-state must be grounded in current sources or local experiments — not training
-knowledge — and note what was checked and when.
+the old entry is fine). When an entry hangs on a claim about current technology
+state, check a current source or run a local experiment — training knowledge is
+stale.
+
+Entries are for choices that are expensive to reverse or that a future agent
+might silently undo (D-062). Routine implementation and naming calls don't
+belong here.
 
 **Reading:** scan the D-NNN headings (or grep) and read only the entries your
 task touches. Full read is for structural or cross-cutting work.
@@ -22,6 +26,40 @@ Decision / Context / Consequences / Reopen if
 ```
 
 ---
+
+## D-062: Process rightsized to MVP scale — one pass, human gate, reviews on demand  (2026-08-04, status: accepted; replaces workflow.md's operating modes and raises the logging thresholds in AGENTS.md rules 1–3)
+
+**Decision.** The default unit of work is one agent implementing the task,
+running `pnpm check`, and handing off to the human commit gate. The mandatory
+multi-mode review pipeline — tech-lead adversarial review before handoff,
+multi-agent reviewer fan-out with an adversarial challenge subagent, fix-pass
+and verify-pass modes with per-finding dispositions and verdicts — is removed.
+Reviews happen when the human asks, as one agent making one pass hunting real
+defects, fixing directly by default. Heavyweight review (multi-agent,
+adversarial, fix/verify rounds) remains available but is opt-in by the human,
+reserved for changes that can destroy a user's local database, corrupt the
+published artifact chain, or open a security hole. Logging thresholds rise in
+the same spirit: decision entries only for expensive-to-reverse or
+silently-undoable choices, rough-edges entries only for quirks that cost real
+debugging time, measurement only where a design decision hangs on the number.
+
+**Context.** Owner direction, 2026-08-04. This is an MVP/demonstration with
+essentially one user, but the process was sized for production software:
+two months of it produced 62 decision entries (~4,400 lines), 18 formal
+findings, and multi-round review pipelines for every task. The rigor did
+catch real defects (D-061's four reproduced failure modes), which is why
+escalation survives as an option for the small dangerous class — but as the
+default it cost far more than it caught.
+
+**Consequences.** Faster iteration and less doc mass. Some defects will reach
+the working tree that the old pipeline would have caught — accepted, because
+deploys are a reversible rsync and the blast radius is the owner's own
+browser. The load-bearing constraints (client-side data plane, no telemetry,
+untrusted CVE input, humans commit) are unchanged; D-001's human commit gate
+is untouched and remains the one checkpoint.
+
+**Reopen if.** The project acquires real users or contributors, or a class of
+regressions starts costing more time than the reviews would have.
 
 ## D-061: Staged replacement — two alternating slots, and the promotion is recorded in the database's own header  (2026-08-04, status: accepted, implements M2's Download task; builds on D-041 and D-051)
 
@@ -4413,7 +4451,7 @@ redistributed in a derived form.
 **Reopen if.** A required capability exists only under an incompatible license,
 or the owner changes the project license.
 
-## D-001: AI-developed, human-gated workflow  (2026-07-30, status: accepted)
+## D-001: AI-developed, human-gated workflow  (2026-07-30, status: accepted; the operating modes its context references were replaced by D-062's lean loop)
 
 **Decision.** Agents implement and review; the human directs, decides, and is
 the sole committer. Agents never run `git commit`, `git push`, or history
