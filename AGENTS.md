@@ -167,7 +167,18 @@ checked against an artifact digest the ledger now records, which settles D-056's
 open question — while retaining the previous generation and its deltas (D-060).
 Both crons are **installed and running in production** on `plex`: the daily is
 advancing the head, and the monthly (~90 s on the real corpus) first fires
-2026-09-01. The client half — Download with staged replacement — is next. A 2026-08-03 owner
+2026-09-01. The client half has started: **Download with staged replacement is
+done** (D-061) — chunks land in one of two alternating OPFS slots, the live
+database is neither closed nor touched until the staged copy passes its
+promotion gate, and which slot is live is recorded in the database's own header
+(`PRAGMA user_version`) so promotion is one SQLite transaction rather than a
+pointer file to keep crash-safe by hand. Verified at both scales, including the
+M1-name upgrade path and, across two review rounds, four reproduced failure
+modes that would have destroyed or corrupted a local copy — the last two being
+SQLite crash-safety: the database header is not the committed state, and a
+stale rollback journal must never be paired with a file it does not describe. Catch-up deltas are deliberately *not* staged yet — applying one is
+the Sync task — so a fresh download currently lands at `snapshot.rev` with the
+head ahead of it. Next: client-built FTS in the progress display, then Sync. A 2026-08-03 owner
 decision re-ordered the AI
 ladder: the first model tier is a site-hosted Ollama behind a restricted
 same-origin chat relay, re-scoping M7 and M8 (D-057). M0 closed with scope,

@@ -320,22 +320,70 @@ everything downstream consumes them.
             scale against a scratch copy of the live plane. `last_snapshot` in
             `ingest.py status` is what will say it worked.
 
-- [ ] **Download with staged replacement.** Chunks and catch-up deltas land in
-      a *staging* OPFS file — never truncating the live database (the M1 path
-      does, and must not survive into M2) — with a persisted per-chunk
-      completion bitmap bound to the manifest's rev and chunk hashes; validate
-      manifest, hashes, and SQLite `meta` before an atomic promotion that
-      keeps the previous good database until the new one is verified.
+- [x] **Download with staged replacement** (D-061). Chunks land in a *staging*
+      OPFS file — one of two alternating slots — and the live database is
+      neither closed nor touched until the staged copy has passed its promotion
+      gate. The per-chunk bitmap in `staging.json` is bound to the snapshot
+      path, its length, and every chunk's offset, length and hash, and each
+      chunk is flushed before its bit is recorded; it is deliberately *not*
+      bound to the head revision, so a delta published mid-download does not
+      throw away staged chunks, and it *is* bound to the staging file's length,
+      without which a record that outlived its file promotes a database with a
+      hole in it. The gate is: the bitmap complete (counted), the staged file
+      unpromoted, the chunks **covering the byte range exactly** with distinct
+      names — per-chunk hashes prove each chunk's bytes and nothing proved the
+      bytes between them, which the M1 path never checked — schema and
+      `meta.rev` agreeing with the manifest, the D-008 notice present, records
+      non-zero, indexes built. Promotion is then one SQLite transaction on the
+      database's own header (`PRAGMA user_version`, zero in every published
+      artifact), which is what makes it atomic and durable without a pointer
+      file to keep crash-safe by hand. Measured at both scales — full corpus:
+      an interrupted re-download leaves the previous copy answering the same
+      query with the same numbers, the retry fetches **11 of 12** chunks, and
+      the origin ends holding one generation (441.1 MB) rather than two. The
+      M1-name upgrade path is covered in the same spec — a copy under
+      `cve.sqlite` is adopted, queried, and retired by the first promotion,
+      which matters because an unrecognised entry is *swept*, not ignored.
+      `opfs-sahpool` keeps M1's destroy-then-download behaviour and none of
+      this is claimed for it (D-051). A second review round found three more
+      crash-safety defects, two of them able to destroy a live copy: discovery
+      trusted raw header bytes, which can advertise a promotion the rollback
+      journal has yet to commit (reproduced by killing a process mid-commit —
+      header 9, SQLite 5); a slot's stale journal was replayed into the next
+      generation written over it (reproduced: a file byte-identical to the
+      published artifact stopped being so the moment it was opened); and a crash
+      during index building refetched the whole snapshot instead of resuming.
+      Each has a regression test checked by removing the fix. **Catch-up deltas are not yet staged**,
+      because applying one is the Sync task below; the staged file is where
+      they will land, and until then a download stops at `snapshot.rev` with
+      the head ahead of it. Four adversarial reviewers over the diff found two
+      defects that would have destroyed a live local copy — a failed *read*
+      licensing a sweep, and an unbound resume record — plus a promotion gate
+      with no test at any level; each now has a regression test checked by
+      removing the fix.
 - [ ] **Client-built FTS** over descriptions, vendors and products (D-035),
       surfaced in the same progress display.
 - [ ] **Sync.** Merged deltas applied in one idempotent transaction, watermark
       advancing with the rows; FTS maintenance with the explicit `'delete'`
       protocol, verified by `integrity-check` at `rank = 1` (RE-005).
 - [ ] **Failure and resume tests** — for replacement, not just first
-      download: kill mid-download and resume refetches only missing chunks; a
-      failure during re-download leaves the prior database intact and usable;
-      an interrupted sync rolls back and re-running is safe; a snapshot
-      rotation mid-download does not strand the client.
+      download. Partly landed with D-061 in `tests/e2e/staged.spec.ts`, and
+      listed here so the rest is not written twice:
+      - [x] kill mid-download and resume refetches only missing chunks
+            (11 of 12 at full scale);
+      - [x] a failure during re-download leaves the prior database intact and
+            usable — plus two failure modes the review pass reproduced: a
+            discovery error must not license a sweep, and a resume record that
+            outlived its file must not be believed;
+      - [ ] an interrupted sync rolls back and re-running is safe (needs the
+            Sync task);
+      - [ ] a snapshot rotation mid-download does not strand the client — the
+            *decision* is unit-tested (`bindsTo` refuses a rotated plan), the
+            end-to-end file behaviour is not;
+      - [ ] a chunk that fails its SHA-256 mid-download, which has no test at
+            any level today;
+      - [x] a failure *during index building*, after the bitmap is complete —
+            the retry fetches zero chunks and resumes at the index build.
 - [ ] **Stall detection** (D-052). Duration is never a failure, but a download
       that has stopped advancing is: surface it as an error with a message
       rather than a bar that never moves. The per-chunk progress already

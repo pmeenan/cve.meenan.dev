@@ -49,3 +49,60 @@ export function isNotFound(error: unknown): boolean {
     (error as { name?: unknown }).name === 'NotFoundError'
   )
 }
+
+/**
+ * Remove an entry, tolerating only "it was not there".
+ *
+ * The same rule `clearStorage` follows, extracted because staged replacement
+ * now deletes several entries in several places and each of them has to
+ * distinguish "already gone" from "another tab is holding this open".
+ */
+export async function removeIfPresent(
+  root: FileSystemDirectoryHandle,
+  name: string
+): Promise<void> {
+  await root.removeEntry(name).catch((error: unknown) => {
+    if (!isNotFound(error)) throw error
+  })
+}
+
+/** Read a small OPFS file as text, or `null` if it is not there. */
+export async function readTextEntry(
+  root: FileSystemDirectoryHandle,
+  name: string
+): Promise<string | null> {
+  try {
+    const handle = await root.getFileHandle(name)
+    return await (await handle.getFile()).text()
+  } catch (error) {
+    if (isNotFound(error)) return null
+    throw error
+  }
+}
+
+/**
+ * Replace a small OPFS file's contents.
+ *
+ * `truncate(0)` first, because writing fewer bytes than last time otherwise
+ * leaves the old tail in place and the result parses as neither record. The
+ * `flush()` is what makes the write survive a kill, which is the only reason
+ * this file exists at all — an unflushed resume record is a resume record that
+ * lies after exactly the crash it was written for.
+ */
+export async function writeTextEntry(
+  root: FileSystemDirectoryHandle,
+  name: string,
+  text: string
+): Promise<void> {
+  const handle = await root.getFileHandle(name, { create: true })
+  const access = await handle.createSyncAccessHandle()
+  try {
+    access.truncate(0)
+    writeFully(access, new TextEncoder().encode(text), 0)
+    access.flush()
+  } finally {
+    // Awaited for RE-007's reason: the exclusive lock outlives the synchronous
+    // return, and the next open of the same file hangs with no error.
+    await access.close()
+  }
+}

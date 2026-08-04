@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 
 import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
 import type {
@@ -30,22 +30,32 @@ LIMIT 15`
 const IDLE: Progress = { phase: 'idle', fraction: null, detail: '' }
 
 /**
- * Import knobs from the query string, for the Q-003/Q-004 sweep only
- * (`?vfs=opfs-sahpool&concurrency=8&cache=64`). Every default is the measured
- * one (D-049 – D-051); anything unrecognised falls back rather than failing,
- * because this is a diagnostic affordance and not a feature.
+ * Import knobs from the query string, for the Q-003/Q-004 sweep and the
+ * staged-replacement tests only (`?vfs=opfs-sahpool&concurrency=8&cache=64`,
+ * `?stop=1`). Every default is the measured one (D-049 – D-051); anything
+ * unrecognised falls back rather than failing, because this is a diagnostic
+ * affordance and not a feature.
  *
  * These are only a convenience: the Worker clamps them again, because a URL is
  * something a stranger can hand you and the memory bound is not negotiable
  * there.
+ *
+ * The knob to be wary of is **`vfs`**, not `stop`. `?stop=` ends a download
+ * early, which leaves the live copy untouched by construction. `?vfs=` selects
+ * the `opfs-sahpool` path, which cannot stage (D-051) and so clears local
+ * storage — both slots included — *before* fetching anything: one click on a
+ * crafted link costs a working local copy. It stays reachable because
+ * `pnpm measure` needs it to re-run Q-004.
  */
 function importOptions(search: string): ImportOptions {
   const params = new URLSearchParams(search)
   const vfs = params.get('vfs')
+  const stop = positive(params.get('stop'))
   return {
     concurrency: positive(params.get('concurrency')) ?? DEFAULT_CONCURRENCY,
     cacheMib: positive(params.get('cache')) ?? DEFAULT_CACHE_MIB,
     vfs: vfs === 'opfs' || vfs === 'opfs-sahpool' ? vfs : DEFAULT_VFS,
+    ...(stop === null ? {} : { stopAfterChunks: stop }),
   }
 }
 
@@ -60,6 +70,21 @@ export default function Home() {
   const workerRef = useRef<Worker | null>(null)
   const [progress, setProgress] = useState<Progress>(IDLE)
   const [ready, setReady] = useState(false)
+  /**
+   * What the Worker has established about local storage.
+   *
+   * `ready` alone cannot express it: false covers "no status yet", "there is no
+   * local copy", and "I could not find out", and the button reads "Download
+   * data" in all three. The first is invisible to a user but silently breaks
+   * tests, which act on the pre-status render. The third is worse — clearing
+   * the panels and inviting a download implies the copy is gone when it may
+   * simply be unreadable this instant (D-061).
+   *
+   * `pending` (no answer yet) is kept distinct from `unknown` (an answer of
+   * "I could not tell") so that both the UI and a test can wait for the Worker
+   * to have spoken without mistaking a failure for silence.
+   */
+  const [storage, setStorage] = useState<'pending' | 'unknown' | 'ready' | 'empty'>('pending')
   const [timings, setTimings] = useState<Timings | null>(null)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
@@ -84,7 +109,17 @@ export default function Home() {
           setProgress(message.progress)
           break
         case 'status':
+          setStorage(message.storage)
           setReady(message.ready)
+          // An unknown origin asserts nothing: the panels stay, because the
+          // local copy they describe may still be there.
+          if (message.storage === 'unknown') {
+            setError(
+              'Could not read local storage, so the state of any downloaded copy is unknown. ' +
+                'Reload to try again; downloading will replace it.'
+            )
+            break
+          }
           // Every panel below is derived from a local copy that may have just
           // stopped existing — "Clear local copy" and a failed re-download both
           // land here. Leaving stale timings, results and a benchmark on screen
@@ -100,6 +135,7 @@ export default function Home() {
           }
           break
         case 'imported':
+          setStorage('ready')
           setReady(true)
           setTimings(message.timings)
           setNotice(message.notice)
@@ -112,6 +148,13 @@ export default function Home() {
           break
         case 'error':
           setError(message.message)
+          // The Import panel describes a run that succeeded. After a failed
+          // one it is describing a different origin than the one on disk —
+          // most sharply in "OPFS footprint", which omits the staged file the
+          // failure left behind and can understate storage several-fold. The
+          // query results below it stay: they came from the live copy, which a
+          // failed staged download does not touch (D-061).
+          setTimings(null)
           break
       }
     }
@@ -126,9 +169,21 @@ export default function Home() {
   }, [])
 
   const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
+  // Read once on mount: the warning below has to be on screen *before* the
+  // button is clicked, and D-061 accepts this path's destroy-then-download
+  // behaviour only because it is diagnostic — an ordinary "Re-download data"
+  // label hides that a crafted link costs the local copy.
+  const vfs = useSyncExternalStore(
+    () => () => undefined,
+    // The *resolved* VFS, through the same fallback the request uses — warning
+    // about `?vfs=garbage` would be warning about a run that takes the ordinary
+    // staged path.
+    () => importOptions(location.search).vfs ?? DEFAULT_VFS,
+    () => DEFAULT_VFS
+  )
 
   return (
-    <main>
+    <main data-status={storage}>
       <h1>cve.meenan.dev</h1>
       <p className="lede">
         Browser-based search and analysis over the CVE List. Everything below runs locally: the
@@ -178,6 +233,15 @@ export default function Home() {
         </section>
       )}
 
+      {vfs !== DEFAULT_VFS && (
+        <p className="error">
+          Diagnostic mode: <code>{vfs}</code>. This VFS cannot stage a download (D-051), so
+          “Re-download data” <strong>deletes the local copy before fetching anything</strong> — a
+          failure part-way leaves nothing. Remove <code>?vfs=</code> from the URL to use the normal
+          path.
+        </p>
+      )}
+
       {error && <p className="error">{error}</p>}
 
       {timings && (
@@ -188,12 +252,30 @@ export default function Home() {
               is the Worker's, not a re-parsed label. */}
           <dl className="timings" data-json={JSON.stringify(timings)}>
             <Timing label="Records" value={timings.records.toLocaleString()} />
-            <Timing label="Downloaded" value={`${(timings.compressedBytes / 1e6).toFixed(1)} MB`} />
+            <Timing
+              label="Chunks fetched"
+              value={
+                // Fewer than the total means this run resumed a staged download
+                // (D-061) — worth saying out loud, because it is also why the
+                // elapsed time will not match a fresh import's.
+                timings.chunksFetched === timings.chunksTotal
+                  ? `${timings.chunksTotal}`
+                  : `${timings.chunksFetched} of ${timings.chunksTotal} (resumed)`
+              }
+            />
+            {/* "Snapshot size", not "Downloaded": this is the whole published
+                snapshot, and a resumed run may have fetched none of it. The
+                row above says what this run actually did. */}
+            <Timing
+              label="Snapshot size"
+              value={`${(timings.compressedBytes / 1e6).toFixed(1)} MB`}
+            />
             <Timing label="Expanded to" value={`${(timings.rawBytes / 1e6).toFixed(1)} MB`} />
             <Timing label="Fetch" value={`${timings.fetchMs} ms`} />
             <Timing label="Decompress" value={`${timings.decompressMs} ms`} />
             <Timing label="Write to OPFS" value={`${timings.writeMs} ms`} />
             <Timing label="Build indexes" value={`${timings.indexMs} ms`} />
+            <Timing label="Verify and promote" value={`${timings.verifyMs} ms`} />
             <Timing label="Total" value={`${(timings.totalMs / 1000).toFixed(1)} s`} />
             <Timing
               label="OPFS footprint"
@@ -296,6 +378,12 @@ function phaseLabel(phase: Progress['phase']): string {
       return 'Downloading and decompressing'
     case 'index':
       return 'Building search indexes'
+    case 'verify':
+      // Deliberately vague: three different steps report under this phase and
+      // each names itself in the detail, so a specific label here would either
+      // repeat the detail or contradict it — the `opfs-sahpool` path reports
+      // here too and does not verify or promote anything (D-051).
+      return 'Finishing up'
     case 'query':
       return 'Running query'
     default:

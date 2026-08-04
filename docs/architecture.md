@@ -363,6 +363,29 @@ hand its id to a different value (D-056).
   transaction* as the rows it describes, so a crash cannot leave the two
   disagreeing. The snapshot carries its own revision in that table, which is how
   a fresh download starts with a correct watermark rather than an assumed one.
+- **A download never writes into the live database.** Chunks land in a staging
+  file — one of two alternating slots, `cve-a.sqlite` and `cve-b.sqlite` — and
+  the live copy is neither closed nor touched until the staged one has passed
+  its promotion gate: the bitmap complete and the staged file unpromoted, chunks
+  covering the byte range exactly under distinct names, schema and revision
+  agreeing with the manifest, the D-008 notice present, records non-zero,
+  indexes built. **Which slot is live is recorded in the database's own header**
+  (`PRAGMA user_version`, zero in every published artifact), so promotion is one
+  SQLite transaction rather than a pointer file we would have to keep
+  crash-safe. That counter is read *through SQLite* rather than from the file's
+  bytes — the header can advertise a promotion the journal has yet to commit —
+  and nothing is deleted until the database discovery chose is open and
+  answering. A slot's SQLite sidecars are cleared before its bytes are reused,
+  because a journal left by an aborted index build would otherwise be replayed
+  into the new generation. The per-chunk completion bitmap in `staging.json` is advisory —
+  losing it costs a re-download and can never cost the live copy — but it is
+  bound to the staging file's length as well as to the manifest, because a
+  record that outlives its file is believed otherwise (D-061). Peak footprint
+  during a re-download is therefore two generations, at least ~882 MB at full
+  scale: arithmetic from the measured 441.1 MB rather than a reading, and a
+  floor, since it omits the journal written while the indexes build. M5's quota
+  work plans against that number, and the two-slot bound is what keeps it from
+  growing further.
 - **Apply is one transaction and is idempotent.** Measured: eight applications
   of the same delta left row counts identical and the file 0.1 MB larger. An
   interrupted sync is safe to retry with no reconciliation logic.
@@ -380,11 +403,14 @@ hand its id to a different value (D-056).
   `rank = 1` form does (RE-005).
 - **Decompression is ours, and it streams.** Chunks arrive as opaque `.br`
   bytes with no `Content-Encoding`; a WASM decoder unpacks each one and writes
-  it straight into the OPFS database at that chunk's byte offset, so peak memory
+  it straight into the staging file at that chunk's byte offset — never the live
+  database, which is what the bullet above is about — so peak memory
   is four chunks in flight rather than the corpus (D-040, D-041; four is the
   measured number, D-049). Resumption is a bitmap of completed chunks — brotli
   is a stream format, so a range-resumed monolith could not be decoded from an
-  arbitrary offset at all.
+  arbitrary offset at all. Each chunk is flushed *before* its bit is recorded:
+  a bitmap that claims a chunk the file does not hold would be trusted by the
+  next run and promoted with a hole in it (D-061).
 - **Nothing cached ever beats a reachable network** (D-054). The SQLite/WASM
   distribution lives at unversioned paths and its three files resolve each other
   by relative URL, so it is served `no-cache` (revalidate) rather than left to

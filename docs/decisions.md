@@ -23,6 +23,310 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-061: Staged replacement — two alternating slots, and the promotion is recorded in the database's own header  (2026-08-04, status: accepted, implements M2's Download task; builds on D-041 and D-051)
+
+**Decision.** A download never writes into the live database. Chunks land
+positionally in a *staging* file that is a different OPFS entry, and the live
+copy is neither closed nor touched until the staged one has been verified.
+Concretely:
+
+- **Two slots, alternating.** The live database is `cve-a.sqlite` or
+  `cve-b.sqlite`; a download always stages into the other. Bounded at two
+  generations, and promotion costs no copying.
+- **A third name is live-capable: `cve.sqlite`, the one M1 wrote.** It is
+  *adopted* rather than discarded — D-013 would permit discarding it, but that
+  charges every existing visitor a 63 MB re-download for a rename — and the
+  first promotion retires it. This matters more than it looks: entries this
+  build does not recognise are **swept**, so failing to adopt would not ignore
+  an M1 copy, it would delete one.
+- **Which slot is live is recorded *in* the database, not beside it.** A
+  promoted database carries a non-zero `PRAGMA user_version`; the higher value
+  is the newer promotion. Published artifacts arrive at 0, so a staging file
+  cannot be mistaken for a live one. Checked 2026-08-04 by executing
+  `pipeline/schema.sql` and reading the header back, and by grepping all of
+  `pipeline/` for pragma writes — `page_size` in `schema.sql` and
+  `journal_mode`/`synchronous` in `build.py` are the only ones, and none is
+  persistent. Nothing *enforces* it upstream, so the gate below re-checks it on
+  every import rather than trusting the survey.
+- **The resume record is advisory.** `staging.json` holds the plan and the
+  per-chunk completion bitmap, bound to the snapshot path, its length, every
+  chunk's offset/length/SHA-256, **and the staging file itself** — exactly
+  `raw_bytes` while the download is in progress, at least that once every chunk
+  has landed, since the indexes are then built into the same file. Anything
+  unparseable, unbound or absent starts a fresh download. It can cost a
+  re-download; it can never cost the live copy.
+- **Promotion gate:** the bitmap is complete (counted, not assumed), the
+  staged file is `user_version` 0, the chunks cover the byte range exactly,
+  schema matches, `meta.rev` is a revision that agrees with `snapshot.rev` when
+  the manifest declares one and is not above head, the D-008 notice is present,
+  and the record count is non-zero. Then the indexes are built — *then* it is
+  promoted. The gate deliberately does **not** run `PRAGMA integrity_check`:
+  the chunk hashes plus full coverage already establish the file is byte-for-byte
+  the published artifact, and re-reading 377 MB on every import to learn that
+  again would be the single most expensive thing in the client. That reasoning
+  has two preconditions, and both were violated by earlier versions of this
+  work. The bitmap must be bound to the file — otherwise a database with an
+  18 MB hole passes all four content checks. And no stale journal may sit beside
+  the slot when it is opened — otherwise SQLite replays it and the file stops
+  being the artifact whose hashes were verified, *after* the verification
+  (RE-017).
+- **`opfs-sahpool` keeps M1's destroy-then-download behaviour**, and none of the
+  above is claimed for it. D-051 already established the pool cannot express
+  this; it survives only so `pnpm measure` can re-run Q-004.
+- **Catch-up deltas are not part of this.** M2's task text puts them in the
+  staging file too; applying one is the Sync task, and this lands the file they
+  will be applied to. Until Sync ships, a fresh download leaves the client at
+  `snapshot.rev` with the manifest's head ahead of it — three revisions ahead on
+  the live origin as of 2026-08-04.
+
+**Protocol changes it required** (`lib/protocol.ts`, the published contract):
+a `verify` value on `Phase`; `chunksTotal`, `chunksFetched` and `verifyMs` on
+`Timings` — `chunksFetched` is the only surface on which the resume claim is
+observable, and `verifyMs` exists because verification, promotion and sweeping a
+replaced generation otherwise land inside what the measurement sweep reports as
+transport; `storage: 'ready' | 'empty' | 'unknown'` on the status message,
+because `ready: false` cannot distinguish an empty origin from an unreadable
+one; and `stopAfterChunks` on `ImportOptions`.
+
+**Context.** M1's import truncated the live database and wrote chunks into it,
+which meant any failure — a dropped connection, a closed laptop, a chunk that
+failed its hash — cost the user the 63 MB they already had. M2 requires the
+opposite, and D-051 chose the `opfs` VFS partly *because* positional writes into
+a second file can express it.
+
+Seven things were less obvious than the shape:
+
+**Where the pointer lives.** The obvious design is a small state file naming the
+live slot, and it has an obvious hole: a small-file write on OPFS is not atomic,
+so a kill during it can leave the origin unable to say which of two 441 MB
+databases is real. Making that safe means a checksummed double-buffer, which is
+a crash-safe-write mechanism written by hand — for a fact SQLite is already
+willing to store durably. `user_version` is a 32-bit header field, written under
+SQLite's normal journalled write path; setting it *is* the promotion, atomic and
+durable by the same guarantees the rest of the database has. What remains
+outside the database is the resume bitmap, and losing that is a re-download
+rather than a lost copy. Reproduced 2026-08-04 on the real schema: the field
+defaults to 0, survives a reopen, lands at header bytes 60–63, and the artifact
+is a rollback-journal database (header bytes 18/19 = 1), so there is no `-wal`
+sidecar to reason about. Confirmed in the browser too — `PRAGMA user_version`
+round-trips through the sqlite-wasm build's `selectValue`, which the promotion
+gate now depends on.
+
+**The manifest can describe a file it does not cover.** Each chunk carries its
+own SHA-256, so corruption costs one refetch (D-041) — but a hash per chunk
+proves nothing about the bytes *between* chunks. A manifest that omitted one, or
+that named one chunk twice (every step downstream is keyed by name, so the
+duplicate collapses and the loser's range is never fetched), would produce a
+database of the right length with a zero-filled hole that every hash in the
+manifest agreed with. `stagingPlan` therefore requires distinct names and exact
+coverage of `[0, raw_bytes)` before anything is written, and the run counts the
+completed bitmap before verifying. Upstream this is structurally impossible —
+`publish.py` cuts chunks with `range(0, total, CHUNK_BYTES)` and names them from
+an `enumerate` — so the check is not defence against our own publisher but
+against a substituted or hostile origin, which is what rule 5 and D-032 ask for.
+M1 checked none of it.
+
+**A counter is not a credential.** Which slot is live is decided by
+`user_version`, and three mistakes followed from treating that number as
+self-evidently meaningful. One is below — the bytes may not be committed. The
+other two are about what the counter *proves*: anything carrying a high number
+won, including a file that merely opens, and then — once discovery re-applied
+the gate — including a perfectly good **published** corpus that had simply never
+been promoted here. That last one is the sharp case, because the promotion gate
+cannot rule it out: the gate runs *before* `buildSearchIndexes`, so passing it
+is not evidence a promotion finished. The client-built FTS tables are: nothing
+else creates them, and they are written immediately before the counter. So
+discovery requires the published schema **and** those three tables, and a
+published artifact that ever arrived carrying a non-zero counter — publisher
+drift, which nothing upstream forbids — is adopted out of a staging file no
+longer, retiring the real copy and leaving a database that cannot be searched.
+
+**Reads and refusals are different answers.** The classifier keeps them apart:
+a read that *fails* says nothing about the file — a transient I/O or BUSY error
+is not evidence that it is disposable — so it yields "unreadable" and blocks the
+sweep, while only values successfully read and then judged unacceptable yield
+"unusable". This is why table presence is counted out of `sqlite_schema`, which
+exists in every database, instead of letting "no such table: meta" surface as an
+exception indistinguishable from a disk error. The decision lives in
+`classifyCandidate` in lib/staging.ts, away from the browser, because every one
+of these branches is a deletion decision and none of them is reachable from an
+e2e test on demand.
+
+**The header is not the committed state.** `user_version` sits at header offset
+60, and reading it directly costs a hundred bytes instead of an open — which is
+what the first version of this did. It is wrong. SQLite's commit sequence writes
+the dirty pages and *then* deletes the rollback journal
+([sqlite.org/atomiccommit.html](https://sqlite.org/atomiccommit.html), read
+2026-08-04), so a crash between those steps leaves a file advertising a
+promotion that never committed and that the next open rolls straight back.
+Reproduced 2026-08-04 by killing a process mid-commit: the raw header read **9**
+while SQLite, after recovering the journal, reported **5** (RE-016). Believing
+the header picks the wrong slot as live — and the sweep then deletes the one
+that really is. So discovery opens each candidate, which also performs that
+recovery, and judges a consistent file rather than an inconsistent one.
+
+**A journal outlives the file it describes.** A crash during index building
+leaves a rollback journal beside the staging slot. If the next download
+overwrites only the main file, SQLite pairs the new bytes with the old journal
+and replays it at open — which SQLite names as a corruption path
+([howtocorrupt.html](https://sqlite.org/howtocorrupt.html#_mispairing_database_files_and_hot_journals),
+read 2026-08-04). Reproduced 2026-08-04: a file byte-identical to a freshly
+published artifact stopped being byte-identical the moment it was opened beside
+a stale journal, and the rows it then held belonged to neither generation
+(RE-017). So sidecars are removed before any raw byte is written into a slot,
+and that removal throws rather than shrugging. It is *not* done when the bitmap
+is already complete: there the journal belongs to the file, and replaying it is
+how a half-built index gets rolled back.
+
+**Discovery runs on every page load, so it is priced.** Opening each candidate
+costs an open, not a scan — but the gate's own "does it hold records" check was
+a `count(*)`, and at full scale that alone put **1.1 s** into every reload
+(measured 2026-08-04: 1,353 ms to `ready` with the count, 242 ms with a
+`LIMIT 1` probe). The gate never compares the number against anything but zero,
+so discovery establishes existence and leaves counting to the import.
+
+**Nothing is deleted while the picture is incomplete.** The sweep's keep list
+comes from discovery, so any uncertainty there has to cancel the sweep rather
+than shrink the list — an unreadable entry reported as "nothing here" is how a
+routine status poll deleted a live database. An inconclusive look still reports
+the copy it *did* find, though: a stray entry in the other slot should cost the
+sweep, not the user's access to their corpus.
+
+**Flush before you record.** The bitmap is written after the chunk's bytes are
+flushed, never before. A record that claims a chunk the file does not hold is
+worse than no record: the next run trusts it, skips the fetch, and hands
+promotion a database with a hole in it.
+
+**Bound to the snapshot *and* to the file, not to head.** A delta published while
+a download was interrupted advances `manifest.rev` without changing one snapshot
+byte, so the binding deliberately ignores the head revision — discarding staged
+chunks over that would make resume useless on exactly the days it matters. It
+does not ignore the staging file: matching the manifest proves the bitmap
+describes this *download*, and only the file's length proves it describes these
+*bytes*. A record that outlives its file (a sweep that could not remove a slot, a
+clear that stopped partway) otherwise makes the next run fetch only the pending
+chunks into a freshly zero-filled file — and, because that run completes the
+bitmap on its way to failing, every retry then fails in seconds without fetching
+anything, with no escape but destroying the good copy.
+
+**Measured** (2026-08-04, Chromium/Linux). Both scales, against
+`tests/e2e/staged.spec.ts`, which annotates the numbers it read so they can be
+re-derived from a run rather than taken from here:
+
+| | M1 slice | full corpus |
+| --- | --- | --- |
+| records | 39,196 | 372,322 |
+| snapshot | 9.9 MB over 2 chunks | 62.7 MB over 12 |
+| expanded | 52.0 MB | 376.7 MB |
+| chunks refetched on resume | **1 of 2** | **11 of 12** |
+| OPFS after promotion | 61.8 MB | 441.1 MB |
+
+In both, the interrupted re-download leaves the previous copy answering the same
+query with the same numbers, the retry skips what already landed, and the origin
+ends holding one generation rather than two. Nine more properties are covered by
+the same spec, each verified by removing the guard and watching it fail: a
+half-finished download is what "Clear local copy" is tested against (clearing
+after a clean promotion proves nothing, because the sweep has already run); an
+M1-named copy is adopted, queried, and retired by the first promotion; a
+discovery failure leaves the origin untouched; a resume record that outlived its
+file is discarded rather than believed; a slot whose header claims a promotion
+SQLite will not confirm does not become live; sidecars beside a staging slot are
+cleared before its bytes are reused; a crash during index building resumes at
+the index build, fetching **zero** chunks; a local copy that cannot be opened is
+reported unknown rather than deleted; and a high counter on a database this
+build would not serve does not win discovery.
+
+Two of those needed care to make honest. A malformed `-journal` is deleted by
+SQLite's own recovery, so planting one proves nothing — the test plants a
+superjournal, which nothing in SQLite's open path touches — and it must plant a
+resume record too, or `tidy` reclaims the slot before the download starts. The
+header-versus-SQLite case cannot be staged in the browser (producing a genuine
+half-committed journal needs a kill inside the commit), so the in-browser test
+uses a slot SQLite cannot open at all, and the commit-window race itself is
+reproduced outside the browser.
+
+**Consequences.**
+
+- **Peak OPFS footprint during a re-download is two generations**, at least
+  ~882 MB at full scale against 441 MB steady-state — arithmetic from D-049's
+  measured 441.1 MB rather than a reading, and a floor rather than a figure: it
+  omits the rollback journal SQLite writes while the indexes are built. That is
+  inherent to "never truncate the live copy" rather than a cost of this design —
+  any staged replacement holds both — but it is the number M5's quota and
+  eviction work has to plan against, and the two-slot bound is what keeps it
+  from growing further.
+- **A failed download leaves the previous copy intact and immediately
+  queryable**, because it is never closed. The page reports "still ready" rather
+  than offering a fresh Download. Note the narrower claim: a query *issued
+  during* a download does not run concurrently with it — the Worker serializes
+  requests on one queue, deliberately (a double-clicked Download would otherwise
+  race itself), so it is queued behind the import.
+- **An interrupted download leaves a staging file the size of the whole expanded
+  database** — 376.7 MB at full scale — because the file is truncated to its
+  final length before the first chunk lands. That is what makes resume a bitmap
+  rather than a re-download, and `tidy` preserves it across sessions on purpose.
+  For a *first* download there is no previous copy for the "costs you nothing"
+  framing to be about: the honest statement is that the live copy, if any, is
+  untouched, and that a partial download occupies real storage until it is
+  resumed or cleared. Surfacing "N of M chunks staged" in the status line is
+  unclaimed, and with D-009 in force the page is the only channel that could.
+- **Indexes are built before promotion**, so a promoted database is one the user
+  can search (D-035). A crash during indexing costs the index build on the next
+  run and never the chunks — the bitmap is already complete, so the retry starts
+  there.
+- **"Clear local copy" enumerates rather than naming one file**: two slots, the
+  legacy name, their SQLite sidecars, and the resume record. It removes the
+  record first and continues past a failure before reporting one, because
+  stopping at the first error left whether the record outlived its file to OPFS
+  enumeration order — and that combination is the input to the worst failure
+  this design has.
+- **A best-effort sweep runs on the read path too.** A promotion that could not
+  remove the old slot would otherwise hold 441 MB until someone cleared storage
+  by hand. It is best-effort *because* it runs after success; "Clear
+  local copy" still throws. Because it deletes, "I could not tell what is on
+  disk" must never be reported as "there is nothing on disk" — conflating them
+  made one unreadable entry enough for a routine status poll to delete the live
+  database. The distinction reaches the UI too: the status message carries
+  `storage: 'ready' | 'empty' | 'unknown'`, and on `unknown` the page keeps its
+  panels and says so rather than clearing them and offering a download over a
+  copy that may still be there.
+- **`tidy` does not reclaim an abandoned staged download.** It has no manifest —
+  `status` performs no network request, and giving it one would put a fetch on
+  the reopen path M5's offline story depends on — so it cannot tell a resumable
+  download from one aimed at a generation the origin has since rotated away, and
+  keeps both. Not a permanent leak: the next download takes the same slot, finds
+  the record does not bind, and overwrites it. Until then it costs the
+  snapshot's expanded size.
+- **Two tabs downloading at once is not handled.** Both compute the same live
+  file and therefore the same staging slot, so the second `createSyncAccessHandle`
+  fails or hangs (RE-007), and a promotion in one tab cannot sweep a slot the
+  other holds open — leaving the second tab querying a retired generation and
+  ~441 MB leaked until a later sweep. Not measured, and not fixed here: M5 owns
+  multi-tab behaviour, and D-051 chose this VFS on the strength of concurrent
+  *readers*, which is unaffected.
+- **A test affordance ships in production code**: `ImportOptions.stopAfterChunks`
+  (`?stop=1`). Neither resume nor "a failed download costs nothing" can be
+  asserted without interrupting a download deterministically, and a 10 MB
+  download over loopback finishes before a test can race it. It is also not the
+  query knob to worry about: `?vfs=opfs-sahpool` selects the path that *cannot*
+  stage, and so clears local storage before fetching a byte — one click on a
+  crafted link costs a working local copy, which is inherent to keeping that
+  path reachable for `pnpm measure`.
+- **`writeMs` is no longer comparable with a pre-D-061 reading.** It now
+  includes a `flush()` per chunk and a bitmap write after each, by design;
+  measured at 4.7 s at full scale against the 3.2 s in features.md. The sweep
+  also only ever measures first installs, since each case starts from a fresh
+  browser context — the re-download path this decision adds is unmeasured by
+  `pnpm measure` and covered by `staged.spec.ts` instead.
+
+**Reopen if.** OPFS gains an atomic rename we are willing to require across the
+D-016 floor — then a single canonical `cve.sqlite` plus `move()` is simpler than
+two slots, though it buys nothing the counter does not already give. Or the
+two-generation footprint turns out to breach quota on real devices during M5's
+storage work, in which case the trade to examine is truncating the live copy on
+an *explicit* user choice, not by default. Or M3's schema-version bump needs a
+promotion to invalidate more than the file it lands in.
+
 ## D-060: The monthly snapshot publishes the artifact head was cut from — it rotates the generation without minting a revision  (2026-08-03, status: accepted, implements the monthly half of D-042; settles the "different content at head" question D-056 left open; relaxes D-055's tiling rule)
 
 **Decision.** `pipeline/snapshot.py` is the monthly cron: take D-042's `flock`,

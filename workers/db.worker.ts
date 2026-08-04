@@ -10,19 +10,50 @@
  * four chunks, so peak memory is bounded by chunks in flight rather than by the
  * corpus (D-040, D-041, D-049). Nothing here sends a request parameter: the
  * manifest names every file (D-032).
+ *
+ * Those writes go into a *staging* file, and the live database is not closed,
+ * truncated or deleted until the staged copy has been verified and promoted
+ * (D-061). M1 wrote straight into the live file, which meant a failed download
+ * cost the user the copy they already had.
  */
 import initBrotli, { decompress as brotliDecompress } from 'brotli-dec-wasm/web'
 import type { Database, SAHPoolUtil, Sqlite3Static } from '@sqlite.org/sqlite-wasm'
 
-import { isNotFound, writeFully } from '../lib/opfs'
+import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
+import {
+  assertLocallyUsable,
+  assertPromotable,
+  assertPromotionCompleted,
+  bindsTo,
+  classifyCandidate,
+  chooseStagingFile,
+  completed,
+  isOurEntry,
+  isSidecarOf,
+  newRecord,
+  parseStagingRecord,
+  pendingChunks,
+  stagingPlan,
+  LEGACY_DB_FILE,
+  SLOT_FILES,
+  REQUIRED_TABLES,
+  STAGING_RECORD_FILE,
+  type Candidate,
+  type SlotFile,
+  type StagedMeta,
+  type StagingPlan,
+  type StagingRecord,
+} from '../lib/staging'
 import {
   assertUsable,
   chunkUrl,
+  isRevision,
   manifestUrl,
   DEFAULT_CACHE_MIB,
   DEFAULT_CONCURRENCY,
   DEFAULT_VFS,
+  SCHEMA_VERSION,
   type BenchResult,
   type ChunkEntry,
   type ImportOptions,
@@ -34,15 +65,26 @@ import {
   type Vfs,
 } from '../lib/protocol'
 
-/** The database's name inside OPFS. */
-const DB_FILE = 'cve.sqlite'
+/**
+ * The name the `opfs-sahpool` path imports to, inside the pool's own opaque
+ * namespace — unrelated to the OPFS entry of the same name that M1 wrote, and
+ * kept because renaming it would orphan any pool database already on disk.
+ *
+ * The `opfs` path's file names live in lib/staging.ts: which of them is live is
+ * a staged-replacement question, not a constant (D-061).
+ */
+const POOL_DB_FILE = 'cve.sqlite'
 
 let sqlite3: Sqlite3Static | null = null
 let db: Database | null = null
 /** Installed lazily: it costs a directory of pre-opened handles (Q-004). */
 let sahPool: SAHPoolUtil | null = null
-/** Which VFS the open database came through, so `reset` cleans the right one. */
-let openedVfs: Vfs = DEFAULT_VFS
+/**
+ * Which OPFS entry the open `db` is reading, so a promotion knows what to close
+ * and what to sweep. Null while nothing is open, and always null on the pool
+ * path, whose files are not OPFS entries we can name.
+ */
+let liveFile: string | null = null
 
 function post(message: Response): void {
   ;(self as DedicatedWorkerGlobalScope).postMessage(message)
@@ -80,12 +122,16 @@ interface ChunkResult {
   decompressMs: number
 }
 
-async function loadChunk(manifest: Manifest, chunk: ChunkEntry): Promise<ChunkResult> {
+async function loadChunk(
+  manifest: Manifest,
+  chunk: ChunkEntry,
+  signal: AbortSignal
+): Promise<ChunkResult> {
   const started = performance.now()
   // No Content-Encoding on these: they are opaque bytes and we decode them
   // ourselves, so progress and resume both count the bytes that crossed the
   // wire (D-040).
-  const response = await fetch(chunkUrl(manifest, chunk))
+  const response = await fetch(chunkUrl(manifest, chunk), { signal })
   if (!response.ok) throw new Error(`${chunk.name}: HTTP ${response.status}`)
   const compressed = new Uint8Array(await response.arrayBuffer())
   const fetched = performance.now()
@@ -133,14 +179,15 @@ async function loadChunk(manifest: Manifest, chunk: ChunkEntry): Promise<ChunkRe
 async function* orderedChunks(
   manifest: Manifest,
   chunks: ChunkEntry[],
-  limit: number
+  limit: number,
+  signal: AbortSignal
 ): AsyncGenerator<ChunkResult> {
   const inFlight = new Map<number, Promise<ChunkResult>>()
   let started = 0
   const fill = () => {
     while (inFlight.size < limit && started < chunks.length) {
       const index = started++
-      const pending = loadChunk(manifest, chunks[index]!)
+      const pending = loadChunk(manifest, chunks[index]!, signal)
       // When one chunk fails, the consumer stops pulling and the rest of the
       // window is abandoned mid-flight. This marks those as handled so a
       // second failure is not reported as an unhandled rejection on top of the
@@ -167,32 +214,63 @@ type Pull = () => Promise<ChunkResult | undefined>
 
 /**
  * The `opfs` VFS: one real OPFS file, written positionally through a sync
- * access handle. Needs COOP/COEP, which production serves (D-030).
+ * access handle, and never the live one. Needs COOP/COEP, which production
+ * serves (D-030).
+ *
+ * Each chunk is flushed and *then* recorded in the bitmap, in that order. A
+ * record that claims a chunk the file does not hold is worse than no record at
+ * all: the next run trusts it, skips the fetch, and promotes a database with a
+ * zero-filled hole that every hash in the manifest agrees with.
+ *
+ * `stopAfter` aborts the run once that many chunks have landed *in this run*,
+ * which is how the resume path gets tested at all — see `ImportOptions`.
  */
-async function writeToOpfsFile(rawBytes: number, pull: Pull): Promise<number> {
+async function writeStagedChunks(
+  root: FileSystemDirectoryHandle,
+  record: StagingRecord,
+  pull: Pull,
+  stopAfter: number | null
+): Promise<number> {
   // Timed from here, not from the first write: `importThroughSahPool` cannot
   // separate its own handle setup from its writes, so this path must include
   // the same span — opening the handle, the 377 MB truncate, and the close —
   // or the two VFSes get compared under one column heading while measuring
-  // different things.
+  // different things. Persisting the bitmap is counted here too; it is an OPFS
+  // write, and hiding it would make the staged path look free.
   const started = performance.now()
   let pullMs = 0
-  const root = await opfsRoot()
-  const handle = await root.getFileHandle(DB_FILE, { create: true })
+  const index = new Map(record.chunks.map((chunk, at) => [chunk.name, at]))
+  const handle = await root.getFileHandle(record.file, { create: true })
   const access = await handle.createSyncAccessHandle()
+  let landed = 0
   try {
-    access.truncate(rawBytes)
+    // Idempotent on a resume: the file is already this long. Growing a short
+    // one zero-fills a tail the pending chunks are about to overwrite, and
+    // shrinking a long one cannot lose a completed chunk, because the bitmap
+    // and the length come from the same record.
+    if (access.getSize() !== record.rawBytes) access.truncate(record.rawBytes)
     for (;;) {
       const pullStart = performance.now()
       const result = await pull()
       pullMs += performance.now() - pullStart
       if (!result) break
       // Positional write: each chunk carries its absolute offset, so resuming
-      // a download is just "which offsets are done" (M2). `writeFully` because
-      // a short write is permitted by the spec and silently corrupts the file.
+      // a download is just "which offsets are done" (D-041). `writeFully`
+      // because a short write is permitted by the spec and silently corrupts
+      // the file (RE-014).
       writeFully(access, result.bytes, result.chunk.offset)
+      access.flush()
+      const at = index.get(result.chunk.name)
+      if (at === undefined) {
+        throw new Error(`staged a chunk the record does not name: ${result.chunk.name}`)
+      }
+      record.done[at] = true
+      await persistRecord(root, record)
+      landed += 1
+      if (stopAfter !== null && landed >= stopAfter) {
+        throw new Error(`download stopped after ${landed} chunks (stopAfterChunks)`)
+      }
     }
-    access.flush()
   } finally {
     // Awaited deliberately: these are declared synchronous in the current spec
     // but Chrome has shipped promise-returning forms, and the exclusive lock is
@@ -201,6 +279,227 @@ async function writeToOpfsFile(rawBytes: number, pull: Pull): Promise<number> {
     await access.close()
   }
   return performance.now() - started - pullMs
+}
+
+async function persistRecord(
+  root: FileSystemDirectoryHandle,
+  record: StagingRecord
+): Promise<void> {
+  await writeTextEntry(root, STAGING_RECORD_FILE, JSON.stringify(record))
+}
+
+/**
+ * The record left by a previous run, if it describes exactly this download.
+ *
+ * Anything else — absent, unparseable, a different generation, a different
+ * slot — starts a fresh one. The record is an optimization and never an
+ * authority: it can cost a re-download and it can never cost the live copy
+ * (D-061).
+ */
+async function loadRecord(
+  root: FileSystemDirectoryHandle,
+  plan: StagingPlan,
+  file: SlotFile
+): Promise<StagingRecord> {
+  const text = await readTextEntry(root, STAGING_RECORD_FILE)
+  if (text !== null) {
+    let parsed: StagingRecord | null = null
+    try {
+      parsed = parseStagingRecord(JSON.parse(text))
+    } catch {
+      parsed = null
+    }
+    if (parsed && bindsTo(parsed, plan, file)) return parsed
+  }
+  return newRecord(plan, file)
+}
+
+/**
+ * A page cache for probe connections. They read one header field and close, so
+ * the 256 MiB the query path wants (D-050) would be pure allocation.
+ */
+const PROBE_CACHE_MIB = 2
+
+/**
+ * Examine a candidate: is it a promoted corpus this build would serve?
+ *
+ * **Read through SQLite, never from the file's bytes.** `user_version` lives at
+ * header offset 60 and reading it directly is tempting — one 100-byte read per
+ * candidate instead of an open — but the raw bytes are not the committed state.
+ * SQLite's commit sequence writes the dirty pages, *then* deletes the rollback
+ * journal (https://sqlite.org/atomiccommit.html, read 2026-08-04), so a crash
+ * between those two steps leaves a file whose header advertises a promotion
+ * that never committed and that the next open rolls straight back. Reproduced
+ * 2026-08-04 by killing a process mid-commit: the header read 9 while SQLite,
+ * after recovering the journal, reported 5. Believing the header there picks the
+ * wrong slot as live and sweeps the one that really is (D-061).
+ *
+ * Opening also performs that recovery, which is the point: discovery leaves
+ * every candidate in a consistent state rather than judging it in an
+ * inconsistent one.
+ */
+async function examine(root: FileSystemDirectoryHandle, name: string): Promise<Candidate> {
+  // The live database is already open; a second connection to the same file
+  // would work but there is nothing to learn from it that this one cannot say.
+  if (db && liveFile === name) {
+    return describe(db)
+  }
+
+  let size: number | null
+  try {
+    size = await entrySize(root, name)
+  } catch {
+    return { kind: 'unreadable' }
+  }
+  if (size === null) return { kind: 'absent' }
+  if (size === 0) return { kind: 'unusable' }
+
+  let probe: Database
+  try {
+    probe = await openDatabase('opfs', name, PROBE_CACHE_MIB, 'w')
+  } catch {
+    // It exists and we could not open it. That is *not* "there is nothing
+    // here": the caller turns that answer into deletions, and this may be the
+    // user's only copy behind a transient failure.
+    return { kind: 'unreadable' }
+  }
+  try {
+    return describe(probe)
+  } finally {
+    probe.close()
+  }
+}
+
+/** Build the reads `classifyCandidate` needs from an open connection. */
+function describe(database: Database): Candidate {
+  return classifyCandidate(
+    {
+      counter: () => counterOf(database),
+      tablesPresent: () =>
+        database.selectValue(
+          "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name IN " +
+            `(${REQUIRED_TABLES.map((name) => `'${name}'`).join(', ')})`
+        ),
+      meta: (generation) => ({
+        schema: database.selectValue("SELECT v FROM meta WHERE k = 'schema'"),
+        rev: database.selectValue("SELECT v FROM meta WHERE k = 'rev'"),
+        notice: database.selectValue("SELECT v FROM meta WHERE k = 'notice'"),
+        // Existence, not a census: the gate compares against zero only, and a
+        // true count over 372k rows adds ~1.1 s to every page load (D-061).
+        records: database.selectValue('SELECT count(*) FROM (SELECT 1 FROM cve LIMIT 1)'),
+        promoted: generation,
+      }),
+    },
+    SCHEMA_VERSION
+  )
+}
+
+/** The promotion counter as SQLite reports it, or null if it is unreadable. */
+function counterOf(database: Database): number | null {
+  const value = database.selectValue('PRAGMA user_version')
+  return typeof value === 'number' ? value : null
+}
+
+/**
+ * Remove the SQLite sidecars belonging to `file`.
+ *
+ * Called before raw bytes are written into a slot, and it throws rather than
+ * shrugging: a rollback journal from an aborted index build describes the
+ * *previous* generation's pages, and SQLite replays it into whatever main file
+ * it finds. Reproduced 2026-08-04 — a staged file byte-identical to the
+ * published artifact stopped being byte-identical the moment it was opened
+ * beside a stale journal, and the rows it then held belonged to neither
+ * generation. Overwriting the main file and leaving the journal is the exact
+ * pattern SQLite documents as corruption (D-061).
+ */
+async function discardSidecars(root: FileSystemDirectoryHandle, file: string): Promise<void> {
+  const doomed: string[] = []
+  for await (const entry of root.values()) {
+    if (isSidecarOf(entry.name, file)) doomed.push(entry.name)
+  }
+  for (const name of doomed) await removeIfPresent(root, name)
+}
+
+/**
+ * What the `opfs` path holds, answered from the files themselves rather than
+ * from a pointer beside them.
+ *
+ * The promoted slot with the highest counter wins, provided it is a corpus this
+ * build would serve. A copy under M1's name has no counter and is adopted only
+ * when no slot has been promoted — the upgrade case, swept by the first
+ * promotion that lands.
+ *
+ * `conclusive` is false when any candidate could not be examined. The live copy
+ * is still reported when one was found: a stray unreadable entry in the other
+ * slot should not cost the user their database's availability. What it does do
+ * is stop the sweep, because a keep list built from an incomplete picture is
+ * exactly how the previous two versions of this deleted a live database.
+ */
+async function findLive(
+  root: FileSystemDirectoryHandle
+): Promise<{ file: string | null; conclusive: boolean }> {
+  let best: { file: string; generation: number } | null = null
+  let conclusive = true
+  for (const slot of SLOT_FILES) {
+    const candidate = await examine(root, slot)
+    if (candidate.kind === 'unreadable') conclusive = false
+    if (candidate.kind !== 'database') continue
+    if (candidate.generation > 0 && (!best || candidate.generation > best.generation)) {
+      best = { file: slot, generation: candidate.generation }
+    }
+  }
+  if (best) return { file: best.file, conclusive }
+
+  const legacy = await examine(root, LEGACY_DB_FILE)
+  if (legacy.kind === 'unreadable') conclusive = false
+  return { file: legacy.kind === 'database' ? LEGACY_DB_FILE : null, conclusive }
+}
+
+/** An entry's byte length, or null if it is not there. */
+async function entrySize(root: FileSystemDirectoryHandle, name: string): Promise<number | null> {
+  try {
+    return (await (await root.getFileHandle(name)).getFile()).size
+  } catch (error) {
+    if (isNotFound(error)) return null
+    throw error
+  }
+}
+
+/**
+ * One past the highest promotion counter on disk. Starts at 1.
+ *
+ * Counts a slot we would not *serve* as well as one we would: the point is that
+ * no counter is ever reissued, so an unusable file carrying 7 still has to push
+ * the next promotion to 8.
+ */
+async function nextGeneration(root: FileSystemDirectoryHandle): Promise<number> {
+  let highest = 0
+  for (const slot of SLOT_FILES) {
+    const candidate = await examine(root, slot)
+    if (candidate.kind === 'database') highest = Math.max(highest, candidate.generation)
+  }
+  return highest + 1
+}
+
+/**
+ * Delete every entry of ours that is not one of `keep` (or a journal belonging
+ * to one), best-effort.
+ *
+ * Best-effort because this runs *after* a download has already succeeded: a
+ * slot another tab still holds open is 441 MB of wasted space, which the next
+ * status or download will clear, and failing a good import over it would be a
+ * worse trade. "Clear local copy" does not use this — that path must report a
+ * clear it did not achieve, so it uses `clearStorage`, which throws.
+ */
+async function sweep(root: FileSystemDirectoryHandle, keep: readonly string[]): Promise<void> {
+  const kept = (name: string) => keep.some((file) => name === file || name.startsWith(`${file}-`))
+  const doomed: string[] = []
+  for await (const entry of root.values()) {
+    if (isOurEntry(entry.name) && !kept(entry.name)) doomed.push(entry.name)
+  }
+  for (const name of doomed) {
+    await removeIfPresent(root, name).catch(() => undefined)
+  }
 }
 
 /**
@@ -216,7 +515,7 @@ async function importThroughSahPool(pull: Pull): Promise<number> {
   const pool = await installSahPool()
   let pullMs = 0
   const started = performance.now()
-  await pool.importDb(`/${DB_FILE}`, async () => {
+  await pool.importDb(`/${POOL_DB_FILE}`, async () => {
     const pullStart = performance.now()
     const result = await pull()
     pullMs += performance.now() - pullStart
@@ -252,6 +551,21 @@ const MAX_CONCURRENCY = 16
 const MAX_CACHE_MIB = 1024
 
 async function importSnapshot(options: ImportOptions = {}): Promise<void> {
+  // Chunks still in flight when an import ends have nobody left to receive
+  // them. Unaborted they keep downloading and decompressing into buffers that
+  // are already garbage — up to `concurrency - 1` × 32 MB of decompressed
+  // output landing *after* the error, which blows the memory bound D-040/D-041
+  // exists to hold at exactly the moment it matters most, and does it while the
+  // user is likely clicking Download again.
+  const transfers = new AbortController()
+  try {
+    await runImport(options, transfers)
+  } finally {
+    transfers.abort()
+  }
+}
+
+async function runImport(options: ImportOptions, transfers: AbortController): Promise<void> {
   const overallStart = performance.now()
   const concurrency = clamp(options.concurrency, DEFAULT_CONCURRENCY, MAX_CONCURRENCY)
   const vfs = options.vfs ?? DEFAULT_VFS
@@ -261,56 +575,279 @@ async function importSnapshot(options: ImportOptions = {}): Promise<void> {
   const manifest = await fetchManifest()
   const { chunks, raw_bytes: rawBytes } = manifest.snapshot
   const compressedTotal = chunks.reduce((sum, c) => sum + c.bytes, 0)
-
-  // Close any open handle before replacing the file underneath it. M2 replaces
-  // this with a staged file and an atomic promotion; today's import truncates
-  // the live database, which is exactly why M2 lists that as a task.
-  db?.close()
-  db = null
-  // Clear *both* VFSes first. Writing only the chosen one would leave the
-  // other's copy behind — which `storedIn()` might then prefer on the next
-  // reload, and which `opfsBytes()` would count into the footprint budget.
-  await clearStorage()
+  // `clamp` substitutes its fallback for anything below 1, so zero and negatives
+  // are filtered out here instead: "stop after 0 chunks" means "do not stop".
+  const requestedStop = Math.trunc(Number(options.stopAfterChunks))
+  const stopAfter =
+    Number.isFinite(requestedStop) && requestedStop > 0
+      ? Math.min(requestedStop, chunks.length)
+      : null
 
   let fetchMs = 0
   let digestMs = 0
   let decompressMs = 0
   let writeMs = 0
-  let written = 0
+  let fetched = 0
 
-  const loader = orderedChunks(manifest, chunks, concurrency)
-  /** One chunk, with the transport accounting both VFS paths share. */
-  const pull = async (): Promise<ChunkResult | undefined> => {
-    const { value, done } = await loader.next()
-    if (done || !value) return undefined
-    fetchMs += value.fetchMs
-    digestMs += value.digestMs
-    decompressMs += value.decompressMs
-    written += 1
+  /**
+   * One chunk, with the transport accounting both VFS paths share. `already`
+   * is what a resumed run found on disk, so the bar measures the download the
+   * user is waiting for rather than the part of it this process performed.
+   */
+  const makePull = (list: ChunkEntry[], already: number): Pull => {
+    const loader = orderedChunks(manifest, list, concurrency, transfers.signal)
+    return async (): Promise<ChunkResult | undefined> => {
+      const { value, done } = await loader.next()
+      if (done || !value) return undefined
+      fetchMs += value.fetchMs
+      digestMs += value.digestMs
+      decompressMs += value.decompressMs
+      fetched += 1
+      report(
+        'download',
+        (already + fetched) / chunks.length,
+        `${already + fetched} / ${chunks.length} chunks (${(compressedTotal / 1e6).toFixed(1)} MB)`
+      )
+      return value
+    }
+  }
+
+  let staged: Database
+  let openMs = 0
+  /** Set on the staged path; the promotion needs it and the pool has none. */
+  let stagedFile: SlotFile | null = null
+  let plan: StagingPlan | null = null
+  const root = await opfsRoot()
+
+  if (vfs === 'opfs-sahpool') {
+    // D-051: the pool cannot express staged replacement — `importDb` truncates
+    // its target and appends strictly sequentially. This path keeps M1's
+    // destroy-then-download behaviour and exists only so `pnpm measure` can
+    // re-run Q-004; nothing selects it by default, and the plan's replacement
+    // guarantees are deliberately not claimed for it.
+    db?.close()
+    db = null
+    liveFile = null
+    await clearStorage()
+    report('download', 0, `0 / ${chunks.length} chunks`)
+    writeMs = await importThroughSahPool(makePull(chunks, 0))
+    report('verify', null, `Opening database — ${capabilities()}`)
+    const openStart = performance.now()
+    staged = await openDatabase('opfs-sahpool', POOL_DB_FILE, cacheMib)
+    openMs = performance.now() - openStart
+  } else {
+    // Refuses a manifest whose chunks do not cover the byte range, or that
+    // names one twice, *before* anything is written: per-chunk hashes prove
+    // each chunk's bytes and nothing proves the bytes between them (D-061).
+    plan = stagingPlan(manifest)
+    // The live database is neither closed nor touched here. It stays on disk
+    // right through the download, and a failure anywhere below leaves it
+    // exactly where it was — which is the whole point of the staged path.
+    //
+    // Asked of OPFS every time rather than remembered in `liveFile`: another
+    // tab may have promoted since, and staging over *its* new live database is
+    // the one mistake this function must not make. Two 100-byte reads.
+    stagedFile = chooseStagingFile((await findLive(root)).file)
+    const record = await loadRecord(root, plan, stagedFile)
+    // Bind the record to the file as well as to the manifest. `bindsTo` proves
+    // the bitmap describes this *download*; only the length proves it describes
+    // these *bytes*. A record that outlived its file — a failed sweep, a clear
+    // that stopped partway — would otherwise make this run fetch only the
+    // chunks the bitmap calls pending into a freshly zero-filled file, and hand
+    // promotion a database with a hole in it. On a genuine resume the length
+    // always matches, because the file is truncated to it before the first
+    // chunk lands.
+    const size = await entrySize(root, stagedFile)
+    // Once every chunk has landed, the client builds its indexes *into* this
+    // file (D-035), so it legitimately grows past `rawBytes` — an exact-length
+    // test there would discard a complete download after a crash in the index
+    // build and refetch the whole snapshot. While the download is still in
+    // progress the length is exact, because the file is truncated to it before
+    // the first chunk lands.
+    const complete = completed(record) === record.chunks.length
+    const describesTheFile =
+      size !== null && (complete ? size >= plan.rawBytes : size === plan.rawBytes)
+    if (completed(record) > 0 && !describesTheFile) {
+      record.done.fill(false)
+      await persistRecord(root, record)
+    }
+    const already = completed(record)
+    const pending = pendingChunks(record, manifest)
+
     report(
       'download',
-      written / chunks.length,
-      `${written} / ${chunks.length} chunks (${(compressedTotal / 1e6).toFixed(1)} MB)`
+      already / chunks.length,
+      already > 0
+        ? `resuming — ${already} / ${chunks.length} chunks already staged`
+        : `0 / ${chunks.length} chunks`
     )
-    return value
+    if (pending.length > 0) {
+      // Before any raw byte goes in: a journal left by an aborted index build
+      // on this slot describes the generation we are about to overwrite, and
+      // SQLite would replay it into the new file at the next open (D-061).
+      await discardSidecars(root, stagedFile)
+      writeMs = await writeStagedChunks(root, record, makePull(pending, already), stopAfter)
+    }
+    // "Every chunk present" is the first clause of the promotion gate, so it is
+    // checked rather than assumed. Without this the gate rests entirely on the
+    // loop having pulled what it was handed, and any way of producing a short
+    // pull list — a duplicate chunk name collapsing two entries into one, a
+    // future change to the loader — reaches `verifyStaged` with an unwritten
+    // byte range that `meta` and a row count cannot see.
+    const landed = completed(record)
+    if (landed !== record.chunks.length) {
+      throw new Error(`staged only ${landed} of ${record.chunks.length} chunks`)
+    }
+
+    report('verify', null, `Verifying the staged copy — ${capabilities()}`)
+    const openStart = performance.now()
+    // Not 'c': on this path the file must already exist, and creating one turns
+    // "the staging file is gone" into an empty database that fails later under
+    // a misleading name.
+    staged = await openDatabase('opfs', stagedFile, cacheMib, 'w')
+    openMs = performance.now() - openStart
   }
 
-  report('download', 0, `0 / ${chunks.length} chunks`)
-  if (vfs === 'opfs-sahpool') {
-    writeMs = await importThroughSahPool(pull)
-  } else {
-    writeMs = await writeToOpfsFile(rawBytes, pull)
+  // One try, one close. Every step from here to the promotion can throw —
+  // `verifyStaged` by design, the fts5 rebuild on hostile description text,
+  // `nextGeneration` on an OPFS read, `promote` on SQLITE_BUSY or quota — and
+  // a `staged` that escapes unclosed holds a sync access handle on the slot for
+  // the life of the Worker, which wedges every later download *and* the clear
+  // button behind RE-007.
+  let indexMs = 0
+  const finalizeStart = performance.now()
+  try {
+    if (plan) verifyStaged(staged, manifest, plan)
+
+    // Indexes before promotion, not after: a promoted database is one the user
+    // can search, and D-035 makes the indexes part of what "downloaded" means.
+    // A crash here costs the index build on the next run, never the chunks —
+    // the bitmap is already complete, so the retry starts at this line.
+    report('index', null, 'Building search indexes')
+    const indexStart = performance.now()
+    buildSearchIndexes(staged)
+    indexMs = performance.now() - indexStart
+
+    if (stagedFile !== null) {
+      // Promotion: one SQLite transaction on the file's own header, which is
+      // what makes it atomic and durable without a pointer file we would have
+      // to keep crash-safe ourselves (D-061). Everything above is discardable;
+      // below it, the staged copy *is* the local database.
+      report('verify', null, 'Promoting the new copy')
+      promote(staged, await nextGeneration(root))
+    }
+  } catch (error) {
+    staged.close()
+    throw error
   }
 
-  report('index', null, `Opening database — ${capabilities()}`)
-  const openStart = performance.now()
-  db = await openDatabase(vfs, cacheMib)
-  const openMs = performance.now() - openStart
+  const previous = db
+  db = staged
+  liveFile = stagedFile
+  if (stagedFile !== null) {
+    // Everything below has already succeeded — the new database is promoted and
+    // is what the user queries — so a failure here must not be reported as a
+    // failed import. Closing the old connection first is the one ordering that
+    // has to be right: an open database cannot be removed.
+    try {
+      previous?.close()
+      await sweep(root, [stagedFile])
+      // M1 cleared both VFSes on every import. The staged path clears neither,
+      // so without this a `?vfs=opfs-sahpool` run followed by a default one
+      // leaves a second full corpus in the pool that nothing reports and
+      // nothing can reclaim — while `opfsBytes` silently counts it into
+      // Q-003's footprint number.
+      await unlinkPoolCopy(root)
+    } catch {
+      /* best-effort: the next status or download sweeps again */
+    }
+  }
 
-  const indexStart = performance.now()
-  buildSearchIndexes(db)
-  const indexMs = performance.now() - indexStart
+  // Everything from opening the staged database to the swept origin, minus the
+  // index build that sits inside it — the span that was previously invisible
+  // and got reported as transport.
+  const verifyMs = performance.now() - finalizeStart - indexMs
 
+  await finishImport({
+    compressedTotal,
+    rawBytes,
+    vfs,
+    concurrency,
+    cacheMib,
+    fetchMs,
+    digestMs,
+    decompressMs,
+    writeMs,
+    openMs,
+    indexMs,
+    verifyMs,
+    chunksTotal: chunks.length,
+    chunksFetched: fetched,
+    overallStart,
+  })
+}
+
+/**
+ * Read the four values the promotion gate turns on and hand them to it.
+ *
+ * The decision itself is `assertPromotable` in lib/staging.ts, where it can be
+ * tested without a browser: reaching it from here costs a 377 MB import, so
+ * every refusal it makes would otherwise ship unexercised.
+ */
+function verifyStaged(staged: Database, manifest: Manifest, plan: StagingPlan): void {
+  assertPromotable(
+    {
+      schema: staged.selectValue("SELECT v FROM meta WHERE k = 'schema'"),
+      rev: staged.selectValue("SELECT v FROM meta WHERE k = 'rev'"),
+      notice: staged.selectValue("SELECT v FROM meta WHERE k = 'notice'"),
+      records: staged.selectValue('SELECT count(*) FROM cve'),
+      promoted: staged.selectValue('PRAGMA user_version'),
+    },
+    manifest.rev,
+    plan,
+    SCHEMA_VERSION
+  )
+}
+
+/**
+ * Record the promotion in the database's own header.
+ *
+ * A pragma takes no bind parameter, so the counter is interpolated — which is
+ * why it is re-derived here as an integer rather than trusted from the caller.
+ */
+function promote(staged: Database, generation: number): void {
+  const value = Math.trunc(generation)
+  if (!Number.isSafeInteger(value) || value < 1 || value > 0x7fffffff) {
+    throw new Error(`refusing to promote with generation ${generation}`)
+  }
+  staged.exec('PRAGMA query_only=OFF')
+  try {
+    staged.exec(`PRAGMA user_version=${value}`)
+  } finally {
+    staged.exec('PRAGMA query_only=ON')
+  }
+}
+
+interface ImportReport {
+  compressedTotal: number
+  rawBytes: number
+  vfs: Vfs
+  concurrency: number
+  cacheMib: number
+  fetchMs: number
+  digestMs: number
+  decompressMs: number
+  writeMs: number
+  openMs: number
+  indexMs: number
+  verifyMs: number
+  chunksTotal: number
+  chunksFetched: number
+  overallStart: number
+}
+
+async function finishImport(run: ImportReport): Promise<void> {
+  if (!db) throw new Error('import finished with no database')
   const records = (db.selectValue('SELECT count(*) FROM cve') as number) ?? 0
   const notice = (db.selectValue("SELECT v FROM meta WHERE k = 'notice'") as string) ?? ''
 
@@ -319,19 +856,22 @@ async function importSnapshot(options: ImportOptions = {}): Promise<void> {
     type: 'imported',
     notice,
     timings: {
-      fetchMs: Math.round(fetchMs),
-      digestMs: Math.round(digestMs),
-      decompressMs: Math.round(decompressMs),
-      writeMs: Math.round(writeMs),
-      openMs: Math.round(openMs),
-      indexMs: Math.round(indexMs),
-      totalMs: Math.round(performance.now() - overallStart),
-      compressedBytes: compressedTotal,
-      rawBytes,
+      fetchMs: Math.round(run.fetchMs),
+      digestMs: Math.round(run.digestMs),
+      decompressMs: Math.round(run.decompressMs),
+      writeMs: Math.round(run.writeMs),
+      openMs: Math.round(run.openMs),
+      indexMs: Math.round(run.indexMs),
+      verifyMs: Math.round(run.verifyMs),
+      totalMs: Math.round(performance.now() - run.overallStart),
+      compressedBytes: run.compressedTotal,
+      rawBytes: run.rawBytes,
       records,
-      vfs,
-      concurrency,
-      cacheMib,
+      chunksTotal: run.chunksTotal,
+      chunksFetched: run.chunksFetched,
+      vfs: run.vfs,
+      concurrency: run.concurrency,
+      cacheMib: run.cacheMib,
       opfsBytes: await opfsBytes(),
       storageBytes: await storageUsage(),
       wasmHeapBytes: sqlite3?.config.memory.buffer.byteLength ?? 0,
@@ -428,16 +968,26 @@ async function installSahPool(): Promise<SAHPoolUtil> {
   return sahPool
 }
 
-async function openDatabase(vfs: Vfs, cacheMib = DEFAULT_CACHE_MIB): Promise<Database> {
+/**
+ * @param flags oo1 open flags. `'c'` creates when absent, `'w'` refuses to —
+ * which is what the staged path wants, so that a missing staging file fails by
+ * name instead of becoming an empty database that fails later as "no such
+ * table: meta".
+ */
+async function openDatabase(
+  vfs: Vfs,
+  file: string,
+  cacheMib = DEFAULT_CACHE_MIB,
+  flags: 'c' | 'w' = 'c'
+): Promise<Database> {
   if (!sqlite3) throw new Error('sqlite3 not initialised')
   // Q-004 picked `opfs`, which needs COOP/COEP — already served (D-030) —
   // over `opfs-sahpool` (D-051). Both stay reachable so the sweep in
   // tests/e2e/measure.spec.ts can re-run the comparison.
   const database =
     vfs === 'opfs-sahpool'
-      ? new (await installSahPool()).OpfsSAHPoolDb(`/${DB_FILE}`)
-      : new sqlite3.oo1.OpfsDb(`/${DB_FILE}`, 'c')
-  openedVfs = vfs
+      ? new (await installSahPool()).OpfsSAHPoolDb(`/${file}`)
+      : new sqlite3.oo1.OpfsDb(`/${file}`, flags)
   // Negative cache_size is KiB rather than pages, which is the unit we can
   // actually budget in (D-050). temp_store=MEMORY because there is no usable
   // temp file here anyway: every GROUP BY that spills would otherwise spill
@@ -481,58 +1031,165 @@ function buildSearchIndexes(database: Database): void {
   }
 }
 
-/**
- * Which VFS, if any, already holds a database. Answered from OPFS rather than
- * remembered, because the Worker has no storage of its own and a reload starts
- * it empty. `opfs` is checked first and without installing the pool, so the
- * default path never pays for the alternative.
- */
-async function storedIn(): Promise<Vfs | null> {
-  try {
-    const root = await opfsRoot()
-    const handle = await root.getFileHandle(DB_FILE)
-    if ((await handle.getFile()).size > 0) return 'opfs'
-  } catch {
-    /* not there */
-  }
-  try {
-    const root = await opfsRoot()
-    await root.getDirectoryHandle('.opfs-sahpool')
-    const pool = await installSahPool()
-    if (pool.getFileNames().includes(`/${DB_FILE}`)) return 'opfs-sahpool'
-  } catch {
-    /* no pool directory, so nothing was ever imported through it */
-  }
-  return null
+/** What discovery concluded, and whether it saw the whole picture. */
+interface Discovery {
+  live: { vfs: Vfs; file: string } | null
+  /** False if any candidate could not be examined; a sweep is then unsafe. */
+  conclusive: boolean
 }
 
+/**
+ * Which VFS and which file, if any, already hold a *promoted* database.
+ * Answered from OPFS rather than remembered, because the Worker has no storage
+ * of its own and a reload starts it empty. `opfs` is checked first and without
+ * installing the pool, so the default path never pays for the alternative.
+ *
+ * A staging file is never returned: it carries no promotion counter, so a
+ * half-downloaded database cannot be mistaken for the local copy (D-061).
+ */
+async function storedIn(): Promise<Discovery> {
+  const root = await opfsRoot()
+  const { file, conclusive } = await findLive(root)
+  if (file) return { live: { vfs: 'opfs', file }, conclusive }
+
+  // A missing pool directory means nothing was ever imported through it. Any
+  // other failure — installation, enumeration — is "I could not tell", and
+  // must not be reported as absence for the same reason the `opfs` half must
+  // not: the caller turns absence into deletions.
+  try {
+    const pooled = await root
+      .getDirectoryHandle('.opfs-sahpool')
+      .then(() => true)
+      .catch((error: unknown) => {
+        if (isNotFound(error)) return false
+        throw error
+      })
+    if (pooled) {
+      const pool = await installSahPool()
+      if (pool.getFileNames().includes(`/${POOL_DB_FILE}`)) {
+        return { live: { vfs: 'opfs-sahpool', file: POOL_DB_FILE }, conclusive }
+      }
+    }
+  } catch {
+    return { live: null, conclusive: false }
+  }
+  return { live: null, conclusive }
+}
+
+/**
+ * Drop whatever is not the live database and not a staged download still worth
+ * resuming. Best-effort, and run on the *read* path on purpose: a promotion
+ * that could not remove the old slot otherwise sits there holding 441 MB until
+ * someone clears storage by hand.
+ *
+ * What it deliberately does **not** reclaim is a staged download whose record
+ * still parses. This function has no manifest — `status` performs no network
+ * request, and giving it one would put a fetch on the reopen path the M5
+ * offline story depends on — so it cannot tell a resumable download from one
+ * aimed at a generation the origin has since rotated away. Both are kept. The
+ * abandoned case is not a permanent leak: the next download picks the same
+ * slot, finds the record does not bind, and overwrites it. Until then it costs
+ * the snapshot's expanded size (D-061).
+ */
+async function tidy(live: string | null): Promise<void> {
+  const root = await opfsRoot()
+  const text = await readTextEntry(root, STAGING_RECORD_FILE)
+  let record: StagingRecord | null = null
+  if (text !== null) {
+    try {
+      record = parseStagingRecord(JSON.parse(text))
+    } catch {
+      record = null
+    }
+  }
+  const keep = [live, record?.file, record ? STAGING_RECORD_FILE : null].filter(
+    (name): name is string => typeof name === 'string'
+  )
+  await sweep(root, keep)
+}
+
+/** Nothing is known, so nothing is claimed and nothing is deleted. */
+function postUnknown(): void {
+  post({
+    type: 'status',
+    ready: false,
+    storage: 'unknown',
+    rev: null,
+    generated: null,
+    notice: null,
+  })
+}
+
+/**
+ * Report what is on disk — and reclaim orphans, but only once that report is
+ * backed by an open database.
+ *
+ * The ordering is the load-bearing part. `tidy` deletes everything not on its
+ * keep list, and the keep list comes from discovery, so *any* uncertainty in
+ * discovery has to stop the sweep rather than shrink the keep list. Two
+ * failures of that shape were reproduced against an earlier version: an
+ * unreadable entry reported as "nothing here" swept the live database, and a
+ * slot chosen from raw header bytes could be one whose promotion never
+ * committed (D-061).
+ */
 async function status(): Promise<void> {
-  const vfs = await storedIn()
-  if (!vfs) {
-    post({ type: 'status', ready: false, rev: null, generated: null, notice: null })
+  let found: Discovery
+  try {
+    found = await storedIn()
+  } catch {
+    postUnknown()
     return
   }
+
+  if (!found.live) {
+    // Only a *conclusive* look at an origin with no promoted database licenses
+    // reclaiming what is left. Otherwise something here could not be examined,
+    // and it may be the copy the user is relying on.
+    if (found.conclusive) {
+      if (!db) await tidy(null).catch(() => undefined)
+      post({
+        type: 'status',
+        ready: false,
+        storage: 'empty',
+        rev: null,
+        generated: null,
+        notice: null,
+      })
+    } else {
+      postUnknown()
+    }
+    return
+  }
+  const live = found.live
+
   try {
     if (!db) {
       // Deliberately not `db ??= await openDatabase(...)`: that tests `db`,
       // awaits, and then assigns unconditionally — so a status racing an
       // import overwrites the connection the import just installed. Re-check
       // after the await and drop the loser.
-      const opened = await openDatabase(vfs)
+      const opened = await openDatabase(live.vfs, live.file)
       if (db) opened.close()
-      else db = opened
+      else {
+        db = opened
+        liveFile = live.vfs === 'opfs' ? live.file : null
+      }
     }
-    post({
-      type: 'status',
-      ready: true,
-      rev: (db.selectValue("SELECT v FROM meta WHERE k = 'rev'") as number) ?? null,
-      generated: (db.selectValue("SELECT v FROM meta WHERE k = 'generated'") as number) ?? null,
-      // D-008 travels with the data, so it is read from the database rather
-      // than remembered by the page that happened to import it.
-      notice: (db.selectValue("SELECT v FROM meta WHERE k = 'notice'") as string) ?? null,
-    })
+    const rev = (db.selectValue("SELECT v FROM meta WHERE k = 'rev'") as number) ?? null
+    const generated = (db.selectValue("SELECT v FROM meta WHERE k = 'generated'") as number) ?? null
+    // D-008 travels with the data, so it is read from the database rather
+    // than remembered by the page that happened to import it.
+    const notice = (db.selectValue("SELECT v FROM meta WHERE k = 'notice'") as string) ?? null
+
+    // Only here, and only on a conclusive look: the database discovery chose is
+    // open and answering, so the keep list names a copy that demonstrably
+    // exists — and nothing else on disk went unexamined.
+    if (found.conclusive) await tidy(liveFile).catch(() => undefined)
+    post({ type: 'status', ready: true, storage: 'ready', rev, generated, notice })
   } catch {
-    post({ type: 'status', ready: false, rev: null, generated: null, notice: null })
+    // Discovery named a file we then could not open or read. That is not an
+    // empty origin — it is an unknown one, and it must not authorise a sweep.
+    postUnknown()
   }
 }
 
@@ -569,8 +1226,11 @@ function query(sql: string): void {
 async function reset(): Promise<void> {
   db?.close()
   db = null
+  liveFile = null
   await clearStorage()
-  post({ type: 'status', ready: false, rev: null, generated: null, notice: null })
+  // `empty` rather than `unknown`: `clearStorage` throws unless every entry
+  // really went, so reaching this line is proof the origin is empty.
+  post({ type: 'status', ready: false, storage: 'empty', rev: null, generated: null, notice: null })
 }
 
 /**
@@ -585,13 +1245,46 @@ async function reset(): Promise<void> {
  *
  * So: only "not found" is tolerated, and only per-VFS. Anything else propagates
  * and the caller reports a failure.
+ *
+ * Staged replacement widened this: there are now up to two database files, the
+ * journals SQLite writes beside them, and a resume record. A clear that leaves
+ * a half-downloaded 441 MB slot behind has not cleared what the user asked
+ * about, so this enumerates rather than naming one file — and unlike `sweep`,
+ * every failure propagates.
  */
 async function clearStorage(): Promise<void> {
   const root = await opfsRoot()
-  await root.removeEntry(DB_FILE).catch((error: unknown) => {
-    if (!isNotFound(error)) throw error
-  })
+  const ours: string[] = []
+  for await (const entry of root.values()) {
+    if (isOurEntry(entry.name)) ours.push(entry.name)
+  }
+  // The resume record first, and keep going after a failure. Returning early
+  // left the outcome to OPFS enumeration order: a slot another tab holds open
+  // would abort the loop, and whether the record outlived the file it describes
+  // came down to which name came first. A record that survives its file is the
+  // input to the worst failure this design has (D-061).
+  ours.sort((a, b) => Number(b === STAGING_RECORD_FILE) - Number(a === STAGING_RECORD_FILE))
+  const failed: string[] = []
+  for (const name of ours) {
+    await removeIfPresent(root, name).catch(() => failed.push(name))
+  }
+  if (failed.length > 0) {
+    throw new Error(`could not remove ${failed.join(', ')} — another tab may have them open`)
+  }
 
+  await unlinkPoolCopy(root)
+}
+
+/**
+ * Remove the `opfs-sahpool` copy, if one was ever made.
+ *
+ * Split out because two callers need it for different reasons: "Clear local
+ * copy", which must not report a clear it did not achieve, and a staged
+ * promotion, which inherits M1's rule that an import leaves exactly one copy
+ * behind. The pool's files are invisible to `removeEntry`, so this is the only
+ * way to reach them.
+ */
+async function unlinkPoolCopy(root: FileSystemDirectoryHandle): Promise<void> {
   // Only touch the pool if it was ever used: installing it opens and holds a
   // file handle per entry, which a default-path session should never pay for.
   // A missing pool directory is "not there", not a failure.
@@ -607,7 +1300,7 @@ async function clearStorage(): Promise<void> {
   const pool = await installSahPool()
   // `unlink` returns whether it removed anything; false means it was already
   // absent, which is fine. A genuine failure throws.
-  pool.unlink(`/${DB_FILE}`)
+  pool.unlink(`/${POOL_DB_FILE}`)
 }
 
 /**
@@ -670,10 +1363,11 @@ async function handle(request: Request): Promise<void> {
   } catch (error) {
     report('error', null, '')
     post({ type: 'error', message: error instanceof Error ? error.message : String(error) })
-    // Resync: a failed import has already closed and truncated the previous
-    // database, and a failed clear may have left one behind. Either way the
-    // page's idea of what exists is now stale, and it cannot work that out from
-    // an error string.
+    // Resync, and on the staged path this is where the good news arrives: a
+    // failed download leaves the previous database untouched, so `status` says
+    // "still ready" and the page keeps its query surface instead of offering a
+    // fresh Download. A failed clear may equally have left a copy behind. The
+    // page cannot work either of those out from an error string.
     await status().catch(() => undefined)
   }
 }

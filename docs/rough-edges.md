@@ -22,6 +22,85 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-017: Overwriting a SQLite database while its rollback journal survives replays the old journal into the new file  (2026-08-04, status: worked-around)
+
+**Environment.** SQLite 3.45.1 via Python 3.12.3 on Linux; the same commit
+machinery the `@sqlite.org/sqlite-wasm` 3.53.0 build uses in the browser. Any
+journal-mode database, which is what the pipeline publishes (header bytes 18/19
+= 1).
+
+**Repro.**
+
+1. Build a database whose rows are marked `GENERATION-A`, then kill a process
+   mid-commit until a rollback journal survives (see RE-016's repro loop).
+2. Build a second, entirely valid database marked `GENERATION-B`.
+3. Copy B's bytes over the first database's *main file only*, leaving the
+   journal in place — what a staged download does when it reuses a slot.
+4. Open it.
+
+**Observed.** The file stops being B. Before the open its bytes are identical to
+B; after the open they are not, and the 4,000 rows it then holds match neither
+marker — SQLite replayed A's pages into B's file. No error is raised.
+
+**Expected.** Nothing to expect, really: SQLite documents this exact pattern as
+a corruption path
+(https://sqlite.org/howtocorrupt.html#_mispairing_database_files_and_hot_journals,
+read 2026-08-04). The trap is that the pairing is by *file name*, so a journal
+becomes a hazard to a file that never had anything to do with it.
+
+**Impact here.** Staged replacement reuses two slots by name (D-061). A crash
+during the client's index build leaves a journal beside the staging slot; the
+next download writes a new generation's verified bytes into that same name. The
+promotion gate then inspects a database that is no longer the artifact whose
+chunk hashes were checked — and the gate reads `meta` and a row count, which a
+replayed page can leave intact. Worked around by removing a slot's sidecars
+before any raw byte is written into it, and *not* removing them when the bitmap
+is already complete, where the journal legitimately belongs to the file and
+rolling back a half-built index is the correct outcome. Regression test:
+`tests/e2e/staged.spec.ts`, "sidecars beside a staging slot are cleared before
+its bytes are reused" — which plants a superjournal rather than a `-journal`,
+because SQLite's own recovery deletes a malformed `-journal` and the test would
+otherwise pass against the bug.
+
+**Links:** D-061, RE-016, RE-014 (the other silent way to get a
+correctly-sized, wrong database).
+
+## RE-016: A SQLite database header can advertise a change the rollback journal has yet to commit  (2026-08-04, status: worked-around)
+
+**Environment.** SQLite 3.45.1 via Python 3.12.3 on Linux. Not engine-specific —
+it follows from the documented commit sequence
+(https://sqlite.org/atomiccommit.html, read 2026-08-04).
+
+**Repro.** In a loop: create a database with `user_version=5`, start a child
+that repeatedly commits a transaction setting `user_version=9` and then resets
+it, `kill -9` the child after a random 200–700 ms, and stop when a
+`-journal` file survives. Then compare the header field at byte offset 60 with
+what SQLite reports after opening. Reproduced on the **first** attempt.
+
+**Observed.** Raw header bytes 60–63 read `9`; `PRAGMA user_version` after the
+open reads `5`, and the journal is gone. The bytes on disk described a change
+that never committed.
+
+**Expected.** Exactly this, once stated: commit writes the dirty pages *and
+then* deletes the journal, so between those two steps the main file is ahead of
+the committed state. The journal is the authority, not the page contents.
+
+**Impact here.** Staged replacement records which of two database files is live
+in `PRAGMA user_version` (D-061), and reading it from the header was tempting —
+one 100-byte read instead of an open. It is unsound: a crash during a promotion
+leaves a slot advertising a promotion that the next open rolls back, that slot
+wins discovery, and the sweep then deletes the database that really was live.
+Worked around by reading the counter through SQLite (which performs the recovery
+as a side effect, so discovery judges a consistent file) and by deleting nothing
+until the chosen database is open and answering.
+
+**Not reproducible in the browser.** Producing a genuine half-committed journal
+needs a kill inside the commit sequence, which a Playwright test cannot arrange;
+the in-browser regression uses a slot SQLite cannot open at all, and this
+reproduction covers the race itself.
+
+**Links:** D-061, RE-017.
+
 ## RE-015: A lone surrogate in a CVE description is legal JSON that SQLite cannot store  (2026-08-02, status: worked-around for the daily ingest 2026-08-03; still open for a direct `build.py` run)
 
 **Environment.** Python 3.12.3 `sqlite3` (SQLite 3.45.1) on Linux; reachable

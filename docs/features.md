@@ -29,11 +29,11 @@ the decision log, not by editing a row. The AI chat layer section was added
 | "N new CVEs since your last sync" summary | `confirmed` | Turns an invisible background chore into the reason to open the app; near-free once a watermark exists. |
 | Notice carried by every served artifact | `confirmed` | D-008 requires MITRE's copyright designation and license text in any copy; in-band where the format allows. Not discretionary. |
 | Scheduled server-side `git fetch` | `confirmed` | D-042. Daily cron under `flock`; monthly snapshot rebuild. Failure leaves the previous generation serving; staleness reaches users through the manifest, not a second channel. |
-| Explicit "Download data" action | `confirmed` | D-025, D-026. Cached monthly snapshot (D-042) *plus* every delta since it was taken, so download leaves the client current. **62.6 MB brotli -q10** for the whole corpus (D-035, D-038). |
+| Explicit "Download data" action | `confirmed` | D-025, D-026. Cached monthly snapshot (D-042) *plus* every delta since it was taken, so download leaves the client current. **62.6 MB brotli -q10** for the whole corpus (D-035, D-038). Snapshot half shipped in M2 with staged replacement (D-061); the catch-up half lands with Sync, so a download currently stops at `snapshot.rev`. |
 | Explicit "Sync" action applying a delta | `confirmed` | D-025. Median day 0.17 MB, busiest observed 0.78 MB — ~574× cheaper than re-downloading. Same apply path as download (D-026). |
 | Monthly snapshot rebuild with cached compressed chunks | `confirmed` | D-042, refining D-026. A month of catch-up is ~31 daily deltas and ~2.6 MB against 62.6 MB — about 4%. |
 | Merged deltas per watermark range | `confirmed` | D-026, D-031. A range query over per-record revisions returns final state by construction. Daily ingest (D-042) means one file per day and no rollup. |
-| Resumable / interruptible download | `confirmed` | D-041. A property of the format rather than a feature: independently-compressed 32 MB chunks make resume a bitmap of what is already written. |
+| Resumable / interruptible download | `confirmed` | D-041, implemented in D-061. A property of the format rather than a feature: independently-compressed 32 MB chunks make resume a bitmap of what is already written. Measured at full scale: an interrupted re-download resumes by fetching 11 of 12 chunks, and the previous copy is untouched throughout. |
 | Server-assigned stable IDs for interned lookups | `confirmed` | D-025 hazard 1. Deltas reference CWE/CNA/vendor/product by integer, so the server must own that ID space permanently and ship new lookup rows with the deltas that use them. |
 | FTS index maintenance on delta apply | `confirmed` | D-025 hazard 2. External-content FTS5 does not self-update; a missed `'delete'` silently desynchronizes search from the data. |
 | Tombstones for removed records | `confirmed` | D-025 hazard 3. Without them an upstream removal persists in every client forever. |
@@ -173,7 +173,7 @@ Ordered by how much rework a late answer would cause.
    | — of which fetch | 13.8 s | cumulative across four concurrent chunks, so larger |
    | — checksum (SHA-256) | 0.1 s | likewise cumulative |
    | — decompress (WASM brotli) | 1.9 s | likewise |
-   | — write to OPFS | 3.2 s | likewise |
+   | — write to OPFS | 3.2 s | likewise. **Pre-D-061**: staged replacement adds a `flush()` and a bitmap write per chunk, taking this to 4.7 s. |
    | Open the database | 31 ms | wall-clock |
    | **Build FTS indexes** | **66.1 s** | wall-clock, serial |
    | **Total** | **73.3 s** | wall-clock |

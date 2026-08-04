@@ -295,7 +295,10 @@ async function importOnce(
     // across concurrent chunks, and already exceeds 10 s unthrottled at
     // concurrency 4, so a threshold on it would only catch the serial case.
     // 62.7 MB at 50 Mbps cannot elapse in under ~10 s at any concurrency.
-    const elapsedTransportMs = timings.totalMs - timings.indexMs - timings.openMs
+    // `verifyMs` is subtracted too: verification, promotion and sweeping a
+    // replaced 441 MB generation sit between the stages stamped above, and
+    // without it they are reported as transport (D-061).
+    const elapsedTransportMs = timings.totalMs - timings.indexMs - timings.openMs - timings.verifyMs
     if (extra.throttle && elapsedTransportMs < 10_000) {
       record({
         kind: 'note',

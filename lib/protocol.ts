@@ -179,7 +179,8 @@ export interface Delta {
  * cold aggregate over the whole corpus takes seconds — silence there is
  * indistinguishable from a hang.
  */
-export type Phase = 'idle' | 'manifest' | 'download' | 'index' | 'query' | 'ready' | 'error'
+export type Phase =
+  'idle' | 'manifest' | 'download' | 'index' | 'verify' | 'query' | 'ready' | 'error'
 
 export interface Progress {
   phase: Phase
@@ -213,6 +214,25 @@ export interface ImportOptions {
   concurrency?: number
   vfs?: Vfs
   cacheMib?: number
+  /**
+   * Abort the download after this many chunks have landed *in this run*, as if
+   * the network had died there.
+   *
+   * A test affordance, in the same spirit as the three knobs above and for the
+   * same reason: staged replacement exists so that an interrupted download can
+   * be resumed and cannot damage the live copy, and neither property can be
+   * asserted without a way to interrupt one deterministically. A 63 MB download
+   * over loopback finishes long before a test can race it.
+   *
+   * It is not a hazard worth guarding beyond the clamp: the worst a crafted
+   * `?stop=1` link can do is make a download stop early, leaving the previous
+   * database exactly where it was — which is the property under test.
+   *
+   * Zero and below mean "do not stop", which is what the name says; they are
+   * not clamped up to 1, because a knob that aborts after one chunk when asked
+   * to abort after none is a trap for the next caller.
+   */
+  stopAfterChunks?: number
 }
 
 export type Request =
@@ -233,6 +253,16 @@ export type Response =
   | {
       type: 'status'
       ready: boolean
+      /**
+       * What the Worker actually established about local storage.
+       *
+       * `ready` cannot carry this: it is false both for "there is no local
+       * copy" and for "I could not find out", and the two call for opposite
+       * responses — the first is an invitation to download, the second must not
+       * clear the panels or claim the copy is gone, because it may not be
+       * (D-061).
+       */
+      storage: 'ready' | 'empty' | 'unknown'
       rev: number | null
       generated: number | null
       notice: string | null
@@ -252,6 +282,11 @@ export interface BenchResult {
 /**
  * Q-003's numbers, reported by the Worker rather than inferred from the UI.
  *
+ * `writeMs` covers everything the staged writer does — the truncate, the
+ * positional writes, a `flush()` per chunk, and persisting the resume bitmap
+ * after each one (D-061). It is therefore not comparable with a pre-D-061
+ * reading, which flushed once for the whole download.
+ *
  * fetchMs / decompressMs / writeMs are *cumulative per-chunk time* summed
  * across chunks that run concurrently — they measure work, not elapsed time,
  * and their sum exceeds wall-clock whenever `concurrency` is above 1. totalMs
@@ -267,10 +302,27 @@ export interface Timings {
   writeMs: number
   openMs: number
   indexMs: number
+  /**
+   * Verifying the staged copy, promoting it, and sweeping what it replaced
+   * (D-061). Serial wall-clock, like `openMs` and `indexMs`.
+   *
+   * Reported separately because it is otherwise invisible: it lands between the
+   * stages the measurement sweep already stamps, so `total - index - open`
+   * silently absorbed it and reported it as transport.
+   */
+  verifyMs: number
   totalMs: number
   compressedBytes: number
   rawBytes: number
   records: number
+  /** Chunks in the snapshot, and how many this run actually had to fetch. */
+  chunksTotal: number
+  /**
+   * Fewer than `chunksTotal` means the run resumed a staged download and
+   * skipped what was already on disk (D-061). `compressedBytes` still reports
+   * the whole snapshot, so the two together say what a resume was worth.
+   */
+  chunksFetched: number
   /** The settings this run used, so a recorded number is never ambiguous. */
   vfs: Vfs
   concurrency: number
