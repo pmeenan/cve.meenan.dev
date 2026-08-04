@@ -215,13 +215,16 @@ than harmful:
 
     43 5 1 * * cd /var/www/meenan.dev && python3 /home/pmeenan/src/meenan.dev/cve/pipeline/snapshot.py cve.pub/data --state cve.data/state >> cve.data/state/snapshot.log 2>&1
 
-**Not installed yet.** The first rotation on the live origin is refused until
-one daily run has *published a delta* — a snapshot landing at head must be the
-artifact that head's content came from, and the ledger had no record of it
-before D-060. Verified against the live ledger: the run stops with the message
-that names the fix. A day is usually enough, but the run has to mint a revision
-to record anything, so a quiet day does not clear it; `ingest.py status` shows
-the head moving when it has.
+**Installed in `pmeenan`'s crontab on `plex` since 2026-08-04**, with a comment
+line above it saying how to remove it, and the previous crontab backed up beside
+it. First unattended firing is 1 September.
+
+Until a revision carries an artifact digest the rotation refuses: a snapshot
+landing at head must *be* the artifact that head's content came from, and the
+ledger recorded none before D-060. Confirmed on the live origin by running the
+cron's own command line, which stopped with the message that names the fix. Only
+a run that **mints a revision** clears it, so a quiet day does not — but the
+first firing is a month of dailies away, so the cron cannot meet that state.
 
 It waits up to 15 minutes for the lock rather than skipping, which is the
 opposite of the daily's non-blocking take and deliberate: a daily finishing

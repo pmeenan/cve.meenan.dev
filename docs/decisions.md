@@ -291,13 +291,23 @@ the result is **byte-for-byte the artifact**, same SHA-256 over all 377 MB. And
 re-running the job reports "snapshot already at head" and rewrites nothing,
 which is what a quiet month looks like.
 
-The fail-closed path in §2 was exercised against the live ledger first, twice:
-it has no artifact records, so the rotation was refused with the message that
-names the fix. That is a **deployment consequence** rather than a hypothetical —
-the first rotation after this ships is refused until one daily run *mints a
-revision*, since a quiet day records nothing. Both runs were made in a scratch
-copy: the live origin was never touched and the checkout D-059 runs from stayed
-clean, checked afterwards.
+The fail-closed path in §2 was exercised against the live ledger first, twice
+in a scratch copy and once for real: it has no artifact records, so the rotation
+was refused with the message that names the fix. That is a **deployment
+consequence** rather than a hypothetical — a rotation is refused until one daily
+run *mints a revision*, since a quiet day records nothing. The scratch runs
+never touched the live origin, and the checkout D-059 runs from stayed clean,
+checked afterwards.
+
+**Deployed and installed 2026-08-04.** `git pull` into the checkout the crons
+run from (D-059), 242 tests green on the server, and the daily's cycle rehearsed
+against the real corpus before anything was scheduled — 43.8 s, 1.22 GB peak
+RSS, 686 upserts, 0 tombstones, nothing published. The monthly is `43 5 1 * *`,
+86 minutes clear of the daily and taking the same lock; its own command line was
+then run in production, which is where the refusal above was observed for real,
+confirming the invocation, the log redirection and the guard in one go without
+recording an outcome. First unattended firing is 2026-09-01, by which time a
+month of dailies will have recorded digests — so the guard cannot trip on it.
 
 Every new guard was checked by mutation, the method D-056 established — each one
 removed, the suite re-run, and a *named* test required to fail. Restoring the

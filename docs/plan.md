@@ -247,9 +247,8 @@ everything downstream consumes them.
       `no-cache` policies, COOP/COEP, no `Access-Control-Allow-Origin`, the
       ledger unreachable — and end to end by a real browser importing the new
       generation from `https://cve.meenan.dev/`.
-- [ ] **Monthly snapshot cron** (D-060). *Built, reviewed and measured
-      2026-08-03; the cron entry itself needs a commit and one daily delta,
-      neither of which an agent can do (rule 7).*
+- [x] **Monthly snapshot cron** (D-060). Built and reviewed 2026-08-03,
+      deployed and installed 2026-08-04; first unattended firing 1 September.
       - [x] **`pipeline/snapshot.py`.** Take D-042's `flock`, finish any crashed
             ingest, publish **the artifact the ingest state points at** at the
             revision it is stamped with — which must be the published head —
@@ -300,10 +299,26 @@ everything downstream consumes them.
             the rotation for a month. Six guards had no failing test when first
             deleted; every guard has one now, and each was checked by removing
             it rather than by watching the suite pass.
-      - [ ] **Install the cron on `plex`.** Needs the change committed and
-            pulled (D-059), and one daily run that mints a revision — a
-            rotation at a head with no recorded artifact digest is refused,
-            which was verified against the live ledger rather than assumed.
+      - [x] **Installed on `plex` 2026-08-04**, `43 5 1 * *`, 86 minutes
+            clear of the daily's 4:17 and taking the same lock. Deployed by
+            `git pull` into the checkout the crons run from (D-059) — 242 tests
+            green on the server, checkout clean — and the daily's whole cycle
+            rehearsed against the real corpus first (`--dry-run`: 43.8 s,
+            1.22 GB peak RSS, 686 upserts, 0 tombstones, nothing published).
+            The cron's own command line was then executed in production, where
+            it refused with D-060's message because rev 5 predates artifact
+            digests: the invocation, the log redirection and the fail-closed
+            guard all confirmed live, and no outcome recorded because a dry run
+            writes none.
+
+            **What has not been observed is the scheduler firing it**, which
+            first happens 1 September — by then a month of dailies will have
+            recorded digests, so the guard above cannot trip. That is the one
+            way this differs from the daily, which was checked only after it had
+            run unattended: a monthly cannot be, without blocking the milestone
+            on a calendar. The work itself is verified four times over at full
+            scale against a scratch copy of the live plane. `last_snapshot` in
+            `ingest.py status` is what will say it worked.
 
 - [ ] **Download with staged replacement.** Chunks and catch-up deltas land in
       a *staging* OPFS file — never truncating the live database (the M1 path

@@ -165,10 +165,9 @@ URL (D-058); and the monthly job rotates the generation onto the artifact that
 daily last built rather than rebuilding, landing *at* the published head —
 checked against an artifact digest the ledger now records, which settles D-056's
 open question — while retaining the previous generation and its deltas (D-060).
-The daily is **running in production** on `plex` and advancing the head; the
-monthly is built and measured (~90 s on the real corpus) but its cron entry is
-not installed, which needs a commit and one daily delta. The client half —
-Download with staged replacement — is next. A 2026-08-03 owner
+Both crons are **installed and running in production** on `plex`: the daily is
+advancing the head, and the monthly (~90 s on the real corpus) first fires
+2026-09-01. The client half — Download with staged replacement — is next. A 2026-08-03 owner
 decision re-ordered the AI
 ladder: the first model tier is a site-hosted Ollama behind a restricted
 same-origin chat relay, re-scoping M7 and M8 (D-057). M0 closed with scope,
