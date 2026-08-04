@@ -35,7 +35,20 @@ test('imports, queries, and survives a reload', async ({ page }) => {
 
   await test.step('import', async () => {
     await page.getByRole('button', { name: /Download data/ }).click()
-    await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 180_000 })
+
+    // Building the indexes is 90% of an import — 9 s on the development slice,
+    // 65 s on the full corpus — so D-052 puts it above the line where silence
+    // is indistinguishable from a hang. Asserted here rather than sampled after
+    // the fact because it is a property of the *wait*: it has to be countable
+    // while the user is looking at it. Not a race at either scale — the phase
+    // lasts seconds and reports about 96 times inside it.
+    const progress = page.locator('.progress')
+    await expect(progress).toContainText(/[\d,]+ descriptions indexed/, { timeout: 300_000 })
+    // And a determinate bar while it does: a fraction, not the full-width
+    // placeholder an unmeasurable phase renders.
+    await expect(page.locator('.progress .fill')).toHaveAttribute('data-indeterminate', 'false')
+
+    await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
 
     const timings = await page.locator('.timings').innerText()
     test.info().annotations.push({ type: 'Q-003', description: timings.replace(/\n/g, ' ') })
@@ -59,6 +72,28 @@ test('imports, queries, and survives a reload', async ({ page }) => {
     const cells = page.locator('.results tbody tr').first().locator('td')
     await expect(cells).toHaveCount(3)
     expect(Number(await cells.nth(1).innerText())).toBeGreaterThan(0)
+  })
+
+  await test.step('the client-built indexes are searchable (D-035)', async () => {
+    // The indexes are built here rather than shipped, a rowid range at a time,
+    // which puts this app in charge of covering the id space. A range dropped
+    // by that walk shows up nowhere else: the fts5 tables exist either way, the
+    // promotion gate counts tables and not rows, and the only symptom is
+    // records that can never be found. tests/unit/search.test.ts holds the
+    // arithmetic to the same standard against SQLite directly; this is the one
+    // place the WASM build's own fts5 answers a search over the real corpus.
+    await page.getByRole('button', { name: 'Measure query latency' }).click()
+    await expect(page.getByRole('heading', { name: 'Query latency' })).toBeVisible({
+      timeout: 300_000,
+    })
+
+    const json = await page.locator('table.bench').getAttribute('data-json')
+    const results = (JSON.parse(json ?? '{}').results ?? []) as { name: string; rows: number }[]
+    const rows = (name: string) => results.find((entry) => entry.name === name)?.rows
+    // Descriptions and vendor names — two of the three indexes, through two
+    // different code paths (a join back to `cve`, and a bare lookup).
+    expect(rows('fts-ranked'), 'no CVE matched a description search').toBeGreaterThan(0)
+    expect(rows('fts-vendor'), 'no vendor matched a name search').toBeGreaterThan(0)
   })
 
   await test.step('the notice travels with the copy (D-008)', async () => {

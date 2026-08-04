@@ -175,7 +175,7 @@ Ordered by how much rework a late answer would cause.
    | — decompress (WASM brotli) | 1.9 s | likewise |
    | — write to OPFS | 3.2 s | likewise. **Pre-D-061**: staged replacement adds a `flush()` and a bitmap write per chunk, taking this to 4.7 s. |
    | Open the database | 31 ms | wall-clock |
-   | **Build FTS indexes** | **66.1 s** | wall-clock, serial |
+   | **Build FTS indexes** | **66.1 s** | wall-clock, serial. **Pre-M2**: the build now walks the rowid space in batches so it can report progress through this minute (D-052), which costs about 1% — 58.0/58.3/58.4 s against `'rebuild'`'s 57.3/57.6/57.8 s, three runs each in one later session on this machine. |
    | **Total** | **73.3 s** | wall-clock |
 
    Semantics caveat (lib/protocol.ts): the indented per-chunk rows are times

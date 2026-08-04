@@ -26,6 +26,7 @@
  * live in the Worker.
  */
 import { chunkUrl, isRevision, type ChunkEntry, type Manifest } from './protocol'
+import { SEARCH_INDEXES } from './search'
 
 /** Bumped when the record's own shape changes; an older record is discarded. */
 export const STAGING_RECORD_VERSION = 1
@@ -377,8 +378,16 @@ export function classifyCandidate(read: CandidateReader, schemaVersion: number):
  * counter — publisher drift, which nothing upstream forbids — would be adopted
  * straight out of a staging file, retiring the real copy and leaving a database
  * that cannot be searched (D-061).
+ *
+ * Read out of `SEARCH_INDEXES` rather than repeated: a fourth index added there
+ * and forgotten here would leave the completion check silently not covering it,
+ * which is a gap that reports nothing.
  */
-export const REQUIRED_TABLES = ['meta', 'cve', 'fts', 'fts_vendor', 'fts_product'] as const
+export const REQUIRED_TABLES: readonly string[] = [
+  'meta',
+  'cve',
+  ...SEARCH_INDEXES.map((index) => index.fts),
+]
 
 /**
  * Refuse a database whose promotion cannot be shown to have completed.

@@ -2936,9 +2936,12 @@ the database compresses at 5×. It is the single most expensive thing per byte
 that we were shipping. Adding vendor and product to the index costs 1.2 MB
 shipped and nothing at all when built locally.
 
-**Consequences.** The client runs `INSERT INTO fts(fts) VALUES('rebuild')` once
-after import and maintains the index incrementally thereafter, exactly as
-D-031's delta apply already does. Delta application is unchanged.
+**Consequences.** The client builds each index once after import and maintains
+it incrementally thereafter, exactly as D-031's delta apply already does. The
+initial build walks the content table's rowid space in batches inside one
+transaction per index. That is equivalent to fts5's opaque `'rebuild'` command,
+but exposes countable progress through the minute-long browser build (D-052) at
+about 1% measured cost. Delta application is unchanged.
 
 The cost moves from bandwidth to first-run CPU, and **that cost is unmeasured in
 a browser**. Native SQLite rebuilt the description index in 3 s; WASM writing

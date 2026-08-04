@@ -361,8 +361,36 @@ everything downstream consumes them.
       licensing a sweep, and an unbound resume record — plus a promotion gate
       with no test at any level; each now has a regression test checked by
       removing the fix.
-- [ ] **Client-built FTS** over descriptions, vendors and products (D-035),
-      surfaced in the same progress display.
+- [x] **Client-built FTS** over descriptions, vendors and products (D-035),
+      surfaced in the same progress display. The index build is 58 of the 64
+      seconds a full-corpus import takes — the longest wait the app has — and it
+      was reporting an indeterminate bar for all of it, which is the case D-052
+      rule 3 exists for. fts5's `'rebuild'` is one opaque statement, so the
+      build now walks the rowid space in batches instead and reports through it:
+      a fraction weighted by each index's measured share of the indexed text
+      (descriptions are 98% of it), and an exact running row count. The rowid
+      range is the progress metric because it is the only one that is free —
+      `min`/`max` on an INTEGER PRIMARY KEY are seeks, where `count(*)` would
+      scan the 122 MB the build is about to read anyway — and it is honest
+      enough: half the id space is 40% of the text, so the bar runs slightly
+      fast early, never backwards. Measured at full scale on the real published
+      artifact, three runs each in one session: **58.0 / 58.3 / 58.4 s batched
+      against 57.3 / 57.6 / 57.8 s for `'rebuild'`** — about 1%, for ~96 updates
+      through a minute of silence. The index is the same size either way,
+      because the batches share one transaction per index and fts5 flushes its
+      hash on its own schedule inside one; committing per batch is what would
+      have cost segments. What the batching moves is *who* covers the id space:
+      a dropped range is records that exist and cannot be found, with the fts5
+      tables present, the row counts right and the promotion gate passing — so
+      the ranges are held to it directly (`tests/unit/search.test.ts`, against
+      the published schema and the same SQLite the browser runs, every row
+      carrying a unique token so coverage is asserted row by row, and the whole
+      build compared against `'rebuild'` on hostile text). Both halves of the
+      claim were checked by breaking them: a dropped range and an off-by-one in
+      the range predicate each fail six tests. `import.spec.ts` now also asserts
+      the index phase reports a row count and a determinate bar while the user
+      is waiting on it, and that a search over the imported corpus returns rows
+      — the one place the WASM build's own fts5 answers a query.
 - [ ] **Sync.** Merged deltas applied in one idempotent transaction, watermark
       advancing with the rows; FTS maintenance with the explicit `'delete'`
       protocol, verified by `integrity-check` at `rank = 1` (RE-005).

@@ -21,6 +21,7 @@ import type { Database, SAHPoolUtil, Sqlite3Static } from '@sqlite.org/sqlite-wa
 
 import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
+import { batchRanges, indexBatches, indexPlan, indexSql, type SearchIndex } from '../lib/search'
 import {
   assertLocallyUsable,
   assertPromotable,
@@ -709,7 +710,7 @@ async function runImport(options: ImportOptions, transfers: AbortController): Pr
   }
 
   // One try, one close. Every step from here to the promotion can throw —
-  // `verifyStaged` by design, the fts5 rebuild on hostile description text,
+  // `verifyStaged` by design, the fts5 build on hostile description text,
   // `nextGeneration` on an OPFS read, `promote` on SQLITE_BUSY or quota — and
   // a `staged` that escapes unclosed holds a sync access handle on the slot for
   // the life of the Worker, which wedges every later download *and* the clear
@@ -723,9 +724,8 @@ async function runImport(options: ImportOptions, transfers: AbortController): Pr
     // can search, and D-035 makes the indexes part of what "downloaded" means.
     // A crash here costs the index build on the next run, never the chunks —
     // the bitmap is already complete, so the retry starts at this line.
-    report('index', null, 'Building search indexes')
     const indexStart = performance.now()
-    buildSearchIndexes(staged)
+    buildSearchIndexes(staged, (fraction, detail) => report('index', fraction, detail))
     indexMs = performance.now() - indexStart
 
     if (stagedFile !== null) {
@@ -1006,29 +1006,93 @@ async function openDatabase(
  * Build the full-text indexes locally rather than shipping them (D-035).
  * Descriptions, vendors and products only: reference URLs would shred into
  * hosts, slugs and file names and pollute the same term space as the prose.
+ *
+ * Built a rowid range at a time rather than with fts5's own `'rebuild'`, which
+ * is one opaque statement. At full scale this is 58 of the 64 seconds an import
+ * takes — the single longest thing the app ever does — and D-052 requires
+ * anything past about a second to report real progress wherever the work is
+ * countable. Here it is countable, so an indeterminate bar was the wrong answer
+ * rather than the only one.
+ *
+ * It costs about 1%, which is what made it the right trade. Measured 2026-08-04
+ * against the live artifact (rev 2, 372,322 records) through this browser and
+ * this VFS, three runs each in one session: 58.0 / 58.3 / 58.4 s batched
+ * against 57.3 / 57.6 / 57.8 s for `'rebuild'` — ~0.7 s for about 96 progress
+ * updates through the longest wait the app has. The index is the same size
+ * either way (64.7 MB, measured natively) because inside a transaction fts5
+ * flushes its in-memory hash on its own schedule regardless, so the batches buy
+ * extra statements and not extra segments to merge. Committing per batch *would*
+ * have bought those, which is why they share one transaction.
  */
-function buildSearchIndexes(database: Database): void {
+function buildSearchIndexes(
+  database: Database,
+  onProgress: (fraction: number, detail: string) => void
+): void {
+  let base = 0
+  // Outside the try: if this throws, writes were never enabled and there is
+  // nothing to restore.
+  database.exec('PRAGMA query_only=OFF')
   // The restore is in a `finally` because this is the one place that turns
-  // writes back on, and `rebuild` steps 372k rows of attacker-influenced
+  // writes back on, and the build steps 354,521 rows of attacker-influenced
   // description text through fts5. If that throws mid-batch, a trailing pragma
   // inside the same exec never runs and the connection stays writable for the
   // rest of its life — disarming the very defense the pragma is there to be.
+  // `Database.transaction` has rolled the batch back by the time we get here.
   try {
-    database.exec(`
-      PRAGMA query_only=OFF;
-      DROP TABLE IF EXISTS fts;
-      DROP TABLE IF EXISTS fts_vendor;
-      DROP TABLE IF EXISTS fts_product;
-      CREATE VIRTUAL TABLE fts USING fts5(descr, content='cve_text', content_rowid='cve_id');
-      INSERT INTO fts(fts) VALUES('rebuild');
-      CREATE VIRTUAL TABLE fts_vendor USING fts5(name, content='vendor', content_rowid='id');
-      INSERT INTO fts_vendor(fts_vendor) VALUES('rebuild');
-      CREATE VIRTUAL TABLE fts_product USING fts5(name, content='product', content_rowid='id');
-      INSERT INTO fts_product(fts_product) VALUES('rebuild');
-    `)
+    for (const { index, share } of indexPlan()) {
+      onProgress(base, index.label)
+      fillIndex(database, index, share, (fraction, rows) => {
+        onProgress(base + share * fraction, `${rows.toLocaleString()} ${index.label} indexed`)
+      })
+      base += share
+    }
   } finally {
     database.exec('PRAGMA query_only=ON')
   }
+}
+
+/**
+ * Populate one fts5 index from its content table, one rowid range at a time.
+ *
+ * The rowid range is the progress metric because it is the only one that is
+ * free: `min`/`max` over an INTEGER PRIMARY KEY are b-tree seeks (SEARCH, not
+ * SCAN), where `count(*)` would scan the 122 MB the build is about to read
+ * anyway. It is a proxy and not the truth — descriptions have grown over the
+ * years, so half the id space is 40% of the text rather than 50% — which costs
+ * a bar that runs a little fast early and a little slow late, and never one
+ * that goes backwards. The row count in the detail line is exact, and counts
+ * rows rather than ids, so the holes D-056's retirement leaves in the id space
+ * are not reported as records.
+ */
+function fillIndex(
+  database: Database,
+  index: SearchIndex,
+  share: number,
+  onBatch: (fraction: number, rows: number) => void
+): void {
+  const sql = indexSql(index)
+  database.exec(sql.drop)
+  database.exec(sql.create)
+
+  const lo = database.selectValue(sql.min)
+  const hi = database.selectValue(sql.max)
+  // An empty content table has no bounds and needs no batches. The index still
+  // exists, which is what `assertPromotionCompleted` counts.
+  if (typeof lo !== 'number' || typeof hi !== 'number') return
+
+  const span = hi - lo + 1
+  let rows = 0
+  // One transaction for the whole index, not one per batch: see the note above
+  // on why committing per batch is what would have made this expensive. It is
+  // also what makes a failed build leave no half-populated index behind —
+  // `transaction` rolls back when the callback throws.
+  database.transaction(() => {
+    for (const [from, to] of batchRanges(lo, hi, indexBatches(share))) {
+      database.exec({ sql: sql.insert, bind: [from, to] })
+      rows += Number(database.changes())
+      onBatch((to - lo) / span, rows)
+    }
+  })
 }
 
 /** What discovery concluded, and whether it saw the whole picture. */

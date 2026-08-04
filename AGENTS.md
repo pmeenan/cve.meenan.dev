@@ -149,9 +149,11 @@ build → commit loop, on-demand reviews, and the human commit gate.
 and Sync. The server half is done and running in production on `plex`: delta
 wire contract (D-055), stable interned ID space (D-056), daily ingest (D-058)
 and monthly generation rotation (D-060) crons. On the client, **Download with
-staged replacement is done** (D-061); catch-up deltas aren't applied yet —
+staged replacement is done** (D-061), and the client-built FTS build now
+reports countable progress through the minute it spends indexing (D-035,
+D-052); catch-up deltas aren't applied yet —
 that's Sync — so a fresh download lands at `snapshot.rev` with the head ahead
-of it. Next: client-built FTS in the progress display, then Sync. The AI
+of it. Next: Sync, then stall detection and freshness. The AI
 ladder was re-ordered 2026-08-03: the first model tier is site-hosted Ollama
 behind a restricted same-origin relay, re-scoping M7/M8 (D-057). Process was
 rightsized for MVP scale 2026-08-04 (D-062). Details live in plan.md and the
