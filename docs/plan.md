@@ -15,9 +15,10 @@ it touched.
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
 Milestones are decomposed into task-sized checkboxes (the workflow's unit of
-work) no later than when they become the next milestone up — M2 is decomposed
-now; M3+ carry scope prose and exit criteria until their turn, and get their
-checkbox breakdown before work starts.
+work) no later than when they become the next milestone up — M0 – M2 are
+decomposed and closed; **M3 is next and still carries only scope prose**, so its
+checkbox breakdown is the first thing that milestone owes. M4+ carry scope prose
+and exit criteria until their turn.
 
 ## M0 — Plan the plan  `done`
 
@@ -178,298 +179,142 @@ and `pnpm check` / `pnpm e2e` are green. The one item deliberately left open is
 Cloudflare (below): it is not in the request path at all, which is M5's problem
 rather than a gap in this milestone.
 
-## M2 — Full-corpus Download and Sync  `in progress`
+## M2 — Full-corpus Download and Sync  `done`
 
-Tasks in dependency order; the wire contract and stable IDs come first because
-everything downstream consumes them.
+Tasks in dependency order — the wire contract and stable IDs came first because
+everything downstream consumes them. These are summaries: the reasoning, the
+failure modes each guard exists for, and the full measurements are in the
+decision entry each item names.
 
-- [x] **The delta wire contract** (D-055). Finalized for the full accepted
-      schema — all seven lookup tables, reference and version rows, tombstones
-      by CVE ID — typed in `lib/protocol.ts` (`Manifest.deltas: unknown[]` is
-      gone, and `snapshot.rev` joins the head `rev`), validated at runtime by
-      `lib/delta.ts`, emitted by `pipeline/delta.py` with the manifest writer
-      in `pipeline/manifest.py`. Contract-tested both ways: a pipeline-published
-      data plane validated by the browser's own code
+- [x] **The delta wire contract** (D-055). The whole accepted schema on the
+      wire — seven lookup tables, reference and version rows, tombstones by CVE
+      ID — typed in `lib/protocol.ts`, validated at runtime by `lib/delta.ts`,
+      emitted by `pipeline/delta.py`. Contract-tested both ways: a
+      pipeline-published data plane validated by the browser's own code
       (`tests/unit/contract.test.ts`), and a reference apply proving
       *sufficiency* — snapshot N + delta reconstructs snapshot N+1 table by
-      table, idempotently (`pipeline/tests/`). Lookup rows are selected by
-      per-table id floors rather than a `rev` column, which is the same range
-      query D-031 specified for seven fewer columns.
-- [x] **Stable interned IDs** (D-056). Builds seed from the previous artifact
-      or explicitly bootstrap — there is no default — and seeding covers
-      `cve.id` as well as the seven lookups. A value the corpus stops using is
-      retired rather than carried forward, which is safe only because its id is
-      never reissued: the high-water marks are recorded in the artifact's
-      `meta` (`hwm`, `cve_hwm`) instead of being recomputed as `max(id)`, and
-      that record is now where a delta's `floors` come from. The ID space also
-      has a name (`idspace`) and each artifact records the revision it
-      continued (`seed_rev`); `ledger.py` remembers the name the data plane was
-      published from, and both publishers refuse an artifact that contradicts
-      either — a different lineage, or the same lineage grown from the wrong
-      ancestor, which a fingerprint of the ID space separates even when two
-      builds share a revision. Proven at both scales: the fixture corpora are built twice,
-      unseeded and seeded, so D-055's renumbering reproductions are regression
-      tests; and on a synthetic corpus at the real corpus's ID-space
-      cardinalities, 1,252,797 ids survived a day's churn — 200 records
-      inserted ahead of every existing one — without one moving. The cost of
-      seeding is memory, not time; the numbers and their caveats are in D-056,
-      and they are dev-VM measurements on synthetic text, not production ones.
+      table, idempotently (`pipeline/tests/`).
+- [x] **Stable interned IDs** (D-056). Builds seed from the previous artifact or
+      explicitly bootstrap — there is no default — and a value the corpus stops
+      using is retired rather than carried forward, which is safe only because
+      ids are never reissued: the high-water marks live in the artifact's `meta`
+      rather than being recomputed, and both publishers refuse an artifact whose
+      lineage or ancestor contradicts the ledger. Proven at the real corpus's
+      cardinalities: 1,252,797 ids survived a day's churn without one moving.
 - [x] **Daily ingest cron** (D-058). `pipeline/ingest.py run` under `flock`:
-      fetch → hash → diff → tombstone guard → build → one delta, with
-      `pipeline/state.py` holding the hash state the diff needs. The guard runs
-      before the **build**, not merely before publication, because seeding
+      fetch → hash → diff → tombstone guard → build → one delta. The guard runs
+      before the **build** rather than before publication, because seeding
       retires permanently and a half-fetched tree would cost a new ID space —
-      which is why the run pays for a second walk of the corpus (16.9 s) and
-      then checks the two walks against each other. That check found and fixed a
-      real defect: `build.retired_records` counted every newly minted record as
-      a retirement. Re-run semantics are decided and tested at all three crash
-      windows, and turn on one question — was anything ever published at this
-      range? If nothing was, the pending run is abandoned and the revision
-      re-minted (which is what keeps a deterministic refusal from being replayed
-      forever); if something was, the pinned changeset is republished byte for
-      byte. Each test moves the tree on *and* advances the clock before
-      retrying, because otherwise the two behaviours are indistinguishable. A
-      missed day needs no handling; a no-change run mints no revision. Measured on `plex` against the real corpus, in scratch: one run
-      is 54.9 s and 1.22 GB peak RSS, and the real 69.5-hour window M1 left
-      behind produced a 204 KB delta (843 records) that the reference applier
-      turned into a database **identical to the rebuild across 3,778,313 rows**,
-      holding exactly the 15 products and 2 urls the rebuild retired. The D-056
-      migration is rehearsed at full scale and written up as the first
-      production run in `pipeline/README.md`; the seeded rebuild of the live
-      artifact minted zero ids, which is what makes `--adopt-id-space` honest.
-      D-056's deferred question is answered with it: the ID-space marker stays
-      **off** the wire, because the one path that looked like it could bypass
-      the ledger fails closed. **Run in production 2026-08-03** with the owner's
-      go-ahead (nothing is live yet, so the adoption's re-download cost was
-      zero): the origin was rebuilt onto a recorded ID space as snapshot rev 2,
-      the first delta carried 881 upserts in 218 KB, and the cron is installed
-      and advancing the head daily. Verified over HTTPS from outside the machine — immutable and
-      `no-cache` policies, COOP/COEP, no `Access-Control-Allow-Origin`, the
-      ledger unreachable — and end to end by a real browser importing the new
-      generation from `https://cve.meenan.dev/`.
-- [x] **Monthly snapshot cron** (D-060). Built and reviewed 2026-08-03,
-      deployed and installed 2026-08-04; first unattended firing 1 September.
-      - [x] **`pipeline/snapshot.py`.** Take D-042's `flock`, finish any crashed
-            ingest, publish **the artifact the ingest state points at** at the
-            revision it is stamped with — which must be the published head —
-            then retain and retire. It does not rebuild, because the daily
-            already does: every daily run writes a complete artifact and the
-            delta is only the wire file it emits afterwards, so the rotation is
-            the other four verbs and costs what compressing a generation costs.
-            It does not fetch either — a monthly job that could abort on the
-            tombstone guard would take out the rotation path with the freshness
-            path. Measured on `plex` against the real corpus in a scratch copy
-            of the live plane, three times: **85–101 s** and 391 MB peak RSS, 12 chunks and
-            62.9 MB published, 3 deltas retained, the pre-D-056 generation
-            retired — and the published chunks, fetched and decompressed the
-            way the client does, reassemble to the artifact **byte for byte
-            across all 377 MB**.
-      - [x] **The open question D-056 left**, settled the strong way: a snapshot
-            at head is the one publication nobody already synced ever fetches,
-            so it must be *the artifact that revision's content came from*,
-            checked against a digest the ledger now records. The reproduction is
-            a sibling build sharing the lineage, the `seed_rev`, the marks and
-            the ID-space fingerprint — invisible to every other guard. The
-            refusal lands before the generation directory moves, and `--force`
-            does not skip it.
-      - [x] **Pruning**, and it is not a separate job: retention happens inside
-            the snapshot publish, so the manifest stops naming a file in the
-            same operation that deletes it. What is retained is defined by what
-            the *previous manifest advertised* — deriving it from the directory
-            listing or from the ledger each deleted files a live manifest still
-            named, three reproductions across two review rounds — and a delta
-            file outlives its manifest entry by one full rotation, for the same
-            reason a generation does.
-      - [x] **The bridging delta**, unblocked: `assert_tiling` now requires only
-            that nothing the manifest names is a dead end, which is also what
-            makes retention expressible. Deliberately unused by the cron, which
-            lands *at* head where the bridge is the identity; it exists for a
-            content-changing rebuild, which must land above head and cost a
-            re-download.
-      - [x] **Adversarial review**, three rounds — four reviewers over the
-            diff, an adversarial pass over their fixes, and a pass that
-            reproduced recovery and migration paths nothing had exercised, plus
-            a verification round that caught one fix applied to two of its three
-            paths. Twenty-one defects, of which five would have corrupted the live data
-            plane (a retention sweep deleting delta files the manifest still
-            named; a `--force` refusal landing after the chunk swap; `--force`
-            landing any content at head where the record was missing; a bridge
-            redefining a published revision through the same gap; an artifact
-            swapped between digest and publication) and two would have blocked
-            the rotation for a month. Six guards had no failing test when first
-            deleted; every guard has one now, and each was checked by removing
-            it rather than by watching the suite pass.
-      - [x] **Installed on `plex` 2026-08-04**, `43 5 1 * *`, 86 minutes
-            clear of the daily's 4:17 and taking the same lock. Deployed by
-            `git pull` into the checkout the crons run from (D-059) — 242 tests
-            green on the server, checkout clean — and the daily's whole cycle
-            rehearsed against the real corpus first (`--dry-run`: 43.8 s,
-            1.22 GB peak RSS, 686 upserts, 0 tombstones, nothing published).
-            The cron's own command line was then executed in production, where
-            it refused with D-060's message because rev 5 predates artifact
-            digests: the invocation, the log redirection and the fail-closed
-            guard all confirmed live, and no outcome recorded because a dry run
-            writes none.
-
-            **What has not been observed is the scheduler firing it**, which
-            first happens 1 September — by then a month of dailies will have
-            recorded digests, so the guard above cannot trip. That is the one
-            way this differs from the daily, which was checked only after it had
-            run unattended: a monthly cannot be, without blocking the milestone
-            on a calendar. The work itself is verified four times over at full
-            scale against a scratch copy of the live plane. `last_snapshot` in
-            `ingest.py status` is what will say it worked.
-
+      which is why the run pays for a second walk of the corpus. 54.9 s and
+      1.22 GB peak RSS on the real corpus, with re-run semantics decided and
+      tested at all three crash windows. **Running in production since
+      2026-08-03**: the origin was rebuilt onto a recorded ID space as snapshot
+      rev 2 and the cron has advanced the head daily since, verified over HTTPS
+      from outside the machine and end to end by a real browser.
+- [x] **Monthly snapshot cron** (D-060). `pipeline/snapshot.py` publishes the
+      artifact the ingest state points at, at the revision it is stamped with,
+      then retains and retires. It neither rebuilds — the daily already writes a
+      complete artifact — nor fetches, so the freshness path cannot take the
+      rotation path down with it; and retention is defined by what the *previous
+      manifest advertised*, so the manifest stops naming a file in the same
+      operation that deletes it. 85–101 s and 391 MB peak RSS against a scratch
+      copy of the live plane, with the published chunks reassembling to the
+      artifact **byte for byte across all 377 MB**. Three adversarial review
+      rounds found twenty-one defects, five of them able to corrupt the live
+      data plane; every guard now has a test checked by removing it rather than
+      by watching the suite pass. **Installed on `plex` 2026-08-04**
+      (`43 5 1 * *`, 86 minutes clear of the daily). Its first unattended firing
+      is 1 September — the one thing this milestone closed without observing —
+      and `last_snapshot` in `ingest.py status` is what will say it worked.
 - [x] **Download with staged replacement** (D-061). Chunks land in a *staging*
       OPFS file — one of two alternating slots — and the live database is
       neither closed nor touched until the staged copy has passed its promotion
-      gate. The per-chunk bitmap in `staging.json` is bound to the snapshot
-      path, its length, and every chunk's offset, length and hash, and each
-      chunk is flushed before its bit is recorded; it is deliberately *not*
-      bound to the head revision, so a delta published mid-download does not
-      throw away staged chunks, and it *is* bound to the staging file's length,
-      without which a record that outlived its file promotes a database with a
-      hole in it. The gate is: the bitmap complete (counted), the staged file
-      unpromoted, the chunks **covering the byte range exactly** with distinct
-      names — per-chunk hashes prove each chunk's bytes and nothing proved the
-      bytes between them, which the M1 path never checked — schema and
-      `meta.rev` agreeing with the manifest, the D-008 notice present, records
-      non-zero, indexes built. Promotion is then one SQLite transaction on the
-      database's own header (`PRAGMA user_version`, zero in every published
-      artifact), which is what makes it atomic and durable without a pointer
-      file to keep crash-safe by hand. Measured at both scales — full corpus:
-      an interrupted re-download leaves the previous copy answering the same
-      query with the same numbers, the retry fetches **11 of 12** chunks, and
-      the origin ends holding one generation (441.1 MB) rather than two. The
-      M1-name upgrade path is covered in the same spec — a copy under
-      `cve.sqlite` is adopted, queried, and retired by the first promotion,
-      which matters because an unrecognised entry is *swept*, not ignored.
-      `opfs-sahpool` keeps M1's destroy-then-download behaviour and none of
-      this is claimed for it (D-051). A second review round found three more
-      crash-safety defects, two of them able to destroy a live copy: discovery
-      trusted raw header bytes, which can advertise a promotion the rollback
-      journal has yet to commit (reproduced by killing a process mid-commit —
-      header 9, SQLite 5); a slot's stale journal was replayed into the next
-      generation written over it (reproduced: a file byte-identical to the
-      published artifact stopped being so the moment it was opened); and a crash
-      during index building refetched the whole snapshot instead of resuming.
-      Each has a regression test checked by removing the fix. **Catch-up deltas are not yet staged**,
-      because applying one is the Sync task below; the staged file is where
-      they will land, and until then a download stops at `snapshot.rev` with
-      the head ahead of it. Four adversarial reviewers over the diff found two
-      defects that would have destroyed a live local copy — a failed *read*
-      licensing a sweep, and an unbound resume record — plus a promotion gate
-      with no test at any level; each now has a regression test checked by
-      removing the fix.
+      gate. Promotion is then one SQLite transaction on the database's own
+      header, which is what makes it atomic and durable without a pointer file
+      to keep crash-safe by hand. The resume bitmap is bound to everything that
+      decides what the bytes are, and each chunk is flushed before its bit is
+      recorded. Measured at full scale: an interrupted re-download leaves the
+      previous copy answering the same query, the retry fetches **11 of 12**
+      chunks, and the origin ends holding one generation (441.1 MB) rather than
+      two. Five crash-safety defects across two review rounds, four of them able
+      to destroy a live copy, each now with a regression test checked by
+      removing the fix. `opfs-sahpool` keeps M1's destroy-then-download
+      behaviour and none of this is claimed for it (D-051).
 - [x] **Client-built FTS** over descriptions, vendors and products (D-035),
-      surfaced in the same progress display. The index build is 58 of the 64
-      seconds a full-corpus import takes — the longest wait the app has — and it
-      was reporting an indeterminate bar for all of it, which is the case D-052
-      rule 3 exists for. fts5's `'rebuild'` is one opaque statement, so the
-      build now walks the rowid space in batches instead and reports through it:
-      a fraction weighted by each index's measured share of the indexed text
-      (descriptions are 98% of it), and an exact running row count. The rowid
-      range is the progress metric because it is the only one that is free —
-      `min`/`max` on an INTEGER PRIMARY KEY are seeks, where `count(*)` would
-      scan the 122 MB the build is about to read anyway — and it is honest
-      enough: half the id space is 40% of the text, so the bar runs slightly
-      fast early, never backwards. Measured at full scale on the real published
-      artifact, three runs each in one session: **58.0 / 58.3 / 58.4 s batched
-      against 57.3 / 57.6 / 57.8 s for `'rebuild'`** — about 1%, for ~96 updates
-      through a minute of silence. The index is the same size either way,
-      because the batches share one transaction per index and fts5 flushes its
-      hash on its own schedule inside one; committing per batch is what would
-      have cost segments. What the batching moves is *who* covers the id space:
-      a dropped range is records that exist and cannot be found, with the fts5
-      tables present, the row counts right and the promotion gate passing — so
-      the ranges are held to it directly (`tests/unit/search.test.ts`, against
-      the published schema and the same SQLite the browser runs, every row
-      carrying a unique token so coverage is asserted row by row, and the whole
-      build compared against `'rebuild'` on hostile text). Both halves of the
-      claim were checked by breaking them: a dropped range and an off-by-one in
-      the range predicate each fail six tests. `import.spec.ts` now also asserts
-      the index phase reports a row count and a determinate bar while the user
-      is waiting on it, and that a search over the imported corpus returns rows
-      — the one place the WASM build's own fts5 answers a query.
+      reported in the same progress display. The build is 58 of the 64 seconds a
+      full-corpus import takes — the longest wait the app has — and fts5's
+      `'rebuild'` is one opaque statement, so it walks the rowid space in
+      batches instead and reports an exact row count and a weighted fraction
+      through it (D-052 rule 3). It costs about 1%: **58.0 / 58.3 / 58.4 s
+      batched against 57.3 / 57.6 / 57.8 s for `'rebuild'`**, for ~96 updates
+      through a minute of silence. What batching moves is *who* covers the id
+      space — a dropped range is records that exist and cannot be found, with
+      the tables present, the counts right and the promotion gate passing — so
+      coverage is asserted row by row in `tests/unit/search.test.ts`, and both
+      halves of the claim were checked by breaking them.
 - [x] **Sync** (D-063). Each delta applies in **one transaction** with the
-      watermark inside it, so there is no window where the rows and the revision
-      disagree, and a failure anywhere — a drifted ID space, a dangling
-      reference, a full disk — leaves the copy exactly where it was. Applying
-      one file at a time rather than wrapping the chain is deliberate: a chain
-      is a sequence of *published* revisions, and stopping part way leaves the
-      copy at one of them instead of discarding every file that did apply. The
-      catch-up runs on the **live** database after promotion, not on the staging
-      file before it — reversing what D-061 said it would do, because applying
-      there would put a finished 63 MB download at the mercy of a delta fetch,
-      break the promotion gate's `snapshot.rev == meta.rev` check, and need a
-      *second* apply path with no fts5 tables to maintain, which is precisely
-      the path whose failure is invisible. A download now ends by catching up,
-      so a fresh copy lands at head rather than at `snapshot.rev`.
-      **FTS maintenance is inside that transaction**, with the explicit
-      `'delete'` protocol and the old value read out of the content table an
-      instant before it changes — the half the pipeline has no counterpart for,
-      since it publishes no fts5 tables, and the half that fails silently: an
-      un-maintained index keeps matching records on words their text no longer
-      contains, with the tables present, the row counts right and the promotion
-      gate passing. `integrity-check` at `rank = 1` is what disagrees, and it
-      ends every case in `tests/unit/sync.test.ts` — including a control that
-      breaks the index deliberately and shows the *obvious* invocation passing
-      on it (RE-005, re-verified on 3.53.0 for this task; it is not run at
-      runtime, where it would cost what building the index cost). Apply refuses
-      rather than guesses: watermark equality, the id↔CVE pairing checked in
-      **both** directions, closure of every referenced lookup id against this
-      copy, and a self-consistency pass before the transaction opens. Each of
-      those was checked by deleting it and watching a test fail. Proven at two
-      scales — `tests/unit/contract.test.ts` reassembles the published snapshot
-      from its chunks, indexes it, applies the pipeline's *own* published delta
-      with this code, and gets the artifact the pipeline built for that revision
-      (record tables exactly, lookups as a superset, because a rebuild retires
-      rows a sync keeps, D-056); and `tests/e2e/sync.spec.ts` runs the whole
-      path in a browser, against a local mirror of the **live** data plane —
-      the full corpus at snapshot rev 2 walked up through the four real daily
-      deltas the cron has published since, to rev 6, **1,589 records changed in
-      56.8 s**, then queried, reloaded and queried again.
-      That 56.8 s is the notable number and it is **not** the fts5 protocol:
-      the same four deltas against the same artifact natively are 1.11 s with
-      index maintenance and 0.91 s with the fts statements stubbed out, so
-      maintenance is 0.2 s of the work and the rest is the WASM/OPFS write path
-      — roughly 28,000 small statements at about 2 ms each, each one compiled
-      afresh by `Database.exec()`. Reusing prepared statements in the Worker's
-      adapter is the obvious lever and is deliberately **not** taken here: it is
-      a change to the write path that would need its own tests, and the daily
-      case (one delta, ~400 records) is a few seconds rather than a minute.
-- [ ] **Failure and resume tests** — for replacement, not just first
-      download. Partly landed with D-061 in `tests/e2e/staged.spec.ts`, and
-      listed here so the rest is not written twice:
-      - [x] kill mid-download and resume refetches only missing chunks
+      watermark and the full-text indexes inside it, so a failure anywhere
+      leaves the copy exactly where it was — one file at a time rather than the
+      whole chain, because stopping part way then leaves the copy at a published
+      revision instead of discarding every file that did apply. The catch-up
+      runs on the **live** database after promotion, reversing what D-061 said
+      it would do, and a download now ends by catching up so a fresh copy lands
+      at head. fts5 maintenance uses the explicit `'delete'` protocol with the
+      old value read out of the content table an instant before it changes: the
+      half that fails silently, and the half only `integrity-check` at
+      `rank = 1` catches (RE-005). Proven at two scales, ending with the full
+      corpus at snapshot rev 2 walked up through four real daily deltas to
+      rev 6 — **1,589 records changed in 56.8 s** in a browser, then queried,
+      reloaded and queried again.
+- [x] **Failure and resume tests** — for replacement, not just first download.
+      Six cases, all passing:
+      - [x] kill mid-download and resume refetches only the missing chunks
             (11 of 12 at full scale);
       - [x] a failure during re-download leaves the prior database intact and
-            usable — plus two failure modes the review pass reproduced: a
-            discovery error must not license a sweep, and a resume record that
-            outlived its file must not be believed;
-      - [x] an interrupted sync rolls back and re-running is safe — asserted in
-            `tests/unit/sync.test.ts` against real SQLite and the published
-            schema, with the refusal placed at the *last* record of a delta that
-            has already written lookups, a tombstone and an upsert, so the
-            unwinding is real rather than nominal: rows, watermark, `generated`
-            and both full-text indexes all come back unchanged, and a delta the
-            copy *can* take then applies. A process killed mid-`COMMIT` is
-            SQLite's rollback journal rather than our code (the same mechanism
-            RE-017 and D-061's header-read finding turn on) and is not
-            re-exercised here;
-      - [ ] a snapshot rotation mid-download does not strand the client — the
-            *decision* is unit-tested (`bindsTo` refuses a rotated plan), the
-            end-to-end file behaviour is not;
-      - [ ] a chunk that fails its SHA-256 mid-download, which has no test at
-            any level today;
+            usable — including a discovery error, which must not license a
+            sweep, and a resume record that outlived its file, which must not be
+            believed;
+      - [x] an interrupted sync rolls back and re-running is safe, with the
+            refusal placed at the *last* record of a delta that has already
+            written lookups, a tombstone and an upsert, so the unwinding is real
+            rather than nominal (`tests/unit/sync.test.ts`);
+      - [x] a snapshot rotation mid-download starts the download over rather
+            than resuming one generation's bytes into another's staging file —
+            the failure no hash in the manifest would catch;
+      - [x] a chunk that fails its SHA-256 refuses the download by name, leaves
+            the live copy answering, and is refetched by the retry;
       - [x] a failure *during index building*, after the bitmap is complete —
             the retry fetches zero chunks and resumes at the index build.
-- [ ] **Stall detection** (D-052). Duration is never a failure, but a download
-      that has stopped advancing is: surface it as an error with a message
-      rather than a bar that never moves. The per-chunk progress already
-      landed in M1 is what this hangs off.
-- [ ] **Freshness.** The visible staleness indicator and the "N new CVEs
-      since your last sync" summary.
+
+      The network failures are produced with `page.route`, which turns out to
+      see the Worker's requests; the rotation and checksum cases were run at
+      both scales, against the development slice and against a local mirror of
+      the live data plane.
+- [x] **Stall detection** (D-064, implementing D-052). The signal is bytes
+      received, not elapsed time: sixty seconds without one aborts the transfer
+      and reports that it *stalled rather than being slow*, while a download
+      that is merely slow runs as long as it takes. Per-chunk progress was the
+      wrong thing to hang it off — a chunk is 5 MB, so a connection that died
+      mid-chunk would look alive — so responses are read as streams, which also
+      bounds each one at the length the manifest published. The watch covers the
+      download and the delta fetches and is disarmed before the index build;
+      what keeps it honest is D-064 §2, every long *synchronous* step beating
+      when it returns. Tested both ways: a hung chunk is reported with the live
+      copy intact and the staged chunks still worth resuming
+      (`tests/e2e/staged.spec.ts`), and a transfer that keeps beating is never
+      reported however long it runs (`tests/unit/stall.test.ts`).
+- [x] **Freshness** (D-064). The staleness indicator reads `meta.generated` —
+      the data's own build stamp, which travels with every delta — so a synced
+      copy and a freshly downloaded one at the same revision report the same
+      age. It is deliberately an *age* rather than a verdict about the origin,
+      because `status` makes no network request, which is what keeps a reopen
+      working offline (D-048); past two days the page says the copy is behind
+      unless the origin has stopped publishing, and points at Sync. The "N new
+      CVEs since your last sync" summary is a real count rather than the total
+      change: `inserts` falls out of the ID-pairing preflight apply already runs
+      (D-063), so it costs no extra query. Against the live plane the page
+      reported **529 new CVEs, 1,060 records revised, 0 withdrawn in 56.0 s**,
+      matching an independent count of the four published delta files.
 
 **Exit criteria:** a browser downloads all 372,092 records, decompresses them
 itself, builds its indexes, and queries the result — with one honest progress
@@ -482,6 +327,26 @@ holding, by design, the lookup rows a rebuild retired (D-056); a sync applies a
 real day of upstream changes; every failure-and-resume
 test above passes, including failure *during replacement* leaving the previous
 copy usable.
+
+**Exit criteria — met 2026-08-05**, accepted by the project owner. Every task
+above is checked, and each clause has evidence behind it rather than a claim:
+the full corpus downloads, decompresses, indexes and queries in the browser
+(D-049, re-run against the live generation for this milestone); each stage names
+itself and reports countable progress, the index build included (D-035, D-052);
+a stalled download is reported as stalled and a slow one is not (D-064); peak
+memory is bounded by chunks in flight (D-041, D-049); the downloaded database
+reassembles to the published artifact byte for byte (D-060) and a synced one
+reproduces the pipeline's own next generation, lookups excepted by design
+(D-063, D-056); a sync applies four real days of upstream change; and every
+failure-and-resume case passes, including a failed *replacement* leaving the
+previous copy queryable.
+
+Two things are deliberately **not** claimed by this closure. The monthly
+rotation cron has never been observed *firing* — its first unattended run is
+1 September, and blocking a milestone on a calendar was the alternative
+(D-060). And the `opfs-sahpool` path keeps M1's destroy-then-download behaviour;
+none of the staged-replacement guarantees are claimed for it, which is what
+D-051 chose against.
 
 ## M3 — Query surfaces and tuning  `pending`
 

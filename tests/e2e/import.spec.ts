@@ -96,6 +96,32 @@ test('imports, queries, and survives a reload', async ({ page }) => {
     expect(rows('fts-vendor'), 'no vendor matched a name search').toBeGreaterThan(0)
   })
 
+  await test.step('the copy says how old its data is (M2 freshness)', async () => {
+    // Sync is manual after the first one (D-025), so the thing that keeps a
+    // month-old corpus from producing confident-looking counts is the app
+    // saying how old it is. The stamp has to come from the data itself — the
+    // `generated` the pipeline writes and every delta carries (D-058 §4a) —
+    // and not from when this browser happened to download it, which is why it
+    // is checked against the manifest rather than against the clock.
+    const generated = await page.evaluate(async () => {
+      const manifest = await (await fetch('/data/manifest.json', { cache: 'no-cache' })).json()
+      return manifest.generated as number
+    })
+    const freshness = page.locator('[data-freshness]')
+    await expect(freshness).toContainText('Data as of', { timeout: 60_000 })
+    await expect(freshness).toContainText(/old\b/)
+    await expect(freshness.locator('time')).toHaveAttribute(
+      'datetime',
+      new Date(generated * 1000).toISOString()
+    )
+    // Which verdict it renders depends on how old the served generation is, so
+    // the assertion is on the pair being consistent rather than on either one.
+    const age = Number(await freshness.getAttribute('data-age-ms'))
+    const stale = (await freshness.getAttribute('data-freshness')) === 'stale'
+    expect(age).toBeGreaterThanOrEqual(0)
+    expect(stale).toBe(age > 2 * 24 * 3_600_000)
+  })
+
   await test.step('the notice travels with the copy (D-008)', async () => {
     // The terms require reproducing MITRE's copyright designation and the
     // license clause — assert the required components, not just the name

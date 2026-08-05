@@ -242,12 +242,22 @@ export interface ImportOptions {
    * to abort after none is a trap for the next caller.
    */
   stopAfterChunks?: number
+  /**
+   * How long a transfer may go without receiving a byte before it is reported
+   * as stalled (D-052). Clamped by `stallTimeout` in `lib/stall.ts`.
+   *
+   * Settable for the same reason `stopAfterChunks` is: a stalled connection is
+   * a state a test has to be able to produce, and waiting out the real
+   * sixty-second default in every run would be a minute per assertion.
+   */
+  stallMs?: number
 }
 
 export type Request =
   | { type: 'status' }
   | { type: 'import'; options?: ImportOptions }
-  | { type: 'sync' }
+  /** Only `stallMs` is read here; the rest describe a download (D-052). */
+  | { type: 'sync'; options?: ImportOptions }
   | { type: 'query'; sql: string }
   | { type: 'bench' }
   | { type: 'reset' }
@@ -267,6 +277,12 @@ export interface SyncOutcome {
   applied: number
   /** Records replaced and records tombstoned, summed across those files. */
   upserts: number
+  /**
+   * How many of those records are CVEs this copy did not hold before — the
+   * "N new CVEs since your last sync" number the UI reports. A subset of
+   * `upserts`; the remainder are revisions of records already here.
+   */
+  inserts: number
   deletes: number
   /** Compressed bytes that crossed the wire. */
   bytes: number

@@ -1,9 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
 
-import type { Timings } from '../../lib/protocol'
+import type { Manifest, Timings } from '../../lib/protocol'
 
 /**
- * Staged replacement (D-061), as a test.
+ * Staged replacement (D-061) and the download's failure-and-resume matrix (M2),
+ * as tests.
  *
  * The property under test is not "download works" — `import.spec.ts` covers
  * that. It is that a download the user *starts and loses* costs them nothing:
@@ -12,7 +13,10 @@ import type { Timings } from '../../lib/protocol'
  *
  * The interruption is deterministic (`?stop=1`) rather than raced, because a
  * 10 MB download over loopback finishes long before a test could kill it — see
- * `ImportOptions.stopAfterChunks`.
+ * `ImportOptions.stopAfterChunks`. The failures that need the *network* to
+ * misbehave — a corrupted chunk, a rotated snapshot, a dead connection — are
+ * produced with `page.route`, which sees the Worker's requests as well as the
+ * page's (verified 2026-08-05 on Playwright 1.62 before these were written).
  */
 test('an interrupted download resumes and never destroys the live copy', async ({ page }) => {
   // Generous because this spec is also worth pointing at the full corpus, where
@@ -721,6 +725,280 @@ test('a high counter on a database this build would not serve does not win disco
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
 })
+
+/**
+ * A chunk that fails its SHA-256, which had no test at any level (M2).
+ *
+ * The manifest's per-chunk hash is the only thing standing between a corrupted
+ * transfer and a promoted database, and it is checked *before* decompression —
+ * so the bad bytes never reach the staging file, its bit is never recorded, and
+ * the download is refused rather than promoted. All three are asserted here:
+ * the refusal names the checksum, the live copy is untouched, and the retry
+ * fetches the chunk that failed instead of trusting a bitmap that claims it.
+ */
+test('a chunk that fails its checksum refuses the download, and the retry refetches it', async ({
+  page,
+}) => {
+  test.setTimeout(600_000)
+  const failures = watchForErrors(page)
+
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  const first = await importedTimings(page)
+  const rows = await queryFirstCell(page)
+
+  // Corrupt the *last* chunk, so the ones before it land and are recorded —
+  // which is what makes the resume assertion below mean something.
+  const chunks = await snapshotChunks(page)
+  const doomed = chunks[chunks.length - 1]!
+  let corruptions = 0
+  await page.route(`**/${doomed}`, async (route) => {
+    const response = await route.fetch()
+    const body = Buffer.from(await response.body())
+    // One byte, in the middle: enough to fail SHA-256, and nothing else about
+    // the response changes — same length, same headers, same status.
+    const at = Math.floor(body.length / 2)
+    body[at] = (body[at] ?? 0) ^ 0xff
+    corruptions += 1
+    await route.fulfill({ response, body })
+  })
+
+  await test.step('the download is refused and says why', async () => {
+    await page.getByRole('button', { name: 'Re-download data' }).click()
+    await expect(page.locator('.error')).toContainText('checksum mismatch', { timeout: 180_000 })
+    expect(corruptions).toBeGreaterThan(0)
+  })
+
+  await test.step('and the copy the user already had still answers', async () => {
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled()
+    await expect(page.locator('.notice')).toContainText('The MITRE Corporation')
+    expect(await queryFirstCell(page)).toBe(rows)
+  })
+
+  await test.step('the retry refetches the chunk that failed', async () => {
+    await page.unroute(`**/${doomed}`)
+    await page.goto('/')
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+      timeout: 60_000,
+    })
+    await page.getByRole('button', { name: 'Re-download data' }).click()
+    const retried = await importedTimings(page)
+
+    // At least the corrupted one, and never all of them at the scale this runs
+    // at by default: the chunks that landed before the failure are still
+    // staged. A bitmap that had recorded the failed chunk would show zero here
+    // and promote a database with a hole where its bytes belong.
+    expect(retried.chunksFetched).toBeGreaterThan(0)
+    expect(retried.chunksFetched).toBeLessThan(retried.chunksTotal)
+    expect(retried.records).toBe(first.records)
+    expect(await queryFirstCell(page)).toBe(rows)
+  })
+
+  expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
+})
+
+/**
+ * A snapshot rotation mid-download (M2).
+ *
+ * The *decision* is unit-tested — `bindsTo` refuses a record whose plan names a
+ * different generation — but the file behaviour was not: what has to be true is
+ * that the client is never stranded. It keeps the copy it has, it never resumes
+ * one generation's download into another's staging file, and the next download
+ * simply starts over against the generation the origin now advertises.
+ *
+ * The rotation is served rather than performed: the manifest is rewritten to
+ * name a different snapshot directory, whose chunks resolve to the real ones.
+ * That is what a D-060 rotation looks like to a client — the same content at a
+ * new immutable path — and it exercises the one thing that matters here, a
+ * staged file left over from a path the manifest no longer names.
+ */
+test('a snapshot rotation mid-download starts over rather than stranding the client', async ({
+  page,
+}) => {
+  test.setTimeout(600_000)
+  const failures = watchForErrors(page)
+
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  const first = await importedTimings(page)
+  const rows = await queryFirstCell(page)
+
+  await test.step('a download dies partway, leaving a staged generation behind', async () => {
+    await page.goto('/?stop=1')
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+      timeout: 60_000,
+    })
+    await page.getByRole('button', { name: 'Re-download data' }).click()
+    await expect(page.locator('.error')).toContainText('stopAfterChunks', { timeout: 180_000 })
+    await page.goto('/no-such-page')
+    expect(await opfsEntries(page)).toContain('staging.json')
+  })
+
+  // From here the origin advertises a different generation at a different
+  // path. `ROTATED` is a directory name of the shape publish.py writes, which
+  // is the only shape the client will fetch from (D-055).
+  const ROTATED = 'snapshot-99999'
+  const published = await page.evaluate(async () => {
+    const manifest = await (await fetch('/data/manifest.json', { cache: 'no-cache' })).json()
+    return manifest.snapshot.path as string
+  })
+  await page.route('**/data/manifest.json', async (route) => {
+    const response = await route.fetch()
+    const manifest = (await response.json()) as Manifest
+    manifest.snapshot.path = ROTATED
+    await route.fulfill({ response, json: manifest })
+  })
+  await page.route(`**/data/${ROTATED}/*.br`, async (route) => {
+    // The rotated generation holds the same bytes at a new path, which is what
+    // a D-060 rotation republishes: same content, new immutable URL.
+    const url = route.request().url().replace(`/${ROTATED}/`, `/${published}/`)
+    await route.continue({ url })
+  })
+
+  await test.step('the stale staged copy is discarded, not resumed into', async () => {
+    await page.goto('/')
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+      timeout: 60_000,
+    })
+    // Still usable while the origin has moved on: a rotation is not an outage.
+    expect(await queryFirstCell(page)).toBe(rows)
+
+    await page.getByRole('button', { name: 'Re-download data' }).click()
+    const rotated = await importedTimings(page)
+    // Every chunk, because nothing staged for the old generation may be reused
+    // — a resumed mix of two generations is a database whose per-chunk hashes
+    // all pass and whose contents belong to neither.
+    expect(rotated.chunksFetched).toBe(rotated.chunksTotal)
+    expect(rotated.records).toBe(first.records)
+    expect(await queryFirstCell(page)).toBe(rows)
+  })
+
+  await test.step('and the origin ends holding one generation, with no stale record', async () => {
+    await page.goto('/no-such-page')
+    expect(await opfsEntries(page)).toEqual(['cve-b.sqlite'])
+  })
+
+  expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
+})
+
+/**
+ * Stall detection (D-052), as the user meets it.
+ *
+ * D-052 draws the line at forward progress rather than elapsed time, so both
+ * halves are asserted here: a transfer that stops receiving bytes is reported
+ * as stalled — with the local copy intact and the staged chunks still worth
+ * something — and a transfer that is merely slow is left alone. The timeout is
+ * shortened with `?stall=` for the same reason `?stop=` exists: waiting out the
+ * real sixty seconds in every run is a minute an assertion does not need.
+ */
+test('a download that stops receiving data is reported as stalled, not left spinning', async ({
+  page,
+}) => {
+  test.setTimeout(600_000)
+  const failures = watchForErrors(page)
+
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  const first = await importedTimings(page)
+  const rows = await queryFirstCell(page)
+
+  const chunks = await snapshotChunks(page)
+  const doomed = chunks[chunks.length - 1]!
+  // Accepted and never answered: the connection a dead link or a wedged server
+  // leaves behind, which is exactly what an elapsed-time budget cannot tell
+  // apart from a slow one. Held open until the test lets go, rather than for a
+  // fixed sleep — a handler still sleeping when the run ends is a teardown
+  // hazard for a property that has nothing to do with sleeping.
+  let release = () => {}
+  const released = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.route(`**/${doomed}`, async (route) => {
+    await released
+    await route.abort().catch(() => undefined)
+  })
+
+  await test.step('the stall is named as a stall', async () => {
+    await page.goto('/?stall=2000')
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+      timeout: 60_000,
+    })
+    await page.getByRole('button', { name: 'Re-download data' }).click()
+
+    const error = page.locator('.error')
+    await expect(error).toContainText('stalled', { timeout: 120_000 })
+    // The distinction D-052 exists for, in the message itself.
+    await expect(error).toContainText('rather than a slow one')
+    await expect(error).toContainText('untouched')
+  })
+
+  await test.step('and it costs nothing but the chunks that never arrived', async () => {
+    await expect(page.locator('.notice')).toContainText('The MITRE Corporation')
+    expect(await queryFirstCell(page)).toBe(rows)
+
+    release()
+    await page.unroute(`**/${doomed}`)
+
+    await page.goto('/')
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+      timeout: 60_000,
+    })
+    await page.getByRole('button', { name: 'Re-download data' }).click()
+    const resumed = await importedTimings(page)
+    // The chunks that did land are still staged: a stall is a failed transfer,
+    // not a lost download.
+    expect(resumed.chunksFetched).toBeLessThan(resumed.chunksTotal)
+    expect(resumed.records).toBe(first.records)
+  })
+
+  await test.step('a slow transfer is not a stalled one', async () => {
+    // Every chunk arrives, each after a pause that is most of the timeout. The
+    // import has to complete: "slow" and "stuck" are different conditions, and
+    // a watch that cannot tell them apart is worse than none — it turns a
+    // working download on a bad link into an error the user cannot get past.
+    // (The unbounded version of this — a transfer that beats for ten minutes
+    // under a one-minute timeout — is in tests/unit/stall.test.ts.)
+    await page.route('**/data/snapshot-*/*.br', async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
+      await route.continue()
+    })
+    await page.goto('/?stall=5000')
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+      timeout: 60_000,
+    })
+    await page.getByRole('button', { name: 'Clear local copy' }).click()
+    await expect(page.getByRole('button', { name: 'Download data', exact: true })).toBeVisible({
+      timeout: 60_000,
+    })
+    await page.getByRole('button', { name: 'Download data', exact: true }).click()
+    const slow = await importedTimings(page)
+    expect(slow.chunksFetched).toBe(slow.chunksTotal)
+    expect(slow.records).toBe(first.records)
+    await expect(page.locator('.error')).toHaveCount(0)
+  })
+
+  expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
+})
+
+/** The snapshot's chunk file names, in file order, as the origin advertises them. */
+async function snapshotChunks(page: Page): Promise<string[]> {
+  return await page.evaluate(async () => {
+    const manifest = await (await fetch('/data/manifest.json', { cache: 'no-cache' })).json()
+    return [...manifest.snapshot.chunks]
+      .sort((a: { offset: number }, b: { offset: number }) => a.offset - b.offset)
+      .map((chunk: { name: string }) => chunk.name)
+  })
+}
+
+/**
+ * Run the demo query and return one cell of it — the cheapest proof that the
+ * database on disk is the corpus and not a truncated or half-written copy.
+ */
+async function queryFirstCell(page: Page): Promise<string> {
+  await page.getByRole('button', { name: 'Run query' }).click()
+  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+  return await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
+}
 
 /** Everything the origin holds in OPFS, read from a page that runs no Worker. */
 async function opfsEntries(page: Page): Promise<string[]> {

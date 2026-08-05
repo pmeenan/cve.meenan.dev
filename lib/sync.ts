@@ -93,6 +93,18 @@ export interface SyncCounts {
   from: number
   to: number
   upserts: number
+  /**
+   * How many of those upserts are CVEs this copy did not already hold — the
+   * "N new CVEs since your last sync" number.
+   *
+   * Counted in `assertRecordIds`, which already asks the database for every
+   * upsert's existing pairing, so it costs nothing: a record whose CVE ID is
+   * absent there is new by definition, and the preflight has already refused
+   * the one case where that would be a lie (an id belonging to a *different*
+   * CVE). Deriving it later would mean a second pass, or asking after the rows
+   * were written, when the answer is gone.
+   */
+  inserts: number
   deletes: number
 }
 
@@ -116,6 +128,7 @@ export function applyDelta(db: SyncDb, delta: Delta): SyncCounts {
   // contradicts itself is refused without taking a write lock.
   assertSelfConsistent(delta)
 
+  let inserts = 0
   db.run('BEGIN IMMEDIATE')
   try {
     assertWatermark(db, delta.from)
@@ -123,7 +136,7 @@ export function applyDelta(db: SyncDb, delta: Delta): SyncCounts {
     // evidence about. Otherwise a malformed delta can delete the CVE currently
     // at row N and then insert a different CVE at N, hiding exactly the ID-space
     // reuse D-056 says must be refused.
-    assertRecordIds(db, delta)
+    inserts = assertRecordIds(db, delta)
     applyLookups(db, delta)
     // After the lookups are in, so one existence check covers both "shipped in
     // this file" and "already local" — which together are the only two places
@@ -158,12 +171,14 @@ export function applyDelta(db: SyncDb, delta: Delta): SyncCounts {
     from: delta.from,
     to: delta.to,
     upserts: delta.upsert.length,
+    inserts,
     deletes: delta.delete.length,
   }
 }
 
 /**
- * Refuse any upsert whose stable row-id pairing disagrees with this copy.
+ * Refuse any upsert whose stable row-id pairing disagrees with this copy, and
+ * return how many of them are CVEs this copy has never held.
  *
  * This is a preflight over the whole delta rather than only a check immediately
  * before each insert: tombstones are intentionally applied before upserts, and
@@ -171,11 +186,14 @@ export function applyDelta(db: SyncDb, delta: Delta): SyncCounts {
  * id. It stays inside the transaction so every pairing describes the same
  * database revision guarded by `assertWatermark`.
  */
-function assertRecordIds(db: SyncDb, delta: Delta): void {
-  for (const record of delta.upsert) assertRecordId(db, record)
+function assertRecordIds(db: SyncDb, delta: Delta): number {
+  let inserts = 0
+  for (const record of delta.upsert) if (assertRecordId(db, record)) inserts += 1
+  return inserts
 }
 
-function assertRecordId(db: SyncDb, record: DeltaRecord): void {
+/** @returns true when this copy holds no record under that CVE ID yet. */
+function assertRecordId(db: SyncDb, record: DeltaRecord): boolean {
   const byCve = db.row('SELECT id FROM cve WHERE cve_id = ?', [record.cve])
   if (byCve !== null && Number(byCve[0]) !== record.id) {
     throw new Error(
@@ -190,6 +208,12 @@ function assertRecordId(db: SyncDb, record: DeltaRecord): void {
         "server's ID space has drifted, and this copy has to be re-downloaded rather than synced"
     )
   }
+  // Both probes agree there is no such record: neither its CVE ID nor its row
+  // id is present, so applying this upsert adds a CVE rather than revising one.
+  // (`byCve === null` alone would be enough — an id held by a different CVE is
+  // refused above — but saying it with both reads is what makes that obvious
+  // here rather than three paragraphs away.)
+  return byCve === null && byId === null
 }
 
 /**

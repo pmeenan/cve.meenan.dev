@@ -144,17 +144,18 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M1 closed 2026-08-01** — the deployed site imports the full corpus from
-`https://cve.meenan.dev/` and queries it locally. **M2 in progress** — Download
-and Sync. The server half is done and running in production on `plex`: delta
-wire contract (D-055), stable interned ID space (D-056), daily ingest (D-058)
-and monthly generation rotation (D-060) crons. On the client, **Download with
-staged replacement is done** (D-061), the client-built FTS build reports
-countable progress through the minute it spends indexing (D-035, D-052), and
-**Sync is done** (D-063): deltas apply to the live copy one transaction at a
-time with the watermark and the full-text indexes inside it, and a download
-ends by catching up, so a fresh copy lands at head rather than at
-`snapshot.rev`. Next: stall detection and freshness. The AI
+**M2 closed 2026-08-05** — the browser downloads the full corpus, builds its
+own indexes, syncs itself forward and says how old its data is. The server half
+runs in production on `plex`: delta wire contract (D-055), stable interned ID
+space (D-056), daily ingest (D-058) and monthly rotation (D-060) crons — the
+monthly's first unattended firing is 1 September, the one thing M2 closed
+without observing. On the client: staged replacement, so a failed download
+cannot cost the copy you have (D-061); sync as one transaction per delta with
+the watermark and the full-text indexes inside it, and a download that ends by
+catching up (D-063); and stall detection and freshness (D-064) — a stall is
+sixty seconds without a byte rather than an elapsed-time budget, and staleness
+is the age of the data's own build stamp. **M3 is next** — query surfaces and
+tuning — and is not yet decomposed into tasks. The AI
 ladder was re-ordered 2026-08-03: the first model tier is site-hosted Ollama
 behind a restricted same-origin relay, re-scoping M7/M8 (D-057). Process was
 rightsized for MVP scale 2026-08-04 (D-062). Details live in plan.md and the

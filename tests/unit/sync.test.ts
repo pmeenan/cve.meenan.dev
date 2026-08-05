@@ -178,13 +178,62 @@ describe('applying a delta', () => {
       })
     )
 
-    expect(counts).toEqual({ from: 1, to: 2, upserts: 1, deletes: 0 })
+    expect(counts).toEqual({ from: 1, to: 2, upserts: 1, inserts: 1, deletes: 0 })
     expect(watermark(db)).toBe(2)
     // `generated` moves with it: it dates the same content, and the staleness
     // indicator reads it.
     expect(value(db, "SELECT v FROM meta WHERE k = 'generated'")).toBe(2_000)
     expect(value(db, 'SELECT count(*) FROM cve')).toBe(3)
     expect(matches(db, 'fts', 'gamma')).toEqual([3])
+    assertIndexesAgree(db)
+    db.close()
+  })
+
+  it('counts new CVEs apart from revisions of records this copy holds', () => {
+    // The number behind "N new CVEs since your last sync". It has to be counted
+    // *before* the rows are written, because afterwards every upsert looks
+    // identical — which is why it comes out of the pairing preflight rather
+    // than from a second pass.
+    const db = corpus()
+    const counts = applyDelta(
+      adapt(db),
+      delta(1, 2, {
+        upsert: [
+          // One record this copy already holds, revised…
+          { id: 1, cve: 'CVE-2026-0001', y: 2026, st: 1, descr: 'alpha, now with a fix' },
+          // …and one it has never seen.
+          { id: 3, cve: 'CVE-2026-0003', y: 2026, st: 1, descr: 'gamma use after free' },
+        ],
+      })
+    )
+
+    expect(counts.upserts).toBe(2)
+    expect(counts.inserts).toBe(1)
+
+    // And re-applying the same records at the next revision adds nothing new:
+    // both are now held, so the honest answer is zero rather than two.
+    const again = applyDelta(
+      adapt(db),
+      delta(2, 3, {
+        upsert: [
+          { id: 1, cve: 'CVE-2026-0001', y: 2026, st: 1, descr: 'alpha, fixed again' },
+          { id: 3, cve: 'CVE-2026-0003', y: 2026, st: 1, descr: 'gamma, unchanged' },
+        ],
+      })
+    )
+    expect(again.upserts).toBe(2)
+    expect(again.inserts).toBe(0)
+
+    // A record a tombstone removed and a later delta re-publishes is new again,
+    // which is what the user's copy actually experiences.
+    applyDelta(adapt(db), delta(3, 4, { delete: ['CVE-2026-0003'] }))
+    const revived = applyDelta(
+      adapt(db),
+      delta(4, 5, {
+        upsert: [{ id: 3, cve: 'CVE-2026-0003', y: 2026, st: 1, descr: 'gamma, back' }],
+      })
+    )
+    expect(revived.inserts).toBe(1)
     assertIndexesAgree(db)
     db.close()
   })

@@ -27,6 +27,82 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-064: A stall is sixty seconds without a byte; staleness is the data's own age  (2026-08-05, status: accepted, implements D-052's M2 obligations)
+
+**Decision.** Four parts.
+
+1. **A stall is measured in bytes received, never in elapsed time**, and only on
+   the transfer paths — the snapshot download and the delta fetches. A watch
+   polls; any byte off the wire is a beat; sixty seconds without one aborts the
+   transfer with a message that says it stalled *rather than being slow*.
+   Duration remains never a failure (D-052 rule 1), so a download that takes an
+   hour on a bad link keeps running.
+2. **Every long synchronous step beats immediately after it returns.** SQLite,
+   OPFS and brotli work blocks the Worker thread, so no tick can run while it
+   is happening and the first tick afterwards would measure the work itself as
+   idle time. This is a standing rule for new code on these paths, not a
+   one-off: the 377 MB truncate, each chunk write, each decompression and each
+   delta apply beat.
+3. **The watch is disarmed before the index build**, which at full scale is 58
+   of an import's 64 seconds inside a single call no watch can see into (D-035).
+   Nothing after that line crosses the network.
+4. **Staleness is the age of `meta.generated`** — when the pipeline built the
+   revision this copy holds — and not a comparison against the origin's head.
+   Past two days the UI says the copy is behind and points at Sync.
+
+**Context.** Byte-level beats rather than per-chunk ones because a chunk is
+5 MB: a connection that dies mid-chunk would look alive until the fetch itself
+gave up, which it may never do. Reading the body as a stream pays for itself
+twice — it is also what lets each response be read into a buffer allocated at
+the length the manifest published, so a response that runs long is refused at
+the byte that overruns instead of growing a buffer nobody bounded.
+
+Sixty seconds is chosen against what it must not do — fire on a retransmit, a
+server pause, a laptop that briefly suspends — and not against a latency target.
+Being generous costs only how late a dead connection is reported.
+
+Part 4 is bounded by what `status` is allowed to do: it performs no network
+request, which is what keeps a reopen working offline (D-048), so an age is the
+strongest honest claim available without one. Two days is the threshold because
+the pipeline publishes daily (D-058) — past it, either the user has not synced
+or the origin stopped advancing, and the wording says both are possible rather
+than asserting there is something to fetch. That the origin can genuinely stop
+is not hypothetical: a run that changes nothing mints no revision and does not
+move `generated` (D-058 §4).
+
+**Measured** (2026-08-05, Chromium/Linux, against a local mirror of the live
+data plane — snapshot rev 2, 12 chunks, 372,322 records, the four daily deltas
+the cron has published since). Walking that copy from rev 2 to rev 6, the page
+reported **529 new CVEs, 1,060 records revised, 0 withdrawn in 56.0 s** —
+and counting the four published delta files against the snapshot independently
+gives the same 1,589 upserts split 529 / 1,060. That second count is the point:
+a number that is merely self-consistent proves nothing about what it means.
+
+The freshness stamp is asserted against the manifest's `generated` at both
+scales (`tests/e2e/import.spec.ts`), which is also both sides of the two-day
+threshold — the fixture plane is old enough to be stale, the live one was
+~18 hours old. The stall path was checked by removing the fix: with the stall
+never reported, the download spins and the e2e test fails on an error that never
+arrives, which is the bar-that-never-moves failure this exists to prevent.
+
+**Consequences.**
+
+- `ImportOptions.stallMs`, surfaced as `?stall=`, clamped to
+  [500 ms, 10 minutes] — a test affordance in the same spirit as `?stop=`
+  (D-061), and bounded for the same reason: the worst a crafted link can do is
+  end a download early, which leaves the live copy untouched.
+- The "N new CVEs since your last sync" count comes out of the ID-pairing
+  preflight the applier already runs (D-063), so it costs no extra query: a CVE
+  whose ID is absent there is new by definition.
+- Long *queries* are not covered. A query is one synchronous call in the
+  Worker; feedback and cancellation for it are M3's, as D-052 assigned them.
+
+**Reopen if.** Sixty seconds turns out to fire on a real slow link — the answer
+is a longer timeout or a byte-rate floor, not dropping the distinction; or a
+transfer path appears that is not fetch-based; or the freshness indicator needs
+to distinguish "you have not synced" from "the origin stopped", which takes a
+manifest fetch and therefore a decision about what the reopen path may do.
+
 ## D-063: Sync applies to the live database after promotion, one transaction per delta, with fts5 maintenance inside it  (2026-08-04, status: accepted, implements M2's Sync task; amends D-061's stated intent for catch-up deltas)
 
 **Decision.** Five parts.

@@ -433,16 +433,32 @@ hand its id to a different value (D-056).
   deploy day (RE-012). The M5 service worker follows the same rule: network
   first, cache as fallback, so the offline story never costs a user a stale
   shell while online.
+- **A stall is a failure; duration never is** (D-052, D-064). Every transfer
+  runs under a watch whose only signal is bytes received: sixty seconds without
+  one aborts it and reports that it stalled *rather than being slow*, with the
+  local copy untouched and the staged chunks still resumable. Responses are read
+  as streams for that reason — a chunk is 5 MB, so per-chunk beats would leave a
+  connection that died mid-chunk looking alive — and into a buffer allocated at
+  the published length, so an over-long response is refused at the byte that
+  overruns. The watch can only see *network* stalls: SQLite, OPFS and brotli
+  work blocks the Worker thread, so every long synchronous step beats when it
+  returns, and the watch is disarmed before the index build entirely.
 - **Capability gate before the import path**, so an unsupported browser is told
   on arrival rather than failing partway through a large import (D-016).
 - **Storage sized in advance.** Quota, eviction, and
   `navigator.storage.persist()` are part of the import design, not error
   handling bolted on later.
-- **Staleness is visible.** Sync is manual after the first one (D-025) — a
-  download catches itself up, and after that the user chooses when — so a user
-  can sit on a month-old corpus getting confident-looking counts. The freshness indicator is
-  what keeps results honest — it replaces the coverage tracking that bulk import
-  made unnecessary.
+- **Staleness is visible** (D-064). Sync is manual after the first one (D-025)
+  — a download catches itself up, and after that the user chooses when — so a
+  user can sit on a month-old corpus getting confident-looking counts. The
+  indicator reads the data's own build stamp, `meta.generated`, which the delta
+  carries so that a synced copy and a freshly downloaded one at the same
+  revision report the same age (D-058 §4a). It is an age rather than a verdict
+  about the origin, because `status` makes no network request — that is what
+  lets a reopen work offline (D-048) — so past two days it says the copy is
+  behind unless the origin has stopped publishing, and points at Sync. A sync
+  then reports how many of the records it brought are CVEs this copy did not
+  hold, which is the number a user actually opens the app for.
 
 ## The AI layer (planned — M7/M8, D-044 – D-046, D-057)
 

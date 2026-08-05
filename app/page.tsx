@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 
+import { describeFreshness } from '@/lib/freshness'
 import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
 import type {
   BenchResult,
@@ -41,22 +42,25 @@ const IDLE: Progress = { phase: 'idle', fraction: null, detail: '' }
  * something a stranger can hand you and the memory bound is not negotiable
  * there.
  *
- * The knob to be wary of is **`vfs`**, not `stop`. `?stop=` ends a download
- * early, which leaves the live copy untouched by construction. `?vfs=` selects
- * the `opfs-sahpool` path, which cannot stage (D-051) and so clears local
- * storage — both slots included — *before* fetching anything: one click on a
- * crafted link costs a working local copy. It stays reachable because
- * `pnpm measure` needs it to re-run Q-004.
+ * The knob to be wary of is **`vfs`**, not `stop` or `stall`. `?stop=` ends a
+ * download early and `?stall=` shortens the no-progress timeout, both of which
+ * leave the live copy untouched by construction. `?vfs=` selects the
+ * `opfs-sahpool` path, which cannot stage (D-051) and so clears local storage —
+ * both slots included — *before* fetching anything: one click on a crafted link
+ * costs a working local copy. It stays reachable because `pnpm measure` needs
+ * it to re-run Q-004.
  */
 function importOptions(search: string): ImportOptions {
   const params = new URLSearchParams(search)
   const vfs = params.get('vfs')
   const stop = positive(params.get('stop'))
+  const stall = positive(params.get('stall'))
   return {
     concurrency: positive(params.get('concurrency')) ?? DEFAULT_CONCURRENCY,
     cacheMib: positive(params.get('cache')) ?? DEFAULT_CACHE_MIB,
     vfs: vfs === 'opfs' || vfs === 'opfs-sahpool' ? vfs : DEFAULT_VFS,
     ...(stop === null ? {} : { stopAfterChunks: stop }),
+    ...(stall === null ? {} : { stallMs: stall }),
   }
 }
 
@@ -89,6 +93,19 @@ export default function Home() {
   const [timings, setTimings] = useState<Timings | null>(null)
   const [sync, setSync] = useState<SyncOutcome | null>(null)
   const [revision, setRevision] = useState<number | null>(null)
+  /**
+   * `meta.generated` — when the pipeline built the revision this copy holds,
+   * which is what the staleness indicator is about. Read from the database via
+   * `status`, so it survives a reload and needs no network request (D-048).
+   */
+  const [generated, setGenerated] = useState<number | null>(null)
+  /**
+   * The clock the staleness indicator is measured against, sampled in an effect
+   * rather than read during render — `Date.now()` in a render body is an impure
+   * read React's rules forbid, and it would also freeze the label for as long as
+   * nothing else re-rendered. A tab left open overnight should notice.
+   */
+  const [now, setNow] = useState<number | null>(null)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   /**
@@ -141,6 +158,7 @@ export default function Home() {
           // visitor whose page never ran an import.
           setNotice(message.notice ?? '')
           setRevision(message.rev)
+          setGenerated(message.generated)
           if (!message.ready) {
             setTimings(null)
             setResult(null)
@@ -185,6 +203,17 @@ export default function Home() {
     return () => worker.terminate()
   }, [])
 
+  useEffect(() => {
+    // A minute is far finer than the units this reports in (hours, then days),
+    // so the label is never more than a minute behind and the timer costs
+    // nothing. It also means the indicator crosses into "stale" on its own,
+    // rather than the next time the user happens to click something.
+    const tick = () => setNow(Date.now())
+    tick()
+    const timer = setInterval(tick, 60_000)
+    return () => clearInterval(timer)
+  }, [])
+
   const send = useCallback((request: Request) => {
     setError('')
     // A new run's panels describe that run. Anything a previous one left on
@@ -198,6 +227,7 @@ export default function Home() {
   }, [])
 
   const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
+  const freshness = ready && now !== null ? describeFreshness(generated, now) : null
   // Read once on mount: the warning below has to be on screen *before* the
   // button is clicked, and D-061 accepts this path's destroy-then-download
   // behaviour only because it is diagnostic — an ordinary "Re-download data"
@@ -226,7 +256,10 @@ export default function Home() {
         >
           {ready ? 'Re-download data' : 'Download data'}
         </button>
-        <button onClick={() => send({ type: 'sync' })} disabled={!ready || busy}>
+        <button
+          onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
+          disabled={!ready || busy}
+        >
           Sync
         </button>
         <button onClick={() => send({ type: 'query', sql: DEMO_QUERY })} disabled={!ready || busy}>
@@ -279,15 +312,26 @@ export default function Home() {
       {ready && revision !== null && (
         <p className="muted" data-revision={revision}>
           Local copy at revision {revision}
-          {/* Deliberately flat prose, not a staleness verdict: knowing whether
-              revision N is old means comparing it against the origin's head,
-              which is the freshness task and not this one. */}
-          {sync &&
-            (sync.applied === 0
-              ? ' — already current at the last check.'
-              : ` — ${sync.applied} update${sync.applied === 1 ? '' : 's'} applied, ` +
-                `${sync.upserts.toLocaleString()} records changed and ` +
-                `${sync.deletes.toLocaleString()} withdrawn in ${(sync.ms / 1000).toFixed(1)} s.`)}
+          {sync && syncSummary(sync)}
+        </p>
+      )}
+
+      {/* Staleness, from the data's own build stamp rather than from a
+          comparison with the origin: `status` makes no network request, which
+          is what lets a reopen work offline (D-048). So this says how old the
+          data is — a fact — and prompts a check rather than asserting there is
+          something newer to fetch. */}
+      {ready && freshness !== null && (
+        <p
+          className={freshness.stale ? 'stale' : 'muted'}
+          data-freshness={freshness.stale ? 'stale' : 'current'}
+          data-age-ms={Math.round(freshness.ageMs)}
+        >
+          Data as of <time dateTime={freshness.iso}>{localTime(freshness.iso)}</time> —{' '}
+          {freshness.age}.
+          {freshness.stale &&
+            ' The corpus is published daily, so this copy is behind unless the origin has ' +
+              'stopped publishing — Sync to find out.'}
         </p>
       )}
 
@@ -406,6 +450,39 @@ export default function Home() {
       {notice && <footer className="notice">{notice}</footer>}
     </main>
   )
+}
+
+/**
+ * What a catch-up did, in the terms a user asked the question in.
+ *
+ * "N new CVEs since your last sync" is the number this whole feature exists
+ * for, so it leads: `inserts` are records this copy did not hold, and the
+ * remainder of `upserts` are revisions of records it did. Reporting only the
+ * total would answer "something changed" when the question is "what is new".
+ */
+function syncSummary(sync: SyncOutcome): string {
+  if (sync.applied === 0) return ' — already current at the last check.'
+  const revised = sync.upserts - sync.inserts
+  return (
+    ` — ${count(sync.applied, 'update')} applied: ` +
+    `${count(sync.inserts, 'new CVE')}, ` +
+    `${revised.toLocaleString()} records revised, ` +
+    `${sync.deletes.toLocaleString()} withdrawn, in ${(sync.ms / 1000).toFixed(1)} s.`
+  )
+}
+
+function count(value: number, noun: string): string {
+  return `${value.toLocaleString()} ${noun}${value === 1 ? '' : 's'}`
+}
+
+/**
+ * The build stamp in the reader's own locale and zone. The machine-readable
+ * form stays in the `datetime` attribute, which is where a test reads it —
+ * asserting on a locale string would be asserting on the test runner's zone.
+ */
+function localTime(iso: string): string {
+  const at = new Date(iso)
+  return Number.isNaN(at.getTime()) ? iso : at.toLocaleString()
 }
 
 function Timing({ label, value }: { label: string; value: string }) {

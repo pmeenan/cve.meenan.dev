@@ -84,7 +84,10 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
       // A plane with deltas above its snapshot: the client must have fetched
       // and applied them rather than reported itself current.
       expect(summary).toMatch(/update(s)? applied/)
-      expect(summary).toMatch(/records changed/)
+      // The "N new CVEs since your last sync" number (M2 freshness), counted
+      // apart from revisions of records this copy already held.
+      expect(summary).toMatch(/[\d,]+ new CVEs?/)
+      expect(summary).toMatch(/[\d,]+ records revised/)
     } else {
       // A plane whose head *is* its snapshot — the development slice, and the
       // state the origin is in for the hours after a monthly rotation (D-060).

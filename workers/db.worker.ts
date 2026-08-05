@@ -23,6 +23,7 @@ import { parseDelta } from '../lib/delta'
 import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
 import { batchRanges, indexBatches, indexPlan, indexSql, type SearchIndex } from '../lib/search'
+import { stallError, stallTimeout, watchForStalls, type StallWatch } from '../lib/stall'
 import { applyDelta, type SyncDb } from '../lib/sync'
 import {
   assertLocallyUsable,
@@ -67,7 +68,10 @@ import {
   type Manifest,
   type Progress,
   type Request,
-  type Response,
+  // Aliased so `Response` still means the platform's here: this module is
+  // mostly fetch code, and shadowing the global in a file that reads response
+  // bodies is a trap.
+  type Response as WorkerMessage,
   type SyncOutcome,
   type Timings,
   type Vfs,
@@ -94,7 +98,7 @@ let sahPool: SAHPoolUtil | null = null
  */
 let liveFile: string | null = null
 
-function post(message: Response): void {
+function post(message: WorkerMessage): void {
   ;(self as DedicatedWorkerGlobalScope).postMessage(message)
 }
 
@@ -114,12 +118,112 @@ async function digest(bytes: Uint8Array): Promise<string> {
     .join('')
 }
 
-async function fetchManifest(): Promise<Manifest> {
-  const response = await fetch(manifestUrl(), { cache: 'no-cache' })
+/**
+ * The manifest is small, but it is still part of both transfer paths. Reading
+ * it through `response.json()` would give the stall watch no beats until the
+ * whole body arrived, so a connection delivering it slowly but continuously
+ * would be reported as stalled after sixty seconds. Stream it for the same
+ * reason chunks and deltas are streamed, with a generous bound so the one
+ * response whose length is not declared by the manifest cannot grow without
+ * limit.
+ */
+const MAX_MANIFEST_BYTES = 1_048_576
+
+async function readManifest(response: Response, beat: () => void): Promise<Manifest> {
+  const body = response.body
+  if (!body) return (await response.json()) as Manifest
+
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let json = ''
+  let received = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    // An empty stream chunk is not forward progress: the policy is explicitly
+    // about bytes received, not callbacks delivered.
+    if (value.length === 0) continue
+    received += value.length
+    if (received > MAX_MANIFEST_BYTES) {
+      await reader.cancel().catch(() => undefined)
+      throw new Error(`manifest: exceeds the ${MAX_MANIFEST_BYTES} byte client limit`)
+    }
+    json += decoder.decode(value, { stream: true })
+    beat()
+  }
+  json += decoder.decode()
+  return JSON.parse(json) as Manifest
+}
+
+async function fetchManifest(
+  signal?: AbortSignal,
+  beat: () => void = () => undefined
+): Promise<Manifest> {
+  const response = await fetch(manifestUrl(), { cache: 'no-cache', signal })
   if (!response.ok) throw new Error(`manifest: HTTP ${response.status}`)
-  const manifest = (await response.json()) as Manifest
+  const manifest = await readManifest(response, beat)
   assertUsable(manifest)
   return manifest
+}
+
+/**
+ * Read a response body into a buffer of exactly the length the manifest
+ * declared, beating the stall watch as bytes arrive.
+ *
+ * Two things come out of reading the stream rather than calling
+ * `arrayBuffer()`. The stall watch gets a signal per network read instead of
+ * one per 5 MB chunk, which is what makes "stopped receiving data" a question
+ * about bytes rather than about whole files (D-052). And the buffer is
+ * allocated once, at the published length, so a response that runs long is
+ * refused at the byte that overruns instead of growing a buffer for it — the
+ * memory bound D-040/D-041 imposes is over *our* accounting, and a body whose
+ * length nobody checked is outside it.
+ *
+ * The length itself is a check the M1 path never made: a short body would have
+ * failed its SHA-256 anyway, but it would have failed it after decompressing
+ * whatever arrived, and the error would have named a checksum rather than a
+ * truncated download.
+ */
+async function readBody(
+  response: Response,
+  expected: number,
+  label: string,
+  beat: () => void
+): Promise<Uint8Array> {
+  if (!isRevision(expected) || expected === 0) {
+    throw new Error(`${label}: the manifest declares an unusable compressed length ${expected}`)
+  }
+  const body = response.body
+  if (!body) {
+    // No stream to read (a body already buffered by the platform). The length
+    // is still checked, which is the part that matters.
+    const whole = new Uint8Array(await response.arrayBuffer())
+    beat()
+    if (whole.length !== expected) {
+      throw new Error(`${label}: manifest says ${expected} bytes, got ${whole.length}`)
+    }
+    return whole
+  }
+
+  const out = new Uint8Array(expected)
+  const reader = body.getReader()
+  let at = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value.length === 0) continue
+    if (at + value.length > expected) {
+      await reader.cancel().catch(() => undefined)
+      throw new Error(`${label}: server sent more than the ${expected} bytes the manifest declares`)
+    }
+    out.set(value, at)
+    at += value.length
+    beat()
+  }
+  if (at !== expected) {
+    throw new Error(`${label}: manifest says ${expected} bytes, got ${at}`)
+  }
+  return out
 }
 
 interface ChunkResult {
@@ -133,7 +237,8 @@ interface ChunkResult {
 async function loadChunk(
   manifest: Manifest,
   chunk: ChunkEntry,
-  signal: AbortSignal
+  signal: AbortSignal,
+  beat: () => void
 ): Promise<ChunkResult> {
   const started = performance.now()
   // No Content-Encoding on these: they are opaque bytes and we decode them
@@ -141,7 +246,7 @@ async function loadChunk(
   // wire (D-040).
   const response = await fetch(chunkUrl(manifest, chunk), { signal })
   if (!response.ok) throw new Error(`${chunk.name}: HTTP ${response.status}`)
-  const compressed = new Uint8Array(await response.arrayBuffer())
+  const compressed = await readBody(response, chunk.bytes, chunk.name, beat)
   const fetched = performance.now()
 
   const actual = await digest(compressed)
@@ -153,6 +258,10 @@ async function loadChunk(
   }
 
   const bytes = brotliDecompress(compressed)
+  // Decompressing 5 MB is a synchronous block, so nothing has been able to
+  // report progress for its duration: beat before the next await rather than
+  // let the first tick after it measure the decode as idle time.
+  beat()
   const decompressed = performance.now()
 
   if (bytes.length !== chunk.raw_bytes) {
@@ -188,14 +297,15 @@ async function* orderedChunks(
   manifest: Manifest,
   chunks: ChunkEntry[],
   limit: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  beat: () => void
 ): AsyncGenerator<ChunkResult> {
   const inFlight = new Map<number, Promise<ChunkResult>>()
   let started = 0
   const fill = () => {
     while (inFlight.size < limit && started < chunks.length) {
       const index = started++
-      const pending = loadChunk(manifest, chunks[index]!, signal)
+      const pending = loadChunk(manifest, chunks[index]!, signal, beat)
       // When one chunk fails, the consumer stops pulling and the rest of the
       // window is abandoned mid-flight. This marks those as handled so a
       // second failure is not reported as an unhandled rejection on top of the
@@ -237,7 +347,8 @@ async function writeStagedChunks(
   root: FileSystemDirectoryHandle,
   record: StagingRecord,
   pull: Pull,
-  stopAfter: number | null
+  stopAfter: number | null,
+  watch: StallWatch
 ): Promise<number> {
   // Timed from here, not from the first write: `importThroughSahPool` cannot
   // separate its own handle setup from its writes, so this path must include
@@ -257,6 +368,11 @@ async function writeStagedChunks(
     // shrinking a long one cannot lose a completed chunk, because the bitmap
     // and the length come from the same record.
     if (access.getSize() !== record.rawBytes) access.truncate(record.rawBytes)
+    // Truncating to 377 MB blocks this thread, so the first stall tick after it
+    // would otherwise measure the truncate. Same reason as the beat after each
+    // write below: this watch can only see network stalls, and every long
+    // synchronous step has to hand it back a fresh reading (D-052).
+    watch.beat()
     for (;;) {
       const pullStart = performance.now()
       const result = await pull()
@@ -268,6 +384,7 @@ async function writeStagedChunks(
       // the file (RE-014).
       writeFully(access, result.bytes, result.chunk.offset)
       access.flush()
+      watch.beat()
       const at = index.get(result.chunk.name)
       if (at === undefined) {
         throw new Error(`staged a chunk the record does not name: ${result.chunk.name}`)
@@ -566,21 +683,52 @@ async function importSnapshot(options: ImportOptions = {}): Promise<void> {
   // exists to hold at exactly the moment it matters most, and does it while the
   // user is likely clicking Download again.
   const transfers = new AbortController()
+  // A download that has stopped advancing is a failure, and a slow one is not
+  // (D-052). The watch turns the first into an aborted transfer carrying a
+  // message; the second it never touches, because every byte received is a
+  // beat. The error is kept as the abort *reason* so the catch below can report
+  // it even when Fetch substitutes its own generic AbortError.
+  const watch = watchForStalls({
+    timeoutMs: stallTimeout(options.stallMs),
+    onStall: (idleMs) =>
+      transfers.abort(
+        stallError(
+          'The download',
+          idleMs,
+          'Your local copy is untouched, and downloading again resumes from the chunks ' +
+            'already staged.'
+        )
+      ),
+  })
   try {
-    await runImport(options, transfers)
+    await runImport(options, transfers, watch)
+  } catch (error) {
+    // Chromium preserves an AbortSignal's custom reason while `fetch()` is
+    // waiting for headers, but a response body reader rejects with a generic
+    // AbortError once headers have arrived. A stall in the middle of a chunk
+    // must not lose the diagnosis and recovery message just because it reached
+    // that later phase of Fetch.
+    throw transfers.signal.aborted ? transfers.signal.reason : error
   } finally {
+    // Stopped here as well as inside `runImport`, because a failure anywhere
+    // above leaves the interval running for the life of the Worker otherwise.
+    watch.stop()
     transfers.abort()
   }
 }
 
-async function runImport(options: ImportOptions, transfers: AbortController): Promise<void> {
+async function runImport(
+  options: ImportOptions,
+  transfers: AbortController,
+  watch: StallWatch
+): Promise<void> {
   const overallStart = performance.now()
   const concurrency = clamp(options.concurrency, DEFAULT_CONCURRENCY, MAX_CONCURRENCY)
   const vfs = options.vfs ?? DEFAULT_VFS
   const cacheMib = clamp(options.cacheMib, DEFAULT_CACHE_MIB, MAX_CACHE_MIB)
 
   report('manifest', null, 'Reading manifest')
-  const manifest = await fetchManifest()
+  const manifest = await fetchManifest(transfers.signal, () => watch.beat())
   const { chunks, raw_bytes: rawBytes } = manifest.snapshot
   const compressedTotal = chunks.reduce((sum, c) => sum + c.bytes, 0)
   // `clamp` substitutes its fallback for anything below 1, so zero and negatives
@@ -603,7 +751,7 @@ async function runImport(options: ImportOptions, transfers: AbortController): Pr
    * user is waiting for rather than the part of it this process performed.
    */
   const makePull = (list: ChunkEntry[], already: number): Pull => {
-    const loader = orderedChunks(manifest, list, concurrency, transfers.signal)
+    const loader = orderedChunks(manifest, list, concurrency, transfers.signal, () => watch.beat())
     return async (): Promise<ChunkResult | undefined> => {
       const { value, done } = await loader.next()
       if (done || !value) return undefined
@@ -637,8 +785,11 @@ async function runImport(options: ImportOptions, transfers: AbortController): Pr
     db = null
     liveFile = null
     await clearStorage()
+    // Deleting a 441 MB database is not instant either.
+    watch.beat()
     report('download', 0, `0 / ${chunks.length} chunks`)
     writeMs = await importThroughSahPool(makePull(chunks, 0))
+    watch.stop()
     report('verify', null, `Opening database — ${capabilities()}`)
     const openStart = performance.now()
     staged = await openDatabase('opfs-sahpool', POOL_DB_FILE, cacheMib)
@@ -681,6 +832,10 @@ async function runImport(options: ImportOptions, transfers: AbortController): Pr
     }
     const already = completed(record)
     const pending = pendingChunks(record, manifest)
+    // Discovery opened and closed both slots and read a resume record — real
+    // work, and on a large local copy not instant. Beat before the transfers
+    // start so the first gap the watch measures is a network gap.
+    watch.beat()
 
     report(
       'download',
@@ -694,7 +849,7 @@ async function runImport(options: ImportOptions, transfers: AbortController): Pr
       // on this slot describes the generation we are about to overwrite, and
       // SQLite would replay it into the new file at the next open (D-061).
       await discardSidecars(root, stagedFile)
-      writeMs = await writeStagedChunks(root, record, makePull(pending, already), stopAfter)
+      writeMs = await writeStagedChunks(root, record, makePull(pending, already), stopAfter, watch)
     }
     // "Every chunk present" is the first clause of the promotion gate, so it is
     // checked rather than assumed. Without this the gate rests entirely on the
@@ -707,6 +862,12 @@ async function runImport(options: ImportOptions, transfers: AbortController): Pr
       throw new Error(`staged only ${landed} of ${record.chunks.length} chunks`)
     }
 
+    // Nothing below this line crosses the network, and what follows it is the
+    // index build: 58 of the 64 seconds an import takes, spent inside one
+    // synchronous call that no watch can see into. Leaving the watch armed
+    // through it would mean the first tick afterwards measuring the build and
+    // reporting a stall that never happened.
+    watch.stop()
     report('verify', null, `Verifying the staged copy — ${capabilities()}`)
     const openStart = performance.now()
     // Not 'c': on this path the file must already exist, and creating one turns
@@ -982,14 +1143,11 @@ function syncDb(database: Database): SyncDb {
  * No `cache: 'no-cache'`: a delta file is immutable at its URL, so the ordinary
  * cache is exactly right — unlike the manifest, which is the thing that changes.
  */
-async function loadDelta(entry: DeltaEntry, signal: AbortSignal): Promise<Delta> {
+async function loadDelta(entry: DeltaEntry, signal: AbortSignal, beat: () => void): Promise<Delta> {
   const name = `delta ${entry.from}-${entry.to}`
   const response = await fetch(deltaUrl(entry), { signal })
   if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`)
-  const compressed = new Uint8Array(await response.arrayBuffer())
-  if (compressed.length !== entry.bytes) {
-    throw new Error(`${name}: manifest says ${entry.bytes} bytes, got ${compressed.length}`)
-  }
+  const compressed = await readBody(response, entry.bytes, name, beat)
   if ((await digest(compressed)) !== entry.sha256) throw new Error(`${name}: checksum mismatch`)
 
   const bytes = brotliDecompress(compressed)
@@ -1015,7 +1173,8 @@ async function loadDelta(entry: DeltaEntry, signal: AbortSignal): Promise<Delta>
 async function catchUp(
   manifest: Manifest,
   database: Database,
-  signal: AbortSignal
+  signal: AbortSignal,
+  watch: StallWatch
 ): Promise<SyncOutcome> {
   const started = performance.now()
   const watermark = database.selectValue("SELECT v FROM meta WHERE k = 'rev'")
@@ -1039,6 +1198,7 @@ async function catchUp(
     to: watermark,
     applied: 0,
     upserts: 0,
+    inserts: 0,
     deletes: 0,
     bytes: 0,
     ms: 0,
@@ -1046,16 +1206,21 @@ async function catchUp(
   const target = syncDb(database)
   for (const [index, entry] of chain.entries()) {
     report('sync', index / chain.length, `revision ${entry.to} — ${index + 1} of ${chain.length}`)
-    const delta = await loadDelta(entry, signal)
+    const delta = await loadDelta(entry, signal, () => watch.beat())
     database.exec('PRAGMA query_only=OFF')
     let counts
     try {
       counts = applyDelta(target, delta)
     } finally {
       database.exec('PRAGMA query_only=ON')
+      // Applying a delta is one synchronous transaction — 14 s per file at full
+      // scale — during which no tick can run. Beat before the next fetch, or
+      // the first tick after it reports the apply as a stalled download.
+      watch.beat()
     }
     outcome.applied += 1
     outcome.upserts += counts.upserts
+    outcome.inserts += counts.inserts
     outcome.deletes += counts.deletes
     outcome.bytes += entry.bytes
     outcome.to = counts.to
@@ -1072,15 +1237,36 @@ async function catchUp(
  * revision and the head is above it as soon as one delta has been published
  * since (D-055) — a download that stopped there would be stale on arrival.
  */
-async function syncToHead(): Promise<void> {
+async function syncToHead(options: ImportOptions = {}): Promise<void> {
   if (!db) throw new Error('no local copy — download the corpus first')
   const transfers = new AbortController()
+  // Deltas are small — 218 KB for a real day (D-058) — so a sync that stops
+  // advancing is a connection that died rather than a slow one, and the same
+  // watch applies. A stall here leaves the copy at whichever published revision
+  // the last completed file took it to (D-063).
+  const watch = watchForStalls({
+    timeoutMs: stallTimeout(options.stallMs),
+    onStall: (idleMs) =>
+      transfers.abort(
+        stallError(
+          'The sync',
+          idleMs,
+          'The local copy is unchanged at the last revision that applied; syncing again ' +
+            'picks up from there.'
+        )
+      ),
+  })
   let outcome: SyncOutcome
   try {
     report('manifest', null, 'Reading manifest')
-    const manifest = await fetchManifest()
-    outcome = await catchUp(manifest, db, transfers.signal)
+    const manifest = await fetchManifest(transfers.signal, () => watch.beat())
+    outcome = await catchUp(manifest, db, transfers.signal, watch)
+  } catch (error) {
+    // Same Fetch distinction as the snapshot path: body consumption reports a
+    // generic AbortError, while the signal retains the stall message.
+    throw transfers.signal.aborted ? transfers.signal.reason : error
   } finally {
+    watch.stop()
     // Same reason the import path aborts: a delta still in flight when this
     // ends has nobody left to receive it.
     transfers.abort()
@@ -1607,10 +1793,10 @@ async function handle(request: Request): Promise<void> {
         // it finished. `imported` has already been posted by the time this
         // runs, so a catch-up that fails reports itself without retracting a
         // download that succeeded.
-        await syncToHead()
+        await syncToHead(request.options)
         break
       case 'sync':
-        await syncToHead()
+        await syncToHead(request.options)
         break
       case 'query':
         query(request.sql)

@@ -120,6 +120,21 @@ button:disabled {
   padding-left: 0.75rem;
 }
 
+/* Stale data is a warning, not a failure: the copy still works and every
+   number it produces is real — it is just old (M2 freshness). */
+.stale {
+  color: #8a5300;
+  border-left: 3px solid #b4771f;
+  padding-left: 0.75rem;
+  font-size: 0.9rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .stale {
+    color: #e0a44a;
+  }
+}
+
 .timings {
   display: grid;
   grid-template-columns: auto auto;
