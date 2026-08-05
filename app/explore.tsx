@@ -4,6 +4,7 @@ import { useState } from 'react'
 
 import {
   CVSS_VERSION_LABELS,
+  DIMENSION_LABELS,
   DIMENSIONS,
   SEVERITY_LABELS,
   STATE_LABELS,
@@ -75,18 +76,6 @@ const EMPTY: Draft = {
   state: 'published',
   groupBy: '',
   sort: 'published',
-}
-
-const DIMENSION_LABELS: Record<Dimension, string> = {
-  year: 'Year',
-  severity: 'Severity',
-  cvssVersion: 'CVSS version',
-  state: 'State',
-  cna: 'CNA',
-  vendor: 'Vendor',
-  product: 'Product',
-  cwe: 'CWE',
-  host: 'Reference host',
 }
 
 /** How many records a list asks for. Bounded again in the Worker (D-052 §4). */

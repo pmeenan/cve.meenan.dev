@@ -6,6 +6,8 @@ import { describe, expect, it } from 'vitest'
 import {
   compile,
   countSql,
+  crossSql,
+  CROSS_CELL_LIMIT,
   ftsQuery,
   groupSql,
   lookupKey,
@@ -307,6 +309,119 @@ describe('grouped counts', () => {
 
   it('refuses a dimension it does not know', () => {
     expect(() => groupSql({}, {}, 'sqlite_master' as Dimension)).toThrow(/not a dimension/)
+  })
+})
+
+/**
+ * Two-axis aggregates (M4) — the shape both D-046 benchmark questions are in.
+ *
+ * The failure this section is really guarding is a cross-tab that runs and is
+ * wrong: cells that pair attributes no record actually has, a NULL bucket
+ * silently deleted by an `IN` clause, or a row's cells scattered through the
+ * result set. None of those raise.
+ */
+describe('cross-tab counts', () => {
+  const cells = (rows: Dimension, series: Dimension | null, filters: Filters = {}) => {
+    const built = crossSql(filters, resolve(filters), rows, series)
+    return run(built.sql, built.params)
+  }
+
+  it('answers every axis pair against the published schema', () => {
+    for (const rows of DIMENSIONS) {
+      for (const series of DIMENSIONS) {
+        if (rows === series) continue
+        const built = crossSql({}, {}, rows, series)
+        const result = run(built.sql, built.params)
+        // Five columns: bucket, label, series, series label, count.
+        for (const row of result) expect(row).toHaveLength(5)
+      }
+    }
+  })
+
+  it('never pairs a vendor with another vendor’s product', () => {
+    // CVE-2024-0004 affects Apache's Struts *and* the hostile vendor's product.
+    // Joining `cve_prod` once per axis would report a Struts row under the
+    // hostile vendor and vice versa — a cell for a combination no record has.
+    const rows = cells('vendor', 'product')
+    for (const row of rows) {
+      const vendor = String(row[1])
+      const product = String(row[3])
+      expect(product.startsWith(vendor)).toBe(true)
+    }
+  })
+
+  it('keeps a bucket that is NULL rather than dropping it', () => {
+    // CVE-2023-0003 is REJECTED and carries no CVSS severity. About half the
+    // real corpus is unscored, and the owner's call is that the band is always
+    // shown — so `IN (SELECT …)`, which is never true for NULL, would delete
+    // exactly the band the chart is required to render.
+    const rows = cells('year', 'severity', { state: 'all' })
+    const nulls = rows.filter((row) => row[2] === null)
+    expect(nulls).toHaveLength(1)
+    expect(Number(nulls[0]?.[0])).toBe(2023)
+    expect(Number(nulls[0]?.[4])).toBe(1)
+  })
+
+  it('counts a record once per cell, not once per link row', () => {
+    // CVE-2024-0004 affects two Apache-side products but is one CRITICAL CVE.
+    const rows = cells('vendor', 'severity')
+    const apache = rows.filter((row) => String(row[1]).startsWith('Apache'))
+    const total = apache.reduce((sum, row) => sum + Number(row[4]), 0)
+    expect(total).toBe(2)
+  })
+
+  it('keeps a row’s cells together and orders rows by their own total', () => {
+    const rows = cells('vendor', 'severity')
+    const order = rows.map((row) => String(row[0]))
+    // Every bucket appears in exactly one contiguous run: a reader scrolling a
+    // table, and a chart stacking segments, both depend on it.
+    const runs = order.filter((bucket, index) => index === 0 || order[index - 1] !== bucket)
+    expect(new Set(runs).size).toBe(runs.length)
+  })
+
+  it('orders a time axis forwards and a scale by its code', () => {
+    const rows = cells('year', 'severity')
+    const years = [...new Set(rows.map((row) => Number(row[0])))]
+    expect(years).toEqual([...years].sort((a, b) => a - b))
+    const first = rows.filter((row) => Number(row[0]) === years[0]).map((row) => Number(row[2]))
+    expect(first).toEqual([...first].sort((a, b) => a - b))
+  })
+
+  it('buckets by month and quarter from the stored timestamp', () => {
+    const months = cells('month', 'severity').map((row) => String(row[0]))
+    expect(months).toContain('2021-12')
+    const quarters = cells('quarter', 'severity').map((row) => String(row[0]))
+    expect(quarters).toContain('2021-Q4')
+    expect(quarters).toContain('2024-Q3')
+  })
+
+  it('falls back to a one-dimension aggregate when there is no series', () => {
+    const built = crossSql({}, {}, 'year', null)
+    expect(built.sql).not.toContain('top_series')
+    for (const row of run(built.sql, built.params)) expect(row).toHaveLength(3)
+  })
+
+  it('bounds the cells it will return', () => {
+    const built = crossSql({}, {}, 'vendor', 'severity', { rows: 10 ** 6, series: 10 ** 6 })
+    expect(built.params.at(-1)).toBe(CROSS_CELL_LIMIT)
+  })
+
+  it('applies the state default to both axis cuts as well as the cells', () => {
+    // D-022 lives in `compile`, and a cross-tab compiles it three times — the
+    // two narrowing passes and the cells. A pass that missed it would widen the
+    // axes with REJECTED records the cells then cannot fill.
+    const built = crossSql({}, {}, 'year', 'severity')
+    expect(built.sql.match(/c\.state = \?/g)).toHaveLength(3)
+    const rows = run(built.sql, built.params)
+    expect(rows.some((row) => Number(row[0]) === 2023)).toBe(false)
+  })
+
+  it('binds filter values in every one of its passes', () => {
+    const filters: Filters = { vendor: [HOSTILE_VENDOR], severity: [4] }
+    const built = crossSql(filters, resolve(filters), 'vendor', 'severity')
+    expect(built.sql).not.toContain('DROP')
+    expect(built.sql).not.toContain(HOSTILE_VENDOR)
+    expect(() => run(built.sql, built.params)).not.toThrow()
   })
 })
 

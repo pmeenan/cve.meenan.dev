@@ -16,9 +16,8 @@ it touched.
 
 Milestones are decomposed into task-sized checkboxes (the workflow's unit of
 work) no later than when they become the next milestone up — M0 – M3 are
-decomposed and closed. **M4 is next and still carries only scope prose**, so its
-checkbox breakdown is the first thing that milestone owes. M5+ carry scope prose
-and exit criteria until their turn.
+decomposed and closed, and **M4 is decomposed and in progress**. M5+ carry scope
+prose and exit criteria until their turn.
 
 ## M0 — Plan the plan  `done`
 
@@ -419,7 +418,7 @@ One thing is deliberately **not** claimed: the re-download at a *new* schema is
 not exercised end to end, because that needs a data plane at the new schema and
 a client that speaks it — two builds of the app (D-068).
 
-## M4 — Analysis and reporting  `pending`
+## M4 — Analysis and reporting  `in progress`
 
 Scope: structured filtering UI, aggregate and trend reporting, charting, saved
 queries and history, shareable query permalinks, CSV/JSON export carrying the
@@ -432,6 +431,120 @@ pass: keyboard operability and labels for filters, tables, and charts.
 The serializable report definition behind permalinks is now also the contract
 the AI chat layer emits (D-044) — design it here as a shared primitive, not a
 permalink implementation detail.
+
+Four shape decisions were taken by the owner before decomposition (2026-08-05),
+because each of them changes what the tasks below are: the app becomes a
+**tabbed workspace on one route** rather than a longer page or real routes, so
+the Worker and its OPFS handle survive navigation; a report definition carries
+**filters plus a rows dimension, an optional series dimension, and a time
+bucket**, because both D-046 benchmark questions are cross-tabs and a
+one-dimension primitive would be revised the moment M7 consumed it; charts are
+**hand-rolled inline SVG**, which adds no dependency to audit under D-002 and
+puts the accessibility story in our own hands rather than in a library's
+defaults; and exports cover the **whole match set up to a disclosed cap**
+rather than whatever the table happens to be showing.
+
+Four more were taken against the first mockup, which was drawn from real records
+rather than invented ones — which is what surfaced them. **Records with no CVSS
+score are always shown as their own band**, never excluded by default: about
+half the corpus has never been scored (189,742 of 372,322), so a severity chart
+that quietly dropped them would understate every bucket, and hiding an absence
+that large is the same failure D-022 guards against for REJECTED records.
+**CRITICAL sits at the stack's baseline**, because stacked segments share only
+that edge and the bottom series is the only one a reader can compare accurately
+across buckets — so the founding question's series gets the readable position,
+and the unscored band lands at the top where it cannot distort the trend
+beneath it. **M4 adds a per-CVE detail view** — description, CWEs, affected
+version ranges, reference URLs — which is what the scope's link-hardening
+clause is actually for, is the only surface that reaches the references and
+version ranges D-033 put in the schema, and is what D-044's "CVE detail" chat
+tool will render through in M7. And accessibility is verified by **axe-core in
+Playwright plus hand-written keyboard tests** — the automated pass for labels,
+roles and contrast across every tab, the hand-written ones for tab order,
+arrow-key movement and the chart's table fallback, which no rule engine checks.
+
+One thing follows from the constraints rather than from preference, and is
+recorded here so it is not re-litigated as a styling choice: a permalink puts
+its report in the **URL fragment, never the query string**. A query string
+reaches nginx in the request line and its access log, and a report definition
+is made of predicates — the exact thing D-014 forbids the server to learn and
+D-032 keeps it structurally unable to. The fragment is never sent.
+
+Tasks in dependency order. The report definition comes first because everything
+after it is either a producer or a consumer of one.
+
+- [ ] **The report definition** (`lib/report.ts`). The serializable object
+      D-044 calls the shared primitive: filters, rows, series, bucket, chart
+      type, sort, limit, title. It arrives from a URL fragment written by a
+      stranger and, in M7, from a model — so it is *validated*, not cast, and
+      an unknown dimension or chart type is refused by name rather than
+      defaulted past. Carries a version, so a definition this build cannot read
+      says so instead of rendering something subtly different from what its
+      author saw.
+- [ ] **Two-axis aggregation and time buckets** in `lib/filters.ts`. `groupSql`
+      grows a second dimension and a `year | quarter | month` bucket over
+      `published`. Two properties have to survive the second axis: link-table
+      dimensions still count `DISTINCT c.id`, so a record affecting eight
+      products stays one record; and the cell count is bounded, because rows ×
+      series is a product and a vendor × product cross-tab is not renderable at
+      the corpus's cardinalities. Truncation is reported, never silent (D-052).
+- [ ] **The tabbed shell.** Data / Explore / Report / Saved / SQL on one route,
+      as an ARIA tablist with roving tabindex and arrow-key movement. The
+      Worker stays mounted across tabs — remounting costs the 3.4 s reopen
+      measured in D-049 — and the freshness line and MITRE notice stay visible
+      from every tab, since D-008 attaches to the copy rather than to a view of
+      it.
+- [ ] **The report builder.** Filters as removable chips over a disclosure
+      holding the full form, plus the rows/series/bucket/chart pickers. The M3
+      filter form is refactored into a shared component rather than duplicated:
+      Explore and Report must not drift into disagreeing about what an axis
+      means. D-022's PUBLISHED-only default is shown as a chip rather than
+      implied, because the one thing a report must never do is change its
+      denominator quietly.
+- [ ] **Charts** — hand-rolled SVG: stacked and grouped bars, and lines over
+      time. Severity is an **ordinal** encoding (a lightness-ordered ramp,
+      validated in both themes against this app's own surfaces), not a
+      categorical one, because LOW→CRITICAL is an ordered scale and hue alone
+      puts MEDIUM and HIGH — the two largest bands — below the separation
+      floor. Identity dimensions (vendor, CWE, CNA) use categorical slots and
+      cap at what stays distinguishable. Every chart ships its numbers as a
+      table view, which is both the accessibility channel and the audit one.
+- [ ] **Permalinks.** Fragment-encoded report definitions, a Copy link action,
+      and restore-on-load. Bounded on the way in: a hostile fragment is a
+      stranger's input, so length and structure are checked before anything is
+      decoded. Verified on a **fresh browser profile** with its own local copy,
+      which is the only test that proves the link carries the report and not a
+      pointer into this browser's state.
+- [ ] **Saved reports and history.** Named saves plus an automatic recent list,
+      in `localStorage` — deliberately *not* in the SQLite copy, which is a
+      rebuildable cache (D-013) that a re-download or a schema bump destroys.
+      Losing a week of saved reports to a schema bump would be exactly the
+      "quiet wrongness" vision criterion 7 rules out. Versioned, and survives a
+      reload.
+- [ ] **Export, and the hardening it drags in.** CSV and JSON, streamed from
+      the Worker in batches so a large export is bounded by a batch rather than
+      by the result set, up to a disclosed cap. Every format carries the D-008
+      notice — an export is a copy, and the notice obligation is functional
+      rather than decorative (D-047). CVE text is hostile input (rule 4), so:
+      formula injection neutralized so a cell cannot execute in a spreadsheet,
+      control characters stripped, and any URL rendered as a link held to a
+      scheme allowlist. Tested with records built to carry each payload, not
+      with clean ones.
+- [ ] **The per-CVE detail view.** Description, CWEs, affected version ranges
+      and references for one record — the first surface to reach the two
+      sections D-033 accepted into the schema and nothing has rendered since.
+      References are the hostile part: a URL in a CVE record is
+      attacker-supplied, so it is held to a scheme allowlist, rendered with its
+      host shown, never auto-fetched, and never turned into a request by
+      hovering it (rule 4, D-011's referrer concern).
+- [ ] **Accessibility as an acceptance criterion.** Keyboard operability and
+      labels across tabs, the filter form, tables and charts — asserted by
+      tests rather than inspected once: `@axe-core/playwright` for labels, roles
+      and contrast on every tab, hand-written tests for tab order, arrow-key
+      movement and the chart's table fallback. The dependency's license is
+      verified from its own metadata before it lands (D-002).
+
+
 
 **Exit criteria:** the owner's motivating question — counts by vendor, product,
 and severity over the last two years (D-046 benchmark item #2) — is answerable

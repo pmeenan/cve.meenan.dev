@@ -155,8 +155,12 @@ Worker sitting inside SQLite (D-066); query statistics ship in the artifact and 
 slowest shape in the benchmark by a third, at no cost to the import (D-067);
 and a
 schema bump announces itself and keeps the copy it invalidated instead of
-sweeping it (D-068). **M4 is next** — analysis and reporting — and is not yet
-decomposed into tasks. M2 closed the server half in production on `plex` (daily
+sweeping it (D-068). **M4 is in progress** — analysis and reporting — decomposed
+into tasks 2026-08-05 around four owner shape calls: a tabbed workspace on one
+route, a report definition carrying rows × series × time bucket, hand-rolled SVG
+charts, and exports covering the whole match set to a disclosed cap. Permalinks
+go in the URL fragment, never the query string, so a report's predicates never
+reach the server's request line (D-014, D-032). M2 closed the server half in production on `plex` (daily
 ingest D-058, monthly rotation D-060); the monthly's first unattended firing is
 1 September, still unobserved. The AI ladder was re-ordered 2026-08-03: the
 first model tier is site-hosted Ollama behind a restricted same-origin relay,

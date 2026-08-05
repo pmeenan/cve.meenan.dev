@@ -441,9 +441,21 @@ export function countSql(
   return { sql: `SELECT count(*) AS matches FROM cve c WHERE ${where}`, params }
 }
 
-/** The axes an aggregate can group by — every filter axis, plus time. */
+/**
+ * The axes an aggregate can group by — every filter axis, plus three time
+ * grains.
+ *
+ * `year` reads the stored `c.year` column, which is indexed; `quarter` and
+ * `month` are computed from `c.published`. They are separate dimensions rather
+ * than one dimension with a grain parameter because that keeps the report
+ * definition flat — one field naming an axis — which is both simpler to
+ * validate coming out of a URL fragment and simpler for a small model to emit
+ * correctly (D-044, M7).
+ */
 export const DIMENSIONS = [
   'year',
+  'quarter',
+  'month',
   'severity',
   'cvssVersion',
   'state',
@@ -456,80 +468,107 @@ export const DIMENSIONS = [
 
 export type Dimension = (typeof DIMENSIONS)[number]
 
+/** Dimensions whose buckets are points in time, ordered by the axis not by size. */
+export const TIME_DIMENSIONS = new Set<Dimension>(['year', 'quarter', 'month'])
+
+/** What each axis is called on screen. Beside the other label maps, and typed
+ * against `Dimension`, so adding an axis cannot leave a picker showing a key. */
+export const DIMENSION_LABELS: Record<Dimension, string> = {
+  year: 'Year',
+  quarter: 'Quarter',
+  month: 'Month',
+  severity: 'Severity',
+  cvssVersion: 'CVSS version',
+  state: 'State',
+  cna: 'CNA',
+  vendor: 'Vendor',
+  product: 'Product',
+  cwe: 'CWE',
+  host: 'Reference host',
+}
+
 /**
- * How each dimension is grouped. `key` is what the UI turns into a label, and
- * `expr`/`from`/`group` are this file's own SQL — no caller-supplied text
- * reaches any of them.
+ * Dimensions whose buckets are a stored code the UI maps to a label — ordered
+ * by the code, because they are scales (severity) or version identifiers, not
+ * rankings.
+ */
+const CODE_DIMENSIONS = new Set<Dimension>(['severity', 'cvssVersion', 'state'])
+
+/**
+ * The time grains, as SQL over `c.published` (unix seconds).
  *
- * The link-table dimensions count `DISTINCT c.id` rather than rows, because a
- * record affecting five Cisco products is one Cisco CVE, not five.
+ * Both yield a sortable string, so ordering the axis is ordering the bucket and
+ * no separate sort key is needed. A record with no publication date buckets to
+ * NULL rather than to a wrong period — `strftime` propagates it — which the UI
+ * renders as "(none recorded)" the same way an absent lookup is rendered.
+ */
+const MONTH_EXPR = "strftime('%Y-%m', c.published, 'unixepoch')"
+const QUARTER_EXPR =
+  "strftime('%Y', c.published, 'unixepoch') || '-Q' || " +
+  "((CAST(strftime('%m', c.published, 'unixepoch') AS INTEGER) + 2) / 3)"
+
+/**
+ * The join chains a dimension can need, each declared **once** and shared by
+ * every axis that uses it.
+ *
+ * Sharing is what makes a two-axis aggregate correct rather than merely
+ * runnable. Vendor and product both hang off `cve_prod`; joined twice under
+ * separate aliases, a vendor × product cross-tab would pair every vendor of a
+ * record with every product of it, so a record affecting Cisco/IOS and
+ * Juniper/JunOS would report a "Cisco / JunOS" cell that does not exist. One
+ * chain per group means product's vendor is *its own* vendor.
+ *
+ * Independent groups are a different matter: vendor × CWE genuinely is every
+ * pairing, and joining both chains is what expresses that.
+ */
+type JoinGroup = 'prod' | 'cwe' | 'ref' | 'cna'
+
+const JOIN_SQL: Record<JoinGroup, string> = {
+  prod:
+    'JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ' +
+    'JOIN vendor v ON v.id = p.vendor_id',
+  cwe: 'JOIN cve_cwe x ON x.cve_id = c.id JOIN cwe w ON w.id = x.cwe_id',
+  ref:
+    'JOIN cve_ref r ON r.cve_id = c.id JOIN url u ON u.id = r.url_id ' +
+    'JOIN host h ON h.id = u.host_id',
+  cna: 'LEFT JOIN cna n ON n.id = c.cna_id',
+}
+
+/**
+ * Which join groups put more than one row on screen per record. `cna` does not
+ * — it is a scalar foreign key reached by a LEFT JOIN — so a grouping that
+ * needs only it can count rows. Any of the others means counting
+ * `DISTINCT c.id`, because a record affecting five Cisco products is one Cisco
+ * CVE, not five.
+ */
+const MULTIPLYING: ReadonlySet<JoinGroup> = new Set<JoinGroup>(['prod', 'cwe', 'ref'])
+
+/**
+ * How each dimension is grouped. Every string here is this file's own SQL — no
+ * caller-supplied text reaches any of them.
  */
 interface DimensionSql {
   key: string
   label: string
-  join: string
   group: string
-  count: string
+  join?: JoinGroup
 }
 
 const DIMENSION_SQL: Record<Dimension, DimensionSql> = {
-  year: { key: 'c.year', label: 'c.year', join: '', group: 'c.year', count: 'count(*)' },
-  severity: {
-    key: 'c.cvss_sev',
-    label: 'c.cvss_sev',
-    join: '',
-    group: 'c.cvss_sev',
-    count: 'count(*)',
-  },
-  cvssVersion: {
-    key: 'c.cvss_ver',
-    label: 'c.cvss_ver',
-    join: '',
-    group: 'c.cvss_ver',
-    count: 'count(*)',
-  },
-  state: { key: 'c.state', label: 'c.state', join: '', group: 'c.state', count: 'count(*)' },
-  cna: {
-    key: 'c.cna_id',
-    label: 'n.name',
-    join: 'LEFT JOIN cna n ON n.id = c.cna_id',
-    group: 'c.cna_id',
-    count: 'count(*)',
-  },
-  vendor: {
-    key: 'v.id',
-    label: 'v.name',
-    join:
-      'JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ' +
-      'JOIN vendor v ON v.id = p.vendor_id',
-    group: 'v.id',
-    count: 'count(DISTINCT c.id)',
-  },
-  product: {
-    key: 'p.id',
-    label: "v.name || ' / ' || p.name",
-    join:
-      'JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ' +
-      'JOIN vendor v ON v.id = p.vendor_id',
-    group: 'p.id',
-    count: 'count(DISTINCT c.id)',
-  },
-  cwe: {
-    key: 'w.id',
-    label: "w.cwe || ' — ' || w.descr",
-    join: 'JOIN cve_cwe x ON x.cve_id = c.id JOIN cwe w ON w.id = x.cwe_id',
-    group: 'w.id',
-    count: 'count(DISTINCT c.id)',
-  },
-  host: {
-    key: 'h.id',
-    label: 'h.name',
-    join:
-      'JOIN cve_ref r ON r.cve_id = c.id JOIN url u ON u.id = r.url_id ' +
-      'JOIN host h ON h.id = u.host_id',
-    group: 'h.id',
-    count: 'count(DISTINCT c.id)',
-  },
+  year: { key: 'c.year', label: 'c.year', group: 'c.year' },
+  // Computed from the stored timestamp rather than stored: a second column per
+  // grain would cost download bytes for every user (the trade D-033 made
+  // against indexes), and a grouped scan is doing the work either way.
+  quarter: { key: QUARTER_EXPR, label: QUARTER_EXPR, group: QUARTER_EXPR },
+  month: { key: MONTH_EXPR, label: MONTH_EXPR, group: MONTH_EXPR },
+  severity: { key: 'c.cvss_sev', label: 'c.cvss_sev', group: 'c.cvss_sev' },
+  cvssVersion: { key: 'c.cvss_ver', label: 'c.cvss_ver', group: 'c.cvss_ver' },
+  state: { key: 'c.state', label: 'c.state', group: 'c.state' },
+  cna: { key: 'c.cna_id', label: 'n.name', group: 'c.cna_id', join: 'cna' },
+  vendor: { key: 'v.id', label: 'v.name', group: 'v.id', join: 'prod' },
+  product: { key: 'p.id', label: "v.name || ' / ' || p.name", group: 'p.id', join: 'prod' },
+  cwe: { key: 'w.id', label: "w.cwe || ' — ' || w.descr", group: 'w.id', join: 'cwe' },
+  host: { key: 'h.id', label: 'h.name', group: 'h.id', join: 'ref' },
 }
 
 /** Aggregate rows a grouped query may return. Generous: 2026 has 28 years of
@@ -550,8 +589,7 @@ export function groupSql(
   dimension: Dimension,
   limit = GROUP_LIMIT
 ): { sql: string; params: SqlParam[] } {
-  const shape = DIMENSION_SQL[dimension]
-  if (!shape) throw new Error(`not a dimension this build groups by: ${String(dimension)}`)
+  const shape = shapeOf(dimension)
   const { where, params } = compile(filters, resolved)
   const ordered =
     dimension === 'year' || dimension === 'state' || dimension === 'cvssVersion'
@@ -559,11 +597,159 @@ export function groupSql(
       : 'cves DESC'
   return {
     sql:
-      `SELECT ${shape.key} AS bucket, ${shape.label} AS label, ${shape.count} AS cves ` +
-      `FROM cve c ${shape.join} WHERE ${where} GROUP BY ${shape.group} ` +
+      `SELECT ${shape.key} AS bucket, ${shape.label} AS label, ${countFor([shape])} AS cves ` +
+      `FROM cve c ${joinsFor([shape])} WHERE ${where} GROUP BY ${shape.group} ` +
       `ORDER BY ${ordered} LIMIT ?`,
     params: [...params, clampLimit(limit, GROUP_LIMIT, GROUP_LIMIT)],
   }
+}
+
+/** Refuses by name rather than defaulting past it: this arrives from a URL. */
+function shapeOf(dimension: Dimension): DimensionSql {
+  const shape = DIMENSION_SQL[dimension]
+  if (!shape) throw new Error(`not a dimension this build groups by: ${String(dimension)}`)
+  return shape
+}
+
+/** Each needed join group emitted once, in a fixed order. */
+function joinsFor(shapes: DimensionSql[]): string {
+  const groups: JoinGroup[] = []
+  for (const shape of shapes) {
+    if (shape.join && !groups.includes(shape.join)) groups.push(shape.join)
+  }
+  return groups.map((group) => JOIN_SQL[group]).join(' ')
+}
+
+function countFor(shapes: DimensionSql[]): string {
+  const multiplies = shapes.some((shape) => shape.join && MULTIPLYING.has(shape.join))
+  return multiplies ? 'count(DISTINCT c.id)' : 'count(*)'
+}
+
+/**
+ * How many buckets a cross-tab may carry on each axis, and how many cells in
+ * total.
+ *
+ * Rows × series is a *product*, so two axes that are each individually
+ * reasonable are not: vendor × product is 24,436 × 80,213. The cell cap is the
+ * backstop that makes any pair of axes safe to ask for, and what it stops is a
+ * result set the Worker would hold in memory and structured-clone to the page
+ * (the same reasoning as ROW_LIMIT).
+ */
+export const CROSS_ROW_LIMIT = 250
+export const CROSS_SERIES_LIMIT = 24
+export const CROSS_CELL_LIMIT = 3_000
+
+export interface CrossOptions {
+  /** Distinct row buckets. Charts ask for far fewer than the cap. */
+  rows?: number
+  /** Distinct series buckets. */
+  series?: number
+}
+
+/**
+ * Counts by two dimensions at once — the shape both D-046 benchmark questions
+ * are in, and what a stacked or grouped chart renders.
+ *
+ * The axes are narrowed *before* the cross-tab is computed, each by its own
+ * total, rather than by taking the biggest cells: a vendor belongs on the chart
+ * because it has many CVEs, not because one of its severity buckets happens to
+ * be large. Selecting on cells would drop a vendor whose records are spread
+ * evenly across severities in favour of one that is entirely MEDIUM, which is
+ * the opposite of what "top vendors" means.
+ *
+ * Rows come back ordered for reading: time ascending, so a chart's x-axis runs
+ * forwards, and everything else by size. The narrowing itself takes time
+ * *descending* — with 336 months in the corpus and a cap below that, the
+ * interesting end is the recent one, and ordering the cut the same way as the
+ * output would silently answer about 1999.
+ */
+export function crossSql(
+  filters: Filters,
+  resolved: Resolved,
+  rows: Dimension,
+  series: Dimension | null,
+  options: CrossOptions = {}
+): { sql: string; params: SqlParam[] } {
+  const rowLimit = clampLimit(options.rows, CROSS_ROW_LIMIT, CROSS_ROW_LIMIT)
+  if (series === null) return groupSql(filters, resolved, rows, rowLimit)
+
+  const rowShape = shapeOf(rows)
+  const seriesShape = shapeOf(series)
+  const seriesLimit = clampLimit(options.series, CROSS_SERIES_LIMIT, CROSS_SERIES_LIMIT)
+  const { where, params } = compile(filters, resolved)
+
+  // Each axis narrowed on its own terms, through its own joins only — a
+  // vendor's total must not be computed through the CWE chain, which would
+  // count it once per CWE.
+  const topRows =
+    `SELECT ${rowShape.key} AS bucket FROM cve c ${joinsFor([rowShape])} WHERE ${where} ` +
+    `GROUP BY ${rowShape.group} ORDER BY ${narrowOrder(rows, rowShape)} LIMIT ?`
+  const topSeries =
+    `SELECT ${seriesShape.key} AS bucket FROM cve c ${joinsFor([seriesShape])} WHERE ${where} ` +
+    `GROUP BY ${seriesShape.group} ORDER BY ${narrowOrder(series, seriesShape)} LIMIT ?`
+
+  // `IS` rather than `IN`: a NULL bucket is a real answer — records with no
+  // CVSS severity are about half the corpus and are shown as their own band
+  // rather than dropped — and `x IN (SELECT …)` is never true for NULL, so a
+  // plain IN would delete exactly the band the chart is required to show.
+  const rowIn =
+    `(${rowShape.key} IN (SELECT bucket FROM top_rows) OR ` +
+    `(${rowShape.key} IS NULL AND EXISTS (SELECT 1 FROM top_rows WHERE bucket IS NULL)))`
+  const seriesIn =
+    `(${seriesShape.key} IN (SELECT bucket FROM top_series) OR ` +
+    `(${seriesShape.key} IS NULL AND EXISTS (SELECT 1 FROM top_series WHERE bucket IS NULL)))`
+
+  const sql =
+    `WITH top_rows AS (${topRows}), top_series AS (${topSeries}) ` +
+    `SELECT ${rowShape.key} AS bucket, ${rowShape.label} AS label, ` +
+    `${seriesShape.key} AS series, ${seriesShape.label} AS series_label, ` +
+    `${countFor([rowShape, seriesShape])} AS cves ` +
+    `FROM cve c ${joinsFor([rowShape, seriesShape])} ` +
+    `WHERE ${where} AND ${rowIn} AND ${seriesIn} ` +
+    `GROUP BY ${rowShape.group}, ${seriesShape.group} ` +
+    `ORDER BY ${rowOrder(rows, rowShape, countFor([rowShape, seriesShape]))}, ` +
+    `${seriesOrder(series, seriesShape)} LIMIT ?`
+
+  return {
+    sql,
+    params: [
+      ...params,
+      rowLimit,
+      ...params,
+      seriesLimit,
+      ...params,
+      Math.min(rowLimit * seriesLimit, CROSS_CELL_LIMIT),
+    ],
+  }
+}
+
+/**
+ * How an axis is cut down to its cap: time takes the recent end, else the big
+ * end — by *records*, not by joined rows, or a vendor with many products per
+ * record would outrank one with many records.
+ */
+function narrowOrder(dimension: Dimension, shape: DimensionSql): string {
+  return TIME_DIMENSIONS.has(dimension) ? `${shape.key} DESC` : `${countFor([shape])} DESC`
+}
+
+/**
+ * How rows are ordered for reading.
+ *
+ * A cross-tab returns cells, so ordering by cell size would interleave rows —
+ * a vendor's CRITICAL cell landing pages away from its LOW one. Every row's
+ * cells therefore sort together, by that row's own total, which is what the
+ * window function computes: the ordering is over rows even though the result
+ * set is cells.
+ */
+function rowOrder(dimension: Dimension, shape: DimensionSql, count: string): string {
+  if (TIME_DIMENSIONS.has(dimension) || CODE_DIMENSIONS.has(dimension)) return `${shape.key} ASC`
+  return `sum(${count}) OVER (PARTITION BY ${shape.group}) DESC, ${shape.key}`
+}
+
+/** How cells are ordered within a row: scales by their value, identity by size. */
+function seriesOrder(dimension: Dimension, shape: DimensionSql): string {
+  if (TIME_DIMENSIONS.has(dimension) || CODE_DIMENSIONS.has(dimension)) return `${shape.key} ASC`
+  return 'cves DESC'
 }
 
 function clampLimit(

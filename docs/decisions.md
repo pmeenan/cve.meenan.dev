@@ -27,6 +27,78 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-069: The report definition — one validated object, carried only in the URL fragment  (2026-08-05, status: accepted, implements D-044's shared primitive)
+
+**Decision.** M4's report definition (`lib/report.ts`) is the single
+serializable object built by the report UI, carried by a permalink, stored by a
+saved report, and — from M7 — emitted by the chat layer. Four commitments bind
+it:
+
+- **Filters plus two axes.** `{ v, title?, filters, rows, series, chart, sort?,
+  limit? }`. `rows` and `series` are both plain dimensions, and the three time
+  grains are *dimensions* (`year`, `quarter`, `month`) rather than a separate
+  grain parameter — which keeps the object flat, so validating it out of a
+  fragment is a field check rather than a consistency check, and a small model
+  emitting one has one fewer way to be internally inconsistent (D-046).
+- **Validated, never cast.** `parseReport` returns a value or an error naming
+  the field. An unknown dimension or chart type is refused *by name* rather than
+  defaulted past, and the D-022 PUBLISHED-only default is re-applied here as
+  well as in `compile` — a definition with no state, or an unrecognised one,
+  reads as PUBLISHED rather than widening the corpus by ~5% silently. Unknown
+  fields are dropped rather than rejected, so a definition from a newer build at
+  the same version still opens at the parts this one understands.
+- **It travels in the fragment, never the query string.** A report definition
+  is made of predicates — a vendor, a search term, a date range — and D-014
+  forbids the server to learn those while D-032 keeps it structurally unable to.
+  A query string reaches nginx in the request line and lands in its access log;
+  a fragment is never sent. Encoded base64url so it survives copy-paste and mail
+  clients without percent-encoding, bounded at 16 KB and character-checked
+  before anything is decoded.
+- **Versioned.** `REPORT_VERSION` is bumped only when a change would make an
+  older definition *mean* something different. A definition from a newer build
+  is refused with a message naming the situation, because a permalink outlives
+  the build that wrote it and "invalid link" would send the reader hunting a
+  typo that is not there.
+
+**Context.** Decided while decomposing M4 (2026-08-05), with the two-axis shape
+settled by the owner: both D-046 benchmark questions are cross-tabs, so a
+one-dimension primitive would have been revised the moment M7 consumed it.
+
+The fragment rule is the part most likely to be undone by a later change on
+readability grounds, which is why it is here rather than only in the code. It is
+not a URL-style preference: `?vendor=cisco` would put a predicate in the
+server's log, which is the one thing the whole data-plane design exists to
+prevent.
+
+Two-axis aggregation (`crossSql`) came with a correctness trap worth recording,
+because it is invisible in a passing test. Join chains are declared **once per
+group** and shared by every axis that uses them: vendor and product both hang
+off `cve_prod`, and joining it twice under separate aliases pairs every vendor
+of a record with every product of it — a record affecting Cisco/IOS and
+Juniper/JunOS reports a "Cisco / JunOS" cell that no record has. Verified by
+building the broken variant against the real schema: it invents two impossible
+cells out of four where the shared chain produces two correct ones. Independent
+groups are the opposite case — vendor × CWE genuinely is every pairing — so the
+rule is per join group, not global. The axes are also narrowed *before* the
+cross-tab, each by its own total, so a vendor earns its place by record count
+rather than by having one large severity bucket; and bucket membership is tested
+with an explicit NULL arm, because `IN (SELECT …)` is never true for NULL and
+would delete exactly the unscored band the owner required always be shown.
+
+**Consequences.** M4's remaining surfaces are all producers or consumers of this
+object rather than of each other, and M7's presentation tools have a contract to
+emit against that already exists and is already tested. The permalink's privacy
+property is now a property of the *format* rather than of the code that happens
+to build URLs. Because the definition is validated at the boundary, a hostile
+fragment, a stale `localStorage` entry and a confused model's tool call all fail
+the same way and in the same place.
+
+**Reopen if.** Report definitions prove too rigid for what models usefully emit
+(D-044's own reopen condition), a third axis turns out to be needed often enough
+that flatness costs more than it saves, or a definition grows past what a
+fragment can carry — at which point the answer is a smaller definition, not a
+query string.
+
 ## D-068: A schema bump announces itself and keeps the copy it invalidated  (2026-08-05, status: accepted, refines D-013)
 
 **Decision.** When the schema version in a local copy is not the one this build
