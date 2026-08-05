@@ -386,9 +386,18 @@ hand its id to a different value (D-056).
   floor, since it omits the journal written while the indexes build. M5's quota
   work plans against that number, and the two-slot bound is what keeps it from
   growing further.
-- **Apply is one transaction and is idempotent.** Measured: eight applications
-  of the same delta left row counts identical and the file 0.1 MB larger. An
-  interrupted sync is safe to retry with no reconciliation logic.
+- **Apply is one transaction per delta file, on the live database** (D-063).
+  Lookups, then tombstones, then whole-record replacements, then the watermark —
+  all inside it, so a failure leaves the copy at the revision it started from
+  and a retry is safe with no reconciliation logic. A *chain* is not wrapped:
+  each file is a step between published revisions, so stopping part way leaves
+  the copy at one of them rather than discarding the files that did apply. The
+  catch-up runs after promotion rather than on the staging file, so a delta
+  fetch can never cost a finished download, and a download ends by catching up —
+  a fresh copy lands at head, not at `snapshot.rev`. Apply refuses rather than
+  guesses: the delta's `from` must equal the local watermark, a CVE's row id
+  must match in **both** directions, and every lookup id a record references
+  must exist once the delta's own lookups are in. Drift means re-download.
 - **The client builds its own full-text indexes** after import, over
   descriptions, vendor names and product names — never references, whose URLs
   would shred into the same term space as the prose (D-035). Shipping the
@@ -396,11 +405,17 @@ hand its id to a different value (D-056).
   Building them costs 66.1 s at full scale and 64.4 MB in OPFS — ~90% of import
   time, and the reason the progress display has to treat it as its own phase
   (D-049).
-- **FTS5 maintenance is explicit.** The indexes are external-content, so every
-  update must issue `INSERT INTO fts(fts, rowid, descr) VALUES('delete', …)`
-  with the *old* text before writing the new row. Skipping it corrupts search
+- **FTS5 maintenance is explicit, and lives inside that transaction.** The
+  indexes are external-content, so every update issues
+  `INSERT INTO fts(fts, rowid, descr) VALUES('delete', …)` with the *old* text —
+  read out of the content table an instant before it changes, which is the only
+  place that value exists — before writing the new row. Vendor and product names
+  get the same treatment, since a delta can re-ship a lookup row whose content
+  changed under an id the client already holds. Skipping it corrupts search
   silently, and the default `integrity-check` will not catch it — only the
-  `rank = 1` form does (RE-005).
+  `rank = 1` form does (RE-005). That form ends every case in
+  `tests/unit/sync.test.ts`; it is not run at runtime, where re-tokenizing
+  122 MB of description text would cost about what building the index cost.
 - **Decompression is ours, and it streams.** Chunks arrive as opaque `.br`
   bytes with no `Content-Encoding`; a WASM decoder unpacks each one and writes
   it straight into the staging file at that chunk's byte offset — never the live
@@ -423,8 +438,9 @@ hand its id to a different value (D-056).
 - **Storage sized in advance.** Quota, eviction, and
   `navigator.storage.persist()` are part of the import design, not error
   handling bolted on later.
-- **Staleness is visible.** Sync is manual (D-025), so a user can sit on a
-  month-old corpus getting confident-looking counts. The freshness indicator is
+- **Staleness is visible.** Sync is manual after the first one (D-025) — a
+  download catches itself up, and after that the user chooses when — so a user
+  can sit on a month-old corpus getting confident-looking counts. The freshness indicator is
   what keeps results honest — it replaces the coverage tracking that bulk import
   made unnecessary.
 
@@ -558,7 +574,7 @@ addresses — are simply absent (D-039).
 | Interrupted rotation | The next run finishes it | The chunks land by rename before the manifest names them; re-cutting the same bytes completes the publication without `--force` (D-047, D-060) |
 | Corrupted chunk | Refetch that chunk | Per-chunk SHA-256 in the manifest; costs 5 MB, not 63 |
 | Snapshot rotates mid-download | Old generation still served | One previous generation is retained, and its deltas one rotation longer still (D-042, D-060) |
-| Interrupted sync | Transaction rolls back; watermark unchanged; retry is safe | Apply is idempotent, measured |
+| Interrupted sync | Transaction rolls back; watermark unchanged; retry is safe | The watermark advances inside the same transaction as the rows, and a repeat of an applied file is refused rather than applied twice (D-063) |
 | Schema version bump | Full re-download, announced in the UI | The local database is a rebuildable cache (D-013), but it must not be a surprise |
 | Client older than the oldest delta | Full re-download | Delta retention is bounded to the previous generation, and `planSync` returns `null` rather than a chain that does not exist (D-042, D-060) |
 | Upstream force-push | Nothing special | The pipeline diffs content hashes, never git history (RE-006) |

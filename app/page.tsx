@@ -9,6 +9,7 @@ import type {
   Progress,
   Request,
   Response,
+  SyncOutcome,
   Timings,
 } from '@/lib/protocol'
 
@@ -86,8 +87,19 @@ export default function Home() {
    */
   const [storage, setStorage] = useState<'pending' | 'unknown' | 'ready' | 'empty'>('pending')
   const [timings, setTimings] = useState<Timings | null>(null)
+  const [sync, setSync] = useState<SyncOutcome | null>(null)
+  const [revision, setRevision] = useState<number | null>(null)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
+  /**
+   * Whether the run that is on screen imported successfully.
+   *
+   * A download is followed by a catch-up (M2), so an error can arrive *after* a
+   * successful import — and the Import panel is then still describing what is
+   * on disk. Clearing it there would hide an accurate report of the thing that
+   * worked, which is the opposite of what the clearing rule below is for.
+   */
+  const importedThisRun = useRef(false)
   const [result, setResult] = useState<{ columns: string[]; rows: unknown[][]; ms: number } | null>(
     null
   )
@@ -128,17 +140,27 @@ export default function Home() {
           // present, because D-008 requires it to accompany the data even for a
           // visitor whose page never ran an import.
           setNotice(message.notice ?? '')
+          setRevision(message.rev)
           if (!message.ready) {
             setTimings(null)
             setResult(null)
             setBenchmark(null)
+            setSync(null)
           }
           break
         case 'imported':
           setStorage('ready')
           setReady(true)
+          importedThisRun.current = true
           setTimings(message.timings)
           setNotice(message.notice)
+          break
+        case 'synced':
+          setSync(message.outcome)
+          // `synced` is itself proof of the new watermark. Do not make the UI
+          // depend on the follow-up storage discovery succeeding before it can
+          // report the revision the Worker just committed.
+          setRevision(message.outcome.to)
           break
         case 'rows':
           setResult({ columns: message.columns, rows: message.rows, ms: message.ms })
@@ -154,7 +176,7 @@ export default function Home() {
           // failure left behind and can understate storage several-fold. The
           // query results below it stay: they came from the live copy, which a
           // failed staged download does not touch (D-061).
-          setTimings(null)
+          if (!importedThisRun.current) setTimings(null)
           break
       }
     }
@@ -165,6 +187,13 @@ export default function Home() {
 
   const send = useCallback((request: Request) => {
     setError('')
+    // A new run's panels describe that run. Anything a previous one left on
+    // screen is about to be either replaced or invalidated.
+    if (request.type === 'import') {
+      importedThisRun.current = false
+      setSync(null)
+    }
+    if (request.type === 'sync') setSync(null)
     workerRef.current?.postMessage(request)
   }, [])
 
@@ -196,6 +225,9 @@ export default function Home() {
           disabled={busy}
         >
           {ready ? 'Re-download data' : 'Download data'}
+        </button>
+        <button onClick={() => send({ type: 'sync' })} disabled={!ready || busy}>
+          Sync
         </button>
         <button onClick={() => send({ type: 'query', sql: DEMO_QUERY })} disabled={!ready || busy}>
           Run query
@@ -243,6 +275,21 @@ export default function Home() {
       )}
 
       {error && <p className="error">{error}</p>}
+
+      {ready && revision !== null && (
+        <p className="muted" data-revision={revision}>
+          Local copy at revision {revision}
+          {/* Deliberately flat prose, not a staleness verdict: knowing whether
+              revision N is old means comparing it against the origin's head,
+              which is the freshness task and not this one. */}
+          {sync &&
+            (sync.applied === 0
+              ? ' — already current at the last check.'
+              : ` — ${sync.applied} update${sync.applied === 1 ? '' : 's'} applied, ` +
+                `${sync.upserts.toLocaleString()} records changed and ` +
+                `${sync.deletes.toLocaleString()} withdrawn in ${(sync.ms / 1000).toFixed(1)} s.`)}
+        </p>
+      )}
 
       {timings && (
         <section>
@@ -378,6 +425,8 @@ function phaseLabel(phase: Progress['phase']): string {
       return 'Downloading and decompressing'
     case 'index':
       return 'Building search indexes'
+    case 'sync':
+      return 'Applying updates'
     case 'verify':
       // Deliberately vague: three different steps report under this phase and
       // each names itself in the detail, so a specific label here would either

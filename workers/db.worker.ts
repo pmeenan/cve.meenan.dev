@@ -17,11 +17,13 @@
  * cost the user the copy they already had.
  */
 import initBrotli, { decompress as brotliDecompress } from 'brotli-dec-wasm/web'
-import type { Database, SAHPoolUtil, Sqlite3Static } from '@sqlite.org/sqlite-wasm'
+import type { Database, SAHPoolUtil, Sqlite3Static, SqlValue } from '@sqlite.org/sqlite-wasm'
 
+import { parseDelta } from '../lib/delta'
 import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
 import { batchRanges, indexBatches, indexPlan, indexSql, type SearchIndex } from '../lib/search'
+import { applyDelta, type SyncDb } from '../lib/sync'
 import {
   assertLocallyUsable,
   assertPromotable,
@@ -49,19 +51,24 @@ import {
 import {
   assertUsable,
   chunkUrl,
+  deltaUrl,
   isRevision,
   manifestUrl,
+  planSync,
   DEFAULT_CACHE_MIB,
   DEFAULT_CONCURRENCY,
   DEFAULT_VFS,
   SCHEMA_VERSION,
   type BenchResult,
   type ChunkEntry,
+  type Delta,
+  type DeltaEntry,
   type ImportOptions,
   type Manifest,
   type Progress,
   type Request,
   type Response,
+  type SyncOutcome,
   type Timings,
   type Vfs,
 } from '../lib/protocol'
@@ -911,6 +918,187 @@ async function storageUsage(): Promise<number | null> {
   }
 }
 
+/**
+ * The `SyncDb` the applier runs against, over an open connection.
+ *
+ * Three methods, because that is all delta apply needs and because it is the
+ * seam that lets the same applier be tested against `node:sqlite` outside a
+ * browser (lib/sync.ts) — where the fts5 `'delete'` protocol can be checked
+ * with `integrity-check` at `rank = 1`, which is far too expensive to run here
+ * (RE-005).
+ */
+function syncDb(database: Database): SyncDb {
+  // The applier deals in `unknown` because it is written against no particular
+  // driver; every value it binds came out of `parseDelta`, which has already
+  // established it is a number, a string or null. This is where that becomes
+  // the driver's own type.
+  const bind = (params?: readonly unknown[]) => (params ? ([...params] as SqlValue[]) : undefined)
+  return {
+    run(sql, params) {
+      database.exec({ sql, bind: bind(params) })
+    },
+    row(sql, params) {
+      let out: unknown[] | null = null
+      database.exec({
+        sql,
+        bind: bind(params),
+        rowMode: 'array',
+        // Literal false stops iteration: these are all single-row lookups and a
+        // `SELECT ... WHERE id = ?` that somehow matched more should not be
+        // walked to the end.
+        callback: (row: unknown[]): false => {
+          out ??= row
+          return false
+        },
+      })
+      return out
+    },
+    column(sql, params) {
+      const out: unknown[] = []
+      database.exec({
+        sql,
+        bind: bind(params),
+        // An integer rowMode is "this column only", which is what the existence
+        // probes want — one value per row rather than a one-element array.
+        rowMode: 0,
+        callback: (value: unknown) => {
+          out.push(value)
+        },
+      })
+      return out
+    },
+  }
+}
+
+/**
+ * Fetch one delta file and turn it into a `Delta`, or refuse it.
+ *
+ * Same treatment as a snapshot chunk: the compressed bytes are checked against
+ * the length and SHA-256 the manifest published *before* they are decompressed,
+ * and the expanded length is checked after. The result then goes through
+ * `parseDelta`, which is what decides the payload is one this build can apply
+ * at all (D-055).
+ *
+ * No `cache: 'no-cache'`: a delta file is immutable at its URL, so the ordinary
+ * cache is exactly right — unlike the manifest, which is the thing that changes.
+ */
+async function loadDelta(entry: DeltaEntry, signal: AbortSignal): Promise<Delta> {
+  const name = `delta ${entry.from}-${entry.to}`
+  const response = await fetch(deltaUrl(entry), { signal })
+  if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`)
+  const compressed = new Uint8Array(await response.arrayBuffer())
+  if (compressed.length !== entry.bytes) {
+    throw new Error(`${name}: manifest says ${entry.bytes} bytes, got ${compressed.length}`)
+  }
+  if ((await digest(compressed)) !== entry.sha256) throw new Error(`${name}: checksum mismatch`)
+
+  const bytes = brotliDecompress(compressed)
+  if (bytes.length !== entry.raw_bytes) {
+    throw new Error(`${name}: expanded to ${bytes.length} bytes, not ${entry.raw_bytes}`)
+  }
+  return parseDelta(JSON.parse(new TextDecoder().decode(bytes)), entry)
+}
+
+/**
+ * Walk the local copy up to the manifest's head, one delta at a time.
+ *
+ * Each file is its own transaction rather than the whole chain being one. A
+ * chain is a sequence of steps between real published revisions, and stopping
+ * part way through leaves the database at one of them — consistent, queryable,
+ * and with less to do next time. Wrapping the chain would throw away every
+ * applied file because the last one failed, which is the opposite trade.
+ *
+ * Writes are enabled for the apply and disabled again immediately, so the
+ * window in which this connection can write is the transaction and not the
+ * fetch before it.
+ */
+async function catchUp(
+  manifest: Manifest,
+  database: Database,
+  signal: AbortSignal
+): Promise<SyncOutcome> {
+  const started = performance.now()
+  const watermark = database.selectValue("SELECT v FROM meta WHERE k = 'rev'")
+  if (!isRevision(watermark)) {
+    throw new Error(`the local copy carries no usable revision (meta.rev = ${watermark})`)
+  }
+
+  const chain = planSync(manifest, watermark)
+  if (chain === null) {
+    // Retention is finite (D-042, D-060): a copy older than the oldest delta
+    // still served cannot be walked forward, and saying so is the honest
+    // answer. It is not an error the user caused.
+    throw new Error(
+      `this copy is at revision ${watermark} and the origin no longer serves a path from ` +
+        `there to revision ${manifest.rev} — download the corpus again to catch up`
+    )
+  }
+
+  const outcome: SyncOutcome = {
+    from: watermark,
+    to: watermark,
+    applied: 0,
+    upserts: 0,
+    deletes: 0,
+    bytes: 0,
+    ms: 0,
+  }
+  const target = syncDb(database)
+  for (const [index, entry] of chain.entries()) {
+    report('sync', index / chain.length, `revision ${entry.to} — ${index + 1} of ${chain.length}`)
+    const delta = await loadDelta(entry, signal)
+    database.exec('PRAGMA query_only=OFF')
+    let counts
+    try {
+      counts = applyDelta(target, delta)
+    } finally {
+      database.exec('PRAGMA query_only=ON')
+    }
+    outcome.applied += 1
+    outcome.upserts += counts.upserts
+    outcome.deletes += counts.deletes
+    outcome.bytes += entry.bytes
+    outcome.to = counts.to
+  }
+
+  outcome.ms = performance.now() - started
+  return outcome
+}
+
+/**
+ * Bring the local copy to head, and say what that took.
+ *
+ * Also runs at the end of an import, because a snapshot lands at its own
+ * revision and the head is above it as soon as one delta has been published
+ * since (D-055) — a download that stopped there would be stale on arrival.
+ */
+async function syncToHead(): Promise<void> {
+  if (!db) throw new Error('no local copy — download the corpus first')
+  const transfers = new AbortController()
+  let outcome: SyncOutcome
+  try {
+    report('manifest', null, 'Reading manifest')
+    const manifest = await fetchManifest()
+    outcome = await catchUp(manifest, db, transfers.signal)
+  } finally {
+    // Same reason the import path aborts: a delta still in flight when this
+    // ends has nobody left to receive it.
+    transfers.abort()
+  }
+
+  report(
+    'ready',
+    1,
+    outcome.applied === 0
+      ? `already at revision ${outcome.to}`
+      : `revision ${outcome.to} — ${outcome.upserts.toLocaleString()} records updated`
+  )
+  post({ type: 'synced', outcome })
+  // The revision, the timestamp and the record counts on screen all just
+  // changed; status is what the page reads them from.
+  await status()
+}
+
 /** Run the benchmark set (Q-003's query-latency budgets) in declaration order. */
 function bench(): void {
   if (!db) throw new Error('no database — download the corpus first')
@@ -1413,6 +1601,16 @@ async function handle(request: Request): Promise<void> {
         break
       case 'import':
         await importSnapshot(request.options)
+        // Not a separate step the user has to know about: the snapshot is
+        // published at its own revision and the head moves on daily (D-058), so
+        // a download that stopped at `snapshot.rev` would be stale the moment
+        // it finished. `imported` has already been posted by the time this
+        // runs, so a catch-up that fails reports itself without retracting a
+        // download that succeeded.
+        await syncToHead()
+        break
+      case 'sync':
+        await syncToHead()
         break
       case 'query':
         query(request.sql)

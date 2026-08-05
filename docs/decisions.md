@@ -27,6 +27,77 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-063: Sync applies to the live database after promotion, one transaction per delta, with fts5 maintenance inside it  (2026-08-04, status: accepted, implements M2's Sync task; amends D-061's stated intent for catch-up deltas)
+
+**Decision.** Five parts.
+
+1. **Catch-up applies to the *live* database, after promotion — not to the
+   staging file before it.** D-061 said the staged file "is where they will
+   land"; it is not. A download promotes at `snapshot.rev` and then syncs the
+   promoted copy to head.
+2. **One transaction per delta file, not one per chain.** Each file is a step
+   between two published revisions, and a chain that stops part way leaves the
+   copy *at* one of them — consistent, queryable, and with less to do next time.
+3. **fts5 maintenance is part of apply, using the explicit `'delete'`
+   protocol.** Every description, vendor name and product name that is replaced
+   or removed is un-indexed with the value read out of the content table an
+   instant before it changes. `integrity-check` at `rank = 1` is how that is
+   verified — in the tests, on every case, never at runtime.
+4. **Apply refuses rather than guesses.** The delta's `from` must equal the
+   local watermark; a CVE's row id must match in both directions; every lookup
+   id a record references must exist in this copy once the delta's own lookups
+   are in; and a delta that contradicts itself (a row id or CVE upserted twice,
+   a CVE both upserted and deleted, a lookup id shipped twice) is refused before
+   the transaction opens. The answer to any of them is a re-download.
+5. **A download ends by catching up**, so a fresh copy is at head rather than at
+   the snapshot's own revision.
+
+**Context.** Part 1 is the only reversal, and it turns on what a failure costs.
+Applying to the staged file would put a 63 MB download at the mercy of a delta
+fetch: a catch-up that failed after the chunks landed would discard all of them.
+It would also need a *second* apply path — the staged file has no fts5 tables
+until the index build, so apply there would have to skip the maintenance in
+part 3, which is precisely the code path whose failure is invisible. And it
+would break the promotion gate's `manifest.snapshot.rev === meta.rev` check
+(D-061), since the staged copy would no longer be at the revision the manifest
+promised. Promoting first costs one thing: the copy is briefly at
+`snapshot.rev`, which is a real published revision and a complete database.
+
+Part 3 is the half of apply the pipeline has no counterpart for — it publishes
+no fts5 tables — so `pipeline/tests/apply.py`, the reference implementation the
+wire format was proven sufficient against (D-055), cannot cover it. It is also
+the half that fails silently: an index left un-maintained keeps matching records
+on words their text no longer contains, with the tables present, the row counts
+right and the promotion gate passing. Only `rank = 1` disagrees, and the obvious
+invocation is the useless one (RE-005, re-verified on 3.53.0 for this task).
+
+**Consequences.** `lib/sync.ts` is driven through a three-method `SyncDb` seam,
+so the applier the browser runs is the applier the tests run — against
+`node:sqlite`, which is the same SQLite version, so the fts5 behaviour asserted
+is the fts5 that ships. `tests/unit/contract.test.ts` now reassembles the
+published snapshot from its chunks, indexes it, applies the pipeline's own
+published delta with this code, and checks the result against the artifact the
+pipeline built for that revision — record tables exactly, lookups as a superset,
+because a rebuild retires lookup rows a sync keeps (D-056). Every guard in
+part 4 was checked by deleting it and watching a test fail.
+
+The cost is measured, at full scale and against the live plane: the corpus at
+snapshot rev 2 walked up through the four real daily deltas published since, to
+rev 6 — 1,589 records changed in **56.8 s** in the browser. Part 3 is not what
+that buys: the same four deltas against the same artifact run natively in
+1.11 s with index maintenance and 0.91 s with the fts statements stubbed, so
+maintenance is 0.2 s and the remainder is the WASM/OPFS write path — about
+28,000 small statements, each compiled afresh by `Database.exec()`. Reusing
+prepared statements in the Worker's adapter is the lever, and it is left for a
+pass that can test it: the daily case is one delta and a few seconds.
+
+**Reopen if.** Rollup deltas (D-055) make a chain long enough that per-file
+transactions cost measurable time; a catch-up after a monthly rotation grows
+long enough that the statement-cache work stops being optional; or a reason
+appears that a client must never be observable at `snapshot.rev`, which would
+move the catch-up back before promotion and require the second apply path this
+avoids.
+
 ## D-062: Process rightsized to MVP scale — one pass, human gate, reviews on demand  (2026-08-04, status: accepted; replaces workflow.md's operating modes and raises the logging thresholds in AGENTS.md rules 1–3)
 
 **Decision.** The default unit of work is one agent implementing the task,

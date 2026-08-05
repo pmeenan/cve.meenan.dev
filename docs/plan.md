@@ -391,9 +391,53 @@ everything downstream consumes them.
       the index phase reports a row count and a determinate bar while the user
       is waiting on it, and that a search over the imported corpus returns rows
       — the one place the WASM build's own fts5 answers a query.
-- [ ] **Sync.** Merged deltas applied in one idempotent transaction, watermark
-      advancing with the rows; FTS maintenance with the explicit `'delete'`
-      protocol, verified by `integrity-check` at `rank = 1` (RE-005).
+- [x] **Sync** (D-063). Each delta applies in **one transaction** with the
+      watermark inside it, so there is no window where the rows and the revision
+      disagree, and a failure anywhere — a drifted ID space, a dangling
+      reference, a full disk — leaves the copy exactly where it was. Applying
+      one file at a time rather than wrapping the chain is deliberate: a chain
+      is a sequence of *published* revisions, and stopping part way leaves the
+      copy at one of them instead of discarding every file that did apply. The
+      catch-up runs on the **live** database after promotion, not on the staging
+      file before it — reversing what D-061 said it would do, because applying
+      there would put a finished 63 MB download at the mercy of a delta fetch,
+      break the promotion gate's `snapshot.rev == meta.rev` check, and need a
+      *second* apply path with no fts5 tables to maintain, which is precisely
+      the path whose failure is invisible. A download now ends by catching up,
+      so a fresh copy lands at head rather than at `snapshot.rev`.
+      **FTS maintenance is inside that transaction**, with the explicit
+      `'delete'` protocol and the old value read out of the content table an
+      instant before it changes — the half the pipeline has no counterpart for,
+      since it publishes no fts5 tables, and the half that fails silently: an
+      un-maintained index keeps matching records on words their text no longer
+      contains, with the tables present, the row counts right and the promotion
+      gate passing. `integrity-check` at `rank = 1` is what disagrees, and it
+      ends every case in `tests/unit/sync.test.ts` — including a control that
+      breaks the index deliberately and shows the *obvious* invocation passing
+      on it (RE-005, re-verified on 3.53.0 for this task; it is not run at
+      runtime, where it would cost what building the index cost). Apply refuses
+      rather than guesses: watermark equality, the id↔CVE pairing checked in
+      **both** directions, closure of every referenced lookup id against this
+      copy, and a self-consistency pass before the transaction opens. Each of
+      those was checked by deleting it and watching a test fail. Proven at two
+      scales — `tests/unit/contract.test.ts` reassembles the published snapshot
+      from its chunks, indexes it, applies the pipeline's *own* published delta
+      with this code, and gets the artifact the pipeline built for that revision
+      (record tables exactly, lookups as a superset, because a rebuild retires
+      rows a sync keeps, D-056); and `tests/e2e/sync.spec.ts` runs the whole
+      path in a browser, against a local mirror of the **live** data plane —
+      the full corpus at snapshot rev 2 walked up through the four real daily
+      deltas the cron has published since, to rev 6, **1,589 records changed in
+      56.8 s**, then queried, reloaded and queried again.
+      That 56.8 s is the notable number and it is **not** the fts5 protocol:
+      the same four deltas against the same artifact natively are 1.11 s with
+      index maintenance and 0.91 s with the fts statements stubbed out, so
+      maintenance is 0.2 s of the work and the rest is the WASM/OPFS write path
+      — roughly 28,000 small statements at about 2 ms each, each one compiled
+      afresh by `Database.exec()`. Reusing prepared statements in the Worker's
+      adapter is the obvious lever and is deliberately **not** taken here: it is
+      a change to the write path that would need its own tests, and the daily
+      case (one delta, ~400 records) is a few seconds rather than a minute.
 - [ ] **Failure and resume tests** — for replacement, not just first
       download. Partly landed with D-061 in `tests/e2e/staged.spec.ts`, and
       listed here so the rest is not written twice:
@@ -403,8 +447,16 @@ everything downstream consumes them.
             usable — plus two failure modes the review pass reproduced: a
             discovery error must not license a sweep, and a resume record that
             outlived its file must not be believed;
-      - [ ] an interrupted sync rolls back and re-running is safe (needs the
-            Sync task);
+      - [x] an interrupted sync rolls back and re-running is safe — asserted in
+            `tests/unit/sync.test.ts` against real SQLite and the published
+            schema, with the refusal placed at the *last* record of a delta that
+            has already written lookups, a tombstone and an upsert, so the
+            unwinding is real rather than nominal: rows, watermark, `generated`
+            and both full-text indexes all come back unchanged, and a delta the
+            copy *can* take then applies. A process killed mid-`COMMIT` is
+            SQLite's rollback journal rather than our code (the same mechanism
+            RE-017 and D-061's header-read finding turn on) and is not
+            re-exercised here;
       - [ ] a snapshot rotation mid-download does not strand the client — the
             *decision* is unit-tested (`bindsTo` refuses a rotated plan), the
             end-to-end file behaviour is not;

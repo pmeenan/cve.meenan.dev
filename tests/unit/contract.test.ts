@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { brotliDecompressSync } from 'node:zlib'
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -16,8 +17,11 @@ import {
   LOOKUP_ORDER,
   planSync,
   snapshotRev,
+  type DeltaEntry,
   type Manifest,
 } from '../../lib/protocol'
+import { indexSql, SEARCH_INDEXES } from '../../lib/search'
+import { applyDelta, type SyncDb } from '../../lib/sync'
 
 /**
  * The cross-language contract test (D-055).
@@ -37,6 +41,7 @@ let manifest: Manifest
 let rotated: Manifest
 let published: {
   delta: { from: number; to: number }
+  next_db: string
   hostile_text: string
   rotated: {
     pub: string
@@ -222,6 +227,142 @@ describe('planning a sync against it', () => {
   it('reports that the published delta is the one it planned for', () => {
     expect(published.delta.from).toBe(1)
     expect(published.delta.to).toBe(2)
+  })
+})
+
+/**
+ * The other half of D-055's sufficiency claim, made against the code the
+ * browser runs.
+ *
+ * `pipeline/tests/apply.py` already proves the *wire format* carries enough:
+ * snapshot N plus a delta reconstructs snapshot N+1. This proves the same thing
+ * about `lib/sync.ts`, and it starts from the client's own bytes — the database
+ * is reassembled from the published chunks the way the Worker assembles it,
+ * indexed the way the Worker indexes it, and brought forward by the delta the
+ * Worker would have fetched.
+ *
+ * If the two appliers ever disagree, this is where it surfaces: the pipeline
+ * built rev 2 from the corpus, and the client built it from rev 1 and a 200-byte
+ * file.
+ */
+describe('a client that syncs instead of re-downloading', () => {
+  /** The published snapshot, decompressed and reassembled as the Worker does. */
+  function reassemble(): DatabaseSync {
+    const bytes = Buffer.alloc(manifest.snapshot.raw_bytes)
+    for (const chunk of manifest.snapshot.chunks) {
+      const expanded = brotliDecompressSync(readFileSync(dataFile(chunkUrl(manifest, chunk))))
+      expect(expanded.length).toBe(chunk.raw_bytes)
+      expanded.copy(bytes, chunk.offset)
+    }
+    const path = join(root, 'synced.sqlite')
+    writeFileSync(path, bytes)
+    const db = new DatabaseSync(path)
+    // What the client builds for itself after a download (D-035), and what
+    // apply then has to maintain.
+    for (const index of SEARCH_INDEXES) {
+      const sql = indexSql(index)
+      db.exec(sql.drop)
+      db.exec(sql.create)
+      db.exec(`INSERT INTO ${index.fts}(${index.fts}) VALUES('rebuild')`)
+    }
+    return db
+  }
+
+  function adapt(db: DatabaseSync): SyncDb {
+    return {
+      run: (sql, params) => void db.prepare(sql).run(...((params ?? []) as never[])),
+      row: (sql, params) => {
+        const found = db.prepare(sql).get(...((params ?? []) as never[]))
+        return found === undefined ? null : Object.values(found)
+      },
+      column: (sql, params) =>
+        db
+          .prepare(sql)
+          .all(...((params ?? []) as never[]))
+          .map((found) => Object.values(found)[0]),
+    }
+  }
+
+  function rows(db: DatabaseSync, table: string, order: string): unknown[][] {
+    return db
+      .prepare(`SELECT * FROM ${table} ORDER BY ${order}`)
+      .all()
+      .map((row) => Object.values(row))
+  }
+
+  /** Fetch-and-verify, minus the fetch: exactly what `loadDelta` does. */
+  function readDelta(entry: DeltaEntry) {
+    const compressed = readFileSync(dataFile(deltaUrl(entry)))
+    expect(compressed.length).toBe(entry.bytes)
+    expect(createHash('sha256').update(compressed).digest('hex')).toBe(entry.sha256)
+    const expanded = brotliDecompressSync(compressed)
+    expect(expanded.length).toBe(entry.raw_bytes)
+    return parseDelta(JSON.parse(expanded.toString()), entry)
+  }
+
+  it('reconstructs the next generation the pipeline built, record for record', () => {
+    const synced = reassemble()
+    const chain = planSync(manifest, snapshotRev(manifest))!
+    expect(chain.length).toBeGreaterThan(0)
+    for (const entry of chain) applyDelta(adapt(synced), readDelta(entry))
+
+    const rebuilt = new DatabaseSync(published.next_db, { readOnly: true })
+    // The record tables, exactly. This is the claim: a synced copy and a rebuilt
+    // one hold the same corpus.
+    for (const [table, order] of [
+      ['cve', 'id'],
+      ['cve_text', 'cve_id'],
+      ['cve_cwe', 'cve_id, cwe_id'],
+      ['cve_prod', 'cve_id, product_id'],
+      ['cve_ref', 'cve_id, url_id'],
+      ['cve_ver', 'cve_id, product_id, version'],
+    ] as const) {
+      expect(rows(synced, table, order), `${table} differs`).toEqual(rows(rebuilt, table, order))
+    }
+
+    // Lookups are a *superset*, by design: a value the corpus stopped using
+    // loses its row in a rebuild but keeps its id reserved forever, and a delta
+    // has no way to say "this id is retired" — nor any need to, since the id is
+    // never reissued (D-056).
+    for (const table of LOOKUP_ORDER) {
+      const local = new Map(rows(synced, table, 'id').map((row) => [row[0], row]))
+      for (const row of rows(rebuilt, table, 'id')) {
+        expect(local.get(row[0]), `${table} row ${String(row[0])}`).toEqual(row)
+      }
+    }
+
+    // And the watermark landed on the revision the rebuild carries.
+    const rev = (db: DatabaseSync) =>
+      Object.values(db.prepare("SELECT v FROM meta WHERE k = 'rev'").get()!)[0]
+    expect(rev(synced)).toBe(rev(rebuilt))
+    expect(rev(synced)).toBe(manifest.rev)
+
+    // The indexes agree with the content they now describe — the one form of
+    // the check that reads the external content table (RE-005).
+    for (const index of SEARCH_INDEXES) {
+      expect(() =>
+        synced.exec(`INSERT INTO ${index.fts}(${index.fts}, rank) VALUES('integrity-check', 1)`)
+      ).not.toThrow()
+    }
+    // And the indexes hold what the delta introduced, which is the half a
+    // row-by-row table comparison cannot see: the pipeline publishes no fts5
+    // tables, so nothing above would notice a sync that maintained none.
+    // `CVE-2026-1002` had no English description at rev 1 and gains one here,
+    // so this row is *only* in the index if apply put it there.
+    const found = (fts: string, term: string) =>
+      synced
+        .prepare(`SELECT rowid FROM ${fts} WHERE ${fts} MATCH ?`)
+        .all(term)
+        .map((row) => Number((row as { rowid: number }).rowid))
+    const gained = Object.values(
+      synced.prepare("SELECT id FROM cve WHERE cve_id = 'CVE-2026-1002'").get()!
+    )[0]
+    expect(found('fts', 'rejected')).toEqual([gained])
+    // A product interned by the delta, indexed under its new id.
+    expect(found('fts_product', 'sprocket')).toEqual([4])
+
+    synced.close()
+    rebuilt.close()
   })
 })
 

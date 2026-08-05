@@ -37,6 +37,13 @@ def main() -> int:
                 "pub": published["pub"],
                 "snapshot_rev": 1,
                 "head_rev": 2,
+                # The artifact this data plane's *head* was built from. The
+                # contract test reassembles the published snapshot from its
+                # chunks, applies the published delta with the **client's**
+                # applier, and checks the result against this — the same
+                # sufficiency claim `pipeline/tests/apply.py` makes, made
+                # against the code the browser actually runs.
+                "next_db": published["next"],
                 "delta": published["delta"],
                 "counts": {
                     "upserts": published["summary"]["upserts"],

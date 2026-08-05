@@ -518,9 +518,17 @@ corrupt.
 Cost measured on the spike database: 0.8 s for the full 55 MB index, which is
 affordable as an explicit verification action but not on every sync.
 
-**Note for re-verification.** Behavior confirmed on 3.45.1 only. The browser
-ships a different and newer SQLite via `@sqlite.org/sqlite-wasm`; re-run this in
-M1 rather than assuming it carries over.
+**Re-verified 2026-08-04 on SQLite 3.53.0** — `node:sqlite`, the same version
+`@sqlite.org/sqlite-wasm` ships — against the published schema, and it carries
+over unchanged: a `cve_text` row updated without the `'delete'` protocol still
+passes the bare `integrity-check` and still fails at `rank = 1`, with the row
+still matching a word its text no longer contains. That reproduction is a
+standing test (`tests/unit/sync.test.ts`), so M2's delta apply cannot quietly
+lose the protocol; it is the check every case in that file ends with. It is
+deliberately *not* run after a sync at runtime — at full scale it re-tokenizes
+122 MB of description text, about what building the index cost in the first
+place (~58 s) — so it belongs in the tests and in M5's diagnostics panel as
+something a user can ask for.
 
 **Links.**
 - [SQLite FTS5 — the 'integrity-check' command](https://www.sqlite.org/fts5.html)

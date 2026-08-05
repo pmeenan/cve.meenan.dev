@@ -180,7 +180,16 @@ export interface Delta {
  * indistinguishable from a hang.
  */
 export type Phase =
-  'idle' | 'manifest' | 'download' | 'index' | 'verify' | 'query' | 'ready' | 'error'
+  | 'idle'
+  | 'manifest'
+  | 'download'
+  | 'index'
+  | 'verify'
+  /** Fetching and applying catch-up deltas (D-031). */
+  | 'sync'
+  | 'query'
+  | 'ready'
+  | 'error'
 
 export interface Progress {
   phase: Phase
@@ -238,9 +247,32 @@ export interface ImportOptions {
 export type Request =
   | { type: 'status' }
   | { type: 'import'; options?: ImportOptions }
+  | { type: 'sync' }
   | { type: 'query'; sql: string }
   | { type: 'bench' }
   | { type: 'reset' }
+
+/**
+ * What a catch-up did, summed across the chain it applied (M2).
+ *
+ * `from === to` with `applied: 0` is the ordinary answer on most days: the copy
+ * was already at head and nothing was fetched. That is a *result*, not a
+ * no-op — it is how a client learns it is current — so it is reported like one.
+ */
+export interface SyncOutcome {
+  /** The local watermark before and after. */
+  from: number
+  to: number
+  /** Delta files applied. Each one was its own transaction. */
+  applied: number
+  /** Records replaced and records tombstoned, summed across those files. */
+  upserts: number
+  deletes: number
+  /** Compressed bytes that crossed the wire. */
+  bytes: number
+  /** Wall-clock in the Worker, fetch and apply together. */
+  ms: number
+}
 
 export type Response =
   | { type: 'progress'; progress: Progress }
@@ -268,6 +300,7 @@ export type Response =
       notice: string | null
     }
   | { type: 'imported'; timings: Timings; notice: string }
+  | { type: 'synced'; outcome: SyncOutcome }
   | { type: 'rows'; columns: string[]; rows: unknown[][]; ms: number }
   | { type: 'bench'; results: BenchResult[]; wasmHeapBytes: number }
   | { type: 'error'; message: string }

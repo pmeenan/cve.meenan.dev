@@ -75,6 +75,18 @@ const LOOKUP_SHAPE: Record<LookupTable, readonly ('id' | 'text')[]> = {
 }
 
 /**
+ * How many columns each lookup tuple carries, derived from the shape above so
+ * the two cannot disagree.
+ *
+ * Exported for `lib/sync.ts`, which binds those tuples into an INSERT with a
+ * named column list: the arity is what ties the wire shape to that list, and a
+ * mismatch there would bind values into the wrong columns rather than fail.
+ */
+export const LOOKUP_ARITY: Record<LookupTable, number> = Object.fromEntries(
+  LOOKUP_ORDER.map((table) => [table, LOOKUP_SHAPE[table].length])
+) as Record<LookupTable, number>
+
+/**
  * A bound, not a format check. The canonical CVE ID is publisher-supplied text
  * that our normalization passes through, so the client treats it as data — but
  * nothing legitimate is anywhere near this long, and an unbounded string here
