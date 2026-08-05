@@ -181,6 +181,36 @@ test.describe('full-scale measurement', () => {
   }
 
   /**
+   * M3's tuning, as three runs that differ in one thing each.
+   *
+   * `m3:baseline` is M1's shipped behaviour — indexes built, no statistics, no
+   * progress handler on the query path — and is what "no regression against the
+   * M1 baseline" is measured against on *this* machine and *this* artifact,
+   * rather than against a table recorded in a different month. `m3:handler`
+   * adds the progress handler that makes a query reportable and cancellable,
+   * which is a cost paid on every query. The last two add `ANALYZE`, which is
+   * what the milestone is buying, and differ only in whether it reads every
+   * index or samples — the trade D-067 turns on.
+   *
+   * Same import path, same page cache, same VFS: the only variables are the
+   * knobs, so the benchmark columns can be read against each other.
+   *
+   * The two rejected variants are not cases here — a bare `ANALYZE` including
+   * the full-text shadow tables, and a sampled one (`PRAGMA analysis_limit`) —
+   * because both were measured once and lost (D-067). Re-running either is two
+   * lines in `buildSearchIndexes`.
+   */
+  for (const [label, options] of [
+    ['m3:baseline (no stats, no handler)', { analyze: false, progressOps: 0 }],
+    ['m3:handler (no stats)', { analyze: false }],
+    ['m3:stats — shipped', {}],
+  ] as [string, ImportOptions][]) {
+    test(`${label} (M3)`, async ({ browser }) => {
+      record({ kind: 'run', run: await importOnce(browser, label, options, { bench: true }) })
+    })
+  }
+
+  /**
    * The reopen path, which is a different question from the import path and was
    * being answered with the import's `openMs` — a number taken mid-import, with
    * the WASM module already instantiated and the file cache hot. What criterion
@@ -357,6 +387,8 @@ async function importInPage(page: Page, options: ImportOptions): Promise<Timings
   if (options.concurrency) query.set('concurrency', String(options.concurrency))
   if (options.cacheMib) query.set('cache', String(options.cacheMib))
   if (options.vfs) query.set('vfs', options.vfs)
+  if (options.analyze === false) query.set('analyze', '0')
+  if (options.progressOps !== undefined) query.set('ops', String(options.progressOps))
   await page.goto(`/?${query}`)
 
   await page.getByRole('button', { name: /Download data/ }).click()

@@ -683,6 +683,16 @@ def build(
             ],
         )
         db.commit()
+        # Query statistics travel *with* the artifact (D-067). They are 21 rows
+        # and a few kilobytes on the wire, they take about a second here, and
+        # they are what makes the client's slowest query shape a third faster —
+        # the alternative was the browser deriving the same rows by reading
+        # every index back through OPFS, measured at 20.4 s on top of an
+        # already 65-second import. A bare ANALYZE is exactly the published
+        # schema's tables: the artifact has no full-text indexes, because the
+        # client builds its own (D-035).
+        db.execute("ANALYZE")
+        db.commit()
         db.execute("VACUUM")
         db.close()
     except BaseException:

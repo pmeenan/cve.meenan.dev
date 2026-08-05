@@ -115,7 +115,9 @@ what they agree on is that a day's delta is one small file.
    (D-058).
 4. **Normalize.** Build the relational artifact (see [Schema](#schema)). 24.2 s
    seeded, measured on `plex` 2026-08-03 (D-058); the 19 s in D-023 was the
-   M0 spike, against a smaller schema and unseeded.
+   M0 spike, against a smaller schema and unseeded. The build ends with
+   `ANALYZE`, so the artifact carries its own query statistics — under a second
+   here, 20.4 s if the browser has to derive them instead (D-067).
    The build **seeds its ID space from the previous artifact** — `--seed`, or an
    explicit `--bootstrap`, never a default (D-056) — so every id it already
    issued means what it meant, and new values append above the recorded
@@ -398,9 +400,32 @@ hand its id to a different value (D-056).
   guesses: the delta's `from` must equal the local watermark, a CVE's row id
   must match in **both** directions, and every lookup id a record references
   must exist once the delta's own lookups are in. Drift means re-download.
+- **Every query goes through one shared layer** ([lib/filters.ts](../lib/filters.ts)),
+  which compiles the confirmed filter axes into a `WHERE` clause with every
+  value bound. Two properties are structural rather than per-report: D-022's
+  PUBLISHED-only default is in the compiler, and link-table axes compile to
+  `EXISTS` so a record affecting eight products is still one record. Lookup
+  names become ids in a separate step, so a typo is reported as a typo. This is
+  the object M4's permalinks and M7's chat tools will emit (D-044).
+- **User SQL runs under a SQLite authorizer, never a text filter** (D-065). The
+  console allows `SELECT`, `READ`, `FUNCTION` and `RECURSIVE` and refuses
+  everything else — from the parser, so `PRAGMA query_only=OFF`, a write after a
+  semicolon and `SELECT * FROM pragma_query_only` are all refusals rather than
+  ways around it. Results are capped at 1,000 rows and the cap is reported.
+- **A running query says so and can be stopped** (D-066). SQLite's progress
+  handler posts an elapsed figure past about a second and aborts the statement
+  when the page sets a flag in a `SharedArrayBuffer` — the only channel that
+  reaches a Worker sitting inside SQLite, and available wherever cross-origin
+  isolation is, which the `opfs` VFS already requires.
 - **The client builds its own full-text indexes** after import, over
   descriptions, vendor names and product names — never references, whose URLs
-  would shred into the same term space as the prose (D-035). Shipping the
+  would shred into the same term space as the prose (D-035). Query statistics
+  are the opposite call: they arrive **in the artifact** (D-067), because
+  deriving them locally means reading every index back through OPFS — 20.4 s at
+  full scale, against under a second on the server and a few kilobytes on the
+  wire. The client collects its own only when a generation arrived without
+  them. They are what let the query layer write natural SQL instead of working
+  around the planner's guesses. Shipping the
   description index instead would cost 35.1 MB compressed, 31% of the download.
   Building them costs 66.1 s at full scale and 64.4 MB in OPFS — ~90% of import
   time, and the reason the progress display has to treat it as its own phase
@@ -539,6 +564,9 @@ CREATE TABLE meta(k TEXT PRIMARY KEY, v);
 CREATE VIRTUAL TABLE fts         USING fts5(descr, content='cve_text', content_rowid='cve_id');
 CREATE VIRTUAL TABLE fts_vendor  USING fts5(name,  content='vendor',   content_rowid='id');
 CREATE VIRTUAL TABLE fts_product USING fts5(name,  content='product',  content_rowid='id');
+
+-- plus sqlite_stat1, which the *build* writes (D-067) — the client only
+-- collects its own if a generation arrived without it
 ```
 
 Three properties are load-bearing rather than stylistic:
@@ -569,6 +597,7 @@ Indexes: `cve(year)`, `cve(cna_id)`, `cve(cvss_score)`, `cve(published)`,
 | Pipeline → `pub/` | Finished artifacts only | Atomic rename; working state stays in sibling directories |
 | `pub/` → browser | Static files | No CORS headers, integrity hashes in the manifest. D-039 removed origin rate limiting in favour of Cloudflare — but as of the first deploy the hostname is **not proxied through Cloudflare**, so nothing is absorbing abuse today. M5 owns closing that before launch (D-034, D-039) |
 | Database → UI | Record text | Never injected as HTML; URLs from records are never auto-fetched |
+| UI → database | The user's own SQL, and filter values that may have come from a link | A SQLite authorizer allows reading and nothing else, from inside the parser rather than by inspecting the text; results are row-capped and the query is cancellable (D-065, D-066). Filter values are bound parameters, never concatenated (rule 4) |
 | Database → model prompt | Attacker-influenced record text entering LLM context | Prompt injection is assumed; the tool surface is read-only and render-only with no network reach, and model output carries no markup or minted URLs — a successful injection yields wrong-but-inspectable presentation, nothing more (D-044) |
 | Browser → hosted model provider | The user's question and its tool results — only when the user supplies a key | Explicit opt-in per provider; key stored client-side only; called browser-direct, never proxied, never touching this server (D-045) |
 | Browser → chat relay → `llm` | The user's question and its tool results — only when the site-hosted tier is selected | Opt-in, disclosed at first use; the relay is same-origin, POST-only, body-capped, rate- and concurrency-limited, pinned to one model and one operation with no caller-supplied URL, host, or model; nothing stored, bodies never logged (D-057) |
@@ -591,7 +620,8 @@ addresses — are simply absent (D-039).
 | Corrupted chunk | Refetch that chunk | Per-chunk SHA-256 in the manifest; costs 5 MB, not 63 |
 | Snapshot rotates mid-download | Old generation still served | One previous generation is retained, and its deltas one rotation longer still (D-042, D-060) |
 | Interrupted sync | Transaction rolls back; watermark unchanged; retry is safe | The watermark advances inside the same transaction as the rows, and a repeat of an applied file is refused rather than applied twice (D-063) |
-| Schema version bump | Full re-download, announced in the UI | The local database is a rebuildable cache (D-013), but it must not be a surprise |
+| Schema version bump, local copy | Announced with both versions, not queried, and **kept** until a download replaces it | The local database is a rebuildable cache (D-013), but replacing it is not the same as deleting it without saying so (D-068) |
+| Schema version bump, manifest | Refused before a byte is fetched; the message says to reload the app | A published schema this build cannot read means the *app* is behind, and re-downloading the same bytes fails identically (D-068) |
 | Client older than the oldest delta | Full re-download | Delta retention is bounded to the previous generation, and `planSync` returns `null` rather than a chain that does not exist (D-042, D-060) |
 | Upstream force-push | Nothing special | The pipeline diffs content hashes, never git history (RE-006) |
 | Broken fetch drops records | Pipeline aborts before publishing | The 0.1% tombstone guard |
@@ -776,22 +806,20 @@ questions not tracked there:
   server deploy plus a client re-import; a client-owned schema makes it a
   migration against a large local database. We have chosen server-owned by
   implication, and never costed the alternative.
-- **What a schema-version bump costs the user.** Deltas cannot bridge one, so
-  the client re-downloads 62.6 MB. Acceptable rarely, unacceptable often — which
-  makes schema stability a release-discipline question, not a technical one.
+
 - **Whether the delta rollup can be made obviously correct.** The tiling
   invariant has a nasty failure mode — a client that can never sync again — and
   wants a property test.
-- **Why the reference-table scan has no index.** At ~850 ms it is an order of
-  magnitude slower than the other nine benchmark shapes, and the only one whose
-  access path is a full scan of `cve_ref` joined through `url`. Not a budget
-  violation — D-049 sets no latency ceiling — but the clearest indexing
-  opportunity in the set. M3 owns it.
-- **Why the first query after a reopen costs 9 s.** The page cache starts
-  empty, so it is all OPFS reads (D-049). Whether that is warmed, amortised, or
-  simply shown to the user is M3's call.
+- **What a schema-version bump costs in practice.** The *behaviour* is settled
+  and tested (D-068); what is not known is how often a bump is worth its cost,
+  which stays a release-discipline question rather than a technical one.
 
-*Resolved:* what building the full-text indexes costs in WASM — 66.1 s for the
+*Resolved:* why the reference-table scan was slow — 1.2 million random rowid
+lookups into `url`, fixed by query statistics that make the planner drive from
+`host` through the covering indexes instead, shipped in the artifact because
+deriving them in the browser costs 20.4 s (D-067); and what to do about the
+cold first query after a reopen — show it, because the page cache starts empty
+and warming does the same I/O at a moment nobody asked for (D-067, D-052 §3). What building the full-text indexes costs in WASM — 66.1 s for the
 full corpus, ~90% of import, and D-035's "progress-bar concern rather than a
 gate" holds, but only with D-050's page cache (247 s without it). How many
 chunks to decompress concurrently — four, decided on throttled transport

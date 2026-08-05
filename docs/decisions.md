@@ -27,6 +27,247 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-068: A schema bump announces itself and keeps the copy it invalidated  (2026-08-05, status: accepted, refines D-013)
+
+**Decision.** When the schema version in a local copy is not the one this build
+reads, the client:
+
+1. **reports it as its own state** — `storage: 'obsolete'`, distinct from
+   "ready", "empty" and "unknown" — and the page says both version numbers, that
+   there is no in-place upgrade, and what to do about it;
+2. **does not query it and does not offer the query surfaces**, because a
+   database this build cannot read is not a database it can be honest about;
+3. **does not delete it.** The copy stays on disk until a download promotes over
+   it, which the ordinary two-slot sweep then reclaims (D-061). A download
+   stages into the *other* slot, so a failed replacement leaves the
+   announcement, not an empty origin.
+
+The manifest half is a different answer: a published schema this build does not
+speak means the **app** is behind the data plane, so the message says to reload
+the page (the origin serves HTML `no-cache`, D-054) and states that the local
+copy is untouched. Re-downloading would fetch the same bytes and fail the same
+way.
+
+`ImportOptions.schema` (`?schema=N`) overrides the version this build claims, so
+both refusals and the announcement can be exercised before a real bump.
+
+**Context.** D-013 makes the local database a rebuildable cache, which is what
+licenses discarding it rather than migrating it — the plan has said since M0
+that a bump forces a full re-download. What D-013 does *not* license is doing it
+silently, and silence was the default behaviour: a copy at another schema failed
+`assertLocallyUsable`, discovery classified it as junk, and `status` swept it
+and reported an empty origin. The user's experience of a schema change would
+have been arriving at the site to find their 441 MB download gone and a fresh
+Download button, with nothing anywhere saying why.
+
+Keeping the bytes costs one generation of storage until the user acts, which is
+the same bound a re-download already accepts (D-061), and buys an announcement
+that survives a reload — the state has to be re-derivable from disk, because the
+page that saw the message is not the page the user will be looking at tomorrow.
+
+The knob exists because this is the one failure mode nobody can rehearse: it
+needs two builds of the app, one on each side of the change, and it happens to
+every existing user at once. It cannot destroy anything — that is what makes it
+safe to leave reachable, unlike `?vfs=` (D-051).
+
+**Consequences.** `classifyCandidate` gains an `obsolete` verdict, which
+`nextGeneration` counts (the copy carries a real promotion counter and reissuing
+it would make the slots indistinguishable) and the sweep spares.
+`tests/e2e/query.spec.ts` walks the whole sequence: the announcement with both
+versions, the query surfaces withdrawn, the origin refused with the actionable
+message, and the copy still live and queryable once the override is removed.
+
+What is **not** claimed: the re-download at the *new* schema is not exercised
+end to end, because that needs a data plane at the new schema and a client that
+speaks it — two builds. The download path is version-agnostic (the number is
+compared, never branched on), and the promotion gate refusing a staged copy of
+the wrong schema is unit-tested.
+
+**Reopen if.** A schema bump turns out to need an in-place migration after all —
+which would be a reversal of D-013 and not of this entry — or the retained copy
+proves to be a quota problem in practice (M5 owns quota, and would be the place
+to decide that an announced deletion beats a retained copy).
+
+## D-067: Query statistics ship in the artifact; the client only derives them when they are missing  (2026-08-05, status: accepted, closes two of D-049's open questions)
+
+**Decision.** The pipeline runs `ANALYZE` at the end of every build, so the
+published artifact carries `sqlite_stat1` — 21 rows, a few kilobytes, and about
+a second of build time (761 ms over the full corpus, measured natively on the
+development machine; the daily ingest run is 55 s). The client checks for those rows after import and
+collects its own **only if they are absent**, which is the case for every
+generation published before this. No new indexes ship, in the artifact or
+locally, and no query is rewritten to work around a plan.
+
+Stale statistics are accepted: deltas move the corpus and nothing re-runs
+`ANALYZE` between snapshots. SQLite treats `sqlite_stat1` as estimates, and a
+day's churn — hundreds of records against 372,322 — cannot change which plan is
+right.
+
+**Context.** M3 owed the two shapes D-049 measured and D-052 declined to call
+violations: the reference-host scan (605–954 ms, an order of magnitude slower
+than the other nine) and the cold first query after a reopen (9.2 s).
+
+The reference-host query was the diagnosable one. Its plan scanned `cve_ref`'s
+covering index and then did **1.2 million random rowid lookups into `url`** — a
+table whose rows are the URLs themselves, so every lookup touches a page full of
+text to read one integer. Two fixes were measured natively against the real
+artifact before either was written: a covering index on `url(id, host_id)`,
+which the planner **ignored** (it prefers an INTEGER PRIMARY KEY seek), and a
+hand-rewritten query driving from `url` through `i_url_host`, which halved it.
+Statistics then made the *unmodified* query take the better plan on its own —
+index-driven from `host`, no table lookups at all — and beat the rewrite. So the
+tuning is `ANALYZE` rather than a rewrite the query layer would have had to
+remember, and every future query shape gets it for free.
+
+That mattered for the shared query layer specifically: without statistics, the
+filter surface would have had to be written around the planner's guesses, and
+every new report would inherit that obligation.
+
+**Where** it runs was the real question, and it was measured rather than
+reasoned about. All numbers at full scale in the browser — Chromium on Linux,
+12 cores, artifact rev 2 (372,322 records), 256 MiB page cache,
+`tests/e2e/measure.spec.ts` cases `m3:*`, one run each:
+
+| | import | index build | reference-hosts | cwe-top |
+| --- | --- | --- | --- | --- |
+| M1 behaviour (no statistics) | 64.6 s | 58.6 s | 605 ms | 88 ms |
+| client `ANALYZE`, full | 85.1 s | 79.1 s | 391 ms | 54 ms |
+| client `ANALYZE`, sampled (`analysis_limit=400`) | 85.2 s | 79.2 s | **533 ms** | 54 ms |
+| client `ANALYZE`, published tables only | 84.6 s | 78.6 s | 391 ms | 53 ms |
+| **statistics in the artifact — shipped** | **64.9 s** | **58.7 s** | **398 ms** | **60 ms** |
+
+Deriving them in the browser costs **20.4 s** — a third again on top of an
+import that is already the longest wait the app has (D-035) — and *every*
+attempt to make that cheaper failed. `analysis_limit`, which SQLite's own
+documentation pairs with `PRAGMA optimize`, cost the same and picked a worse
+plan for the one query that motivated the work. Skipping the full-text shadow
+tables saved 0.5 s, inside the noise. The cost is not sampling, it is reading
+every index back through OPFS.
+
+Shipping the rows instead costs nothing measurable at either end: the import is
+unchanged within noise, the bytes are lost in a 62.7 MB download, and the plans
+are the same. It is also the one option that does not tie the app's slowest
+shape to how patient a user was on the day they first downloaded.
+
+The **cold first query after a reopen** is shown rather than removed (D-052 §3):
+the page cache starts empty, so the first real aggregate reads it from OPFS, and
+the honest answer is a query that says it is running and can be cancelled.
+Warming in the background was rejected — it does the same I/O, at a moment the
+user did not ask for it, and blocks the Worker's queue while a user who *did*
+ask waits behind it. Measured on the reopen path: 11.3 s from reload to rendered
+results, of which 3.4 s is discovery opening the slots (M2's staged replacement,
+D-061) and the rest is the query. M1 recorded 287 ms / 9.2 s against its own
+single-file discovery; the difference is that path, not this decision.
+
+**Consequences.** `pipeline/build.py` gains one statement and
+`pipeline/tests/test_build.py` asserts the artifact carries the rows — a build
+that stopped writing them would fail nothing and quietly hand every user the
+20-second cost. The checked-in development slice predates the change, so
+`pnpm e2e` exercises the client's fallback rather than the shipped path; the
+shipped path is what the full-scale sweep measured. The client keeps the fallback, so the currently-published
+generation gets the better plans today, at that price, and stops paying it at
+the next rotation (D-060). `?analyze=0` reproduces the pre-M3 behaviour, which
+is what "no regression against the M1 baseline" was measured against — same
+machine, same artifact, same session, rather than against a table recorded in a
+different month.
+
+**Reopen if.** A future shape is slow for a reason statistics cannot fix — in
+which case the candidate is a *client-built* index, which costs local time and
+OPFS but never download bytes, and D-035 already established that shape — or the
+artifact's statistics turn out to age badly across a month of deltas, which
+would be visible as a plan regression late in a rotation and answered by the
+client re-running `ANALYZE` on a schedule rather than never.
+
+## D-066: A running query reports and can be cancelled, through SQLite's progress handler and shared memory  (2026-08-05, status: accepted, implements D-052's M3 obligations)
+
+**Decision.** Every query the UI runs is executed under
+`sqlite3_progress_handler`, which SQLite calls every 50,000 virtual-machine
+instructions. That callback does two things and nothing else: it posts "running
+— 4.2 s" once a query passes about a second (D-052 §3), and it returns non-zero
+— aborting the statement with SQLITE_INTERRUPT — when the page has asked it to
+stop.
+
+**The cancel signal is a `SharedArrayBuffer`, not a message.** The Worker is
+inside SQLite when a cancel is needed, so its message queue is not being read;
+shared memory is the only channel that crosses. The flag is created by the page,
+handed over once, cleared by the Worker *before* each query (so a click that
+landed after the previous query returned cannot kill the next one), and read
+with `Atomics.load` from inside the handler.
+
+Cancellation is therefore available exactly where cross-origin isolation is,
+which is where the `opfs` VFS already requires it (D-030, D-051). Without it the
+UI says so rather than offering a button that does nothing.
+
+**Context.** D-052 removed every duration ceiling and left M3 owing the thing a
+ceiling was standing in for: with no limit, a legitimate query may run for
+minutes, and the user needs to see that it is running and be able to stop it.
+Terminating the Worker would also stop a query and is unacceptable — it drops
+the sync access handle mid-statement, against everything D-061 exists for.
+
+Two limits are real and documented rather than hidden. The handler cannot
+interrupt time spent inside a *single* opcode — a large sort or an fts5 match is
+one step — so a query can be briefly uncancellable. And the interrupt is what
+bounds a runaway query in the SQL console, which is why the console's authorizer
+deliberately permits recursive CTEs (D-065) rather than trying to forbid the
+queries that do not terminate.
+
+**Consequences.** The benchmark runs through the same path, so its numbers
+include the handler; `?ops=0` installs none, which is how its cost was priced
+against the M1 baseline (D-067, features.md). The handler is installed per query
+and removed in a `finally`, so the app's own writes — delta apply, index
+building — never run under it.
+
+**Reopen if.** The per-callback cost shows up in the benchmark as the corpus
+grows (raise the instruction count — cancellation latency is the only thing it
+trades against), or a browser we support drops `SharedArrayBuffer` for
+cross-origin-isolated contexts, which would leave termination-and-reopen as the
+only mechanism and is a much larger change.
+
+## D-065: The SQL console is read-only by SQLite authorizer, and row-capped  (2026-08-05, status: accepted, first instalment of D-044)
+
+**Decision.** The console runs the user's SQL on the live connection with an
+authorizer installed for the duration of the statement. It allows exactly four
+actions — `SELECT`, `READ`, `FUNCTION`, `RECURSIVE` — and denies everything
+else, including `PRAGMA`, `ATTACH`, `TRANSACTION`, `ANALYZE` and every DDL and
+DML action. Function calls are additionally refused by name for a short list
+that is not compiled into this build (`load_extension`, the filesystem
+helpers), because "no tool reaches the network or the filesystem" (D-044) is a
+permanent commitment rather than a property of today's compile options.
+
+Results are capped at 1,000 rows and the cap is reported. The `query_only`
+pragma stays on underneath; it is no longer the defence.
+
+**Context.** D-044 requires this surface to be enforced structurally, "never by
+inspecting query text", and the plan repeats it. The reason is not style: a
+denylist of words is a filter in front of a parser, and the parser decides what
+a statement means. `PRAGMA query_only=OFF` in the same string it is guarding,
+a semicolon and a second statement, `SELECT * FROM pragma_query_only` — each
+defeats text inspection and none defeats the authorizer, which SQLite calls
+*from* the parser with the action already resolved.
+
+The policy is a pure function (`lib/authorizer.ts`) taking an action code and
+its operands, because two drivers install it: the WASM build in the Worker and
+`node:sqlite` in the tests, which pass the same arguments in a different order.
+That is what lets the guarantee be tested against real SQLite — 21 hostile
+statements, each asserted to leave the database unchanged rather than merely to
+raise — instead of against our own idea of it.
+
+A read-only *connection* was the alternative D-044 also allows. It was rejected
+because the `opfs` VFS holds an exclusive sync access handle: a second
+connection to the same file is not available, and the one connection there is
+must still apply deltas and build indexes.
+
+**Consequences.** The console is offered at all, which is what makes the corpus
+explorable beyond the filter surface. `lib/authorizer.ts` is where the AI tool
+surface's `SELECT`-only tool will plug in (M7) — the same policy, a different
+caller. A refusal is reported next to the console with the action named, rather
+than in the page's error banner.
+
+**Reopen if.** A legitimate read turns out to need an action this list denies —
+`TRANSACTION` for a consistent multi-statement read is the plausible one, and
+the answer would be to allow it explicitly with the reason recorded, not to
+widen the list to "everything that does not obviously write".
+
 ## D-064: A stall is sixty seconds without a byte; staleness is the data's own age  (2026-08-05, status: accepted, implements D-052's M2 obligations)
 
 **Decision.** Four parts.

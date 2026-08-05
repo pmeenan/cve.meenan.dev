@@ -144,20 +144,22 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M2 closed 2026-08-05** — the browser downloads the full corpus, builds its
-own indexes, syncs itself forward and says how old its data is. The server half
-runs in production on `plex`: delta wire contract (D-055), stable interned ID
-space (D-056), daily ingest (D-058) and monthly rotation (D-060) crons — the
-monthly's first unattended firing is 1 September, the one thing M2 closed
-without observing. On the client: staged replacement, so a failed download
-cannot cost the copy you have (D-061); sync as one transaction per delta with
-the watermark and the full-text indexes inside it, and a download that ends by
-catching up (D-063); and stall detection and freshness (D-064) — a stall is
-sixty seconds without a byte rather than an elapsed-time budget, and staleness
-is the age of the data's own build stamp. **M3 is next** — query surfaces and
-tuning — and is not yet decomposed into tasks. The AI
-ladder was re-ordered 2026-08-03: the first model tier is site-hosted Ollama
-behind a restricted same-origin relay, re-scoping M7/M8 (D-057). Process was
-rightsized for MVP scale 2026-08-04 (D-062). Details live in plan.md and the
-decision log; keep this paragraph short and current when milestone status
-changes (rule 5).
+**M3 closed 2026-08-05** — the corpus is queryable, and the query surface is
+safe by structure rather than by inspection. Every confirmed filter axis goes
+through one shared layer that binds its values and carries D-022's
+PUBLISHED-only default (`lib/filters.ts`); the raw SQL console is read-only
+because a SQLite authorizer refuses every other action from inside the parser
+(D-065); a long query reports itself and can be cancelled, through SQLite's
+progress handler and a `SharedArrayBuffer` — the only channel that reaches a
+Worker sitting inside SQLite (D-066); query statistics ship in the artifact and cut the
+slowest shape in the benchmark by a third, at no cost to the import (D-067);
+and a
+schema bump announces itself and keeps the copy it invalidated instead of
+sweeping it (D-068). **M4 is next** — analysis and reporting — and is not yet
+decomposed into tasks. M2 closed the server half in production on `plex` (daily
+ingest D-058, monthly rotation D-060); the monthly's first unattended firing is
+1 September, still unobserved. The AI ladder was re-ordered 2026-08-03: the
+first model tier is site-hosted Ollama behind a restricted same-origin relay,
+re-scoping M7/M8 (D-057). Process was rightsized for MVP scale 2026-08-04
+(D-062). Details live in plan.md and the decision log; keep this paragraph short
+and current when milestone status changes (rule 5).

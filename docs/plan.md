@@ -15,9 +15,9 @@ it touched.
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
 Milestones are decomposed into task-sized checkboxes (the workflow's unit of
-work) no later than when they become the next milestone up — M0 – M2 are
-decomposed and closed; **M3 is next and still carries only scope prose**, so its
-checkbox breakdown is the first thing that milestone owes. M4+ carry scope prose
+work) no later than when they become the next milestone up — M0 – M3 are
+decomposed and closed. **M4 is next and still carries only scope prose**, so its
+checkbox breakdown is the first thing that milestone owes. M5+ carry scope prose
 and exit criteria until their turn.
 
 ## M0 — Plan the plan  `done`
@@ -348,24 +348,54 @@ rotation cron has never been observed *firing* — its first unattended run is
 none of the staged-replacement guarantees are claimed for it, which is what
 D-051 chose against.
 
-## M3 — Query surfaces and tuning  `pending`
+## M3 — Query surfaces and tuning  `done`
 
 The schema itself shipped in M1 (`pipeline/schema.sql`); this milestone makes
-it queryable, fast, and safe. Scope: every confirmed filter axis — CVSS
-v2/v3.x/v4, CWE, CNA, vendor/product, dates, state, and references *by host*
-(D-033; CPE was rejected there, and FTS never covers references — D-035);
-schema versioning exercised end to end: a bump invalidates and forces an
-announced full re-download, because the local database is a rebuildable cache
-(D-013) and there is no in-place migration; indexing tuned against the M1
-baseline, aiming at the shapes that are actually slow (the reference-host scan,
-and the cold first query after a reopen) rather than at a ceiling — D-049 sets
-none; the raw SQL console, made structurally read-only here — a SQLite
-authorizer, not query-text inspection or the `query_only` pragma alone — and
-row-capped (this is where D-044's tool-surface commitment starts being real
-code). Long-running queries are handled, not forbidden: progress, cancellation,
-and a responsive UI, since with no latency ceiling that is the only way
-slowness can hurt anyone. Any interrupt is a *safety* mechanism against runaway
-or hostile SQL, and must not be a stopwatch that kills a legitimate slow query.
+it queryable, fast, and safe. Tasks in dependency order — the shared query layer
+came first, because the filter surface, the console and the tuning all sit on
+what it decides about defaults and bound parameters. These are summaries; the
+reasoning and the measurements are in the decision entry each item names.
+
+- [x] **The shared query layer** (`lib/filters.ts`). Every confirmed filter axis
+      — CVSS v2/v3.x/v4, CWE, CNA, vendor/product, published and updated dates,
+      year, state, and references **by host** (D-033; CPE was rejected there and
+      FTS never covers references, D-035) — compiled into one `WHERE` clause
+      with every value bound. Two things are structural rather than remembered
+      per report: D-022's PUBLISHED-only default lives in the compiler, and
+      link-table axes compile to `EXISTS`, so a record affecting eight products
+      is one record in a list and one in a count. Lookup names resolve to ids in
+      a separate step, which is what keeps "no vendor is called that" and "no
+      CVE matches that vendor" different answers (D-023). Tested by *executing*
+      the compiled SQL against the published schema, with vendor and product
+      names that are themselves SQL injection attempts.
+- [x] **The filter surface and grouped counts.** A plain form over every axis,
+      counts by any dimension, and the SQL with its bound values on screen under
+      every result. Deliberately not the reporting UI — M4 owns that, and will
+      build it on `Filters`, which is also the object a permalink and a
+      chat-emitted report definition will carry (D-044).
+- [x] **The SQL console, structurally read-only** (D-065). A SQLite authorizer
+      allowing four actions and refusing everything else, installed for the
+      duration of the statement, plus a reported 1,000-row cap. 21 hostile
+      statements are asserted to leave the database *unchanged*, not merely to
+      raise.
+- [x] **Query feedback and cancellation** (D-066). SQLite's progress handler
+      reports elapsed time past about a second (D-052 §3) and aborts the
+      statement when the page sets a flag in shared memory — the only channel
+      that reaches a Worker sitting inside SQLite. Covered by a test that runs a
+      query which would never finish, cancels it, and queries the same database
+      afterwards.
+- [x] **Indexing tuned against the M1 baseline** (D-067). Query statistics, no
+      new indexes and no query rewritten around a plan — and they ship **in the
+      artifact**, because deriving them in the browser costs 20.4 s and every
+      cheaper variant lost. The reference-host scan, the slowest of the ten
+      shapes and the one D-049 left open, drops from **605 ms to 398 ms** with
+      the import unchanged. The cold first query after a reopen (D-049's other
+      open shape) is **shown rather than removed**.
+- [x] **Schema versioning end to end** (D-068). A local copy of another schema
+      is announced with both version numbers, not queried, and **kept** until a
+      download replaces it. A manifest of another schema is refused before a
+      byte is fetched, with the message that actually helps. `?schema=N`
+      exercises all of it, because a real bump needs two builds of the app.
 
 **Exit criteria:** every confirmed filter axis is queryable; no regression
 against the M1 baseline, with any deliberate trade recorded; a query past a
@@ -373,6 +403,21 @@ second reports that it is running, can be cancelled, and does not freeze the
 tab (D-052, covered by a test that runs a slow one); a schema-version bump triggers a correct,
 announced re-download; hostile SQL in the console (writes, pragma flips,
 runaway queries) is refused by structure, covered by tests.
+
+**Exit criteria — met 2026-08-05.** Every axis answers in a browser against the
+real thing: each lookup axis is filtered by a value taken from its own grouped
+counts, and the two numbers have to agree — which is what would catch a filter
+and an aggregate disagreeing about what a record is. The M1 baseline was
+re-measured beside the new numbers, same machine and artifact and session
+(`?analyze=0&ops=0` reproduces it): faster on the two shapes statistics reach,
+unchanged elsewhere, import unchanged (numbers in features.md under Q-003). A
+runaway query reports, stays responsive and cancels; hostile SQL is refused with
+the corpus unchanged, and sync still works afterwards — the check that the guard
+is per-query rather than left on the connection.
+
+One thing is deliberately **not** claimed: the re-download at a *new* schema is
+not exercised end to end, because that needs a data plane at the new schema and
+a client that speaks it — two builds of the app (D-068).
 
 ## M4 — Analysis and reporting  `pending`
 

@@ -61,9 +61,10 @@ the decision log, not by editing a row. The AI chat layer section was added
 | Published and last-modified dates | `confirmed` | D-020. Sourced from `cveMetadata.datePublished` / `dateUpdated` in the record JSON — 98.4% / 100% coverage — not from git. |
 | Record state (`PUBLISHED` / `REJECTED`) as a queryable column | `confirmed` | D-022. ~4.9% of the corpus is REJECTED; excluded from counts by default, filterable on request. |
 | Per-record revision count | `rejected (D-020)` | No confirmed feature queries it, and it was the only consumer of git history. |
-| Schema versioning with invalidation and explicit re-download | `confirmed` | The manifest's `schema` field gates use (`assertUsable`); a bump forces an announced full re-download. The local database is a rebuildable cache (D-013) — there is no in-place migration, deliberately. |
+| Schema versioning with invalidation and explicit re-download | `confirmed` | Shipped in M3 (D-068). The manifest's `schema` field gates use (`assertUsable`) and a local copy of another version is announced with both numbers, not queried, and **kept** until a download replaces it — D-013 licenses replacing the cache, not deleting it silently. There is no in-place migration, deliberately. `?schema=N` rehearses the bump, which otherwise needs two builds of the app. |
 | Year-partitioned download with on-demand backfill | `rejected (D-038)` | Would have saved 24.6 MB on a first download in exchange for coverage becoming a thing the whole product reasons about. D-035 had already banked the larger saving. |
 | Client-side brotli decompression in WASM, streamed into OPFS | `confirmed` | D-040, D-041. Opaque `.br` chunks decoded and written positionally, so peak memory is the four chunks in flight (D-049) and no intermediary can re-encode. |
+| Query statistics shipped with the artifact | `confirmed` | D-067. `ANALYZE` runs in the build — 21 rows, a few kilobytes — because deriving the same rows in the browser costs 20.4 s of OPFS reads for identical plans. The client falls back to collecting its own only for a generation published without them. |
 | Storage quota handling and `navigator.storage.persist()` | `confirmed` | A corpus this size runs into quota and eviction; silent eviction looks like data loss. |
 | Import/export of the whole local database | `rejected (D-013)` | The local database is a rebuildable cache, not a user asset. |
 
@@ -77,11 +78,11 @@ as of the 2026-07-30 triage** — additions go through the decision log.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Search across CVE records | `confirmed` | Stated in the repository description. |
-| Structured filtering (date, severity, CNA, CWE, product) | `confirmed` | The concrete form of "analyzing"; the axes follow from the extraction rows above. |
+| Search across CVE records | `confirmed` | Stated in the repository description. Shipped in M3: full-text over descriptions plus every filter axis, through one shared query layer (`lib/filters.ts`). |
+| Structured filtering (date, severity, CNA, CWE, product) | `confirmed` | The concrete form of "analyzing"; the axes follow from the extraction rows above. **Queryable as of M3** — every axis compiles to bound parameters with D-022's default inside the compiler, and counts by any dimension come from the same predicate. The filtering *UI* is M4; M3 ships a plain form over it. |
 | Aggregate reporting and trend views over time | `confirmed` | The main thing a local corpus enables over a search box — the reason the project exists. |
 | Charting for report output | `confirmed` | Aggregates without visualization push users back to a spreadsheet. |
-| Raw SQL console | `confirmed` | Nearly free given D-004, and the escape hatch for every question the UI did not anticipate. |
+| Raw SQL console | `confirmed` | Nearly free given D-004, and the escape hatch for every question the UI did not anticipate. Shipped in M3 (D-065): read-only by SQLite authorizer rather than by inspecting the text, capped at 1,000 rows, and cancellable. |
 | Saved queries and query history | `confirmed` | Analysis is iterative; losing a refined query on reload is a real cost. |
 | Shareable query/report permalinks (query only, never data) | `confirmed` | Supports vision criterion 6 while preserving the privacy property. |
 | Export result sets (CSV / JSON) | `confirmed` | Makes the tool a step in a workflow rather than a dead end. Exports are "copies" under D-008, so the notice travels with them. |
@@ -126,9 +127,9 @@ definitions the fixed UI renders.
 | --- | --- | --- |
 | Rsync deploy from `dist/` | `confirmed` | D-003. |
 | Multi-tab behavior | `confirmed` | Forced by D-004; D-051 chose `opfs`, where a second tab opens and queries the same database. |
-| Activity feedback for anything over ~1 s | `confirmed` | D-052. No operation has a duration ceiling, so this is what stands in for one: past a second the app says what it is doing, with real progress where the work is countable. Import has it (M1); queries got it with D-052; sync reports the revision it is applying and how far through the chain it is (M2). |
+| Activity feedback for anything over ~1 s | `confirmed` | D-052. No operation has a duration ceiling, so this is what stands in for one: past a second the app says what it is doing, with real progress where the work is countable. Import has it (M1); sync reports the revision it is applying and how far through the chain it is (M2); a running query reports its elapsed time from inside SQLite and can be stopped (M3, D-066). |
 | Stall detection, distinct from slowness | `confirmed` | Shipped in M2 (D-064). The signal is bytes received, not elapsed time: sixty seconds without one aborts the transfer and says it stalled *rather than being slow*; the local copy is untouched and the staged chunks are still worth resuming. Covers the download and the delta fetches — a query is synchronous in the Worker, and cancelling one is M3. |
-| Cancelling a running query | `confirmed` | D-052 makes long queries legitimate, which makes stopping one a requirement rather than a nicety. M3. |
+| Cancelling a running query | `confirmed` | Shipped in M3 (D-066). D-052 makes long queries legitimate, which makes stopping one a requirement rather than a nicety. SQLite's progress handler reads a `SharedArrayBuffer` the page writes — the only channel that reaches a Worker sitting inside SQLite — and aborts the statement. Where cross-origin isolation is missing the UI says so instead of offering a dead button. |
 | Browser support floor and capability gating | `confirmed` | An unsupported browser should say so on arrival, not fail deep inside an import. |
 | Diagnostics panel (storage used, last sync, record counts, schema version) | `confirmed` | Makes "measure, don't assert" possible for users, and is the only support channel given D-009. |
 | Offline app shell (service worker) | `confirmed` | D-048, owner-confirmed 2026-08-01. Caches the shell, Worker, WASM and decoder so an offline *reopen* works — OPFS preserves the data, this preserves the app. **Network-first with cache fallback, never cache-first** (D-054). Never caches `/data/` (the manifest is the freshness signal) or model weights. Lands in M5. |
@@ -209,6 +210,33 @@ Ordered by how much rework a late answer would cause.
    server on loopback). Index-build time varied 20% across runs that should
    have been identical, so differences smaller than that are not results —
    D-049 says which conclusions clear that bar.
+
+   **Re-measured for M3** (2026-08-05, artifact rev 2, same machine and
+   session). The rows above were recorded against rev 1 a month earlier, so the
+   milestone's "no regression" claim is against a baseline re-run *beside* the
+   new numbers rather than against them — `?analyze=0&ops=0` reproduces M1's
+   behaviour, and `tests/e2e/measure.spec.ts` carries all three as `m3:*` cases.
+
+   | | import | index build | reference-hosts | cwe-top | everything else |
+   | --- | --- | --- | --- | --- | --- |
+   | M1 behaviour | 64.6 s | 58.6 s | 605 ms | 88 ms | 5–158 ms |
+   | + progress handler (D-066) | 64.3 s | 58.3 s | 608 ms | 86 ms | 5–152 ms |
+   | + statistics in the artifact (D-067) | 64.9 s | 58.7 s | **398 ms** | **60 ms** | 5–176 ms |
+
+   Two conclusions clear the noise bar. The progress handler that makes every
+   query report itself and be cancellable costs **nothing measurable** — every
+   shape lands within ±5%, in both directions. And query statistics cut the
+   slowest shape by a third and the CWE aggregate by 30%, at **no cost to the
+   import**, because they are collected on the server rather than in the
+   browser; deriving them locally was measured at 20.4 s and every cheaper
+   variant of that either cost the same or picked a worse plan (D-067).
+
+   Reopening with a local copy, same session: **3.4 s** to report the copy and
+   **11.3 s** to rendered results, against M1's 287 ms / 9.2 s. The query itself
+   got *faster* (7.9 s against 8.9 s); what grew is discovery, which M2 changed
+   — staged replacement opens each slot to decide which is live (D-061), where
+   M1 opened one file by name. Tracked, not gated (D-052 §4); M5's diagnostics
+   work is where it becomes visible to a user.
 **Q-004. Which OPFS VFS — `opfs` or `opfs-sahpool`?** **Answered 2026-08-01 by
    D-051: `opfs`.** D-030 had already removed the server-config half —
    `cve.meenan.dev` serves COOP/COEP, so both were available — leaving a

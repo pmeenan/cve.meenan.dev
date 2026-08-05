@@ -2,17 +2,23 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 
+import { newCancelFlag, requestCancel } from '@/lib/cancel'
 import { describeFreshness } from '@/lib/freshness'
 import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
 import type {
   BenchResult,
   ImportOptions,
   Progress,
+  QueryResult,
   Request,
   Response,
+  SearchRequest,
   SyncOutcome,
   Timings,
 } from '@/lib/protocol'
+
+import { Console } from './console'
+import { Explore, type SearchOutcome } from './explore'
 
 /**
  * M1's end-to-end path: download the published chunks, decompress them in
@@ -42,25 +48,37 @@ const IDLE: Progress = { phase: 'idle', fraction: null, detail: '' }
  * something a stranger can hand you and the memory bound is not negotiable
  * there.
  *
- * The knob to be wary of is **`vfs`**, not `stop` or `stall`. `?stop=` ends a
- * download early and `?stall=` shortens the no-progress timeout, both of which
- * leave the live copy untouched by construction. `?vfs=` selects the
- * `opfs-sahpool` path, which cannot stage (D-051) and so clears local storage —
- * both slots included — *before* fetching anything: one click on a crafted link
- * costs a working local copy. It stays reachable because `pnpm measure` needs
- * it to re-run Q-004.
+ * The knob to be wary of is **`vfs`**, not the others. `?stop=` ends a download
+ * early, `?stall=` shortens the no-progress timeout, `?schema=` changes the
+ * schema version this build claims to read (D-068), `?ops=` and `?analyze=`
+ * turn off the query progress handler and the statistics pass so the M3 sweep
+ * can price them (D-066, D-067) — all of which leave the local copy where it
+ * was by construction. `?vfs=` selects the `opfs-sahpool` path, which cannot
+ * stage (D-051) and so clears local storage — both slots included — *before*
+ * fetching anything: one click on a crafted link costs a working local copy. It
+ * stays reachable because `pnpm measure` needs it to re-run Q-004.
  */
 function importOptions(search: string): ImportOptions {
   const params = new URLSearchParams(search)
   const vfs = params.get('vfs')
   const stop = positive(params.get('stop'))
   const stall = positive(params.get('stall'))
+  const schema = positive(params.get('schema'))
+  // Zero is meaningful here — it means "install no progress handler" — so this
+  // one is read as a plain integer rather than through `positive`.
+  const ops = params.get('ops')
+  const progressOps = ops !== null && /^\d+$/.test(ops.trim()) ? Number(ops) : null
+  // `?analyze=0` only: anything else leaves the default, which is on.
+  const analyze = params.get('analyze') === '0' ? false : null
   return {
     concurrency: positive(params.get('concurrency')) ?? DEFAULT_CONCURRENCY,
     cacheMib: positive(params.get('cache')) ?? DEFAULT_CACHE_MIB,
     vfs: vfs === 'opfs' || vfs === 'opfs-sahpool' ? vfs : DEFAULT_VFS,
     ...(stop === null ? {} : { stopAfterChunks: stop }),
     ...(stall === null ? {} : { stallMs: stall }),
+    ...(schema === null ? {} : { schema }),
+    ...(progressOps === null ? {} : { progressOps }),
+    ...(analyze === null ? {} : { analyze }),
   }
 }
 
@@ -89,7 +107,18 @@ export default function Home() {
    * "I could not tell") so that both the UI and a test can wait for the Worker
    * to have spoken without mistaking a failure for silence.
    */
-  const [storage, setStorage] = useState<'pending' | 'unknown' | 'ready' | 'empty'>('pending')
+  const [storage, setStorage] = useState<'pending' | 'unknown' | 'ready' | 'empty' | 'obsolete'>(
+    'pending'
+  )
+  /**
+   * The schema the local copy carries and the one this build reads. Equal
+   * whenever the copy is usable; the pair is the announcement a bump owes
+   * (M3, D-013).
+   */
+  const [schemas, setSchemas] = useState<{ local: number | null; speaks: number }>({
+    local: null,
+    speaks: 0,
+  })
   const [timings, setTimings] = useState<Timings | null>(null)
   const [sync, setSync] = useState<SyncOutcome | null>(null)
   const [revision, setRevision] = useState<number | null>(null)
@@ -117,13 +146,37 @@ export default function Home() {
    * worked, which is the opposite of what the clearing rule below is for.
    */
   const importedThisRun = useRef(false)
-  const [result, setResult] = useState<{ columns: string[]; rows: unknown[][]; ms: number } | null>(
-    null
-  )
+  const [result, setResult] = useState<QueryResult | null>(null)
+  const [search, setSearch] = useState<SearchOutcome | null>(null)
+  const [consoleResult, setConsoleResult] = useState<QueryResult | null>(null)
+  const [consoleError, setConsoleError] = useState('')
+  /** Which surface a cancellation belongs to, so it is reported where it happened. */
+  const [cancelled, setCancelled] = useState<{ kind: string; ms: number } | null>(null)
+  /**
+   * How many answers the Worker has given this page — a result, a cancellation
+   * or a refusal.
+   *
+   * On screen it is nothing; it is rendered as `data-run` so a test can wait for
+   * *this* answer rather than reading the previous one. Without it a query that
+   * finishes in single-digit milliseconds is indistinguishable from one that has
+   * not started, and the assertion passes against the last result — which is how
+   * a filter that never applied can look correct.
+   */
+  const [runSeq, setRunSeq] = useState(0)
+  const [stopping, setStopping] = useState(false)
   const [benchmark, setBenchmark] = useState<{
     results: BenchResult[]
     wasmHeapBytes: number
   } | null>(null)
+  /**
+   * The shared cancellation flag (lib/cancel.ts). Created once here, because
+   * the page owns the button; null on a browser with no `SharedArrayBuffer`,
+   * where the UI says so rather than offering a Cancel that does nothing.
+   *
+   * `useState` with an initializer rather than `useRef`, so the render that
+   * decides whether to offer Cancel sees it.
+   */
+  const [cancelFlag] = useState<Int32Array | null>(() => newCancelFlag())
 
   useEffect(() => {
     const worker = new Worker(new URL('../workers/db.worker.ts', import.meta.url), {
@@ -140,6 +193,7 @@ export default function Home() {
         case 'status':
           setStorage(message.storage)
           setReady(message.ready)
+          setSchemas({ local: message.localSchema, speaks: message.schema })
           // An unknown origin asserts nothing: the panels stay, because the
           // local copy they describe may still be there.
           if (message.storage === 'unknown') {
@@ -162,6 +216,8 @@ export default function Home() {
           if (!message.ready) {
             setTimings(null)
             setResult(null)
+            setSearch(null)
+            setConsoleResult(null)
             setBenchmark(null)
             setSync(null)
           }
@@ -180,13 +236,40 @@ export default function Home() {
           // report the revision the Worker just committed.
           setRevision(message.outcome.to)
           break
-        case 'rows':
-          setResult({ columns: message.columns, rows: message.rows, ms: message.ms })
+        case 'result':
+          setRunSeq((seq) => seq + 1)
+          setStopping(false)
+          if (message.kind === 'console') setConsoleResult(message.result)
+          else if (message.kind === 'search') {
+            setSearch({
+              result: message.result,
+              matches: message.matches ?? null,
+              unmatched: message.unmatched ?? [],
+              groupBy: message.groupBy ?? null,
+              state: message.state ?? 'published',
+            })
+          } else setResult(message.result)
+          break
+        case 'cancelled':
+          // Not an error and not shown as one: the user asked for it, the
+          // database is untouched, and the surface that was running says so.
+          setRunSeq((seq) => seq + 1)
+          setStopping(false)
+          setCancelled({ kind: message.kind, ms: message.ms })
           break
         case 'bench':
           setBenchmark({ results: message.results, wasmHeapBytes: message.wasmHeapBytes })
           break
         case 'error':
+          setRunSeq((seq) => seq + 1)
+          setStopping(false)
+          // A refusal from the console belongs beside the console, not in the
+          // page-level banner: it is the answer to what the user just typed.
+          if (message.kind === 'console') {
+            setConsoleError(message.message)
+            setConsoleResult(null)
+            break
+          }
           setError(message.message)
           // The Import panel describes a run that succeeded. After a failed
           // one it is describing a different origin than the one on disk —
@@ -199,9 +282,21 @@ export default function Home() {
       }
     }
 
-    worker.postMessage({ type: 'status' } satisfies Request)
+    // The cancellation flag first: it has to be in the Worker's hands before
+    // any query can be started, and `status` is the first thing that runs.
+    if (cancelFlag) {
+      worker.postMessage({
+        type: 'control',
+        cancel: cancelFlag,
+        options: importOptions(location.search),
+      } satisfies Request)
+    }
+    worker.postMessage({
+      type: 'status',
+      options: importOptions(location.search),
+    } satisfies Request)
     return () => worker.terminate()
-  }, [])
+  }, [cancelFlag])
 
   useEffect(() => {
     // A minute is far finer than the units this reports in (hours, then days),
@@ -216,6 +311,8 @@ export default function Home() {
 
   const send = useCallback((request: Request) => {
     setError('')
+    setCancelled(null)
+    setStopping(false)
     // A new run's panels describe that run. Anything a previous one left on
     // screen is about to be either replaced or invalidated.
     if (request.type === 'import') {
@@ -223,8 +320,25 @@ export default function Home() {
       setSync(null)
     }
     if (request.type === 'sync') setSync(null)
+    if (request.type === 'console') {
+      setConsoleError('')
+      setConsoleResult(null)
+    }
+    if (request.type === 'search') setSearch(null)
     workerRef.current?.postMessage(request)
   }, [])
+
+  /**
+   * Stop the running query.
+   *
+   * A write to shared memory, not a message: the Worker is inside SQLite and
+   * will not read its message queue until the query it is running has finished,
+   * which is the whole problem (lib/cancel.ts).
+   */
+  const cancel = useCallback(() => {
+    setStopping(true)
+    requestCancel(cancelFlag)
+  }, [cancelFlag])
 
   const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
   const freshness = ready && now !== null ? describeFreshness(generated, now) : null
@@ -295,6 +409,24 @@ export default function Home() {
             {phaseLabel(progress.phase)}
             {progress.detail && ` — ${progress.detail}`}
           </p>
+          {/* Only queries can be stopped. An import or a sync has its own
+              answer to "this is taking too long" — the stall watch (D-064) —
+              and stopping one part way is what staged replacement already
+              makes safe without a button. */}
+          {progress.phase === 'query' && (
+            <p className="muted">
+              {cancelFlag === null ? (
+                <span data-cancel="unavailable">
+                  This browser is not cross-origin isolated, so a running query cannot be stopped
+                  from here. The tab stays responsive; the query finishes on its own.
+                </span>
+              ) : (
+                <button type="button" className="quiet" onClick={cancel} disabled={stopping}>
+                  {stopping ? 'Stopping…' : 'Cancel query'}
+                </button>
+              )}
+            </p>
+          )}
         </section>
       )}
 
@@ -307,7 +439,30 @@ export default function Home() {
         </p>
       )}
 
-      {error && <p className="error">{error}</p>}
+      {/* A schema bump, announced (M3). The local database is a rebuildable
+          cache (D-013) and there is no in-place migration, so the honest thing
+          is to say what happened, keep the bytes until a new download replaces
+          them, and name the action. Silence here would look identical to a
+          first visit — the state a user would meet after every schema change
+          without this. */}
+      {storage === 'obsolete' && (
+        <p className="error" data-obsolete={schemas.local ?? ''}>
+          The data format changed. Your local copy is schema {schemas.local ?? '?'} and this version
+          of the app reads schema {schemas.speaks}, and there is no in-place upgrade — the local
+          database is a cache that can always be rebuilt from the origin. Download the corpus again
+          to replace it; the old copy stays until the new one is ready.
+        </p>
+      )}
+
+      {/* The page-level banner. `data-error` distinguishes it from the other
+          things styled as errors — the schema announcement above, an unmatched
+          filter name below — which are statements about state rather than
+          reports of a failure. */}
+      {error && (
+        <p className="error" data-error="1">
+          {error}
+        </p>
+      )}
 
       {ready && revision !== null && (
         <p className="muted" data-revision={revision}>
@@ -388,6 +543,27 @@ export default function Home() {
         </section>
       )}
 
+      {ready && (
+        <Explore
+          disabled={busy}
+          onRun={(request: SearchRequest) => send({ type: 'search', request })}
+          outcome={search}
+          run={runSeq}
+          cancelledMs={cancelled?.kind === 'search' ? cancelled.ms : null}
+        />
+      )}
+
+      {ready && (
+        <Console
+          disabled={busy}
+          onRun={(sql: string) => send({ type: 'console', sql })}
+          result={consoleResult}
+          run={runSeq}
+          error={consoleError}
+          cancelledMs={cancelled?.kind === 'console' ? cancelled.ms : null}
+        />
+      )}
+
       {benchmark && (
         <section>
           <h2>Query latency</h2>
@@ -415,6 +591,10 @@ export default function Home() {
             </table>
           </div>
         </section>
+      )}
+
+      {cancelled?.kind === 'demo' && (
+        <p className="muted">Query cancelled after {(cancelled.ms / 1000).toFixed(1)} s.</p>
       )}
 
       {result && (

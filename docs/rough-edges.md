@@ -22,6 +22,65 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-019: An accessible name includes the value of the control its label wraps  (2026-08-05, status: worked-around)
+
+**Environment.** Chromium 151 via Playwright 1.62 on Linux, 2026-08-05.
+Accessible-name computation is the spec's (accname §4.3.2 step 2F), so this is
+every engine, not a Chromium quirk.
+
+**Repro.** Two labelled controls on the same page:
+
+```html
+<label><span>Group by</span><select>…</select></label>
+<label><span>SQL</span><textarea>SELECT … GROUP BY w.id …</textarea></label>
+```
+
+`page.getByLabel('Group by')` matches **both**, and fails with a strict-mode
+violation naming the textarea.
+
+**Observed / expected.** Expected the textarea's name to be `SQL`. It is
+`SQL SELECT … GROUP BY w.id …`: when a label wraps a control, the value of that
+control is part of the label's text content, so a `<textarea>` names itself with
+whatever the user has typed into it. Playwright's `getByLabel` is a substring
+match by default, so any query the user pastes can start matching unrelated
+fields.
+
+**Impact.** A test that is *scoped to the right form* is unaffected; one that
+searches the page is not, and the failure mode is a locator resolving to a
+control on the other side of the page. Worse, it depends on the *contents* of a
+text box, so it appears and disappears with the example SQL. The fix is to scope
+locators to the form under test (`page.locator('form.filters').getByLabel(…)`),
+which `tests/e2e/query.spec.ts` now does for every field.
+
+**Links:** M3's query surfaces; `tests/e2e/query.spec.ts`.
+
+## RE-018: The e2e suite serves `dist/`, so an unbuilt UI change is invisible to it  (2026-08-05, status: fixed)
+
+**Environment.** This repository, Playwright 1.62, Next.js 16 static export.
+
+**The trap.** `playwright.config.ts` starts `scripts/serve.mjs` over `dist/` —
+the export, on purpose, because the export is what ships (D-027, and RE-012 is
+what happens when the local server is more permissive than production). But
+`pnpm e2e` did not build first, so an edited component that had not been through
+`next build` was simply not on screen. The tests then pass or fail against the
+*previous* version of the app.
+
+**Observed.** An M3 assertion on a newly added `data-run` attribute failed with
+"expected not null" for two full runs; the attribute was in the component and
+not in `dist/`. The tests were green about code that was not running.
+
+**Why it is worth an entry.** The failure looks like a bug in the code under
+test, not like a stale artifact, and it gets *worse* as the suite grows: a
+change that only adds behaviour produces a plausible-looking failure, while a
+change that only removes behaviour produces a plausible-looking pass.
+
+**Fix.** The `webServer` command is now `npx next build && node scripts/serve.mjs`,
+so the served export is always the working tree. Turbopack builds this project
+in a few seconds, which is cheaper than one wrong debugging session. `pnpm check`
+is unaffected — it never serves anything.
+
+**Links:** D-027 (static export), RE-012 (the local server matching production).
+
 ## RE-017: Overwriting a SQLite database while its rollback journal survives replays the old journal into the new file  (2026-08-04, status: worked-around)
 
 **Environment.** SQLite 3.45.1 via Python 3.12.3 on Linux; the same commit

@@ -1,0 +1,586 @@
+/**
+ * The shared query layer: every confirmed filter axis, compiled to SQL with
+ * bound parameters (M3).
+ *
+ * Two rules are structural here rather than remembered by each caller.
+ *
+ * **Nothing but an allowlisted identifier is ever interpolated.** Filter values
+ * — vendor names, search text, CVE ids, dates — are attacker-influenced twice
+ * over: they come from a URL or a form, and they are compared against corpus
+ * text. They become `?` placeholders, always. What *is* interpolated is a table
+ * or column name this file chose, or a run of `?`s whose length comes from an
+ * array's length. `tests/unit/filters.test.ts` asserts that every compiled
+ * fragment is free of the values it was built from (rule 4).
+ *
+ * **REJECTED records are excluded unless asked for** (D-022). ~4.8% of the
+ * corpus is REJECTED — 17,801 records of 372,322 in the live artifact — so an
+ * aggregate without the predicate overcounts by about a twentieth and looks
+ * entirely plausible. The default lives in `compile` because "easy to write and
+ * easy to forget" is exactly what a shared layer is for; a report that wants
+ * them says so, and the UI has to say so too.
+ */
+
+/** Bindable scalar. Everything a filter contributes is one of these. */
+export type SqlParam = string | number
+
+/** `cve.state`, as stored. */
+export const STATE_PUBLISHED = 1
+export const STATE_REJECTED = 2
+
+/**
+ * Which records an aggregate is over. `published` is the default everywhere
+ * (D-022); the other two are opt-ins the UI must show, because a chart whose
+ * denominator changed silently is worse than one that refuses.
+ */
+export type StateFilter = 'published' | 'rejected' | 'all'
+
+/** `cve.cvss_sev`, as stored, with the labels the UI shows. */
+export const SEVERITY_LABELS: Record<number, string> = {
+  0: 'NONE',
+  1: 'LOW',
+  2: 'MEDIUM',
+  3: 'HIGH',
+  4: 'CRITICAL',
+}
+
+/**
+ * `cve.cvss_ver`, as stored — **codes, not magnitudes**. 31 is CVSS v3.1 and 4
+ * is v4.0, so 31 > 4 is not "newer" (D-047). Comparing them numerically is the
+ * defect that shipped once already.
+ */
+export const CVSS_VERSION_LABELS: Record<number, string> = {
+  2: 'v2.0',
+  30: 'v3.0',
+  31: 'v3.1',
+  4: 'v4.0',
+}
+
+export const STATE_LABELS: Record<number, string> = {
+  [STATE_PUBLISHED]: 'PUBLISHED',
+  [STATE_REJECTED]: 'REJECTED',
+}
+
+/**
+ * The axes whose values are interned lookup rows, so a filter on one is a name
+ * the user typed that has to become an id before it can be compared (D-055's
+ * ID space is the server's, and the client holds only the ids it was sent).
+ *
+ * Resolution is deliberately a separate step from compilation: "no vendor is
+ * called that" and "no CVE matches that vendor" are different answers, and a
+ * layer that folded the first into the second would report an empty table for a
+ * typo (the same confusion D-023 warns about for records with no description).
+ */
+export const LOOKUP_AXES = ['vendor', 'product', 'cna', 'cwe', 'host'] as const
+
+export type LookupAxis = (typeof LOOKUP_AXES)[number]
+
+/**
+ * Every confirmed filter axis (M3 scope, from D-033's accepted schema).
+ *
+ * Names rather than ids on the lookup axes, because this object is what a
+ * permalink and the chat layer's report definition will carry (D-044, M4), and
+ * an id means nothing outside the artifact that issued it. Ids are resolved
+ * against the local database immediately before compiling.
+ */
+export interface Filters {
+  /** Full-text over descriptions (D-035). Parsed by `ftsQuery`, never pasted in. */
+  text?: string
+  /** An exact canonical CVE ID, e.g. `CVE-2021-44228`. Case-insensitive. */
+  cveId?: string
+  vendor?: string[]
+  product?: string[]
+  cna?: string[]
+  /** `CWE-787`, or the bare number. */
+  cwe?: string[]
+  /** Reference *hosts* (D-033) — never the URLs, which are not indexed. */
+  host?: string[]
+  /** `cve.cvss_sev` codes, 0..4. */
+  severity?: number[]
+  /** `cve.cvss_ver` codes — 2, 30, 31, 4. */
+  cvssVersion?: number[]
+  scoreMin?: number
+  scoreMax?: number
+  /** Unix seconds, inclusive on both ends. */
+  publishedFrom?: number
+  publishedTo?: number
+  updatedFrom?: number
+  updatedTo?: number
+  yearFrom?: number
+  yearTo?: number
+  /** Defaults to `published` (D-022). */
+  state?: StateFilter
+}
+
+/**
+ * Lookup ids resolved from the names in `Filters`, per axis. An empty array is
+ * meaningful: the axis was requested and none of its names exist in this copy.
+ */
+export type Resolved = Partial<Record<LookupAxis, number[]>>
+
+/** A compiled predicate: SQL with `?` placeholders, and the values for them. */
+export interface Compiled {
+  where: string
+  params: SqlParam[]
+}
+
+/**
+ * How a lookup name is matched to a row, per axis.
+ *
+ * Vendor, product and CNA names are stored as upstream wrote them —
+ * `pipeline/normalize.py` strips whitespace and nothing else — so matching is
+ * case-insensitive against `lower(name)`. Hosts are already lowercased at
+ * ingest. CWE is matched on the `CWE-NNN` identifier, and `normalizeCwe`
+ * accepts a bare number so that typing `79` works.
+ *
+ * None of these use an index: `vendor` is 24,436 rows and `product` 80,213, so
+ * a scan is milliseconds and an index would cost download bytes for every user
+ * to save them (D-033 dropped exactly this kind of index).
+ */
+export const LOOKUP_SQL: Record<LookupAxis, string> = {
+  vendor: 'SELECT id, name FROM vendor WHERE lower(name) = ?',
+  product: 'SELECT id, name FROM product WHERE lower(name) = ?',
+  cna: 'SELECT id, name FROM cna WHERE lower(name) = ?',
+  cwe: 'SELECT id, cwe AS name FROM cwe WHERE lower(cwe) = ?',
+  host: 'SELECT id, name FROM host WHERE lower(name) = ?',
+}
+
+/** The form `LOOKUP_SQL` compares against, per axis. */
+export function lookupKey(axis: LookupAxis, value: string): string {
+  const trimmed = value.trim()
+  return axis === 'cwe' ? normalizeCwe(trimmed) : trimmed.toLowerCase()
+}
+
+/** `787`, `cwe-787` and `CWE-787` are the same CWE; anything else is passed through. */
+export function normalizeCwe(value: string): string {
+  const trimmed = value.trim().toLowerCase()
+  return /^\d+$/.test(trimmed) ? `cwe-${trimmed}` : trimmed
+}
+
+/**
+ * Compile the filters into one `WHERE` clause over `cve c`.
+ *
+ * Link-table axes compile to `EXISTS`, not to a join: a record with eight
+ * affected products must not appear eight times in a list or count eight times
+ * in an aggregate, and a join would do both. Every `EXISTS` correlates on
+ * `cve_id`, which is the leading column of each link table's primary key, so
+ * the access path is a seek rather than a scan (schema.sql's first load-bearing
+ * property).
+ */
+export function compile(filters: Filters, resolved: Resolved = {}): Compiled {
+  const clauses: string[] = []
+  const params: SqlParam[] = []
+
+  // D-022, first and unconditional: every other clause narrows what this
+  // already excluded.
+  const state = filters.state
+  if (state !== 'rejected' && state !== 'all') {
+    clauses.push('c.state = ?')
+    params.push(STATE_PUBLISHED)
+  } else if (state === 'rejected') {
+    clauses.push('c.state = ?')
+    params.push(STATE_REJECTED)
+  }
+
+  if (filters.cveId) {
+    clauses.push('lower(c.cve_id) = ?')
+    params.push(filters.cveId.trim().toLowerCase())
+  }
+
+  const match = ftsQuery(filters.text)
+  if (match !== null) {
+    // The fts5 table is external-content over `cve_text`, whose rowid is
+    // `cve.id` — so a match set is a set of record ids and needs no join back
+    // through a second table (D-035).
+    clauses.push('c.id IN (SELECT rowid FROM fts WHERE fts MATCH ?)')
+    params.push(match)
+  } else if (filters.text?.trim()) {
+    // A non-empty string with no searchable token (for example `!!!`) is not
+    // an absent filter. Returning the whole corpus for it would make a failed
+    // search look like a successful broad one.
+    clauses.push('0')
+  }
+
+  pushIn(clauses, params, 'c.cvss_sev', filters.severity)
+  pushIn(clauses, params, 'c.cvss_ver', filters.cvssVersion)
+  pushRange(clauses, params, 'c.cvss_score', filters.scoreMin, filters.scoreMax)
+  pushRange(clauses, params, 'c.published', filters.publishedFrom, filters.publishedTo)
+  pushRange(clauses, params, 'c.updated', filters.updatedFrom, filters.updatedTo)
+  pushRange(clauses, params, 'c.year', filters.yearFrom, filters.yearTo)
+
+  pushResolvedIn(clauses, params, 'c.cna_id', lookupResolution(filters.cna, resolved.cna))
+  pushResolvedExists(
+    clauses,
+    params,
+    'SELECT 1 FROM cve_cwe x WHERE x.cve_id = c.id AND x.cwe_id IN',
+    lookupResolution(filters.cwe, resolved.cwe)
+  )
+  pushResolvedExists(
+    clauses,
+    params,
+    'SELECT 1 FROM cve_prod cp WHERE cp.cve_id = c.id AND cp.product_id IN',
+    lookupResolution(filters.product, resolved.product)
+  )
+  pushResolvedExists(
+    clauses,
+    params,
+    'SELECT 1 FROM cve_prod cp JOIN product p ON p.id = cp.product_id ' +
+      'WHERE cp.cve_id = c.id AND p.vendor_id IN',
+    lookupResolution(filters.vendor, resolved.vendor)
+  )
+  // References by host, never by URL (D-033): `url` carries no index on its
+  // text and FTS deliberately does not cover it (D-035), so a host is the only
+  // reference axis that is a lookup rather than a scan.
+  pushResolvedExists(
+    clauses,
+    params,
+    'SELECT 1 FROM cve_ref r JOIN url u ON u.id = r.url_id ' +
+      'WHERE r.cve_id = c.id AND u.host_id IN',
+    lookupResolution(filters.host, resolved.host)
+  )
+
+  return { where: clauses.length ? clauses.join(' AND ') : '1', params }
+}
+
+/** `column IN (?, ?)`, or nothing at all for an absent or empty list. */
+function pushIn(
+  clauses: string[],
+  params: SqlParam[],
+  column: string,
+  values: number[] | undefined
+): void {
+  if (!values?.length) return
+  clauses.push(`${column} IN (${placeholders(values.length)})`)
+  params.push(...values)
+}
+
+function pushExists(
+  clauses: string[],
+  params: SqlParam[],
+  prefix: string,
+  ids: number[] | undefined
+): void {
+  if (!ids?.length) return
+  clauses.push(`EXISTS (${prefix} (${placeholders(ids.length)}))`)
+  params.push(...ids)
+}
+
+/**
+ * A resolved lookup has three states, not two: `undefined` means the axis was
+ * not requested, ids mean the requested names matched, and an empty array means
+ * names were requested but none exist in this copy. The last case must compile
+ * to false. Treating it like an absent filter returns the whole corpus for a
+ * typo, precisely the quiet wrongness the separate resolution step exists to
+ * prevent.
+ */
+function pushResolvedIn(
+  clauses: string[],
+  params: SqlParam[],
+  column: string,
+  ids: number[] | undefined
+): void {
+  if (ids === undefined) return
+  if (ids.length === 0) {
+    clauses.push('0')
+    return
+  }
+  pushIn(clauses, params, column, ids)
+}
+
+function pushResolvedExists(
+  clauses: string[],
+  params: SqlParam[],
+  prefix: string,
+  ids: number[] | undefined
+): void {
+  if (ids === undefined) return
+  if (ids.length === 0) {
+    clauses.push('0')
+    return
+  }
+  pushExists(clauses, params, prefix, ids)
+}
+
+/**
+ * Require a resolution whenever names were supplied. If a future caller
+ * forgets the separate lookup step, failing closed to no matches is safer than
+ * silently dropping that axis and returning unrelated records.
+ */
+function lookupResolution(names: string[] | undefined, ids: number[] | undefined) {
+  return names?.some((name) => name.trim()) ? (ids ?? []) : undefined
+}
+
+function pushRange(
+  clauses: string[],
+  params: SqlParam[],
+  column: string,
+  from: number | undefined,
+  to: number | undefined
+): void {
+  if (typeof from === 'number' && Number.isFinite(from)) {
+    clauses.push(`${column} >= ?`)
+    params.push(from)
+  }
+  if (typeof to === 'number' && Number.isFinite(to)) {
+    clauses.push(`${column} <= ?`)
+    params.push(to)
+  }
+}
+
+/** `?, ?, ?` — built from a count, never from a value. */
+function placeholders(count: number): string {
+  if (!Number.isSafeInteger(count) || count < 1) throw new Error(`bad placeholder count ${count}`)
+  return new Array(count).fill('?').join(', ')
+}
+
+/**
+ * Turn what a user typed into an fts5 query string, or null if it holds nothing
+ * searchable.
+ *
+ * The string is a *bound parameter*, so this is not about SQL injection — it is
+ * about fts5's own query syntax, which is a second parser this text reaches.
+ * `AND`, `OR`, `NOT`, `NEAR`, `^`, `:`, `-`, `(` and `"` all mean something
+ * there, so a search for `NEAR(` or an unbalanced quote is a syntax error the
+ * user cannot diagnose, and `descr : foo` silently means something else. Every
+ * token is therefore emitted as a quoted fts5 string, which is the form that
+ * has no syntax inside it at all.
+ *
+ * What the user keeps: multiple words mean *all of them* (`AND`, which is what
+ * a search box implies), `"a phrase"` stays a phrase, and a trailing `*` is a
+ * prefix search — the three behaviours a search box is expected to have.
+ */
+export function ftsQuery(text: string | undefined): string | null {
+  if (!text) return null
+  const terms: string[] = []
+  // A quoted span is one term; everything else splits on anything that is not a
+  // letter, a digit, an underscore or a hyphen. Hyphens are kept inside tokens
+  // so `cross-site` stays one phrase rather than becoming two terms.
+  const pattern = /"([^"]*)"|([\p{L}\p{N}_][\p{L}\p{N}_-]*)(\*?)/gu
+  for (const found of text.matchAll(pattern)) {
+    const phrase = found[1] ?? found[2] ?? ''
+    const cleaned = phrase.trim()
+    if (!cleaned) continue
+    // Doubling is fts5's own escape for a quote inside a quoted string. A
+    // phrase from a `"…"` span cannot contain one, but a defensive escape here
+    // costs nothing and survives a future change to the pattern.
+    const quoted = `"${cleaned.replace(/"/g, '""')}"`
+    terms.push(found[3] === '*' ? `${quoted}*` : quoted)
+  }
+  return terms.length ? terms.join(' AND ') : null
+}
+
+/** How results are ordered. An allowlist, because this reaches SQL as text. */
+export type SortKey = 'published' | 'updated' | 'score' | 'cve'
+
+const SORT_SQL: Record<SortKey, string> = {
+  published: 'c.published DESC, c.id DESC',
+  updated: 'c.updated DESC, c.id DESC',
+  // NULLS LAST: two thirds of the corpus carries no CVSS score at all (189,742
+  // of 372,322), and SQLite sorts NULL first descending — so the default
+  // ordering would open on a page of blanks.
+  score: 'c.cvss_score DESC NULLS LAST, c.id DESC',
+  cve: 'c.cve_id DESC',
+}
+
+/**
+ * How many rows a result set may carry back to the UI.
+ *
+ * A cap rather than a page count: the Worker holds every row in memory and
+ * posts it structured-cloned to the page, so an unbounded `SELECT *` over
+ * 372,322 records is two copies of the corpus in RAM before anything renders.
+ * The UI says when it truncated (D-052's rule that silence is the enemy applies
+ * to results as much as to waits).
+ */
+export const ROW_LIMIT = 500
+
+/** The maximum a caller may ask for, whatever it asks for. */
+export const MAX_ROW_LIMIT = 5_000
+
+export interface RowOptions {
+  limit?: number
+  offset?: number
+  sort?: SortKey
+}
+
+/**
+ * The record list: one row per matching CVE, with enough to identify it.
+ *
+ * `cve_text` is a LEFT JOIN because 4.46% of records have no English
+ * description (D-023) — an inner join would silently drop them from every
+ * result set, which is the quiet wrongness vision criterion 7 exists to
+ * prevent.
+ */
+export function rowsSql(
+  filters: Filters,
+  resolved: Resolved = {},
+  options: RowOptions = {}
+): { sql: string; params: SqlParam[] } {
+  const { where, params } = compile(filters, resolved)
+  const limit = clampLimit(options.limit)
+  const offset = clampOffset(options.offset)
+  // Falls back rather than trusting the key: this arrives in a message from the
+  // page and, in M4, out of a permalink, so an unknown one is a value from
+  // outside — and `ORDER BY undefined` would be a broken statement built from
+  // it. The allowlist is the whole defence, so its miss case has to be safe.
+  const sort = SORT_SQL[options.sort as SortKey] ?? SORT_SQL.published
+  return {
+    sql:
+      `SELECT c.cve_id AS cve, c.state, c.published, c.updated, c.cvss_ver, c.cvss_score, ` +
+      `c.cvss_sev, n.name AS cna, substr(t.descr, 1, 400) AS description ` +
+      `FROM cve c LEFT JOIN cna n ON n.id = c.cna_id LEFT JOIN cve_text t ON t.cve_id = c.id ` +
+      `WHERE ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`,
+    params: [...params, limit, offset],
+  }
+}
+
+/** How many records match, which is the number a list of 500 cannot tell you. */
+export function countSql(
+  filters: Filters,
+  resolved: Resolved = {}
+): { sql: string; params: SqlParam[] } {
+  const { where, params } = compile(filters, resolved)
+  return { sql: `SELECT count(*) AS matches FROM cve c WHERE ${where}`, params }
+}
+
+/** The axes an aggregate can group by — every filter axis, plus time. */
+export const DIMENSIONS = [
+  'year',
+  'severity',
+  'cvssVersion',
+  'state',
+  'cna',
+  'vendor',
+  'product',
+  'cwe',
+  'host',
+] as const
+
+export type Dimension = (typeof DIMENSIONS)[number]
+
+/**
+ * How each dimension is grouped. `key` is what the UI turns into a label, and
+ * `expr`/`from`/`group` are this file's own SQL — no caller-supplied text
+ * reaches any of them.
+ *
+ * The link-table dimensions count `DISTINCT c.id` rather than rows, because a
+ * record affecting five Cisco products is one Cisco CVE, not five.
+ */
+interface DimensionSql {
+  key: string
+  label: string
+  join: string
+  group: string
+  count: string
+}
+
+const DIMENSION_SQL: Record<Dimension, DimensionSql> = {
+  year: { key: 'c.year', label: 'c.year', join: '', group: 'c.year', count: 'count(*)' },
+  severity: {
+    key: 'c.cvss_sev',
+    label: 'c.cvss_sev',
+    join: '',
+    group: 'c.cvss_sev',
+    count: 'count(*)',
+  },
+  cvssVersion: {
+    key: 'c.cvss_ver',
+    label: 'c.cvss_ver',
+    join: '',
+    group: 'c.cvss_ver',
+    count: 'count(*)',
+  },
+  state: { key: 'c.state', label: 'c.state', join: '', group: 'c.state', count: 'count(*)' },
+  cna: {
+    key: 'c.cna_id',
+    label: 'n.name',
+    join: 'LEFT JOIN cna n ON n.id = c.cna_id',
+    group: 'c.cna_id',
+    count: 'count(*)',
+  },
+  vendor: {
+    key: 'v.id',
+    label: 'v.name',
+    join:
+      'JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ' +
+      'JOIN vendor v ON v.id = p.vendor_id',
+    group: 'v.id',
+    count: 'count(DISTINCT c.id)',
+  },
+  product: {
+    key: 'p.id',
+    label: "v.name || ' / ' || p.name",
+    join:
+      'JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ' +
+      'JOIN vendor v ON v.id = p.vendor_id',
+    group: 'p.id',
+    count: 'count(DISTINCT c.id)',
+  },
+  cwe: {
+    key: 'w.id',
+    label: "w.cwe || ' — ' || w.descr",
+    join: 'JOIN cve_cwe x ON x.cve_id = c.id JOIN cwe w ON w.id = x.cwe_id',
+    group: 'w.id',
+    count: 'count(DISTINCT c.id)',
+  },
+  host: {
+    key: 'h.id',
+    label: 'h.name',
+    join:
+      'JOIN cve_ref r ON r.cve_id = c.id JOIN url u ON u.id = r.url_id ' +
+      'JOIN host h ON h.id = u.host_id',
+    group: 'h.id',
+    count: 'count(DISTINCT c.id)',
+  },
+}
+
+/** Aggregate rows a grouped query may return. Generous: 2026 has 28 years of
+ * data and a CWE breakdown has 797 possible rows, but a vendor breakdown has
+ * 24,436 and nothing renders that. */
+export const GROUP_LIMIT = 250
+
+/**
+ * Counts by one dimension, under the same filters as the list.
+ *
+ * Ordered by count for the dimensions where "the top ones" is the question, and
+ * by the key itself for the time-like ones, where a chart wants the axis in
+ * order.
+ */
+export function groupSql(
+  filters: Filters,
+  resolved: Resolved,
+  dimension: Dimension,
+  limit = GROUP_LIMIT
+): { sql: string; params: SqlParam[] } {
+  const shape = DIMENSION_SQL[dimension]
+  if (!shape) throw new Error(`not a dimension this build groups by: ${String(dimension)}`)
+  const { where, params } = compile(filters, resolved)
+  const ordered =
+    dimension === 'year' || dimension === 'state' || dimension === 'cvssVersion'
+      ? `${shape.key} DESC`
+      : 'cves DESC'
+  return {
+    sql:
+      `SELECT ${shape.key} AS bucket, ${shape.label} AS label, ${shape.count} AS cves ` +
+      `FROM cve c ${shape.join} WHERE ${where} GROUP BY ${shape.group} ` +
+      `ORDER BY ${ordered} LIMIT ?`,
+    params: [...params, clampLimit(limit, GROUP_LIMIT, GROUP_LIMIT)],
+  }
+}
+
+function clampLimit(
+  value: number | undefined,
+  fallback = ROW_LIMIT,
+  maximum = MAX_ROW_LIMIT
+): number {
+  const n = Math.trunc(Number(value))
+  if (!Number.isFinite(n) || n < 1) return fallback
+  return Math.min(n, maximum)
+}
+
+function clampOffset(value: number | undefined): number {
+  const n = Math.trunc(Number(value))
+  if (!Number.isFinite(n) || n < 0) return 0
+  // Bounded because it reaches SQL as a number and OFFSET makes SQLite walk
+  // every skipped row; a URL asking for offset 10^9 is a request to scan the
+  // corpus for nothing.
+  return Math.min(n, 1_000_000)
+}

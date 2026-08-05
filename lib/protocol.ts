@@ -6,6 +6,8 @@
  * drift.
  */
 
+import type { Dimension, Filters, SortKey, StateFilter } from './filters'
+
 export const SCHEMA_VERSION = 1
 export const FORMAT_VERSION = 1
 
@@ -251,14 +253,81 @@ export interface ImportOptions {
    * sixty-second default in every run would be a minute per assertion.
    */
   stallMs?: number
+  /**
+   * The schema version this build claims to speak, overriding `SCHEMA_VERSION`.
+   *
+   * A schema bump is the one failure mode nobody can rehearse: it needs two
+   * client builds, one on each side of the change, and by the time it happens
+   * for real every existing user meets it at once. This knob is how the
+   * announcement and the refusals get exercised before then — `?schema=2`
+   * against a schema-1 data plane puts this build in exactly the position the
+   * next one will be in.
+   *
+   * It cannot destroy anything, which is what makes it safe to leave reachable
+   * (unlike `?vfs=`): a copy of another schema is *kept*, announced, and
+   * replaced only by a download the user starts, and a manifest of another
+   * schema is refused before a byte is fetched. The worst a crafted `?schema=`
+   * link does is tell someone their copy needs re-downloading when it does not.
+   */
+  schema?: number
+  /**
+   * Virtual-machine instructions between SQLite progress callbacks, overriding
+   * `PROGRESS_OPS`. **Zero installs no handler at all**, which is the only way
+   * to measure what the handler costs — and what the M3 sweep compares against
+   * the M1 baseline, where there was none. A session with no handler cannot
+   * cancel a query and cannot report one running, so this is a measurement
+   * affordance and not a setting.
+   */
+  progressOps?: number
+  /**
+   * Collect query statistics (`ANALYZE`) at the end of an import. Default true;
+   * `?analyze=0` imports without them, which is the M1 baseline this
+   * milestone's tuning is measured against and the only way to re-run that
+   * comparison later (M3).
+   */
+  analyze?: boolean
+}
+
+/**
+ * What the UI asks the query layer for (M3).
+ *
+ * `filters` carries names rather than lookup ids, so the same object is what a
+ * permalink and the chat layer's report definition will serialize (M4, D-044).
+ * The Worker resolves the names against its own copy immediately before
+ * compiling, and says which ones matched nothing.
+ */
+export interface SearchRequest {
+  filters: Filters
+  /** null or absent: the record list. A dimension: counts grouped by it. */
+  groupBy?: Dimension | null
+  sort?: SortKey
+  limit?: number
+  offset?: number
+  /** Also run the `count(*)`, which a capped list cannot tell you. */
+  count?: boolean
 }
 
 export type Request =
-  | { type: 'status' }
+  | { type: 'status'; options?: ImportOptions }
+  /**
+   * Hand the Worker the shared cancellation flag (lib/cancel.ts).
+   *
+   * A message rather than a Worker-created buffer because the page owns the
+   * button. Sending it is optional: without one, queries run to completion and
+   * the UI says cancellation is unavailable.
+   *
+   * It carries the session's query-time knobs for the same reason — this is the
+   * one message the page sends before anything else happens.
+   */
+  | { type: 'control'; cancel: Int32Array; options?: ImportOptions }
   | { type: 'import'; options?: ImportOptions }
   /** Only `stallMs` is read here; the rest describe a download (D-052). */
   | { type: 'sync'; options?: ImportOptions }
+  /** The built-in demo query — this build's own SQL, run without the authorizer. */
   | { type: 'query'; sql: string }
+  /** Whatever the user typed. Runs under the authorizer and the row cap (M3). */
+  | { type: 'console'; sql: string }
+  | { type: 'search'; request: SearchRequest }
   | { type: 'bench' }
   | { type: 'reset' }
 
@@ -290,6 +359,33 @@ export interface SyncOutcome {
   ms: number
 }
 
+/** One result set, whatever asked for it. */
+export interface QueryResult {
+  columns: string[]
+  rows: unknown[][]
+  /** Wall-clock inside the Worker, SQLite only. */
+  ms: number
+  /**
+   * The row cap stopped it. Reported rather than left implicit: a capped result
+   * that looks complete is the same quiet wrongness as a missing state
+   * predicate (D-022).
+   */
+  truncated: boolean
+  /**
+   * The SQL that ran and the values bound into it, so a number on screen can
+   * always be traced to a query. This is the deterministic half of the
+   * "backing queries are inspectable" property the chat layer will need (D-044).
+   */
+  sql: string
+  params: (string | number)[]
+}
+
+/** A filter value that named nothing in this copy — a typo, not an empty result. */
+export interface Unmatched {
+  axis: string
+  values: string[]
+}
+
 export type Response =
   | { type: 'progress'; progress: Progress }
   /**
@@ -309,17 +405,49 @@ export type Response =
        * responses — the first is an invitation to download, the second must not
        * clear the panels or claim the copy is gone, because it may not be
        * (D-061).
+       *
+       * `obsolete` is the fourth answer and the one a schema bump produces: a
+       * complete local copy of a version this build cannot read. It is not
+       * `empty` — there is a database, it is just not queryable — and not
+       * `unknown`, because we know exactly what it is (M3).
        */
-      storage: 'ready' | 'empty' | 'unknown'
+      storage: 'ready' | 'empty' | 'unknown' | 'obsolete'
       rev: number | null
       generated: number | null
       notice: string | null
+      /** `meta.schema` of the copy on disk, when one was read. */
+      localSchema: number | null
+      /** The schema version this build speaks — `SCHEMA_VERSION`, or the override. */
+      schema: number
     }
   | { type: 'imported'; timings: Timings; notice: string }
   | { type: 'synced'; outcome: SyncOutcome }
-  | { type: 'rows'; columns: string[]; rows: unknown[][]; ms: number }
+  | {
+      type: 'result'
+      /** Which surface asked, so the page renders it in the right place. */
+      kind: 'demo' | 'console' | 'search'
+      result: QueryResult
+      /** `count(*)` under the same filters, when the request asked for it. */
+      matches?: number | null
+      /** Filter values that named nothing, so a typo does not read as "no CVEs". */
+      unmatched?: Unmatched[]
+      /** Present on a grouped search: which dimension the buckets are. */
+      groupBy?: Dimension | null
+      /** The effective record-state scope used for this answer. */
+      state?: StateFilter
+    }
+  /**
+   * The user stopped a running query (M3). A result, not an error: nothing is
+   * wrong, and the page must not show it in red next to a stack of failures.
+   */
+  | { type: 'cancelled'; kind: 'demo' | 'console' | 'search'; ms: number }
   | { type: 'bench'; results: BenchResult[]; wasmHeapBytes: number }
-  | { type: 'error'; message: string }
+  | {
+      type: 'error'
+      message: string
+      /** Present when the failed request belonged to a query surface. */
+      kind?: 'demo' | 'console' | 'search'
+    }
 
 /** One benchmark query's outcome. `ms` is wall-clock inside the Worker. */
 export interface BenchResult {
@@ -531,14 +659,27 @@ export function planSync(manifest: Manifest, watermark: number): DeltaEntry[] | 
   return null
 }
 
-/** Reject a manifest we cannot honestly consume before acting on any of it. */
-export function assertUsable(manifest: Manifest): void {
+/**
+ * Reject a manifest we cannot honestly consume before acting on any of it.
+ *
+ * The schema clause is the *other* half of a bump, and it says something
+ * different from the local-copy half. A published schema this build does not
+ * speak is not a re-download — re-downloading fetches the same bytes and fails
+ * the same way — it means the app is older than the data plane, and the fix is
+ * to load the app again. The origin serves HTML `no-cache` for exactly this
+ * (D-054), so saying "reload" is actionable rather than a shrug (M3).
+ *
+ * @param speaks the schema version this build reads; overridable so the bump
+ * can be exercised before it happens (`ImportOptions.schema`).
+ */
+export function assertUsable(manifest: Manifest, speaks: number = SCHEMA_VERSION): void {
   if (manifest.format !== FORMAT_VERSION) {
     throw new Error(`unsupported wire format ${manifest.format} (expected ${FORMAT_VERSION})`)
   }
-  if (manifest.schema !== SCHEMA_VERSION) {
+  if (manifest.schema !== speaks) {
     throw new Error(
-      `schema ${manifest.schema} needs a full re-download (this build speaks ${SCHEMA_VERSION})`
+      `the published data is at schema ${manifest.schema} and this app reads schema ${speaks} — ` +
+        'reload the page to pick up the matching version of the app. Your local copy is untouched.'
     )
   }
   if (!manifest.snapshot?.chunks?.length) {

@@ -47,7 +47,21 @@ describe('assertUsable', () => {
   })
 
   it('refuses a schema mismatch, since deltas cannot bridge one (D-025)', () => {
-    expect(() => assertUsable(manifest({ schema: 2 }))).toThrow(/re-download/)
+    // The message names both versions and the action, because a published
+    // schema this build does not speak means the *app* is behind, and
+    // re-downloading the same bytes would fail the same way (M3). The local
+    // copy is untouched either way, which is the other half of what a user
+    // needs to hear.
+    expect(() => assertUsable(manifest({ schema: 2 }))).toThrow(/schema 2 .*schema 1/)
+    expect(() => assertUsable(manifest({ schema: 2 }))).toThrow(/reload the page/)
+    expect(() => assertUsable(manifest({ schema: 2 }))).toThrow(/local copy is untouched/)
+  })
+
+  it('takes the schema it speaks from the caller, so a bump can be rehearsed', () => {
+    // `?schema=2` is how the announcement and the refusals get exercised before
+    // the day a real bump puts every existing user through them at once.
+    expect(() => assertUsable(manifest({ schema: 2 }), 2)).not.toThrow()
+    expect(() => assertUsable(manifest(), 2)).toThrow(/schema 1 .*schema 2/)
   })
 
   it('refuses a manifest with no chunks', () => {

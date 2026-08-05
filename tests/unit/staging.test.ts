@@ -542,7 +542,46 @@ describe('classifyCandidate', () => {
   })
 
   it('reports a database this build would not serve as unusable', () => {
+    // Not the schema case — that has its own answer below. This is a corpus
+    // that fails the gate for a reason nothing can announce its way out of.
+    expect(classifyCandidate(reader({ meta: () => ({ ...meta, notice: '' }) }), 1)).toEqual({
+      kind: 'unusable',
+    })
+    expect(classifyCandidate(reader({ meta: () => ({ ...meta, records: 0 }) }), 1)).toEqual({
+      kind: 'unusable',
+    })
+  })
+
+  /**
+   * The schema bump (M3). A complete copy of another version is neither
+   * "usable" nor "junk": it is the state every existing user will be in the
+   * first time the schema changes, and the difference between the two answers
+   * is whether they are told or whether their copy quietly vanishes and the
+   * page offers a download as though they had never been here.
+   */
+  it('reports a complete copy of another schema version as obsolete, with its version', () => {
     expect(classifyCandidate(reader({ meta: () => ({ ...meta, schema: 2 }) }), 1)).toEqual({
+      kind: 'obsolete',
+      generation: 4,
+      schema: 2,
+    })
+    // Both directions: a copy from a *newer* build than this one is the same
+    // situation seen from the other side.
+    expect(classifyCandidate(reader(), 2)).toEqual({ kind: 'obsolete', generation: 4, schema: 1 })
+  })
+
+  it('does not call a copy obsolete when the rest of it is broken too', () => {
+    // "Obsolete" is a promise that the only thing wrong is the version, because
+    // the client offers to replace it rather than reclaiming it. A copy with
+    // another schema *and* no notice, or no records, is not that.
+    expect(
+      classifyCandidate(reader({ meta: () => ({ ...meta, schema: 2, notice: '' }) }), 1)
+    ).toEqual({ kind: 'unusable' })
+    expect(
+      classifyCandidate(reader({ meta: () => ({ ...meta, schema: 2, records: 0 }) }), 1)
+    ).toEqual({ kind: 'unusable' })
+    // A schema that is not a number at all is not a version we can name.
+    expect(classifyCandidate(reader({ meta: () => ({ ...meta, schema: 'one' }) }), 1)).toEqual({
       kind: 'unusable',
     })
   })

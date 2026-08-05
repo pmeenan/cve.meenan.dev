@@ -76,6 +76,18 @@ export const SEARCH_INDEXES: readonly SearchIndex[] = [
  */
 export const INDEX_BATCHES = 96
 
+/**
+ * The share of the index-building bar that belongs to `ANALYZE`, on the
+ * fallback path where the client has to collect statistics itself (D-067).
+ *
+ * A display weight, like `textBytes`: the pass reports nothing from inside a
+ * statement, so all the bar can do is stop short of the end and say what it is
+ * doing. Measured at full scale: 20.4 s against a 58.6 s full-text build. An
+ * artifact that arrives with statistics skips it entirely and the bar runs to
+ * the end on the indexes alone.
+ */
+export const ANALYZE_SHARE = 0.26
+
 /** Each index paired with its share of the progress bar, in build order. */
 export function indexPlan(
   indexes: readonly SearchIndex[] = SEARCH_INDEXES

@@ -1,0 +1,437 @@
+import { readFileSync } from 'node:fs'
+import { DatabaseSync } from 'node:sqlite'
+
+import { describe, expect, it } from 'vitest'
+
+import {
+  compile,
+  countSql,
+  ftsQuery,
+  groupSql,
+  lookupKey,
+  LOOKUP_AXES,
+  LOOKUP_SQL,
+  normalizeCwe,
+  rowsSql,
+  DIMENSIONS,
+  GROUP_LIMIT,
+  MAX_ROW_LIMIT,
+  type Dimension,
+  type Filters,
+  type LookupAxis,
+  type Resolved,
+  type SqlParam,
+} from '../../lib/filters'
+import { indexPlan, indexSql } from '../../lib/search'
+
+/**
+ * The shared query layer (M3), against real SQLite and the published schema.
+ *
+ * Two classes of failure are worth a test here and neither shows up in a type
+ * check. The first is *quiet wrongness*: a missing state predicate inflating
+ * every count by ~5% (D-022), a link-table join turning one CVE with eight
+ * products into eight CVEs, a LEFT JOIN that became an INNER one and silently
+ * dropped the 4.46% of records with no description (D-023). The second is
+ * *injection*: filter values are attacker-influenced twice over — they come
+ * from a URL and they are compared against corpus text — so every one of them
+ * has to arrive as a bound parameter rather than as SQL (rule 4).
+ *
+ * So the compiled SQL is executed rather than pattern-matched, against a corpus
+ * shaped like the real one where it matters: PUBLISHED and REJECTED records, a
+ * record with no description, one CVE affecting several products, and names
+ * containing quotes and SQL.
+ */
+
+/** Names that would end the statement if any of them reached SQL as text. */
+const HOSTILE_VENDOR = "O'Reilly'); DROP TABLE cve; --"
+const HOSTILE_PRODUCT = '"quoted" \\ product % _'
+
+function corpus(): DatabaseSync {
+  const db = new DatabaseSync(':memory:')
+  // The published schema, executed rather than paraphrased (D-043).
+  db.exec(readFileSync('pipeline/schema.sql', 'utf-8'))
+
+  db.exec(
+    `
+    INSERT INTO cna(id, name) VALUES (1, 'Apache'), (2, 'MITRE'), (3, 'Cisco Systems');
+    INSERT INTO vendor(id, name) VALUES (1, 'Apache Software Foundation'), (2, 'Cisco'), (3, ?1);
+    INSERT INTO product(id, vendor_id, name)
+      VALUES (1, 1, 'Log4j'), (2, 2, 'IOS XE'), (3, 1, 'Struts'), (4, 3, ?2);
+    INSERT INTO cwe(id, cwe, descr) VALUES (1, 'CWE-502', 'Deserialization'), (2, 'CWE-79', 'XSS');
+    INSERT INTO host(id, name) VALUES (1, 'github.com'), (2, 'nvd.nist.gov');
+    INSERT INTO url(id, url, host_id)
+      VALUES (1, 'https://github.com/a', 1), (2, 'https://nvd.nist.gov/b', 2),
+             (3, 'https://github.com/c', 1);
+  `
+      .replace('?1', `'${HOSTILE_VENDOR.replace(/'/g, "''")}'`)
+      .replace('?2', `'${HOSTILE_PRODUCT.replace(/'/g, "''")}'`)
+  )
+
+  const cve = db.prepare(
+    `INSERT INTO cve(id, cve_id, year, state, cna_id, published, updated,
+                     cvss_ver, cvss_score, cvss_sev, cvss_vec)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  // published/updated are unix seconds, as stored.
+  const day = (iso: string) => Math.floor(Date.parse(`${iso}T00:00:00Z`) / 1000)
+  cve.run(1, 'CVE-2021-44228', 2021, 1, 1, day('2021-12-10'), day('2022-01-05'), 31, 10, 4, 'AV:N')
+  cve.run(2, 'CVE-2022-0002', 2022, 1, 2, day('2022-03-01'), day('2022-03-02'), 30, 5.5, 2, 'AV:L')
+  cve.run(
+    3,
+    'CVE-2023-0003',
+    2023,
+    2,
+    2,
+    day('2023-06-01'),
+    day('2023-06-02'),
+    null,
+    null,
+    null,
+    ''
+  )
+  cve.run(4, 'CVE-2024-0004', 2024, 1, 3, day('2024-09-09'), day('2024-09-10'), 4, 9.1, 4, 'AV:N')
+  // No `cve_text` row: 4.46% of the corpus has no English description (D-023),
+  // and a list that quietly dropped them would look like a shorter answer.
+  cve.run(5, 'CVE-2020-0005', 2020, 1, 3, day('2020-02-02'), day('2020-02-03'), 2, 3, 1, 'AV:L')
+
+  const text = db.prepare('INSERT INTO cve_text(cve_id, descr) VALUES (?, ?)')
+  text.run(1, 'Remote code execution via JNDI lookup, a deserialization flaw in the logger')
+  text.run(2, 'Cross-site scripting in the web console')
+  text.run(3, 'Rejected: this candidate was withdrawn')
+  text.run(4, 'Buffer overflow in the packet parser')
+
+  db.exec(`
+    INSERT INTO cve_prod(cve_id, product_id) VALUES (1,1), (2,2), (4,3), (4,4), (5,2);
+    INSERT INTO cve_cwe(cve_id, cwe_id) VALUES (1,1), (2,2), (4,2);
+    INSERT INTO cve_ref(cve_id, url_id) VALUES (1,1), (1,2), (2,3), (4,2);
+  `)
+
+  // The client builds these after import (D-035); the text axis needs them.
+  for (const { index } of indexPlan()) {
+    const sql = indexSql(index)
+    db.exec(sql.create)
+    db.exec(`INSERT INTO ${index.fts}(${index.fts}) VALUES('rebuild')`)
+  }
+  return db
+}
+
+const db = corpus()
+
+/** Resolve a filter's names the way the Worker does, then run the SQL. */
+function resolve(filters: Filters): Resolved {
+  const resolved: Resolved = {}
+  for (const axis of LOOKUP_AXES) {
+    const names = filters[axis]
+    if (!names?.length) continue
+    const ids: number[] = []
+    for (const name of names) {
+      for (const row of db.prepare(LOOKUP_SQL[axis]).all(lookupKey(axis, name))) {
+        ids.push(Number((row as { id: number }).id))
+      }
+    }
+    // Preserve the requested-but-unmatched state. The shared compiler treats
+    // an empty resolved list as false; dropping it would turn a typo into an
+    // absent filter and return the whole corpus.
+    resolved[axis] = ids
+  }
+  return resolved
+}
+
+function run(sql: string, params: SqlParam[]): unknown[][] {
+  return db
+    .prepare(sql)
+    .all(...params)
+    .map((row) => Object.values(row as Record<string, unknown>))
+}
+
+/** The CVE ids a filter selects, in id order. */
+function ids(filters: Filters): string[] {
+  const built = rowsSql(filters, resolve(filters), { sort: 'cve' })
+  return run(built.sql, built.params)
+    .map((row) => String(row[0]))
+    .sort()
+}
+
+function counted(filters: Filters): number {
+  const built = countSql(filters, resolve(filters))
+  return Number(run(built.sql, built.params)[0]?.[0] ?? -1)
+}
+
+describe('the REJECTED default (D-022)', () => {
+  it('excludes REJECTED records unless asked', () => {
+    expect(ids({})).toEqual(['CVE-2020-0005', 'CVE-2021-44228', 'CVE-2022-0002', 'CVE-2024-0004'])
+    expect(ids({ state: 'rejected' })).toEqual(['CVE-2023-0003'])
+    expect(ids({ state: 'all' })).toHaveLength(5)
+  })
+
+  it('is in the compiled predicate itself, not in each caller', () => {
+    // Every entry point has to carry it, because the failure mode is a report
+    // that forgot: `1` (no predicate) must never be the whole clause by default.
+    expect(compile({}).where).toContain('c.state = ?')
+    expect(compile({}).params).toContain(1)
+    expect(rowsSql({}).sql).toContain('c.state = ?')
+    expect(countSql({}).sql).toContain('c.state = ?')
+    expect(groupSql({}, {}, 'year').sql).toContain('c.state = ?')
+    // `all` is the only way to get no state clause at all.
+    expect(compile({ state: 'all' }).where).not.toContain('c.state')
+  })
+
+  it('counts the same records the list shows', () => {
+    expect(counted({})).toBe(4)
+    expect(counted({ state: 'all' })).toBe(5)
+  })
+})
+
+describe('every confirmed filter axis (M3 scope)', () => {
+  it('full text over descriptions', () => {
+    expect(ids({ text: 'deserialization' })).toEqual(['CVE-2021-44228'])
+    // A record with no description cannot match, and that is a different fact
+    // from "no results" (D-023).
+    expect(ids({ text: 'overflow' })).toEqual(['CVE-2024-0004'])
+  })
+
+  it('CVE ID, case-insensitively', () => {
+    expect(ids({ cveId: 'cve-2021-44228' })).toEqual(['CVE-2021-44228'])
+    expect(ids({ cveId: 'CVE-1999-0001' })).toEqual([])
+  })
+
+  it('vendor and product, through the link table without multiplying records', () => {
+    expect(ids({ vendor: ['Apache Software Foundation'] })).toEqual([
+      'CVE-2021-44228',
+      'CVE-2024-0004',
+    ])
+    expect(ids({ product: ['IOS XE'] })).toEqual(['CVE-2020-0005', 'CVE-2022-0002'])
+    // CVE-2024-0004 affects two products; an EXISTS keeps it one record where a
+    // join would return it twice.
+    expect(ids({ vendor: ['Apache Software Foundation', 'Cisco'] })).toHaveLength(4)
+    expect(counted({ vendor: ['Apache Software Foundation'] })).toBe(2)
+  })
+
+  it('CNA', () => {
+    expect(ids({ cna: ['apache'] })).toEqual(['CVE-2021-44228'])
+  })
+
+  it('returns no records when a requested lookup name does not exist', () => {
+    expect(ids({ vendor: ['zzz-no-such-vendor'] })).toEqual([])
+    expect(counted({ vendor: ['zzz-no-such-vendor'] })).toBe(0)
+    // A valid value and an unknown one are OR alternatives on the same axis:
+    // the valid value still contributes its matches, while the Worker reports
+    // the unknown name separately.
+    expect(ids({ vendor: ['Cisco', 'zzz-no-such-vendor'] })).toEqual([
+      'CVE-2020-0005',
+      'CVE-2022-0002',
+    ])
+  })
+
+  it('CWE, by id or bare number', () => {
+    expect(ids({ cwe: ['CWE-79'] })).toEqual(['CVE-2022-0002', 'CVE-2024-0004'])
+    expect(ids({ cwe: ['79'] })).toEqual(['CVE-2022-0002', 'CVE-2024-0004'])
+    expect(normalizeCwe('787')).toBe('cwe-787')
+  })
+
+  it('references by host (D-033), never by URL', () => {
+    expect(ids({ host: ['github.com'] })).toEqual(['CVE-2021-44228', 'CVE-2022-0002'])
+    expect(ids({ host: ['nvd.nist.gov'] })).toEqual(['CVE-2021-44228', 'CVE-2024-0004'])
+  })
+
+  it('CVSS severity, version and score', () => {
+    expect(ids({ severity: [4] })).toEqual(['CVE-2021-44228', 'CVE-2024-0004'])
+    // Stored codes, never compared numerically: v4.0 is 4 and v3.1 is 31
+    // (D-047), so asking for v4.0 must not also return v3.0 and v3.1.
+    expect(ids({ cvssVersion: [4] })).toEqual(['CVE-2024-0004'])
+    expect(ids({ cvssVersion: [30, 31] })).toEqual(['CVE-2021-44228', 'CVE-2022-0002'])
+    expect(ids({ scoreMin: 9 })).toEqual(['CVE-2021-44228', 'CVE-2024-0004'])
+    expect(ids({ scoreMin: 3, scoreMax: 5.5 })).toEqual(['CVE-2020-0005', 'CVE-2022-0002'])
+  })
+
+  it('dates and years', () => {
+    const day = (iso: string) => Math.floor(Date.parse(`${iso}T00:00:00Z`) / 1000)
+    expect(ids({ publishedFrom: day('2022-01-01') })).toEqual(['CVE-2022-0002', 'CVE-2024-0004'])
+    expect(ids({ publishedTo: day('2021-12-31') })).toEqual(['CVE-2020-0005', 'CVE-2021-44228'])
+    expect(ids({ updatedFrom: day('2024-01-01') })).toEqual(['CVE-2024-0004'])
+    expect(ids({ yearFrom: 2022, yearTo: 2024 })).toEqual(['CVE-2022-0002', 'CVE-2024-0004'])
+  })
+
+  it('state, as an axis rather than only a default', () => {
+    expect(ids({ state: 'rejected' })).toEqual(['CVE-2023-0003'])
+    // Values arriving from a future permalink are runtime input. Only the
+    // explicit `all` opt-in may remove D-022's PUBLISHED predicate.
+    expect(ids({ state: 'everything' as never })).toEqual([
+      'CVE-2020-0005',
+      'CVE-2021-44228',
+      'CVE-2022-0002',
+      'CVE-2024-0004',
+    ])
+  })
+
+  it('combines axes with AND', () => {
+    expect(ids({ vendor: ['Apache Software Foundation'], severity: [4], yearFrom: 2024 })).toEqual([
+      'CVE-2024-0004',
+    ])
+    expect(ids({ text: 'deserialization', host: ['nvd.nist.gov'] })).toEqual(['CVE-2021-44228'])
+  })
+})
+
+describe('grouped counts', () => {
+  it('answers every dimension against the published schema', () => {
+    for (const dimension of DIMENSIONS) {
+      const built = groupSql({}, {}, dimension)
+      // The point is that each one is valid SQL over the real schema and comes
+      // back with (bucket, label, count) — a dimension that names a column that
+      // does not exist would only fail here.
+      const rows = run(built.sql, built.params)
+      for (const row of rows) expect(row).toHaveLength(3)
+      expect(rows.length).toBeGreaterThan(0)
+    }
+  })
+
+  it('counts a record once per bucket, not once per link row', () => {
+    const built = groupSql({}, resolve({}), 'vendor')
+    const rows = run(built.sql, built.params)
+    const apache = rows.find((row) => String(row[1]).startsWith('Apache'))
+    expect(apache?.[2]).toBe(2)
+    // CVE-2024-0004 affects two of Apache's products and is still one CVE.
+    const total = rows.reduce((sum, row) => sum + Number(row[2]), 0)
+    expect(total).toBeGreaterThanOrEqual(4)
+  })
+
+  it('applies the same filters as the list', () => {
+    const filters: Filters = { severity: [4] }
+    const built = groupSql(filters, resolve(filters), 'year')
+    const rows = run(built.sql, built.params)
+    expect(rows.map((row) => [Number(row[0]), Number(row[2])])).toEqual([
+      [2024, 1],
+      [2021, 1],
+    ])
+  })
+
+  it('refuses a dimension it does not know', () => {
+    expect(() => groupSql({}, {}, 'sqlite_master' as Dimension)).toThrow(/not a dimension/)
+  })
+})
+
+describe('values never reach the SQL text (rule 4)', () => {
+  const hostile: Filters = {
+    text: "'; DROP TABLE cve; --",
+    cveId: "CVE-2021-44228' OR '1'='1",
+    vendor: [HOSTILE_VENDOR],
+    product: [HOSTILE_PRODUCT],
+    cwe: ["CWE-79'; DELETE FROM cve; --"],
+    host: ["evil'--"],
+    severity: [4],
+    scoreMin: 1,
+    publishedFrom: 0,
+    state: 'all',
+  }
+
+  it('compiles them all as bound parameters', () => {
+    const built = rowsSql(hostile, resolve(hostile))
+    // Nothing recognisable from the values is in the statement, and the only
+    // punctuation the values could have contributed is absent.
+    expect(built.sql).not.toContain('DROP')
+    expect(built.sql).not.toContain('--')
+    expect(built.sql).not.toContain("'")
+    expect(built.sql).not.toContain(HOSTILE_VENDOR)
+    // Every value is a placeholder, and the counts line up exactly.
+    expect((built.sql.match(/\?/g) ?? []).length).toBe(built.params.length)
+  })
+
+  it('runs them without incident, and the corpus is still there', () => {
+    const built = rowsSql(hostile, resolve(hostile))
+    expect(run(built.sql, built.params)).toEqual([])
+    expect(Number(db.prepare('SELECT count(*) AS n FROM cve').get()?.n)).toBe(5)
+  })
+
+  it('matches a hostile *name* rather than executing it', () => {
+    // The vendor whose name is a SQL injection attempt is a real vendor here,
+    // and filtering on it has to return its records — proof the value is being
+    // compared, not run.
+    expect(ids({ vendor: [HOSTILE_VENDOR] })).toEqual(['CVE-2024-0004'])
+    expect(ids({ product: [HOSTILE_PRODUCT] })).toEqual(['CVE-2024-0004'])
+  })
+
+  it('resolves names case-insensitively without an index', () => {
+    for (const axis of LOOKUP_AXES) {
+      expect(LOOKUP_SQL[axis as LookupAxis]).toContain('?')
+    }
+    expect(ids({ vendor: ['CISCO'] })).toEqual(['CVE-2020-0005', 'CVE-2022-0002'])
+  })
+})
+
+describe('ftsQuery', () => {
+  it('turns a search box into an AND of quoted terms', () => {
+    expect(ftsQuery('buffer overflow')).toBe('"buffer" AND "overflow"')
+    expect(ftsQuery('  ')).toBeNull()
+    expect(ftsQuery(undefined)).toBeNull()
+  })
+
+  it('keeps phrases and prefixes, which is what a search box means', () => {
+    expect(ftsQuery('"remote code execution"')).toBe('"remote code execution"')
+    expect(ftsQuery('overfl*')).toBe('"overfl"*')
+  })
+
+  it('disarms fts5 syntax rather than passing it through', () => {
+    // Every one of these is meaningful to fts5's own parser and would be a
+    // syntax error or a different query if pasted in. They are *bound*, so this
+    // is not about SQL injection — it is about the second parser the text
+    // reaches.
+    for (const input of [
+      'NEAR(',
+      'a OR b',
+      'descr : foo',
+      '"unbalanced',
+      'a AND NOT b',
+      '^anchored',
+      '-negated',
+      "'; DROP TABLE cve; --",
+      '<script>alert(1)</script>',
+    ]) {
+      const query = ftsQuery(input)
+      if (query === null) continue
+      // The real test: fts5 accepts it, whatever it was.
+      expect(() =>
+        db.prepare('SELECT count(*) AS n FROM fts WHERE fts MATCH ?').get(query)
+      ).not.toThrow()
+    }
+  })
+
+  it('finds what a user would expect to find', () => {
+    expect(ids({ text: 'cross-site scripting' })).toEqual(['CVE-2022-0002'])
+    expect(ids({ text: '"packet parser"' })).toEqual(['CVE-2024-0004'])
+    expect(ids({ text: 'parse*' })).toEqual(['CVE-2024-0004'])
+    expect(ids({ text: '!!!' })).toEqual([])
+  })
+})
+
+describe('caps', () => {
+  it('bounds what a caller can ask for', () => {
+    expect(rowsSql({}, {}, { limit: 10 ** 9 }).params.at(-2)).toBe(MAX_ROW_LIMIT)
+    expect(rowsSql({}, {}, { limit: -5 }).params.at(-2)).toBeGreaterThan(0)
+    expect(rowsSql({}, {}, { offset: -5 }).params.at(-1)).toBe(0)
+    expect(rowsSql({}, {}, { offset: 10 ** 12 }).params.at(-1)).toBe(1_000_000)
+    expect(groupSql({}, {}, 'vendor', 10 ** 9).params.at(-1)).toBe(GROUP_LIMIT)
+  })
+
+  it('fails closed when a lookup filter was not resolved', () => {
+    const built = rowsSql({ vendor: ['Cisco'] })
+    expect(built.sql).toContain(' AND 0')
+    expect(run(built.sql, built.params)).toEqual([])
+  })
+
+  it('sorts by an allowlisted key only', () => {
+    // The sort key reaches SQL as text, so it is a lookup rather than a value.
+    const sneaky = rowsSql({}, {}, { sort: 'published; DROP TABLE cve' as never })
+    expect(sneaky.sql).not.toContain('DROP')
+    expect(() => run(sneaky.sql, sneaky.params)).not.toThrow()
+  })
+
+  it('keeps records with no description in the list (D-023)', () => {
+    // CVE-2020-0005 has no `cve_text` row. An INNER JOIN here would drop it and
+    // nothing would say so.
+    const built = rowsSql({}, {}, { sort: 'cve' })
+    const rows = run(built.sql, built.params)
+    const row = rows.find((entry) => entry[0] === 'CVE-2020-0005')
+    expect(row).toBeDefined()
+    expect(row?.[8]).toBeNull()
+  })
+})

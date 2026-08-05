@@ -316,6 +316,19 @@ export type Candidate =
   | { kind: 'absent' }
   | { kind: 'unreadable' }
   | { kind: 'unusable' }
+  /**
+   * A promoted copy of *another* schema version: complete, readable, and not
+   * something this build can query (M3).
+   *
+   * Kept apart from `unusable` because the two call for opposite treatment.
+   * `unusable` is junk to reclaim silently; this is the state a schema bump
+   * puts every existing user in, and the local database being a rebuildable
+   * cache (D-013) is a licence to *replace* it, not to delete it without
+   * saying so. The client announces it and offers the re-download; the copy
+   * stays on disk until that download promotes over it, which is what makes the
+   * announcement survive a reload.
+   */
+  | { kind: 'obsolete'; generation: number; schema: number }
   | { kind: 'database'; generation: number }
 
 /** The reads `classifyCandidate` needs. Any of them may throw. */
@@ -359,6 +372,15 @@ export function classifyCandidate(read: CandidateReader, schemaVersion: number):
     // finished writing.
     assertPromotionCompleted(tables)
     if (!meta) throw new Error('tables present but meta was not read')
+    // Before the general refusal: a complete copy whose *only* problem is its
+    // schema version is the thing a bump produces, and it has an announcement
+    // rather than a shrug (M3). Everything else about it still has to hold —
+    // the notice, a revision, records — because those are what make it a copy
+    // of the corpus at all rather than a file with a `meta` table.
+    if (typeof meta.schema === 'number' && meta.schema !== schemaVersion) {
+      assertLocallyUsable(meta, meta.schema)
+      return { kind: 'obsolete', generation, schema: meta.schema }
+    }
     assertLocallyUsable(meta, schemaVersion)
   } catch {
     return { kind: 'unusable' }

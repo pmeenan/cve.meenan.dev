@@ -36,7 +36,14 @@ export default defineConfig({
   webServer: remote
     ? undefined
     : {
-        command: 'node scripts/serve.mjs',
+        // Built here rather than assumed. The suite serves `dist/`, which is a
+        // *build output*: a UI change that has not been rebuilt is invisible to
+        // Playwright, so the tests pass against the previous version of the app
+        // and say nothing about the diff under review. That is not a
+        // hypothetical — it cost an M3 debugging session, where a new
+        // `data-run` attribute was "missing" because the export predated it
+        // (RE-015). Turbopack rebuilds this project in a few seconds.
+        command: 'npx next build && node scripts/serve.mjs',
         url: 'http://127.0.0.1:4747/',
         // Never reuse someone else's server for a measurement run: `pnpm measure`
         // passes SERVE_DATA_ROOT to select the full artifact, and a server already

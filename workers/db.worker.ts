@@ -19,10 +19,40 @@
 import initBrotli, { decompress as brotliDecompress } from 'brotli-dec-wasm/web'
 import type { Database, SAHPoolUtil, Sqlite3Static, SqlValue } from '@sqlite.org/sqlite-wasm'
 
+import { authorize, AUTH_DENY, AUTH_OK, CONSOLE_ROW_LIMIT } from '../lib/authorizer'
+import {
+  armCancel,
+  cancelRequested,
+  elapsedLabel,
+  isInterrupt,
+  PROGRESS_OPS,
+  QUERY_QUIET_MS,
+  QUERY_REPORT_MS,
+} from '../lib/cancel'
 import { parseDelta } from '../lib/delta'
+import {
+  countSql,
+  groupSql,
+  lookupKey,
+  LOOKUP_AXES,
+  LOOKUP_SQL,
+  rowsSql,
+  ROW_LIMIT,
+  type Filters,
+  type LookupAxis,
+  type Resolved,
+  type SqlParam,
+} from '../lib/filters'
 import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
-import { batchRanges, indexBatches, indexPlan, indexSql, type SearchIndex } from '../lib/search'
+import {
+  ANALYZE_SHARE,
+  batchRanges,
+  indexBatches,
+  indexPlan,
+  indexSql,
+  type SearchIndex,
+} from '../lib/search'
 import { stallError, stallTimeout, watchForStalls, type StallWatch } from '../lib/stall'
 import { applyDelta, type SyncDb } from '../lib/sync'
 import {
@@ -67,13 +97,16 @@ import {
   type ImportOptions,
   type Manifest,
   type Progress,
+  type QueryResult,
   type Request,
   // Aliased so `Response` still means the platform's here: this module is
   // mostly fetch code, and shadowing the global in a file that reads response
   // bodies is a trap.
   type Response as WorkerMessage,
+  type SearchRequest,
   type SyncOutcome,
   type Timings,
+  type Unmatched,
   type Vfs,
 } from '../lib/protocol'
 
@@ -97,6 +130,19 @@ let sahPool: SAHPoolUtil | null = null
  * path, whose files are not OPFS entries we can name.
  */
 let liveFile: string | null = null
+/**
+ * The page's cancellation flag, shared memory rather than a message, because
+ * the message queue does not turn while SQLite is running (lib/cancel.ts).
+ * Null until the page sends one, and on a browser that has no
+ * `SharedArrayBuffer` it stays null and queries simply run to completion.
+ */
+let cancelFlag: Int32Array | null = null
+/**
+ * How many VDBE instructions between progress callbacks, for this session. The
+ * measurement sweep sets it to 0 to run a query with no handler installed at
+ * all, which is how the handler's own cost is priced (M3).
+ */
+let progressOps = PROGRESS_OPS
 
 function post(message: WorkerMessage): void {
   ;(self as DedicatedWorkerGlobalScope).postMessage(message)
@@ -162,7 +208,10 @@ async function fetchManifest(
   const response = await fetch(manifestUrl(), { cache: 'no-cache', signal })
   if (!response.ok) throw new Error(`manifest: HTTP ${response.status}`)
   const manifest = await readManifest(response, beat)
-  assertUsable(manifest)
+  // The schema this session speaks, so a bump can be exercised before it
+  // happens (M3). A manifest at another schema is refused here, before a byte
+  // of it is acted on and with the local copy untouched.
+  assertUsable(manifest, sessionSchema)
   return manifest
 }
 
@@ -495,6 +544,46 @@ async function examine(root: FileSystemDirectoryHandle, name: string): Promise<C
   }
 }
 
+/**
+ * The schema version this run speaks.
+ *
+ * `SCHEMA_VERSION` unless a caller overrode it, and clamped to a small positive
+ * integer because it arrives from a query string. It changes only what this
+ * build *claims*: a copy of another schema is announced and kept, never deleted
+ * (`ImportOptions.schema`).
+ */
+function speaks(options: ImportOptions = {}): number {
+  const n = Math.trunc(Number(options.schema))
+  if (!Number.isFinite(n) || n < 1 || n > 9999) return SCHEMA_VERSION
+  return n
+}
+
+/**
+ * Instructions between progress callbacks for this session.
+ *
+ * Zero means "install no handler", which the measurement sweep uses to price
+ * the handler itself; anything else is clamped to a range that keeps the
+ * callback from firing so often it becomes the workload, or so rarely that
+ * Cancel appears not to work.
+ */
+function queryOps(options: ImportOptions = {}): number {
+  const n = Math.trunc(Number(options.progressOps))
+  if (!Number.isFinite(n)) return PROGRESS_OPS
+  if (n <= 0) return 0
+  return Math.min(Math.max(n, 1_000), 100_000_000)
+}
+
+/**
+ * The schema version discovery and `status` are currently using.
+ *
+ * Discovery runs from several entry points that have no options in hand
+ * (`examine`, `findLive`, `nextGeneration`), and threading one through all of
+ * them would put a diagnostic knob into the middle of the crash-safety code.
+ * The session records it instead, and every request that carries options sets
+ * it first.
+ */
+let sessionSchema = SCHEMA_VERSION
+
 /** Build the reads `classifyCandidate` needs from an open connection. */
 function describe(database: Database): Candidate {
   return classifyCandidate(
@@ -515,7 +604,7 @@ function describe(database: Database): Candidate {
         promoted: generation,
       }),
     },
-    SCHEMA_VERSION
+    sessionSchema
   )
 }
 
@@ -560,24 +649,47 @@ async function discardSidecars(root: FileSystemDirectoryHandle, file: string): P
  * is stop the sweep, because a keep list built from an incomplete picture is
  * exactly how the previous two versions of this deleted a live database.
  */
-async function findLive(
-  root: FileSystemDirectoryHandle
-): Promise<{ file: string | null; conclusive: boolean }> {
+async function findLive(root: FileSystemDirectoryHandle): Promise<Found> {
   let best: { file: string; generation: number } | null = null
+  // A copy of another schema version, kept apart from both "live" and "junk":
+  // it is what a schema bump leaves behind, and it is announced rather than
+  // swept (M3, D-013).
+  let stale: { file: string; generation: number; schema: number } | null = null
   let conclusive = true
   for (const slot of SLOT_FILES) {
     const candidate = await examine(root, slot)
     if (candidate.kind === 'unreadable') conclusive = false
+    if (candidate.kind === 'obsolete' && candidate.generation > 0) {
+      if (!stale || candidate.generation > stale.generation) {
+        stale = { file: slot, generation: candidate.generation, schema: candidate.schema }
+      }
+      continue
+    }
     if (candidate.kind !== 'database') continue
     if (candidate.generation > 0 && (!best || candidate.generation > best.generation)) {
       best = { file: slot, generation: candidate.generation }
     }
   }
-  if (best) return { file: best.file, conclusive }
+  if (best) return { file: best.file, obsolete: null, conclusive }
 
   const legacy = await examine(root, LEGACY_DB_FILE)
   if (legacy.kind === 'unreadable') conclusive = false
-  return { file: legacy.kind === 'database' ? LEGACY_DB_FILE : null, conclusive }
+  if (legacy.kind === 'obsolete' && !stale) {
+    stale = { file: LEGACY_DB_FILE, generation: legacy.generation, schema: legacy.schema }
+  }
+  return {
+    file: legacy.kind === 'database' ? LEGACY_DB_FILE : null,
+    obsolete: stale ? { file: stale.file, schema: stale.schema } : null,
+    conclusive,
+  }
+}
+
+/** What `findLive` concluded: at most one live copy, and any obsolete one. */
+interface Found {
+  file: string | null
+  /** A complete copy this build cannot read, with the schema it carries. */
+  obsolete: { file: string; schema: number } | null
+  conclusive: boolean
 }
 
 /** An entry's byte length, or null if it is not there. */
@@ -601,7 +713,12 @@ async function nextGeneration(root: FileSystemDirectoryHandle): Promise<number> 
   let highest = 0
   for (const slot of SLOT_FILES) {
     const candidate = await examine(root, slot)
-    if (candidate.kind === 'database') highest = Math.max(highest, candidate.generation)
+    // `obsolete` counts as much as `database` does: a copy from another schema
+    // version was promoted by an earlier build of this app and carries a real
+    // counter, so re-issuing it would make the two slots indistinguishable.
+    if (candidate.kind === 'database' || candidate.kind === 'obsolete') {
+      highest = Math.max(highest, candidate.generation)
+    }
   }
   return highest + 1
 }
@@ -806,7 +923,19 @@ async function runImport(
     // Asked of OPFS every time rather than remembered in `liveFile`: another
     // tab may have promoted since, and staging over *its* new live database is
     // the one mistake this function must not make. Two 100-byte reads.
-    stagedFile = chooseStagingFile((await findLive(root)).file)
+    const present = await findLive(root)
+    // The obsolete copy counts as "do not stage here" as well: it is not
+    // queryable, but keeping it until this download promotes is what makes the
+    // schema-bump announcement survive a download that fails half way (M3).
+    // If another slot was unreadable, however, it may be the usable copy. Do
+    // not overwrite that uncertainty merely because the obsolete slot is the
+    // one we could identify.
+    if (present.obsolete && !present.conclusive) {
+      throw new Error(
+        'local storage could not be inspected safely; the existing copies are untouched'
+      )
+    }
+    stagedFile = chooseStagingFile(present.file ?? present.obsolete?.file ?? null)
     const record = await loadRecord(root, plan, stagedFile)
     // Bind the record to the file as well as to the manifest. `bindsTo` proves
     // the bitmap describes this *download*; only the length proves it describes
@@ -893,7 +1022,7 @@ async function runImport(
     // A crash here costs the index build on the next run, never the chunks —
     // the bitmap is already complete, so the retry starts at this line.
     const indexStart = performance.now()
-    buildSearchIndexes(staged, (fraction, detail) => report('index', fraction, detail))
+    buildSearchIndexes(staged, (fraction, detail) => report('index', fraction, detail), options)
     indexMs = performance.now() - indexStart
 
     if (stagedFile !== null) {
@@ -973,7 +1102,7 @@ function verifyStaged(staged: Database, manifest: Manifest, plan: StagingPlan): 
     },
     manifest.rev,
     plan,
-    SCHEMA_VERSION
+    sessionSchema
   )
 }
 
@@ -1287,7 +1416,14 @@ async function syncToHead(options: ImportOptions = {}): Promise<void> {
 
 /** Run the benchmark set (Q-003's query-latency budgets) in declaration order. */
 function bench(): void {
-  if (!db) throw new Error('no database — download the corpus first')
+  // Cancellable like any other query: the sweep runs ten shapes and at a stock
+  // page cache one of them took 92 s (D-050), so the button the progress panel
+  // is already showing has to mean something here too.
+  finishQuery('demo', () => benchAll())
+}
+
+function benchAll(): void {
+  const database = requireDb()
   const results: BenchResult[] = []
   for (const [index, query] of BENCH_QUERIES.entries()) {
     // Countable work, so this one gets real progress rather than a spinner.
@@ -1296,16 +1432,13 @@ function bench(): void {
       index / BENCH_QUERIES.length,
       `${index + 1} / ${BENCH_QUERIES.length}: ${query.name}`
     )
-    const started = performance.now()
-    let rows = 0
-    db.exec({
-      sql: query.sql,
-      rowMode: 'array',
-      callback: () => {
-        rows += 1
-      },
-    })
-    results.push({ name: query.name, ms: Math.round(performance.now() - started), rows })
+    // Through the same path a user's query takes, progress handler included, so
+    // the recorded number is what the app actually costs rather than what
+    // SQLite costs. `?ops=0` runs the sweep with no handler installed, which is
+    // how M3 priced the handler against the M1 baseline. `quiet` because this
+    // loop already reports where it is, per query rather than per second.
+    const result = runSql(database, query.sql, { limit: ROW_LIMIT, quiet: true })
+    results.push({ name: query.name, ms: result.ms, rows: result.rows.length })
   }
   report('ready', 1, `${results.length} queries`)
   // Read here, not at import: aggregates and the temp b-trees behind GROUP BY
@@ -1400,8 +1533,18 @@ async function openDatabase(
  */
 function buildSearchIndexes(
   database: Database,
-  onProgress: (fraction: number, detail: string) => void
+  onProgress: (fraction: number, detail: string) => void,
+  options: ImportOptions = {}
 ): void {
+  // Statistics are collected here only when the artifact did not arrive with
+  // them (D-067). A published artifact carries `sqlite_stat1` — 21 rows the
+  // pipeline collects in under a second on the server — and re-deriving them
+  // costs 20.4 s of OPFS reads in the browser for exactly the same plans. The
+  // check is what makes the client correct against both: a generation
+  // published before the pipeline change still gets good plans, at that price.
+  // `?analyze=0` reproduces the M1 baseline — indexes built, no statistics —
+  // which is the only way to re-run the comparison the tuning was decided on.
+  const analyze = options.analyze !== false && !hasStatistics(database)
   let base = 0
   // Outside the try: if this throws, writes were never enabled and there is
   // nothing to restore.
@@ -1413,16 +1556,57 @@ function buildSearchIndexes(
   // rest of its life — disarming the very defense the pragma is there to be.
   // `Database.transaction` has rolled the batch back by the time we get here.
   try {
+    const textShare = analyze ? 1 - ANALYZE_SHARE : 1
     for (const { index, share } of indexPlan()) {
       onProgress(base, index.label)
-      fillIndex(database, index, share, (fraction, rows) => {
-        onProgress(base + share * fraction, `${rows.toLocaleString()} ${index.label} indexed`)
+      fillIndex(database, index, share * textShare, (fraction, rows) => {
+        onProgress(
+          base + share * textShare * fraction,
+          `${rows.toLocaleString()} ${index.label} indexed`
+        )
       })
-      base += share
+      base += share * textShare
+    }
+    // Statistics, but only if the artifact arrived without them (D-067).
+    //
+    // What they buy is measured: the reference-host scan, the slowest shape in
+    // the benchmark, drops from 605 ms to ~395 ms and the CWE aggregate from
+    // 88 ms to ~55 ms, with no shape regressing. What they cost *here* is
+    // 20.4 s of OPFS reads on top of an already 65-second import, against
+    // under a second on the server — which is why the pipeline collects them
+    // and this is the fallback for a generation published before it did.
+    // Stats going stale as deltas land is harmless: SQLite treats them as
+    // estimates, and a plan chosen from last month's distribution of a
+    // 372k-record corpus is the same plan.
+    if (analyze) {
+      onProgress(textShare, 'collecting query statistics')
+      // Everything, including the full-text shadow tables. Analysing only the
+      // published schema's tables was measured and saved nothing — 78.6 s
+      // against 79.1 s, inside the noise — so the simpler statement wins
+      // (D-067).
+      database.exec('ANALYZE')
     }
   } finally {
     database.exec('PRAGMA query_only=ON')
   }
+}
+
+/**
+ * Whether this database already carries query statistics.
+ *
+ * The published artifact does (D-067): the pipeline runs `ANALYZE` in under a
+ * second on the server, and `sqlite_stat1` is 21 rows. Deriving the same rows
+ * in the browser means reading every index back through OPFS — 20.4 s at full
+ * scale — so the client only does it for a generation that arrived without
+ * them. An empty table counts as absent, because that is what a build which
+ * analysed nothing would leave.
+ */
+function hasStatistics(database: Database): boolean {
+  const present = database.selectValue(
+    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_stat1'"
+  )
+  if (present !== 1) return false
+  return Number(database.selectValue('SELECT count(*) FROM sqlite_stat1') ?? 0) > 0
 }
 
 /**
@@ -1472,6 +1656,13 @@ function fillIndex(
 /** What discovery concluded, and whether it saw the whole picture. */
 interface Discovery {
   live: { vfs: Vfs; file: string } | null
+  /**
+   * A complete local copy of another schema version, when there is no live one
+   * (M3). Reported so the page can say what happened; kept on disk so the next
+   * download can reclaim its slot rather than the user losing it to a sweep
+   * they were never told about.
+   */
+  obsolete: { file: string; schema: number } | null
   /** False if any candidate could not be examined; a sweep is then unsafe. */
   conclusive: boolean
 }
@@ -1487,8 +1678,9 @@ interface Discovery {
  */
 async function storedIn(): Promise<Discovery> {
   const root = await opfsRoot()
-  const { file, conclusive } = await findLive(root)
-  if (file) return { live: { vfs: 'opfs', file }, conclusive }
+  const { file, obsolete, conclusive } = await findLive(root)
+  if (file) return { live: { vfs: 'opfs', file }, obsolete: null, conclusive }
+  if (obsolete) return { live: null, obsolete, conclusive }
 
   // A missing pool directory means nothing was ever imported through it. Any
   // other failure — installation, enumeration — is "I could not tell", and
@@ -1505,13 +1697,13 @@ async function storedIn(): Promise<Discovery> {
     if (pooled) {
       const pool = await installSahPool()
       if (pool.getFileNames().includes(`/${POOL_DB_FILE}`)) {
-        return { live: { vfs: 'opfs-sahpool', file: POOL_DB_FILE }, conclusive }
+        return { live: { vfs: 'opfs-sahpool', file: POOL_DB_FILE }, obsolete: null, conclusive }
       }
     }
   } catch {
-    return { live: null, conclusive: false }
+    return { live: null, obsolete: null, conclusive: false }
   }
-  return { live: null, conclusive }
+  return { live: null, obsolete: null, conclusive }
 }
 
 /**
@@ -1555,6 +1747,8 @@ function postUnknown(): void {
     rev: null,
     generated: null,
     notice: null,
+    localSchema: null,
+    schema: sessionSchema,
   })
 }
 
@@ -1580,6 +1774,25 @@ async function status(): Promise<void> {
   }
 
   if (!found.live) {
+    // A copy of another schema version is neither a live copy nor an empty
+    // origin: the bytes are there and this build cannot read them (M3). It is
+    // announced with both version numbers and **not** swept — the local
+    // database is a rebuildable cache (D-013), which licenses replacing it,
+    // not deleting it out from under a user who has not been told. The slot is
+    // reclaimed by the next download's promotion sweep.
+    if (found.obsolete && found.conclusive) {
+      post({
+        type: 'status',
+        ready: false,
+        storage: 'obsolete',
+        rev: null,
+        generated: null,
+        notice: null,
+        localSchema: found.obsolete.schema,
+        schema: sessionSchema,
+      })
+      return
+    }
     // Only a *conclusive* look at an origin with no promoted database licenses
     // reclaiming what is left. Otherwise something here could not be examined,
     // and it may be the copy the user is relying on.
@@ -1592,6 +1805,8 @@ async function status(): Promise<void> {
         rev: null,
         generated: null,
         notice: null,
+        localSchema: null,
+        schema: sessionSchema,
       })
     } else {
       postUnknown()
@@ -1613,17 +1828,48 @@ async function status(): Promise<void> {
         liveFile = live.vfs === 'opfs' ? live.file : null
       }
     }
+    const storedSchema = db.selectValue("SELECT v FROM meta WHERE k = 'schema'")
+    if (typeof storedSchema !== 'number') throw new Error('local copy carries no numeric schema')
+    const localSchema = storedSchema
+    // The pool VFS cannot be classified through named OPFS entries, so its
+    // schema gate happens after opening. It is still a local copy of another
+    // version: keep it, refuse to query it, and announce both versions just as
+    // the default VFS does.
+    if (localSchema !== sessionSchema) {
+      db.close()
+      db = null
+      liveFile = null
+      post({
+        type: 'status',
+        ready: false,
+        storage: 'obsolete',
+        rev: null,
+        generated: null,
+        notice: null,
+        localSchema,
+        schema: sessionSchema,
+      })
+      return
+    }
     const rev = (db.selectValue("SELECT v FROM meta WHERE k = 'rev'") as number) ?? null
     const generated = (db.selectValue("SELECT v FROM meta WHERE k = 'generated'") as number) ?? null
     // D-008 travels with the data, so it is read from the database rather
     // than remembered by the page that happened to import it.
     const notice = (db.selectValue("SELECT v FROM meta WHERE k = 'notice'") as string) ?? null
-
     // Only here, and only on a conclusive look: the database discovery chose is
     // open and answering, so the keep list names a copy that demonstrably
     // exists — and nothing else on disk went unexamined.
     if (found.conclusive) await tidy(liveFile).catch(() => undefined)
-    post({ type: 'status', ready: true, storage: 'ready', rev, generated, notice })
+    post({
+      type: 'status',
+      ready: true,
+      storage: 'ready',
+      rev,
+      generated,
+      notice,
+      localSchema,
+      schema: sessionSchema,
+    })
   } catch {
     // Discovery named a file we then could not open or read. That is not an
     // empty origin — it is an unknown one, and it must not authorise a sweep.
@@ -1631,27 +1877,306 @@ async function status(): Promise<void> {
   }
 }
 
-function query(sql: string): void {
-  if (!db) throw new Error('no database — download the corpus first')
-  // Reported before the call, not after: `db.exec` blocks this Worker until it
-  // finishes, so this is the last chance to tell anyone it started (D-052).
-  // There is no progress to give — SQLite does not report any mid-statement —
-  // so the phase is deliberately indeterminate rather than a fake fraction.
-  report('query', null, 'Running query')
-  const started = performance.now()
+/** Thrown by `runSql` when the user stopped the query. Not a failure. */
+class Cancelled extends Error {
+  constructor(readonly ms: number) {
+    super(`cancelled after ${elapsedLabel(ms)}`)
+    this.name = 'Cancelled'
+  }
+}
+
+interface RunOptions {
+  params?: SqlParam[]
+  /** Rows to collect before stopping. */
+  limit: number
+  /**
+   * Install the authorizer, because this SQL is the user's rather than this
+   * build's. Everything the app itself runs is a literal in the tree.
+   */
+  guarded?: boolean
+  /** Suppress the "still running" reports — the benchmark posts its own. */
+  quiet?: boolean
+}
+
+/**
+ * Run one read, under the progress handler and (for user SQL) the authorizer.
+ *
+ * This is the only place a query reaches SQLite from the UI, which is what
+ * makes the three M3 properties structural rather than per-caller: a long query
+ * says it is running (D-052 §3), it can be stopped (D-052's M3 consequence),
+ * and user SQL cannot write (D-044).
+ *
+ * The progress callback is the whole mechanism. It is the only code that runs
+ * during a query — the Worker's event loop does not turn — so it is both where
+ * the cancellation flag is read and where the elapsed report is posted from.
+ * `postMessage` from a blocked thread is fine: delivery is the receiver's
+ * problem, and the receiver is the main thread, which is idle.
+ */
+function runSql(database: Database, sql: string, options: RunOptions): QueryResult {
+  if (!sqlite3) throw new Error('sqlite3 not initialised')
+  const capi = sqlite3.capi
+  const handle = database.pointer
   const rows: unknown[][] = []
   const columns: string[] = []
-  db.exec({
+  let truncated = false
+  const started = performance.now()
+  let lastReport = started
+  // A refusal is reported by the authorizer callback, which SQLite turns into
+  // a bare SQLITE_AUTH. Keeping the reason here is what turns "not authorized"
+  // into "this console is read-only: INSERT is refused".
+  let denial: string | null = null
+
+  if (progressOps > 0 && handle) {
+    capi.sqlite3_progress_handler(
+      handle,
+      progressOps,
+      () => {
+        if (cancelRequested(cancelFlag)) return 1
+        if (options.quiet) return 0
+        const now = performance.now()
+        if (now - started < QUERY_QUIET_MS || now - lastReport < QUERY_REPORT_MS) return 0
+        lastReport = now
+        report('query', null, `running — ${elapsedLabel(now - started)} · Cancel to stop`)
+        return 0
+      },
+      0
+    )
+  }
+  if (options.guarded && handle) {
+    capi.sqlite3_set_authorizer(
+      handle,
+      (_arg, code, arg1, arg2) => {
+        const verdict = authorize(code, arg1 === 0 ? null : arg1, arg2 === 0 ? null : arg2)
+        if (verdict.ok) return AUTH_OK
+        denial ??= verdict.reason ?? 'refused'
+        return AUTH_DENY
+      },
+      0
+    )
+  }
+
+  try {
+    database.exec({
+      sql,
+      bind: options.params ? ([...options.params] as SqlValue[]) : undefined,
+      rowMode: 'array',
+      columnNames: columns,
+      callback: (row: unknown[]): false | undefined => {
+        if (rows.length >= options.limit) {
+          truncated = true
+          // Stops iteration — the cap is a memory bound on this Worker, not a
+          // display preference, so it has to stop SQLite rather than filter
+          // afterwards.
+          return false
+        }
+        rows.push(row)
+        return undefined
+      },
+    })
+  } catch (error) {
+    const ms = performance.now() - started
+    if (isInterrupt(error)) throw new Cancelled(ms)
+    if (denial) throw new Error(denial)
+    throw error
+  } finally {
+    // Both are per-connection and both must come off before the app's own
+    // writes run: the authorizer would refuse the sync path's INSERTs, and the
+    // handler would keep a cancellation flag live across a delta apply.
+    if (handle) {
+      if (progressOps > 0) capi.sqlite3_progress_handler(handle, 0, 0, 0)
+      if (options.guarded) clearAuthorizer(handle)
+    }
+  }
+
+  return {
+    columns: [...columns],
+    rows,
+    ms: Math.round(performance.now() - started),
+    truncated,
     sql,
-    rowMode: 'array',
-    columnNames: columns,
-    callback: (row: unknown[]) => {
-      rows.push(row)
-    },
+    params: [...(options.params ?? [])],
+  }
+}
+
+/**
+ * Take the authorizer off the connection.
+ *
+ * The C API removes it when the callback is NULL, and the WASM bindings honour
+ * that — the distribution's own close-time cleanup calls it exactly this way,
+ * and it is what lets the app's writes (sync, index building) run on the same
+ * connection a console query just used. The published TypeScript declaration
+ * describes only the installing form, so the cast is the type catching up with
+ * the API rather than a claim about behaviour: `tests/unit/authorizer.test.ts`
+ * checks that writes work again after a guarded query.
+ */
+function clearAuthorizer(handle: number): void {
+  if (!sqlite3) return
+  const remove = sqlite3.capi.sqlite3_set_authorizer as unknown as (
+    db: number,
+    xAuth: number,
+    cbArg: number
+  ) => void
+  remove(handle, 0, 0)
+}
+
+/** Post a finished result, or the fact that the user stopped it. */
+function finishQuery(
+  kind: 'demo' | 'console' | 'search',
+  work: () => void,
+  onCancel?: () => void
+): void {
+  // Once per top-level request, not once per SQL statement. A structured
+  // search may run its result query and then a count; clearing between them can
+  // erase a click that landed in that narrow gap and leave the count running.
+  // The same applies between shapes in the benchmark sweep.
+  armCancel(cancelFlag)
+  try {
+    work()
+  } catch (error) {
+    if (error instanceof Cancelled) {
+      report('ready', 1, `cancelled after ${elapsedLabel(error.ms)}`)
+      post({ type: 'cancelled', kind, ms: Math.round(error.ms) })
+      onCancel?.()
+      return
+    }
+    throw error
+  }
+}
+
+function query(sql: string): void {
+  const database = requireDb()
+  // Reported before the call, not after: `db.exec` blocks this Worker until it
+  // finishes, so this is the last chance to tell anyone it started (D-052).
+  // The handler takes over from here with an elapsed figure; there is still no
+  // fraction, because SQLite reports no position within a statement.
+  report('query', null, 'Running query')
+  finishQuery('demo', () => {
+    const result = runSql(database, sql, { limit: ROW_LIMIT })
+    report('ready', 1, `${result.rows.length.toLocaleString()} rows in ${result.ms} ms`)
+    post({ type: 'result', kind: 'demo', result })
   })
-  const ms = Math.round(performance.now() - started)
-  report('ready', 1, `${rows.length.toLocaleString()} rows in ${ms} ms`)
-  post({ type: 'rows', columns, rows, ms })
+}
+
+/**
+ * Run whatever the user typed (M3).
+ *
+ * Two things make this safe to expose over a database the app also writes to.
+ * The authorizer refuses every action but reading (lib/authorizer.ts), so a
+ * write is a refusal from SQLite's parser rather than from a regular
+ * expression over the text. And the row cap plus cancellation mean a query that
+ * asks for everything, or for something that never finishes, costs a bounded
+ * amount of memory and as much time as the user is willing to wait.
+ *
+ * `query_only` stays on underneath as it always was; it is no longer the
+ * defence, it is a second one.
+ */
+function consoleQuery(sql: string): void {
+  const database = requireDb()
+  const trimmed = sql.trim()
+  if (!trimmed) throw new Error('nothing to run')
+  report('query', null, 'Running your SQL')
+  finishQuery('console', () => {
+    const result = runSql(database, trimmed, { limit: CONSOLE_ROW_LIMIT, guarded: true })
+    report(
+      'ready',
+      1,
+      `${result.rows.length.toLocaleString()} rows in ${result.ms} ms${result.truncated ? ' (capped)' : ''}`
+    )
+    post({ type: 'result', kind: 'console', result })
+  })
+}
+
+/**
+ * Resolve one axis's names to the lookup ids the compiled SQL binds.
+ *
+ * Names, not ids, are what the UI and a permalink carry (lib/filters.ts), and
+ * an id means nothing outside the artifact that issued it (D-055). Resolution
+ * is also where "there is no vendor called that" is answered — separately from
+ * "no CVE matches", which is what an unresolved name would otherwise look like.
+ */
+function resolveAxis(
+  database: Database,
+  axis: LookupAxis,
+  values: string[] | undefined
+): { ids: number[]; unmatched: string[] } {
+  const ids: number[] = []
+  const unmatched: string[] = []
+  for (const value of values ?? []) {
+    if (!value.trim()) continue
+    let found = false
+    database.exec({
+      sql: LOOKUP_SQL[axis],
+      bind: [lookupKey(axis, value)],
+      rowMode: 0,
+      callback: (id: unknown) => {
+        if (typeof id === 'number') {
+          ids.push(id)
+          found = true
+        }
+      },
+    })
+    if (!found) unmatched.push(value)
+  }
+  return { ids, unmatched }
+}
+
+/** The structured query surface: every confirmed filter axis (M3). */
+function search(request: SearchRequest): void {
+  const database = requireDb()
+  const filters: Filters = request.filters ?? {}
+  report('query', null, 'Running query')
+
+  finishQuery('search', () => {
+    const resolved: Resolved = {}
+    const unmatched: Unmatched[] = []
+    for (const axis of LOOKUP_AXES) {
+      const outcome = resolveAxis(database, axis, filters[axis])
+      // Preserve an empty resolution when names were requested. `undefined`
+      // means no filter; `[]` means the requested names do not exist and compiles
+      // to false in the shared layer. Dropping the empty array would return the
+      // whole corpus for a typo.
+      if (filters[axis]?.some((value) => value.trim())) resolved[axis] = outcome.ids
+      if (outcome.unmatched.length) unmatched.push({ axis, values: outcome.unmatched })
+    }
+
+    const groupBy = request.groupBy ?? null
+    const state =
+      filters.state === 'rejected' || filters.state === 'all' ? filters.state : 'published'
+    const built = groupBy
+      ? groupSql(filters, resolved, groupBy, request.limit)
+      : rowsSql(filters, resolved, {
+          limit: request.limit,
+          offset: request.offset,
+          sort: request.sort,
+        })
+    const result = runSql(database, built.sql, {
+      params: built.params,
+      limit: request.limit && request.limit > 0 ? Math.min(request.limit, ROW_LIMIT) : ROW_LIMIT,
+    })
+
+    // The count is a second query and its own decision: it is what a capped
+    // list cannot tell you, and over the whole corpus with no filters it is a
+    // scan, so the caller asks for it rather than paying for it every time.
+    let matches: number | null = null
+    if (request.count) {
+      const counted = countSql(filters, resolved)
+      const rows = runSql(database, counted.sql, { params: counted.params, limit: 1, quiet: true })
+      const value = rows.rows[0]?.[0]
+      matches = typeof value === 'number' ? value : null
+    }
+
+    report(
+      'ready',
+      1,
+      `${result.rows.length.toLocaleString()} rows in ${result.ms} ms${result.truncated ? ' (capped)' : ''}`
+    )
+    post({ type: 'result', kind: 'search', result, matches, unmatched, groupBy, state })
+  })
+}
+
+function requireDb(): Database {
+  if (!db) throw new Error('no database — download the corpus first')
+  return db
 }
 
 /**
@@ -1668,7 +2193,16 @@ async function reset(): Promise<void> {
   await clearStorage()
   // `empty` rather than `unknown`: `clearStorage` throws unless every entry
   // really went, so reaching this line is proof the origin is empty.
-  post({ type: 'status', ready: false, storage: 'empty', rev: null, generated: null, notice: null })
+  post({
+    type: 'status',
+    ready: false,
+    storage: 'empty',
+    rev: null,
+    generated: null,
+    notice: null,
+    localSchema: null,
+    schema: sessionSchema,
+  })
 }
 
 /**
@@ -1781,9 +2315,22 @@ self.onmessage = (event: MessageEvent<Request>) => {
 async function handle(request: Request): Promise<void> {
   try {
     await ready
+    // Every request that carries options sets the session's schema version
+    // first, because discovery reads it from module state rather than taking it
+    // as an argument through the crash-safety path (see `sessionSchema`).
+    if ('options' in request) sessionSchema = speaks(request.options)
     switch (request.type) {
       case 'status':
         await status()
+        break
+      case 'control':
+        // The shared cancellation flag, and the session's query knobs. Sent
+        // once when the page mounts; a Worker that never receives it runs
+        // queries that cannot be cancelled, which is the honest degradation
+        // where `SharedArrayBuffer` is unavailable (lib/cancel.ts).
+        cancelFlag = ArrayBuffer.isView(request.cancel) ? request.cancel : null
+        progressOps = queryOps(request.options)
+        sessionSchema = speaks(request.options)
         break
       case 'import':
         await importSnapshot(request.options)
@@ -1801,6 +2348,12 @@ async function handle(request: Request): Promise<void> {
       case 'query':
         query(request.sql)
         break
+      case 'console':
+        consoleQuery(request.sql)
+        break
+      case 'search':
+        search(request.request)
+        break
       case 'bench':
         bench()
         break
@@ -1810,7 +2363,19 @@ async function handle(request: Request): Promise<void> {
     }
   } catch (error) {
     report('error', null, '')
-    post({ type: 'error', message: error instanceof Error ? error.message : String(error) })
+    const kind =
+      request.type === 'console'
+        ? 'console'
+        : request.type === 'search'
+          ? 'search'
+          : request.type === 'query' || request.type === 'bench'
+            ? 'demo'
+            : undefined
+    post({
+      type: 'error',
+      message: error instanceof Error ? error.message : String(error),
+      ...(kind ? { kind } : {}),
+    })
     // Resync, and on the staged path this is where the good news arrives: a
     // failed download leaves the previous database untouched, so `status` says
     // "still ready" and the page keeps its query surface instead of offering a
