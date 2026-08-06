@@ -94,13 +94,15 @@ describe('parseReport', () => {
     expect(parsed(good({ filters: { state: 'all' } })).filters.state).toBe('all')
   })
 
-  it('keeps only severity and CVSS-version codes this schema has', () => {
-    const report = parsed(
-      good({ filters: { severity: [4, 99, -1, 2], cvssVersion: [31, 3.5, 40] } as never })
-    )
-    expect(report.filters.severity).toEqual([4, 2])
+  it('refuses severity and CVSS-version codes this schema does not have', () => {
+    expect(parseReport(good({ filters: { severity: [4, 99] } as never })).ok).toBe(false)
     // 31 is v3.1 and 4 is v4.0 — codes, not magnitudes (D-047). 40 is neither.
-    expect(report.filters.cvssVersion).toEqual([31])
+    expect(parseReport(good({ filters: { cvssVersion: [31, 40] } as never })).ok).toBe(false)
+    expect(parsed(good({ filters: { severity: [4, 2], cvssVersion: [31, 4] } })).filters).toEqual({
+      severity: [4, 2],
+      cvssVersion: [31, 4],
+      state: 'published',
+    })
   })
 
   it('refuses a lookup axis that is not a list of names', () => {
@@ -108,10 +110,19 @@ describe('parseReport', () => {
     expect(parseReport(good({ filters: { cwe: { length: 1 } } as never })).ok).toBe(false)
   })
 
-  it('bounds how many names an axis can carry', () => {
+  it('refuses malformed or oversized lookup axes instead of dropping predicates', () => {
+    expect(parseReport(good({ filters: { vendor: [42] } as never })).ok).toBe(false)
+    expect(parseReport(good({ filters: { vendor: [''] } })).ok).toBe(false)
     const many = Array.from({ length: 5_000 }, (_, i) => `vendor-${i}`)
-    const report = parsed(good({ filters: { vendor: many } }))
-    expect(report.filters.vendor?.length).toBeLessThanOrEqual(200)
+    expect(parseReport(good({ filters: { vendor: many } })).ok).toBe(false)
+  })
+
+  it('refuses malformed scalar filters instead of broadening the report', () => {
+    expect(parseReport(good({ filters: { text: 42 } as never })).ok).toBe(false)
+    expect(parseReport(good({ filters: { scoreMin: '9' } as never })).ok).toBe(false)
+    expect(parseReport(good({ filters: { publishedFrom: Number.POSITIVE_INFINITY } })).ok).toBe(
+      false
+    )
   })
 
   it('drops fields it does not know instead of refusing', () => {

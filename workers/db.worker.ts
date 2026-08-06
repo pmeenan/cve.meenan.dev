@@ -2151,7 +2151,9 @@ function search(request: SearchRequest): void {
         })
     const result = runSql(database, built.sql, {
       params: built.params,
-      limit: request.limit && request.limit > 0 ? Math.min(request.limit, ROW_LIMIT) : ROW_LIMIT,
+      // The builders put one sentinel row beyond this limit in SQL. Seeing it is
+      // how runSql distinguishes an exact-size answer from a capped one.
+      limit: built.limit,
     })
 
     // The count is a second query and its own decision: it is what a capped

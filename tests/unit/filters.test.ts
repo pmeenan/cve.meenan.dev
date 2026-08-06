@@ -94,7 +94,10 @@ function corpus(): DatabaseSync {
   cve.run(4, 'CVE-2024-0004', 2024, 1, 3, day('2024-09-09'), day('2024-09-10'), 4, 9.1, 4, 'AV:N')
   // No `cve_text` row: 4.46% of the corpus has no English description (D-023),
   // and a list that quietly dropped them would look like a shorter answer.
-  cve.run(5, 'CVE-2020-0005', 2020, 1, 3, day('2020-02-02'), day('2020-02-03'), 2, 3, 1, 'AV:L')
+  // Deliberately give the stored identifier-year a different value from the
+  // publication year. A report's time bucket is over `published`, not over the
+  // year embedded in a CVE ID.
+  cve.run(5, 'CVE-2020-0005', 1999, 1, 3, day('2020-02-02'), day('2020-02-03'), 2, 3, 1, 'AV:L')
 
   const text = db.prepare('INSERT INTO cve_text(cve_id, descr) VALUES (?, ?)')
   text.run(1, 'Remote code execution via JNDI lookup, a deserialization flaw in the logger')
@@ -302,9 +305,28 @@ describe('grouped counts', () => {
     const built = groupSql(filters, resolve(filters), 'year')
     const rows = run(built.sql, built.params)
     expect(rows.map((row) => [Number(row[0]), Number(row[2])])).toEqual([
-      [2024, 1],
       [2021, 1],
+      [2024, 1],
     ])
+  })
+
+  it('uses publication year and orders every time grain chronologically', () => {
+    const years = groupSql({ state: 'all' }, {}, 'year')
+    const yearBuckets = run(years.sql, years.params).map((row) => Number(row[0]))
+    expect(yearBuckets).toContain(2020)
+    expect(yearBuckets).not.toContain(1999)
+    expect(yearBuckets).toEqual([...yearBuckets].sort((a, b) => a - b))
+
+    for (const dimension of ['quarter', 'month'] as const) {
+      const built = groupSql({ state: 'all' }, {}, dimension)
+      const buckets = run(built.sql, built.params).map((row) => String(row[0]))
+      expect(buckets).toEqual([...buckets].sort())
+    }
+  })
+
+  it('orders CVSS versions semantically rather than by their storage codes', () => {
+    const built = groupSql({}, {}, 'cvssVersion')
+    expect(run(built.sql, built.params).map((row) => Number(row[0]))).toEqual([2, 30, 31, 4])
   })
 
   it('refuses a dimension it does not know', () => {
@@ -387,6 +409,11 @@ describe('cross-tab counts', () => {
     expect(first).toEqual([...first].sort((a, b) => a - b))
   })
 
+  it('orders a CVSS-version series as v2, v3.0, v3.1, then v4.0', () => {
+    const versions = cells('state', 'cvssVersion').map((row) => Number(row[2]))
+    expect(versions).toEqual([2, 30, 31, 4])
+  })
+
   it('buckets by month and quarter from the stored timestamp', () => {
     const months = cells('month', 'severity').map((row) => String(row[0]))
     expect(months).toContain('2021-12')
@@ -403,7 +430,8 @@ describe('cross-tab counts', () => {
 
   it('bounds the cells it will return', () => {
     const built = crossSql({}, {}, 'vendor', 'severity', { rows: 10 ** 6, series: 10 ** 6 })
-    expect(built.params.at(-1)).toBe(CROSS_CELL_LIMIT)
+    expect(built.limit).toBe(CROSS_CELL_LIMIT)
+    expect(built.params.at(-1)).toBe(CROSS_CELL_LIMIT + 1)
   })
 
   it('applies the state default to both axis cuts as well as the cells', () => {
@@ -520,11 +548,23 @@ describe('ftsQuery', () => {
 
 describe('caps', () => {
   it('bounds what a caller can ask for', () => {
-    expect(rowsSql({}, {}, { limit: 10 ** 9 }).params.at(-2)).toBe(MAX_ROW_LIMIT)
+    expect(rowsSql({}, {}, { limit: 10 ** 9 }).params.at(-2)).toBe(MAX_ROW_LIMIT + 1)
     expect(rowsSql({}, {}, { limit: -5 }).params.at(-2)).toBeGreaterThan(0)
     expect(rowsSql({}, {}, { offset: -5 }).params.at(-1)).toBe(0)
     expect(rowsSql({}, {}, { offset: 10 ** 12 }).params.at(-1)).toBe(1_000_000)
-    expect(groupSql({}, {}, 'vendor', 10 ** 9).params.at(-1)).toBe(GROUP_LIMIT)
+    const grouped = groupSql({}, {}, 'vendor', 10 ** 9)
+    expect(grouped.limit).toBe(GROUP_LIMIT)
+    expect(grouped.params.at(-1)).toBe(GROUP_LIMIT + 1)
+  })
+
+  it('asks SQL for one sentinel row beyond the collection cap', () => {
+    const listed = rowsSql({}, {}, { limit: 3 })
+    expect(listed.limit).toBe(3)
+    expect(listed.params.at(-2)).toBe(4)
+
+    const grouped = groupSql({}, {}, 'year', 3)
+    expect(grouped.limit).toBe(3)
+    expect(grouped.params.at(-1)).toBe(4)
   })
 
   it('fails closed when a lookup filter was not resolved', () => {

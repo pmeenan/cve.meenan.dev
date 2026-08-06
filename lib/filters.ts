@@ -124,6 +124,18 @@ export interface Compiled {
 }
 
 /**
+ * A bounded query asks SQLite for one sentinel row beyond the collection limit.
+ * The Worker consumes at most `limit` rows and uses the sentinel to report that
+ * the answer was capped; putting the exact cap in SQL would make truncation
+ * indistinguishable from an answer that happened to have exactly that many rows.
+ */
+export interface BoundedSql {
+  sql: string
+  params: SqlParam[]
+  limit: number
+}
+
+/**
  * How a lookup name is matched to a row, per axis.
  *
  * Vendor, product and CNA names are stored as upstream wrote them —
@@ -413,7 +425,7 @@ export function rowsSql(
   filters: Filters,
   resolved: Resolved = {},
   options: RowOptions = {}
-): { sql: string; params: SqlParam[] } {
+): BoundedSql {
   const { where, params } = compile(filters, resolved)
   const limit = clampLimit(options.limit)
   const offset = clampOffset(options.offset)
@@ -428,7 +440,8 @@ export function rowsSql(
       `c.cvss_sev, n.name AS cna, substr(t.descr, 1, 400) AS description ` +
       `FROM cve c LEFT JOIN cna n ON n.id = c.cna_id LEFT JOIN cve_text t ON t.cve_id = c.id ` +
       `WHERE ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`,
-    params: [...params, limit, offset],
+    params: [...params, limit + 1, offset],
+    limit,
   }
 }
 
@@ -445,8 +458,9 @@ export function countSql(
  * The axes an aggregate can group by — every filter axis, plus three time
  * grains.
  *
- * `year` reads the stored `c.year` column, which is indexed; `quarter` and
- * `month` are computed from `c.published`. They are separate dimensions rather
+ * All three are computed from `c.published`. The stored `c.year` is the year in
+ * the CVE identifier, not necessarily the year the record was published. They
+ * are separate dimensions rather
  * than one dimension with a grain parameter because that keeps the report
  * definition flat — one field naming an axis — which is both simpler to
  * validate coming out of a URL fragment and simpler for a small model to emit
@@ -502,10 +516,17 @@ const CODE_DIMENSIONS = new Set<Dimension>(['severity', 'cvssVersion', 'state'])
  * NULL rather than to a wrong period — `strftime` propagates it — which the UI
  * renders as "(none recorded)" the same way an absent lookup is rendered.
  */
+const YEAR_EXPR = "strftime('%Y', c.published, 'unixepoch')"
 const MONTH_EXPR = "strftime('%Y-%m', c.published, 'unixepoch')"
 const QUARTER_EXPR =
-  "strftime('%Y', c.published, 'unixepoch') || '-Q' || " +
+  `${YEAR_EXPR} || '-Q' || ` +
   "((CAST(strftime('%m', c.published, 'unixepoch') AS INTEGER) + 2) / 3)"
+
+/** Storage codes are identifiers: 4 (v4.0) belongs after 31 (v3.1). */
+const CVSS_VERSION_ORDER =
+  'CASE WHEN c.cvss_ver = 2 THEN 0 WHEN c.cvss_ver = 30 THEN 1 ' +
+  'WHEN c.cvss_ver = 31 THEN 2 WHEN c.cvss_ver = 4 THEN 3 ' +
+  'WHEN c.cvss_ver IS NULL THEN 5 ELSE 4 END'
 
 /**
  * The join chains a dimension can need, each declared **once** and shared by
@@ -551,18 +572,25 @@ interface DimensionSql {
   key: string
   label: string
   group: string
+  /** Semantic display order when the stored key is not itself ordered. */
+  order?: string
   join?: JoinGroup
 }
 
 const DIMENSION_SQL: Record<Dimension, DimensionSql> = {
-  year: { key: 'c.year', label: 'c.year', group: 'c.year' },
+  year: { key: YEAR_EXPR, label: YEAR_EXPR, group: YEAR_EXPR },
   // Computed from the stored timestamp rather than stored: a second column per
   // grain would cost download bytes for every user (the trade D-033 made
   // against indexes), and a grouped scan is doing the work either way.
   quarter: { key: QUARTER_EXPR, label: QUARTER_EXPR, group: QUARTER_EXPR },
   month: { key: MONTH_EXPR, label: MONTH_EXPR, group: MONTH_EXPR },
   severity: { key: 'c.cvss_sev', label: 'c.cvss_sev', group: 'c.cvss_sev' },
-  cvssVersion: { key: 'c.cvss_ver', label: 'c.cvss_ver', group: 'c.cvss_ver' },
+  cvssVersion: {
+    key: 'c.cvss_ver',
+    label: 'c.cvss_ver',
+    group: 'c.cvss_ver',
+    order: CVSS_VERSION_ORDER,
+  },
   state: { key: 'c.state', label: 'c.state', group: 'c.state' },
   cna: { key: 'c.cna_id', label: 'n.name', group: 'c.cna_id', join: 'cna' },
   vendor: { key: 'v.id', label: 'v.name', group: 'v.id', join: 'prod' },
@@ -588,19 +616,24 @@ export function groupSql(
   resolved: Resolved,
   dimension: Dimension,
   limit = GROUP_LIMIT
-): { sql: string; params: SqlParam[] } {
+): BoundedSql {
   const shape = shapeOf(dimension)
   const { where, params } = compile(filters, resolved)
-  const ordered =
-    dimension === 'year' || dimension === 'state' || dimension === 'cvssVersion'
-      ? `${shape.key} DESC`
-      : 'cves DESC'
+  const bounded = clampLimit(limit, GROUP_LIMIT, GROUP_LIMIT)
+  const ordered = TIME_DIMENSIONS.has(dimension)
+    ? `${axisOrder(shape)} ASC`
+    : dimension === 'cvssVersion'
+      ? `${axisOrder(shape)} ASC`
+      : dimension === 'state'
+        ? `${shape.key} DESC`
+        : 'cves DESC'
   return {
     sql:
       `SELECT ${shape.key} AS bucket, ${shape.label} AS label, ${countFor([shape])} AS cves ` +
       `FROM cve c ${joinsFor([shape])} WHERE ${where} GROUP BY ${shape.group} ` +
       `ORDER BY ${ordered} LIMIT ?`,
-    params: [...params, clampLimit(limit, GROUP_LIMIT, GROUP_LIMIT)],
+    params: [...params, bounded + 1],
+    limit: bounded,
   }
 }
 
@@ -669,13 +702,14 @@ export function crossSql(
   rows: Dimension,
   series: Dimension | null,
   options: CrossOptions = {}
-): { sql: string; params: SqlParam[] } {
+): BoundedSql {
   const rowLimit = clampLimit(options.rows, CROSS_ROW_LIMIT, CROSS_ROW_LIMIT)
   if (series === null) return groupSql(filters, resolved, rows, rowLimit)
 
   const rowShape = shapeOf(rows)
   const seriesShape = shapeOf(series)
   const seriesLimit = clampLimit(options.series, CROSS_SERIES_LIMIT, CROSS_SERIES_LIMIT)
+  const cellLimit = Math.min(rowLimit * seriesLimit, CROSS_CELL_LIMIT)
   const { where, params } = compile(filters, resolved)
 
   // Each axis narrowed on its own terms, through its own joins only — a
@@ -712,14 +746,8 @@ export function crossSql(
 
   return {
     sql,
-    params: [
-      ...params,
-      rowLimit,
-      ...params,
-      seriesLimit,
-      ...params,
-      Math.min(rowLimit * seriesLimit, CROSS_CELL_LIMIT),
-    ],
+    params: [...params, rowLimit, ...params, seriesLimit, ...params, cellLimit + 1],
+    limit: cellLimit,
   }
 }
 
@@ -742,14 +770,22 @@ function narrowOrder(dimension: Dimension, shape: DimensionSql): string {
  * set is cells.
  */
 function rowOrder(dimension: Dimension, shape: DimensionSql, count: string): string {
-  if (TIME_DIMENSIONS.has(dimension) || CODE_DIMENSIONS.has(dimension)) return `${shape.key} ASC`
+  if (TIME_DIMENSIONS.has(dimension) || CODE_DIMENSIONS.has(dimension)) {
+    return `${axisOrder(shape)} ASC`
+  }
   return `sum(${count}) OVER (PARTITION BY ${shape.group}) DESC, ${shape.key}`
 }
 
 /** How cells are ordered within a row: scales by their value, identity by size. */
 function seriesOrder(dimension: Dimension, shape: DimensionSql): string {
-  if (TIME_DIMENSIONS.has(dimension) || CODE_DIMENSIONS.has(dimension)) return `${shape.key} ASC`
+  if (TIME_DIMENSIONS.has(dimension) || CODE_DIMENSIONS.has(dimension)) {
+    return `${axisOrder(shape)} ASC`
+  }
   return 'cves DESC'
+}
+
+function axisOrder(shape: DimensionSql): string {
+  return shape.order ?? shape.key
 }
 
 function clampLimit(

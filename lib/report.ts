@@ -181,7 +181,13 @@ function parseFilters(value: unknown): FiltersResult {
   const raw = value as Record<string, unknown>
   const filters: Filters = {}
 
+  if (raw.text !== undefined && typeof raw.text !== 'string') {
+    return { ok: false, error: 'text is not a string' }
+  }
   if (typeof raw.text === 'string' && raw.text.trim()) filters.text = raw.text.slice(0, MAX_TEXT)
+  if (raw.cveId !== undefined && typeof raw.cveId !== 'string') {
+    return { ok: false, error: 'cveId is not a string' }
+  }
   if (typeof raw.cveId === 'string' && raw.cveId.trim()) {
     filters.cveId = raw.cveId.trim().slice(0, MAX_TEXT)
   }
@@ -190,17 +196,20 @@ function parseFilters(value: unknown): FiltersResult {
     const names = raw[axis]
     if (names === undefined) continue
     if (!Array.isArray(names)) return { ok: false, error: `${axis} is not a list of names` }
-    const cleaned = names
-      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
-      .map((name) => name.trim().slice(0, MAX_TEXT))
-      .slice(0, MAX_AXIS_VALUES)
+    if (names.length > MAX_AXIS_VALUES) {
+      return { ok: false, error: `${axis} has too many names` }
+    }
+    if (names.some((name) => typeof name !== 'string' || !name.trim())) {
+      return { ok: false, error: `${axis} contains something that is not a name` }
+    }
+    const cleaned = (names as string[]).map((name) => name.trim().slice(0, MAX_TEXT))
     if (cleaned.length) filters[axis] = cleaned
   }
 
   // Codes rather than free integers: `cvss_sev` is 0..4 and `cvss_ver` is one of
   // four labels where 31 is v3.1 and 4 is v4.0 (D-047). An unrecognised code
-  // cannot match anything, so accepting it would render an empty chart with no
-  // explanation.
+  // cannot match anything. Refusing it is safer than dropping that predicate,
+  // which would silently widen the report to every severity or version.
   const severity = parseCodes(raw.severity, [0, 1, 2, 3, 4])
   if (severity === null) return { ok: false, error: 'severity is not a list of severity codes' }
   if (severity.length) filters.severity = severity
@@ -220,21 +229,23 @@ function parseFilters(value: unknown): FiltersResult {
     'yearTo',
   ] as const) {
     const at = raw[key]
-    if (typeof at === 'number' && Number.isFinite(at)) filters[key] = at
+    if (at === undefined) continue
+    if (typeof at !== 'number' || !Number.isFinite(at)) {
+      return { ok: false, error: `${key} is not a finite number` }
+    }
+    filters[key] = at
   }
 
   filters.state = isStateFilter(raw.state) ? raw.state : 'published'
   return { ok: true, filters }
 }
 
-/** A list of codes drawn from an allowlist, `null` if it is not a list at all. */
+/** A list of allowlisted codes, or `null` if the list or any member is invalid. */
 function parseCodes(value: unknown, allowed: number[]): number[] | null {
   if (value === undefined) return []
   if (!Array.isArray(value)) return null
-  const codes = value.filter(
-    (code): code is number => typeof code === 'number' && allowed.includes(code)
-  )
-  return [...new Set(codes)]
+  if (value.some((code) => typeof code !== 'number' || !allowed.includes(code))) return null
+  return [...new Set(value as number[])]
 }
 
 function isDimension(value: unknown): value is Dimension {
