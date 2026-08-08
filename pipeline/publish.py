@@ -291,6 +291,21 @@ def publish(
     if not str(meta.get("notice") or "").strip():
         raise SystemExit(f"error: {db_path} carries no MITRE notice (D-008); refusing to publish")
 
+    # And the schema, which `delta.extract` has always checked and this — the
+    # publisher of the *larger* artifact — did not, defaulting a missing value
+    # to 1. The bump runbook's step 0 is `git pull`, so building before pulling
+    # and publishing after is an easy order slip; it would have published a
+    # schema-1 artifact under a schema-1 manifest while retiring the old ID
+    # space and every pre-bump delta, and the schema-2 app would then refuse the
+    # plane it had just replaced. Found by M5's data-plane review.
+    stamped = meta.get("schema")
+    if stamped is None or int(stamped) != build.SCHEMA_VERSION:
+        raise SystemExit(
+            f"error: {db_path} is schema {stamped!r} but this pipeline publishes schema "
+            f"{build.SCHEMA_VERSION}; the artifact and the code that publishes it have to "
+            "agree, or the manifest describes a shape the artifact does not have"
+        )
+
     # The ID space this artifact's ids belong to (D-056). A snapshot from a
     # different lineage is publishable — clients re-download rather than sync —
     # but only deliberately, and never alongside deltas cut against the old one.
@@ -313,6 +328,24 @@ def publish(
     space = build.id_space(db_path)
     seed_rev = space["seed_rev"]
 
+    # What this artifact's ID space *is*, computed once and compared whole
+    # wherever it is needed. Built here rather than below because the head guard
+    # has to be able to recognise a resume, and a resume is exactly "the ledger
+    # already records this revision as this ID space".
+    candidate = {"marks": build.id_marks(space), "fingerprint": build.fingerprint(db_path)}
+    recorded = ledger.space_at(pub_dir, rev)
+    # True when this very publication already got as far as the ledger. A
+    # `--new-id-space` run writes the ledger *before* the manifest, so a crash
+    # between the two — ENOSPC on a directory that just took 63 MB, an OOM, a
+    # power cut — leaves `published_head` reading the ledger's new revision
+    # while the manifest still advertises the old one. The retry then met the
+    # guard below and was refused at the revision it had itself just published,
+    # with both crons stopped and no exit but hand-editing the ledger. The
+    # byte-identity resume that exists for this crash (`_same_bytes`) sits 170
+    # lines further down and was never reached. Found by M5's data-plane review;
+    # this is the schema-bump runbook's own step 2.
+    resuming_publication = recorded is not None and recorded == candidate
+
     if new_id_space or adopt_id_space:
         if not token:
             raise SystemExit(f"error: {db_path} records no ID space to publish (D-056)")
@@ -323,7 +356,7 @@ def publish(
         # synced client on the old ids, and the next delta then applied to them.
         # Adoption cannot prove equivalence either: a legacy data plane has no
         # recorded fingerprint to compare against, which is why it is adoption.
-        if rev <= published_head and published_head:
+        if rev <= published_head and published_head and not resuming_publication:
             what = "retiring" if new_id_space else "adopting"
             raise SystemExit(
                 f"error: {what} an ID space needs a revision above the published head "
@@ -352,8 +385,7 @@ def publish(
     # differed but whose rows did not passed this check, was renamed into place,
     # and was then rejected by the ledger — leaving the immutable URL occupied
     # by bytes nothing had registered, which blocked the correct artifact.
-    candidate = {"marks": build.id_marks(space), "fingerprint": build.fingerprint(db_path)}
-    recorded = ledger.space_at(pub_dir, rev)
+    # (Both are computed above, because the head guard needs them too.)
     if recorded is not None and recorded != candidate:
         raise SystemExit(
             f"error: rev {rev} was published with a different ID space "
@@ -445,7 +477,13 @@ def publish(
                 "artifact this one was not built from. Reseed from the most recent build."
             )
 
-    staging = os.path.join(pub_dir, f".staging-{rev}")
+    # Per-process, because nothing here takes a lock (only the two crons do) and
+    # the name used to be `.staging-<rev>` for everyone. Two publishes of one
+    # revision then shared it, and the second's unconditional `rmtree` deleted
+    # the first's compressed chunks between it recording their digests and
+    # renaming the directory into place — publishing a manifest naming twelve
+    # files that were not there. Found by M5's data-plane review.
+    staging = os.path.join(pub_dir, f".staging-{rev}-{os.getpid()}")
     final = os.path.join(pub_dir, f"snapshot-{rev}")
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging, mode=0o755, exist_ok=True)
@@ -497,20 +535,30 @@ def publish(
     # *can* replace bytes. Same rule as a delta's (D-055).
     resuming = _same_bytes(final, chunks)
     retired = None
+    # Revisions only move forward. Deleting a retired generation's directory used
+    # to be enough to let an *older* artifact be republished, which rolled the
+    # manifest backwards — clients that had already synced past it then see an
+    # origin behind their own watermark, and the reused `snapshot-<rev>` URLs
+    # serve different bytes under an immutable cache policy. `rev ==
+    # published_head` stays legal: that is the monthly rebuild landing at the
+    # revision the deltas have already reached.
+    #
+    # **Outside the `resuming` exemption, deliberately.** Byte identity answers
+    # "are these the same bytes as what is already at this URL"; it says nothing
+    # about "is this revision behind head", and the two are independent. Under
+    # retention an older generation's directory is *still on disk*, so a flagless
+    # re-run of that generation's artifact — a plausible shell-history repeat,
+    # and exactly what the schema-bump runbook leaves lying around — matched
+    # here, skipped this check, and rewrote the manifest at the old revision with
+    # every delta dropped. Reproduced three ways, including on the monthly
+    # rotation's own shape; found by M5's data-plane review.
+    if not force and rev < published_head:
+        shutil.rmtree(staging)
+        raise SystemExit(
+            f"error: the data plane is at rev {published_head}; publishing rev {rev} "
+            "would roll it backwards"
+        )
     if not force and not resuming:
-        # Revisions only move forward. Deleting a retired generation's directory
-        # used to be enough to let an *older* artifact be republished, which
-        # rolled the manifest backwards — clients that had already synced past
-        # it then see an origin behind their own watermark, and the reused
-        # `snapshot-<rev>` URLs serve different bytes under an immutable cache
-        # policy. `rev == published_head` stays legal: that is the monthly
-        # rebuild landing at the revision the deltas have already reached.
-        if rev < published_head:
-            shutil.rmtree(staging)
-            raise SystemExit(
-                f"error: the data plane is at rev {published_head}; publishing rev {rev} "
-                "would roll it backwards"
-            )
         if ledger.snapshot_published(pub_dir, rev) or os.path.exists(final):
             shutil.rmtree(staging)
             raise SystemExit(

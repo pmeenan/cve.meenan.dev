@@ -41,7 +41,17 @@ const TYPES = {
 
 /** Resolve a URL path under a root, refusing anything that escapes it. */
 function safeJoin(root, urlPath) {
-  const decoded = decodeURIComponent(urlPath)
+  // `decodeURIComponent('/%')` throws, and this runs inside an async request
+  // handler with nothing above it to catch — so a single stray `%` in any URL
+  // took the whole server down and every later request in the suite failed with
+  // a connection error pointing nowhere near the cause. nginx answers the same
+  // request with a 400, which is what returning null here produces.
+  let decoded
+  try {
+    decoded = decodeURIComponent(urlPath)
+  } catch {
+    return null
+  }
   if (decoded.includes('\0')) return null
   const full = resolve(join(root, normalize(decoded)))
   return full === root || full.startsWith(root + sep) ? full : null
@@ -83,6 +93,13 @@ const server = createServer(async (req, res) => {
     // D-054: unversioned files that must upgrade as a set, so they revalidate.
     // Production says exactly this; omitting it here is how the last
     // production-only cache bug stayed invisible locally (RE-012, RE-013).
+    headers['cache-control'] = 'no-cache'
+  } else if (url.pathname === '/sw.js') {
+    // The service worker script decides which *other* files may be answered
+    // from a cache, so a stale one is a stale shell that outlives its own fix
+    // (D-048, D-054). Browsers already bypass the HTTP cache for this request
+    // when `max-age` exceeds a day, but relying on that would leave a 24-hour
+    // window and depend on a behaviour we do not control.
     headers['cache-control'] = 'no-cache'
   } else if (ext === '.html') {
     headers['cache-control'] = 'no-cache, must-revalidate'

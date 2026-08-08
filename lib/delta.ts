@@ -8,11 +8,17 @@
  * and the client have drifted, and the honest response to drift is a loud
  * failure rather than a partially applied sync (D-055).
  *
- * Strictness has a versioning consequence worth stating: adding a field to the
- * wire format is a `FORMAT_VERSION` bump, because an existing client refuses
- * the unknown key rather than ignoring it. That is the trade this file makes on
- * purpose — the alternative is a client that applies half of a format it does
- * not understand.
+ * Strictness has a versioning consequence worth stating: adding a field here is
+ * a version bump, because an existing client refuses the unknown key rather
+ * than ignoring it. That is the trade this file makes on purpose — the
+ * alternative is a client that applies half of a format it does not understand.
+ * *Which* version depends on what moved. A change to the **record's columns** is
+ * a `SCHEMA_VERSION` bump, because the columns are the schema and no delta may
+ * cross a schema boundary anyway (checked below). A change to the **envelope
+ * around them** is a `FORMAT_VERSION` bump. Bumping both for one change costs
+ * the actionable message: `format` is checked first, here and in `assertUsable`,
+ * so it would mask the schema's "reload the page" with "unsupported wire
+ * format" (D-068).
  *
  * Record text is attacker-influenced (AGENTS.md rule 5), so nothing here is
  * interpolated into SQL or HTML; the values are checked and handed on as data.
@@ -26,7 +32,9 @@ import {
   type DeltaCvss,
   type DeltaEntry,
   type DeltaLookups,
+  type DeltaProduct,
   type DeltaRecord,
+  type DeltaSsvc,
   type DeltaVersion,
   type LookupTable,
 } from './protocol'
@@ -51,13 +59,20 @@ const RECORD_KEYS = [
   'cna',
   'pub',
   'upd',
+  'res',
   'cvss',
+  'ssvc',
   'descr',
+  'title',
+  'reason',
   'cwe',
   'prod',
   'ref',
   'ver',
 ] as const
+
+/** The three text columns of `cve_text`, in the order the schema declares them. */
+const TEXT_KEYS = ['descr', 'title', 'reason'] as const
 
 /**
  * Column types per lookup table, positionally — the same order as
@@ -199,6 +214,32 @@ function parseCvss(value: unknown, where: string): DeltaCvss {
   return [version, score as number | null, severity, text(columns[3], `${where}[3]`)]
 }
 
+/**
+ * The three SSVC decision points. A null is a point nobody assessed, which is a
+ * different fact from `none` (D-070) — so nulls are accepted and carried rather
+ * than coerced. All three null is refused: the emitter omits the key for that,
+ * and two spellings of one state is how a reader ends up disagreeing with a
+ * chart about how many records were assessed.
+ */
+function parseSsvc(value: unknown, where: string): DeltaSsvc {
+  const columns = tuple(value, where, 3)
+  const points = columns.map((point, index) =>
+    point === null ? null : counter(point, `${where}[${index}]`)
+  )
+  if (points.every((point) => point === null)) {
+    bad(where, 'has no decision point set — the key is omitted for that')
+  }
+  return points as DeltaSsvc
+}
+
+function parseProduct(value: unknown, where: string): DeltaProduct {
+  const columns = tuple(value, where, 2)
+  return [
+    id(columns[0], `${where}[0]`),
+    columns[1] === null ? null : counter(columns[1], `${where}[1]`),
+  ]
+}
+
 function parseVersion(value: unknown, where: string): DeltaVersion {
   const columns = tuple(value, where, 6)
   return [
@@ -227,19 +268,27 @@ function parseRecord(value: unknown, index: number): DeltaRecord {
   // one at emit time would be inventing data.
   if (raw.pub !== undefined && raw.pub !== null) out.pub = integer(raw.pub, `${where}.pub`)
   if (raw.upd !== undefined && raw.upd !== null) out.upd = integer(raw.upd, `${where}.upd`)
+  if (raw.res !== undefined && raw.res !== null) out.res = integer(raw.res, `${where}.res`)
   if (raw.cvss !== undefined && raw.cvss !== null) out.cvss = parseCvss(raw.cvss, `${where}.cvss`)
+  if (raw.ssvc !== undefined && raw.ssvc !== null) out.ssvc = parseSsvc(raw.ssvc, `${where}.ssvc`)
 
-  if (raw.descr !== undefined) {
-    const descr = text(raw.descr, `${where}.descr`)
-    // A record with no English description has no `cve_text` row at all
-    // (D-023), which the emitter expresses by omitting the key. An empty
-    // string would insert a row that says something different.
-    if (!descr) bad(`${where}.descr`, 'is empty — omit the key instead')
-    out.descr = descr
+  for (const key of TEXT_KEYS) {
+    if (raw[key] === undefined) continue
+    const value = text(raw[key], `${where}.${key}`)
+    // A record with none of the three has no `cve_text` row at all (D-023,
+    // D-070), and one with only some has NULLs in the others — which the
+    // emitter expresses by omitting the key. An empty string would store
+    // something that says neither.
+    if (!value) bad(`${where}.${key}`, 'is empty — omit the key instead')
+    out[key] = value
   }
 
   if (raw.cwe !== undefined) out.cwe = ids(raw.cwe, `${where}.cwe`)
-  if (raw.prod !== undefined) out.prod = ids(raw.prod, `${where}.prod`)
+  if (raw.prod !== undefined) {
+    out.prod = list(raw.prod, `${where}.prod`).map((row, position) =>
+      parseProduct(row, `${where}.prod[${position}]`)
+    )
+  }
   if (raw.ref !== undefined) out.ref = ids(raw.ref, `${where}.ref`)
   if (raw.ver !== undefined) {
     out.ver = list(raw.ver, `${where}.ver`).map((row, position) =>

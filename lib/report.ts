@@ -25,8 +25,14 @@
  */
 
 import {
+  CVSS_VERSIONS,
   DIMENSIONS,
   LOOKUP_AXES,
+  NOT_ASSESSED,
+  SEVERITIES,
+  SSVC_AUTO,
+  SSVC_EXPL,
+  SSVC_IMPACT,
   type Dimension,
   type Filters,
   type SortKey,
@@ -206,17 +212,26 @@ function parseFilters(value: unknown): FiltersResult {
     if (cleaned.length) filters[axis] = cleaned
   }
 
-  // Codes rather than free integers: `cvss_sev` is 0..4 and `cvss_ver` is one of
-  // four labels where 31 is v3.1 and 4 is v4.0 (D-047). An unrecognised code
-  // cannot match anything. Refusing it is safer than dropping that predicate,
-  // which would silently widen the report to every severity or version.
-  const severity = parseCodes(raw.severity, [0, 1, 2, 3, 4])
-  if (severity === null) return { ok: false, error: 'severity is not a list of severity codes' }
-  if (severity.length) filters.severity = severity
-
-  const versions = parseCodes(raw.cvssVersion, [2, 30, 31, 4])
-  if (versions === null) return { ok: false, error: 'cvssVersion is not a list of version codes' }
-  if (versions.length) filters.cvssVersion = versions
+  // Codes rather than free integers. An unrecognised code cannot match
+  // anything, and dropping the field would silently widen the report. The SSVC
+  // axes also allow `NOT_ASSESSED`, which compiles to `IS NULL` rather than a
+  // stored code (D-070).
+  const codeFilters = [
+    { key: 'severity', allowed: SEVERITIES, name: 'severity codes' },
+    { key: 'cvssVersion', allowed: CVSS_VERSIONS, name: 'version codes' },
+    { key: 'ssvcExpl', allowed: [...SSVC_EXPL, NOT_ASSESSED], name: 'SSVC exploitation codes' },
+    { key: 'ssvcAuto', allowed: [...SSVC_AUTO, NOT_ASSESSED], name: 'SSVC automatable codes' },
+    {
+      key: 'ssvcImpact',
+      allowed: [...SSVC_IMPACT, NOT_ASSESSED],
+      name: 'SSVC technical-impact codes',
+    },
+  ] as const
+  for (const { key, allowed, name } of codeFilters) {
+    const codes = parseCodes(raw[key], allowed)
+    if (codes === null) return { ok: false, error: `${key} is not a list of ${name}` }
+    if (codes.length) filters[key] = codes
+  }
 
   for (const key of [
     'scoreMin',
@@ -241,7 +256,7 @@ function parseFilters(value: unknown): FiltersResult {
 }
 
 /** A list of allowlisted codes, or `null` if the list or any member is invalid. */
-function parseCodes(value: unknown, allowed: number[]): number[] | null {
+function parseCodes(value: unknown, allowed: readonly number[]): number[] | null {
   if (value === undefined) return []
   if (!Array.isArray(value)) return null
   if (value.some((code) => typeof code !== 'number' || !allowed.includes(code))) return null

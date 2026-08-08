@@ -10,3 +10,7 @@ pnpm-lock.yaml
 
 # Generated data artifacts.
 pipeline/pub/
+
+# The service worker template carries `__PRECACHE__` where an array literal
+# goes, so it is not valid JavaScript until `scripts/build-sw.mjs` fills it in.
+scripts/sw.template.js

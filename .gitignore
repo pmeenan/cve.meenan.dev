@@ -11,6 +11,13 @@ __pycache__/
 .venv/
 public/sqlite/
 pipeline/pub/
+# The pre-bump generation `tests/e2e/bump.spec.ts` compares against — a real
+# schema-1 data plane, kept beside the schema-2 one so an old client can be
+# pointed at a new plane for real rather than in a rehearsal. Generated, like
+# `pub/`; the spec skips itself when it is absent, and the README says how to
+# rebuild one.
+pipeline/pub-schema1/
 # The publication ledger sits beside the published directory by design, which
 # for a local `pipeline/pub` means here (pipeline/ledger.py).
 pipeline/published.json
+pipeline/published-schema1.json

@@ -214,7 +214,16 @@ document root and of `cve.data/`, so nothing under `cve.data/` is web-reachable
 | `manifest.json` | `no-cache` | The only mutable file. Lists everything else with byte length and SHA-256. |
 | `snapshot-<rev>/NNN.br` | immutable | 12 chunks, ~5.2 MB each, **62.7 MB** total, each expanding to a 32 MB slice of the 376.7 MB database (D-041). Measured on the first published generation, 2026-08-01. |
 | `deltas/<from>-<to>.json.br` | immutable | One per day; consecutive revisions tile the space by construction (D-042). Retained back to the previous generation, so most of them start below `snapshot.rev` (D-060). |
-| `kev.json` | short | CISA KEV, its own freshness (D-010). |
+| `kev.json` | short — **not yet true** | CISA KEV, its own freshness (D-010). |
+
+`kev.json`'s row is a statement of intent, not of the deployed configuration,
+and M6 has to close the gap before it publishes one. The block below has exactly
+two locations: an exact match for `/data/manifest.json` at `no-cache`, and
+`^~ /data/` stamping `immutable` on everything else. So the first KEV catalog
+published would be pinned for a year at the edge and in every browser that
+fetched it, under an unversioned URL — a frozen known-exploited set shown beside
+a freshness claim. It needs its own `location = /data/kev.json`, exactly as the
+manifest has one (found by M5's data-plane review).
 
 ### Assets the export ships but never loads
 
@@ -232,6 +241,12 @@ response is the kind of thing that wastes an afternoon during the *next*
 investigation. Trimming `copy-wasm.mjs` to the three files the client requests
 (`index.mjs`, `sqlite3.wasm`, `sqlite3-opfs-async-proxy.js`) is the obvious fix
 and is unclaimed.
+
+M5's service worker re-confirmed the `.ts` half independently, and by
+experiment rather than by trace: deleting `db.worker.<hash>.ts` from `dist/`
+and loading the app changes nothing. That is what makes it safe for the shell's
+precache list to skip it — the list is an extension allowlist, and `.ts` is not
+on it.
 
 ### The nginx block, as deployed
 
@@ -284,6 +299,23 @@ Five things about it are load-bearing rather than stylistic:
   same-origin control (D-034). No `brotli_static`, because artifacts are opaque
   `.br` the client decodes itself and an added `Content-Encoding` would corrupt
   that path (D-040). No `limit_conn`/`limit_rate` (D-039).
+
+**One location is still owner-applied and outstanding (M5).** The offline app
+shell's worker (D-048) is served from the document root as `/sw.js`, where the
+site's general `expires max` static-file rule would apply to it. That worker
+decides which *other* files may be answered from a cache, so a stale one is a
+stale shell that outlives its own fix — the failure D-054 exists to prevent,
+reintroduced one level up. Browsers already bypass the HTTP cache for this
+request when `max-age` exceeds a day, but that leaves a 24-hour window and
+depends on a behaviour we do not control. `scripts/serve.mjs` already sends
+`no-cache` here, which is the local server matching production rather than being
+more permissive than it (RE-012's rule):
+
+```nginx
+location = /sw.js {
+    add_header Cache-Control "no-cache";
+}
+```
 
 The manifest carries `format`, `schema`, the head `rev`, the snapshot (with its
 own `rev`), and the list of delta files, each with its byte lengths and SHA-256.
@@ -479,10 +511,46 @@ hand its id to a different value (D-056).
   work blocks the Worker thread, so every long synchronous step beats when it
   returns, and the watch is disarmed before the index build entirely.
 - **Capability gate before the import path**, so an unsupported browser is told
-  on arrival rather than failing partway through a large import (D-016).
+  on arrival rather than failing partway through a large import (D-016). The
+  probe that matters *calls* a method rather than looking for one: Safari
+  15.2–16.3 ships `createSyncAccessHandle` and returns Promises from the
+  handle's methods, which SQLite calls synchronously — so every interface check
+  passes and the import dies inside WASM. `lib/capabilities.ts` opens a scratch
+  OPFS file, reads what `getSize()` returns, and removes it. There is no
+  telemetry (D-009), so whatever the gate says on screen is the whole support
+  channel: it names the specific missing capability *and* the floor, because
+  "why does this not work" and "what do I do" are different questions and a
+  stripped COOP header is a fixable case that has nothing to do with the
+  browser.
 - **Storage sized in advance.** Quota, eviction, and
   `navigator.storage.persist()` are part of the import design, not error
-  handling bolted on later.
+  handling bolted on later. Persistence is requested from the Download click —
+  Firefox prompts, and a prompt outside a user gesture is dismissed — and the
+  *answer* is what gets surfaced. The preflight runs after the manifest and
+  before the first chunk, and budgets **two generations** when a copy is already
+  present, because staged replacement holds both at once (D-061). An unknown
+  quota proceeds: refusing on "I don't know" would block every browser that
+  reports nothing, and the download then fails the way it always could, with the
+  live copy intact.
+- **One writer across tabs, and replacements propagate** (M5). Download and sync
+  take a Web Lock for their whole duration, `ifAvailable` rather than queued — a
+  download that starts twenty minutes later, after the user has moved on, is
+  worse than being told now — and the refused tab is told *which* operation is
+  running and keeps querying. The silent half is the other one: a tab that did
+  not perform a replacement is left holding the slot that was promoted *over*,
+  answering correctly from a generation nobody else can see. A promotion is
+  therefore announced on a `BroadcastChannel` and the other tabs close and
+  re-discover; an applied delta is announced too, so freshness lines agree. This
+  is affordable only because D-051 chose the `opfs` VFS, where a second tab can
+  open the same database at all.
+- **The app shell is cached; the data plane never is** (D-048). A hand-rolled
+  service worker, generated from the finished export so its precache list cannot
+  drift from the chunk names Turbopack emits, and versioned by a hash of that
+  list plus every file's contents — which is what "versioned per deploy" means
+  with no build step on the server (D-003). `/data/` is not merely absent from
+  the list: the worker returns without calling `respondWith` for it, so no later
+  branch can reach one of those URLs. A stale manifest from a cache would break
+  the staleness indicator, which is the one guard vision criterion 7 has.
 - **Staleness is visible** (D-064). Sync is manual after the first one (D-025)
   — a download catches itself up, and after that the user chooses when — so a
   user can sit on a month-old corpus getting confident-looking counts. The
@@ -537,9 +605,12 @@ built — these are the structural commitments:
 
 ## Schema
 
-The floor is D-024; version ranges, references and reference hosts were added by
-D-033 after pricing every candidate. Interning is server-side, so the published
-artifact carries no `UNIQUE` constraints that exist only to support it.
+**Schema 2** since 2026-08-08. The floor is D-024; version ranges, references
+and reference hosts were added by D-033 after pricing every candidate, and
+D-070's five fields landed before public launch because a bump after it costs
+every user a 63 MB re-download (D-075). Interning is server-side, so the
+published artifact carries no `UNIQUE` constraints that exist only to support
+it.
 
 ```sql
 -- interned lookups: server-owned ID space, append-only, never renumbered.
@@ -554,14 +625,22 @@ CREATE TABLE host(id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE url(id INTEGER PRIMARY KEY, url TEXT, host_id INT);
 CREATE TABLE vtype(id INTEGER PRIMARY KEY, name TEXT);
 
+-- reserved / ssvc_* are schema 2 (D-070). NULL there means *not assessed*,
+-- which is a different fact from `ssvc_expl = 0` ("none" — someone looked).
 CREATE TABLE cve(id INTEGER PRIMARY KEY, cve_id TEXT UNIQUE, year INT, state INT,
   cna_id INT, published INT, updated INT,
-  cvss_ver INT, cvss_score REAL, cvss_sev INT, cvss_vec TEXT);
-CREATE TABLE cve_text(cve_id INTEGER PRIMARY KEY, descr TEXT);
+  cvss_ver INT, cvss_score REAL, cvss_sev INT, cvss_vec TEXT,
+  reserved INT, ssvc_expl INT, ssvc_auto INT, ssvc_impact INT);
+-- A row exists if the record has *any* of the three. 17,842 REJECTED records
+-- have only `reason`, which is why they rendered blank before schema 2.
+CREATE TABLE cve_text(cve_id INTEGER PRIMARY KEY, descr TEXT, title TEXT, reason TEXT);
 
 CREATE TABLE cve_cwe (cve_id INT, cwe_id     INT, PRIMARY KEY(cve_id,cwe_id))     WITHOUT ROWID;
-CREATE TABLE cve_prod(cve_id INT, product_id INT, PRIMARY KEY(cve_id,product_id)) WITHOUT ROWID;
 CREATE TABLE cve_ref (cve_id INT, url_id     INT, PRIMARY KEY(cve_id,url_id))     WITHOUT ROWID;
+-- default_status: the container default governing every version *not* listed in
+-- cve_ver, in cve_ver.status's vocabulary (1/2/3), NULL when unstated (D-070).
+CREATE TABLE cve_prod(cve_id INT, product_id INT, default_status INT,
+  PRIMARY KEY(cve_id,product_id)) WITHOUT ROWID;
 CREATE TABLE cve_ver(cve_id INT, product_id INT, status INT,
   version TEXT, lt TEXT, lte TEXT, vtype INT);
 
@@ -571,7 +650,10 @@ CREATE TABLE cve_ver(cve_id INT, product_id INT, status INT,
 CREATE TABLE meta(k TEXT PRIMARY KEY, v);
 
 -- built by the client after import, never shipped (D-035)
-CREATE VIRTUAL TABLE fts         USING fts5(descr, content='cve_text', content_rowid='cve_id');
+-- descr *and* title: 83.3% of titled records have a title that is not a
+-- substring of their own description, and the title is where the vulnerability
+-- class and the sink live (D-075)
+CREATE VIRTUAL TABLE fts         USING fts5(descr, title, content='cve_text', content_rowid='cve_id');
 CREATE VIRTUAL TABLE fts_vendor  USING fts5(name,  content='vendor',   content_rowid='id');
 CREATE VIRTUAL TABLE fts_product USING fts5(name,  content='product',  content_rowid='id');
 
@@ -598,6 +680,10 @@ Three properties are load-bearing rather than stylistic:
 Indexes: `cve(year)`, `cve(cna_id)`, `cve(cvss_score)`, `cve(published)`,
 `cve_cwe(cwe_id,cve_id)`, `cve_prod(product_id,cve_id)`, `cve_ref(url_id,cve_id)`,
 `cve_ver(cve_id)`, `cve_ver(product_id)`, `product(vendor_id)`, `url(host_id)`.
+None on `cvss_sev` and none on the three SSVC columns: they are low-cardinality
+codes on the corpus table, so every grouping over them scans `cve` whichever way
+it is written, and an index would cost download bytes for every user to save
+none of them (D-033's trade, restated in D-075).
 
 ## Trust boundaries
 

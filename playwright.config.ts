@@ -32,7 +32,15 @@ export default defineConfig({
     baseURL: remote ?? 'http://127.0.0.1:4747',
     trace: 'on-first-retry',
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  // Three engines since M5 (D-016, rule 3): a support claim is a measurement
+  // claim, and every milestone's numbers up to M4 were Chromium-only. The
+  // Chromium project stays first so `--project=chromium` is the fast loop; a
+  // bare `pnpm e2e` runs all three, which is the point.
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+    { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
+    { name: 'webkit', use: { ...devices['Desktop Safari'] } },
+  ],
   webServer: remote
     ? undefined
     : {
@@ -43,7 +51,12 @@ export default defineConfig({
         // hypothetical — it cost an M3 debugging session, where a new
         // `data-run` attribute was "missing" because the export predated it
         // (RE-015). Turbopack rebuilds this project in a few seconds.
-        command: 'npx next build && node scripts/serve.mjs',
+        // `pnpm build`, not `npx next build`: the pre/post hooks are what
+        // copy the SQLite distribution into `public/` and generate the
+        // service worker from the finished export (D-048). `npx` skips both,
+        // and the symptom is an offline test that fails against an export
+        // with no `sw.js` in it.
+        command: 'pnpm build && node scripts/serve.mjs',
         url: 'http://127.0.0.1:4747/',
         // Never reuse someone else's server for a measurement run: `pnpm measure`
         // passes SERVE_DATA_ROOT to select the full artifact, and a server already

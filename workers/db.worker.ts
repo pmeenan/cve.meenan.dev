@@ -29,6 +29,7 @@ import {
   QUERY_QUIET_MS,
   QUERY_REPORT_MS,
 } from '../lib/cancel'
+import { assess, gateMessage, probeSyncAccess, type CapabilityReport } from '../lib/capabilities'
 import { parseDelta } from '../lib/delta'
 import {
   countSql,
@@ -74,6 +75,21 @@ import {
   type SearchIndex,
 } from '../lib/search'
 import { stallError, stallTimeout, watchForStalls, type StallWatch } from '../lib/stall'
+import {
+  busyMessage,
+  parseTabMessage,
+  TAB_CHANNEL,
+  WRITER_LOCK,
+  type TabMessage,
+  type WriterOp,
+} from '../lib/tabs'
+import {
+  limitFreeSpace,
+  planSpace,
+  readStorage,
+  spaceMessage,
+  type StorageReport,
+} from '../lib/storage'
 import { applyDelta, type SyncDb } from '../lib/sync'
 import {
   assertLocallyUsable,
@@ -182,6 +198,183 @@ async function opfsRoot(): Promise<FileSystemDirectoryHandle> {
   return navigator.storage.getDirectory()
 }
 
+/**
+ * The capability verdict, probed once and remembered (M5, D-016).
+ *
+ * Once, because the probe creates and removes a scratch OPFS entry and nothing
+ * it asks about can change within a session — a browser does not grow
+ * synchronous access handles between two clicks. The *storage* half is re-read
+ * every time, because that changes constantly.
+ */
+let capabilities: CapabilityReport | null = null
+
+/** Whether the remembered verdict rests on a probe that actually ran. */
+let definite = false
+
+/**
+ * A forced probe verdict (`ImportOptions.probe`), or null for the real one.
+ *
+ * Session state for the same reason `sessionSchema` is: `environment()` is
+ * reached from paths that have no options in hand, and threading a diagnostic
+ * knob through them would put it in the middle of the crash-safety code.
+ */
+let sessionProbe: 'async' | 'unavailable' | null = null
+
+/**
+ * What this browser can do, and how much room it has.
+ *
+ * Runs before anything is fetched: a gate that fires after the download has
+ * started is a gate that has already cost the user the thing it exists to
+ * prevent. The OPFS handle is taken defensively — a browser with no OPFS at all
+ * throws here, and that is one of the answers rather than a crash.
+ */
+async function environment(): Promise<{
+  capabilities: CapabilityReport
+  storage: StorageReport
+}> {
+  // Re-probed while the answer is *indefinite*. A probe that could not run —
+  // OPFS momentarily unavailable, a scratch file that would not open — is not
+  // evidence about the browser, and caching it would brick the session on a
+  // transient failure with no way back but a reload. A definite answer, `sync`
+  // or `async`, cannot change within a session and is remembered.
+  if (capabilities && !definite) capabilities = null
+  if (!capabilities) {
+    let root: FileSystemDirectoryHandle | null = null
+    try {
+      root = await opfsRoot()
+    } catch {
+      root = null
+    }
+    const probed = sessionProbe ?? (await probeSyncAccess(root))
+    capabilities = assess({
+      crossOriginIsolated: typeof crossOriginIsolated === 'boolean' ? crossOriginIsolated : false,
+      hasWasm: typeof WebAssembly === 'object' && typeof WebAssembly.instantiate === 'function',
+      hasSharedArrayBuffer: typeof SharedArrayBuffer === 'function',
+      hasOpfs: root !== null,
+      hasStreams: typeof ReadableStream === 'function',
+      // The check the naive interface test cannot make: Safari 15.2–16.3 has
+      // `createSyncAccessHandle` and returns Promises from the handle's
+      // methods, which SQLite calls synchronously (D-016). `sessionProbe` can
+      // only substitute a *worse* answer (`ImportOptions.probe`).
+      syncAccess: probed,
+    })
+    definite = probed === 'sync' || probed === 'async'
+  }
+  return { capabilities, storage: await readStorage(navigator.storage) }
+}
+
+/** The gate, applied where it matters: before a transfer, not after one. */
+async function assertSupported(): Promise<void> {
+  const { capabilities: report } = await environment()
+  if (!report.supported) throw new Error(gateMessage(report))
+}
+
+// --- Multi-tab (M5, lib/tabs.ts) -----------------------------------------
+
+/**
+ * The channel this tab shares with every other tab of this origin.
+ *
+ * Created lazily and tolerantly: `BroadcastChannel` is at the D-016 floor
+ * everywhere, but a Worker that failed to construct one must still be able to
+ * download — losing multi-tab coordination costs a stale second tab, and
+ * throwing here would cost the corpus.
+ */
+let tabs: BroadcastChannel | null = null
+try {
+  tabs = typeof BroadcastChannel === 'function' ? new BroadcastChannel(TAB_CHANNEL) : null
+} catch {
+  tabs = null
+}
+
+/** What another tab last said it was doing, for the message a blocked tab shows. */
+let othersDoing: WriterOp | null = null
+
+function announce(message: TabMessage): void {
+  try {
+    tabs?.postMessage(message)
+  } catch {
+    /* A channel that will not carry an announcement is not a reason to fail an
+       operation that has already succeeded. */
+  }
+}
+
+if (tabs) {
+  tabs.onmessage = (event: MessageEvent) => {
+    const message = parseTabMessage(event.data)
+    if (!message) return
+    if (message.type === 'writer') {
+      othersDoing = message.state === 'start' ? message.op : null
+      return
+    }
+    // Both of the others change what this tab's *own* database says, so they go
+    // through the same serialized queue as a request: acting on one while a
+    // query is running would close the connection under it.
+    queue = queue.then(() => adoptOtherTabsWork(message).catch(() => undefined))
+  }
+}
+
+/**
+ * Catch up with a write another tab performed.
+ *
+ * A **promotion** is the case that cannot be ignored: the live database is a
+ * different OPFS entry now, and this tab is holding the one that was promoted
+ * *over*. It would keep answering, correctly, from a generation nobody else can
+ * see. Closing and re-running discovery is the whole fix — `status` reopens
+ * whichever slot now carries the highest promotion counter (D-061).
+ *
+ * A **sync** wrote to the file this tab already has open. SQLite's own locking
+ * makes the new rows visible to the next read transaction, so nothing has to be
+ * reopened; what has to happen is that this tab's revision and freshness line
+ * stop disagreeing with the tab next to it, which is what re-running `status`
+ * does.
+ */
+async function adoptOtherTabsWork(message: TabMessage): Promise<void> {
+  if (message.type === 'promoted') {
+    db?.close()
+    db = null
+    liveFile = null
+  }
+  await status()
+}
+
+/**
+ * Run a write operation as the only writer, or refuse and say who is writing.
+ *
+ * `ifAvailable` rather than waiting: a queued download that begins twenty
+ * minutes later, when the user has moved on, is worse than being told now. The
+ * lock is held for the *whole* operation — including the promotion at the end
+ * of a download — because the window that matters is the one where two tabs
+ * disagree about which file is live.
+ *
+ * Where Web Locks are unavailable the operation simply runs. That is the
+ * pre-M5 behaviour, and it is honest: the alternative is refusing to work at
+ * all on a browser whose only failing is that its user might open a second tab.
+ */
+async function asWriter(op: WriterOp, work: () => Promise<void>): Promise<void> {
+  const locks = navigator.locks
+  if (!locks || typeof locks.request !== 'function') {
+    announce({ type: 'writer', op, state: 'start' })
+    try {
+      await work()
+    } finally {
+      announce({ type: 'writer', op, state: 'end' })
+    }
+    return
+  }
+  let ran = false
+  await locks.request(WRITER_LOCK, { ifAvailable: true }, async (lock) => {
+    if (!lock) return
+    ran = true
+    announce({ type: 'writer', op, state: 'start' })
+    try {
+      await work()
+    } finally {
+      announce({ type: 'writer', op, state: 'end' })
+    }
+  })
+  if (!ran) throw new Error(busyMessage(othersDoing))
+}
+
 /** Hex SHA-256, so a corrupted chunk costs one refetch rather than the download. */
 async function digest(bytes: Uint8Array): Promise<string> {
   const buffer = await crypto.subtle.digest('SHA-256', bytes as BufferSource)
@@ -231,7 +424,14 @@ async function fetchManifest(
   signal?: AbortSignal,
   beat: () => void = () => undefined
 ): Promise<Manifest> {
-  const response = await fetch(manifestUrl(), { cache: 'no-cache', signal })
+  // `no-store`, not `no-cache`. `no-cache` means *revalidate*, and with no
+  // network there is nothing to revalidate against — Firefox then serves the
+  // stale manifest from its HTTP cache and a sync attempted offline reports
+  // "already current" instead of failing. That is the exact confusion D-048
+  // keeps the service worker away from `/data/` to prevent, arriving one layer
+  // lower. `no-store` makes the freshness signal a network request or nothing,
+  // which is what it is for; the file is a few kilobytes.
+  const response = await fetch(manifestUrl(), { cache: 'no-store', signal })
   if (!response.ok) throw new Error(`manifest: HTTP ${response.status}`)
   const manifest = await readManifest(response, beat)
   // The schema this session speaks, so a bump can be exercised before it
@@ -870,9 +1070,15 @@ async function runImport(
   const vfs = options.vfs ?? DEFAULT_VFS
   const cacheMib = clamp(options.cacheMib, DEFAULT_CACHE_MIB, MAX_CACHE_MIB)
 
+  // Before the manifest, before anything: a browser that cannot run the import
+  // must be told at the gate rather than tens of seconds and hundreds of
+  // megabytes in, which is where the naive interface check leaves it (D-016).
+  await assertSupported()
+
   report('manifest', null, 'Reading manifest')
   const manifest = await fetchManifest(transfers.signal, () => watch.beat())
   const { chunks, raw_bytes: rawBytes } = manifest.snapshot
+
   const compressedTotal = chunks.reduce((sum, c) => sum + c.bytes, 0)
   // `clamp` substitutes its fallback for anything below 1, so zero and negatives
   // are filtered out here instead: "stop after 0 chunks" means "do not stop".
@@ -924,6 +1130,7 @@ async function runImport(
     // destroy-then-download behaviour and exists only so `pnpm measure` can
     // re-run Q-004; nothing selects it by default, and the plan's replacement
     // guarantees are deliberately not claimed for it.
+    await assertImportSpace(rawBytes, options)
     db?.close()
     db = null
     liveFile = null
@@ -933,7 +1140,7 @@ async function runImport(
     report('download', 0, `0 / ${chunks.length} chunks`)
     writeMs = await importThroughSahPool(makePull(chunks, 0))
     watch.stop()
-    report('verify', null, `Opening database — ${capabilities()}`)
+    report('verify', null, `Opening database — ${sqliteBuild()}`)
     const openStart = performance.now()
     staged = await openDatabase('opfs-sahpool', POOL_DB_FILE, cacheMib)
     openMs = performance.now() - openStart
@@ -972,6 +1179,12 @@ async function runImport(
     // always matches, because the file is truncated to it before the first
     // chunk lands.
     const size = await entrySize(root, stagedFile)
+    // The chosen slot is exactly where this run writes. Its current allocation
+    // is already included in storage `usage`, whether its resume bitmap is
+    // usable or it will be overwritten, so charge only for the rest of the
+    // imported footprint. Capped at rawBytes because a stale indexed database
+    // is truncated back to the artifact length before new chunks land.
+    await assertImportSpace(rawBytes, options, Math.min(size ?? 0, rawBytes))
     // Once every chunk has landed, the client builds its indexes *into* this
     // file (D-035), so it legitimately grows past `rawBytes` — an exact-length
     // test there would discard a complete download after a crash in the index
@@ -1023,7 +1236,7 @@ async function runImport(
     // through it would mean the first tick afterwards measuring the build and
     // reporting a stall that never happened.
     watch.stop()
-    report('verify', null, `Verifying the staged copy — ${capabilities()}`)
+    report('verify', null, `Verifying the staged copy — ${sqliteBuild()}`)
     const openStart = performance.now()
     // Not 'c': on this path the file must already exist, and creating one turns
     // "the staging file is gone" into an empty database that fails later under
@@ -1068,6 +1281,11 @@ async function runImport(
   db = staged
   liveFile = stagedFile
   if (stagedFile !== null) {
+    // Announced *before* the sweep, and before this tab does anything else with
+    // it: another tab is still holding the slot this download promoted over,
+    // and until it lets go the sweep cannot reclaim that slot and the tab is
+    // answering from a generation nobody else can see (lib/tabs.ts).
+    announce({ type: 'promoted', rev: localRevision(staged) })
     // Everything below has already succeeded — the new database is promoted and
     // is what the user queries — so a failure here must not be reported as a
     // failed import. Closing the old connection first is the one ordering that
@@ -1108,6 +1326,22 @@ async function runImport(
     chunksFetched: fetched,
     overallStart,
   })
+}
+
+/** Refuse a demonstrably doomed import before its first snapshot chunk. */
+async function assertImportSpace(
+  rawBytes: number,
+  options: ImportOptions,
+  reusableBytes = 0
+): Promise<void> {
+  const reported = await readStorage(navigator.storage)
+  // `freeBytes` substitutes a *smaller* free figure and nothing else, so the
+  // refusal can be seen without filling a disk (RE-020).
+  const pretend = Math.trunc(Number(options.freeBytes))
+  const storage =
+    Number.isFinite(pretend) && pretend >= 0 ? limitFreeSpace(reported, pretend) : reported
+  const space = planSpace(rawBytes, storage, reusableBytes)
+  if (!space.fits) throw new Error(spaceMessage(space))
 }
 
 /**
@@ -1435,9 +1669,21 @@ async function syncToHead(options: ImportOptions = {}): Promise<void> {
       : `revision ${outcome.to} — ${outcome.upserts.toLocaleString()} records updated`
   )
   post({ type: 'synced', outcome })
+  if (outcome.applied > 0) {
+    // Only when something actually applied. A sync that found nothing to do
+    // changed no other tab's answer, and announcing it would make every tab
+    // re-run discovery for a no-op (lib/tabs.ts).
+    announce({ type: 'synced', rev: outcome.to, generated: localGenerated(db) })
+  }
   // The revision, the timestamp and the record counts on screen all just
   // changed; status is what the page reads them from.
   await status()
+}
+
+/** `meta.generated` of an open copy — the stamp the freshness line reads. */
+function localGenerated(database: Database): number | null {
+  const value = database.selectValue("SELECT v FROM meta WHERE k = 'generated'")
+  return typeof value === 'number' ? value : null
 }
 
 /** Run the benchmark set (Q-003's query-latency budgets) in declaration order. */
@@ -1473,9 +1719,10 @@ function benchAll(): void {
   post({ type: 'bench', results, wasmHeapBytes: sqlite3?.config.memory.buffer.byteLength ?? 0 })
 }
 
-/** What the build actually offers, reported rather than assumed (D-009 means
- * the diagnostics panel is the only support channel we get). */
-function capabilities(): string {
+/** What the SQLite build actually offers, reported rather than assumed (D-009
+ * means the diagnostics panel is the only support channel we get). Distinct
+ * from `environment()` above, which is about the *browser*. */
+function sqliteBuild(): string {
   if (!sqlite3) return 'sqlite3 not initialised'
   const oo1 = sqlite3.oo1 as Record<string, unknown>
   const vfs = sqlite3.capi.sqlite3_vfs_find('opfs')
@@ -2288,6 +2535,17 @@ function num(value: unknown): number | null {
 }
 
 /**
+ * A nullable text column, keeping NULL distinct from `''`.
+ *
+ * The difference is the whole point of three of D-070's five fields: "this
+ * record has no title" and "this record's title is the empty string" would
+ * render identically as `''`, and only the first is true.
+ */
+function nullableText(value: unknown): string | null {
+  return value === null || value === undefined ? null : text(value)
+}
+
+/**
  * One record in full (M4).
  *
  * Five queries rather than one join, each bounded (lib/detail.ts). A record
@@ -2340,13 +2598,22 @@ function detail(cveId: string): void {
         cna: row[9] === null ? null : text(row[9]),
         // Kept as null rather than '': a record with no English description is
         // a fact the UI has to state, and an empty string would render as a
-        // blank box indistinguishable from a layout bug (D-023).
-        description: row[10] === null || row[10] === undefined ? null : text(row[10]),
+        // blank box indistinguishable from a layout bug (D-023). The same holds
+        // for the three below, where null additionally means something specific
+        // — "nobody assessed this" rather than a code (D-070).
+        description: nullableText(row[10]),
+        title: nullableText(row[11]),
+        reason: nullableText(row[12]),
+        reserved: num(row[13]),
+        ssvcExpl: num(row[14]),
+        ssvcAuto: num(row[15]),
+        ssvcImpact: num(row[16]),
       },
       cwes: cwes.rows.map((entry) => ({ cwe: text(entry[0]), descr: text(entry[1]) })),
       products: products.rows.map((entry) => ({
         vendor: text(entry[0]),
         product: text(entry[1]),
+        defaultStatus: num(entry[2]),
       })),
       versions: versions.rows.map((entry): DetailVersion => ({
         vendor: text(entry[0]),
@@ -2356,6 +2623,7 @@ function detail(cveId: string): void {
         lt: entry[4] === null ? null : text(entry[4]),
         lte: entry[5] === null ? null : text(entry[5]),
         vtype: entry[6] === null ? null : text(entry[6]),
+        defaultStatus: num(entry[7]),
       })),
       references: references.rows.map((entry): DetailReference => ({
         url: text(entry[0]),
@@ -2656,9 +2924,20 @@ async function handle(request: Request): Promise<void> {
     // Every request that carries options sets the session's schema version
     // first, because discovery reads it from module state rather than taking it
     // as an argument through the crash-safety path (see `sessionSchema`).
-    if ('options' in request) sessionSchema = speaks(request.options)
+    if ('options' in request) {
+      sessionSchema = speaks(request.options)
+      const forced = request.options?.probe
+      const next = forced === 'async' || forced === 'unavailable' ? forced : null
+      // Re-probe when the knob changes, or a reload with `?probe=` would be
+      // answered from the verdict cached before it was set.
+      if (next !== sessionProbe) capabilities = null
+      sessionProbe = next
+    }
     switch (request.type) {
       case 'status':
+        // The gate's verdict rides alongside the first thing the page asks
+        // for, so it is on screen before the Download button can be pressed.
+        post({ type: 'environment', ...(await environment()) })
         await status()
         break
       case 'control':
@@ -2671,17 +2950,23 @@ async function handle(request: Request): Promise<void> {
         sessionSchema = speaks(request.options)
         break
       case 'import':
-        await importSnapshot(request.options)
-        // Not a separate step the user has to know about: the snapshot is
-        // published at its own revision and the head moves on daily (D-058), so
-        // a download that stopped at `snapshot.rev` would be stale the moment
-        // it finished. `imported` has already been posted by the time this
-        // runs, so a catch-up that fails reports itself without retracting a
-        // download that succeeded.
-        await syncToHead(request.options)
+        // One writer at a time, across tabs (M5). The lock covers the catch-up
+        // too: they are one operation from the user's point of view, and
+        // releasing between them would let another tab's sync land against a
+        // database this one is about to promote over.
+        await asWriter('download', async () => {
+          await importSnapshot(request.options)
+          // Not a separate step the user has to know about: the snapshot is
+          // published at its own revision and the head moves on daily (D-058),
+          // so a download that stopped at `snapshot.rev` would be stale the
+          // moment it finished. `imported` has already been posted by the time
+          // this runs, so a catch-up that fails reports itself without
+          // retracting a download that succeeded.
+          await syncToHead(request.options)
+        })
         break
       case 'sync':
-        await syncToHead(request.options)
+        await asWriter('sync', () => syncToHead(request.options))
         break
       case 'query':
         query(request.sql)
@@ -2704,8 +2989,16 @@ async function handle(request: Request): Promise<void> {
       case 'bench':
         bench()
         break
+      case 'probe':
+        post({ type: 'environment', ...(await environment()) })
+        break
       case 'reset':
-        await reset()
+        // A writer like the other two: `clearStorage` deletes every OPFS entry
+        // this app owns, and doing that while another tab is mid-download meant
+        // deleting the live copy, failing on the staging slot the downloader
+        // holds open, telling the user the clear failed — and then watching the
+        // downloader promote a full corpus anyway (M5's data-plane review).
+        await asWriter('reset', () => reset())
         break
     }
   } catch (error) {

@@ -47,10 +47,13 @@ function payload(overrides: Record<string, unknown> = {}): Record<string, unknow
         cna: 1,
         pub: 1_767_000_000,
         upd: 1_767_100_000,
+        res: 1_766_900_000,
         cvss: [31, 7.5, 3, 'CVSS:3.1/AV:N/AC:L'],
+        ssvc: [1, 0, 1],
         descr: 'Heap overflow in <script>alert(1)</script>',
+        title: 'Widget heap overflow',
         cwe: [2],
-        prod: [1],
+        prod: [[1, 1]],
         ref: [4],
         ver: [[1, 1, '1.0', '2.0', null, 1]],
       },
@@ -72,6 +75,10 @@ describe('parseDelta', () => {
     expect(parsed.to).toBe(2)
     expect(parsed.lookups.url[0]).toEqual([4, 'javascript:alert(1)', 3])
     expect(parsed.upsert[0]!.cvss).toEqual([31, 7.5, 3, 'CVSS:3.1/AV:N/AC:L'])
+    expect(parsed.upsert[0]!.ssvc).toEqual([1, 0, 1])
+    expect(parsed.upsert[0]!.prod).toEqual([[1, 1]])
+    expect(parsed.upsert[0]!.title).toBe('Widget heap overflow')
+    expect(parsed.upsert[0]!.res).toBe(1_766_900_000)
     expect(parsed.upsert[0]!.ver).toEqual([[1, 1, '1.0', '2.0', null, 1]])
     expect(parsed.delete).toEqual(['CVE-2026-9999'])
   })
@@ -79,17 +86,25 @@ describe('parseDelta', () => {
   it('leaves an omitted section omitted rather than inventing an empty one', () => {
     const sparse = record({
       descr: undefined,
+      title: undefined,
       cwe: undefined,
       ref: undefined,
       ver: undefined,
       cvss: undefined,
+      ssvc: undefined,
+      res: undefined,
       upd: undefined,
     })
     const parsed = parseDelta(sparse, entry())
     const first = parsed.upsert[0]!
     expect(first.descr).toBeUndefined()
+    expect(first.title).toBeUndefined()
     expect(first.cwe).toBeUndefined()
     expect(first.cvss).toBeUndefined()
+    // The absence of an SSVC assessment, which is half the corpus (D-070) and
+    // must not arrive as three zeroes.
+    expect(first.ssvc).toBeUndefined()
+    expect(first.res).toBeUndefined()
     // Absent means absent: apply deletes the record's dependent rows and
     // inserts only what is here, so an invented [] and a missing key would
     // mean the same thing — but an invented "" description would not.
@@ -97,9 +112,13 @@ describe('parseDelta', () => {
   })
 
   it('accepts explicit nulls for the columns the schema allows to be null', () => {
-    const parsed = parseDelta(record({ cna: null, pub: null, upd: null, cvss: null }), entry())
+    const parsed = parseDelta(
+      record({ cna: null, pub: null, upd: null, res: null, cvss: null, ssvc: null }),
+      entry()
+    )
     expect(parsed.upsert[0]!.cna).toBeUndefined()
     expect(parsed.upsert[0]!.pub).toBeUndefined()
+    expect(parsed.upsert[0]!.ssvc).toBeUndefined()
   })
 
   it('carries a pre-1970 timestamp rather than clamping it', () => {
@@ -112,7 +131,9 @@ describe('parseDelta', () => {
   })
 
   it('refuses a schema mismatch, since deltas cannot bridge one', () => {
-    expect(() => parseDelta(payload({ schema: 2 }), entry())).toThrow(/re-download/)
+    expect(() => parseDelta(payload({ schema: SCHEMA_VERSION + 1 }), entry())).toThrow(
+      /re-download/
+    )
   })
 
   it('refuses a delta that is not the one the manifest named', () => {
@@ -131,8 +152,27 @@ describe('parseDelta', () => {
     expect(() => parseDelta(record({ cpe: ['cpe:/a'] }), entry())).toThrow(/unexpected key "cpe"/)
   })
 
-  it('refuses an empty description instead of writing an empty row', () => {
+  it('refuses an empty description, title or reason instead of writing an empty row', () => {
     expect(() => parseDelta(record({ descr: '' }), entry())).toThrow(/omit the key/)
+    expect(() => parseDelta(record({ title: '' }), entry())).toThrow(/omit the key/)
+    expect(() => parseDelta(record({ reason: '' }), entry())).toThrow(/omit the key/)
+  })
+
+  it('refuses an SSVC tuple that says nothing, which is spelled by omitting it', () => {
+    expect(() => parseDelta(record({ ssvc: [null, null, null] }), entry())).toThrow(
+      /no decision point set/
+    )
+    expect(() => parseDelta(record({ ssvc: [1, 0] }), entry())).toThrow(/expected 3 columns/)
+    expect(() => parseDelta(record({ ssvc: [-1, null, null] }), entry())).toThrow(/negative/)
+  })
+
+  it('refuses a product that is not [id, default_status]', () => {
+    expect(() => parseDelta(record({ prod: [1] }), entry())).toThrow(/expected an array/)
+    expect(() => parseDelta(record({ prod: [[1]] }), entry())).toThrow(/expected 2 columns/)
+    expect(() => parseDelta(record({ prod: [[0, null]] }), entry())).toThrow(/positive row id/)
+    // NULL is the right answer for a record that states no default, so it is
+    // accepted where a code would be (D-070).
+    expect(parseDelta(record({ prod: [[1, null]] }), entry()).upsert[0]!.prod).toEqual([[1, null]])
   })
 
   it('refuses a row id that is not a positive integer', () => {

@@ -13,10 +13,25 @@
 export interface SearchIndex {
   /** The fts5 table this build creates. */
   fts: string
-  /** Its external content table, and the rowid and column it indexes. */
+  /** Its external content table, and the rowid and columns it indexes. */
   content: string
   rowid: string
-  column: string
+  /**
+   * The indexed columns, in the order the fts5 table declares them.
+   *
+   * A list rather than a single name because the description index covers
+   * `cve_text.descr` **and** `cve_text.title` since schema 2 (D-070): a title
+   * carries the vulnerability class and the sink that the prose buries, and
+   * 83.3% of titled records have a title that is not a substring of their own
+   * description. One index over two columns rather than two indexes, so a
+   * search stays one `MATCH` and the promotion gate keeps counting the same
+   * three tables.
+   *
+   * Order is load-bearing: fts5's external-content `'delete'` protocol takes
+   * the column values positionally, and handing it the wrong one leaves terms
+   * in the index matching a row that no longer contains them (RE-005).
+   */
+  columns: readonly string[]
   /** What the progress display calls the rows going in. */
   label: string
   /**
@@ -46,15 +61,17 @@ export const SEARCH_INDEXES: readonly SearchIndex[] = [
     fts: 'fts',
     content: 'cve_text',
     rowid: 'cve_id',
-    column: 'descr',
-    label: 'descriptions',
-    textBytes: 122_554_315,
+    columns: ['descr', 'title'],
+    label: 'descriptions and titles',
+    // Descriptions 123,525,051 + titles 9,854,710, measured against the
+    // schema-2 build of 2026-08-08 (374,269 records).
+    textBytes: 133_379_761,
   },
   {
     fts: 'fts_vendor',
     content: 'vendor',
     rowid: 'id',
-    column: 'name',
+    columns: ['name'],
     label: 'vendor names',
     textBytes: 276_820,
   },
@@ -62,7 +79,7 @@ export const SEARCH_INDEXES: readonly SearchIndex[] = [
     fts: 'fts_product',
     content: 'product',
     rowid: 'id',
-    column: 'name',
+    columns: ['name'],
     label: 'product names',
     textBytes: 2_122_160,
   },
@@ -146,19 +163,45 @@ export function indexSql(index: SearchIndex): {
   max: string
   insert: string
 } {
+  const columns = index.columns.join(', ')
   return {
     drop: `DROP TABLE IF EXISTS ${index.fts}`,
     create:
       `CREATE VIRTUAL TABLE ${index.fts} USING fts5(` +
-      `${index.column}, content='${index.content}', content_rowid='${index.rowid}')`,
+      `${columns}, content='${index.content}', content_rowid='${index.rowid}')`,
     min: `SELECT min(${index.rowid}) FROM ${index.content}`,
     max: `SELECT max(${index.rowid}) FROM ${index.content}`,
     // The external-content form: fts5 stores no copy of the text, so the
-    // rowid and the column value both have to be supplied here, exactly as its
+    // rowid and every column value have to be supplied here, exactly as its
     // own `'rebuild'` command would have read them out of the content table.
     insert:
-      `INSERT INTO ${index.fts}(rowid, ${index.column}) ` +
-      `SELECT ${index.rowid}, ${index.column} FROM ${index.content} ` +
+      `INSERT INTO ${index.fts}(rowid, ${columns}) ` +
+      `SELECT ${index.rowid}, ${columns} FROM ${index.content} ` +
       `WHERE ${index.rowid} >= ? AND ${index.rowid} < ?`,
   }
+}
+
+/**
+ * The statements that maintain one row of an index, for the incremental path a
+ * sync takes (`lib/sync.ts`).
+ *
+ * `remove` is fts5's explicit `'delete'` protocol for an external-content
+ * index: the index stores no copy of the text, so it cannot work out what to
+ * un-index by itself and the *old* column values have to be supplied. Both
+ * statements are built from `index.columns` so the two can never disagree about
+ * how many placeholders there are, which is the mistake that would bind a title
+ * into the description column and leave the index quietly wrong (RE-005).
+ */
+export function indexRowSql(index: SearchIndex): { insert: string; remove: string } {
+  const columns = index.columns.join(', ')
+  const marks = index.columns.map(() => '?').join(', ')
+  return {
+    insert: `INSERT INTO ${index.fts}(rowid, ${columns}) VALUES(?, ${marks})`,
+    remove: `INSERT INTO ${index.fts}(${index.fts}, rowid, ${columns}) VALUES('delete', ?, ${marks})`,
+  }
+}
+
+/** Read the columns an index covers out of its content table, for one rowid. */
+export function indexRowSelect(index: SearchIndex): string {
+  return `SELECT ${index.columns.join(', ')} FROM ${index.content} WHERE ${index.rowid} = ?`
 }

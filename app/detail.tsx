@@ -25,7 +25,16 @@
 import { useEffect, useRef } from 'react'
 
 import { VERSION_STATUS } from '@/lib/detail'
-import { CVSS_VERSION_LABELS, SEVERITY_LABELS, STATE_LABELS, STATE_REJECTED } from '@/lib/filters'
+import {
+  CVSS_VERSION_LABELS,
+  NOT_ASSESSED_LABEL,
+  SEVERITY_LABELS,
+  SSVC_AUTO_LABELS,
+  SSVC_EXPL_LABELS,
+  SSVC_IMPACT_LABELS,
+  STATE_LABELS,
+  STATE_REJECTED,
+} from '@/lib/filters'
 import type { CveDetail, DetailVersion } from '@/lib/protocol'
 import { safeUrl } from '@/lib/sanitize'
 
@@ -75,9 +84,21 @@ export function Detail({
             </p>
           )}
 
-          <dl className="timings">
+          {/* The title carries the sink and the vulnerability class that the
+              prose buries, so it reads as a heading rather than as one more
+              row of the table below (D-070). Record content, rendered as a
+              text node like everything else. */}
+          {detail.record.title && (
+            <p className="detail-title" data-detail-title="1">
+              {detail.record.title}
+            </p>
+          )}
+
+          <dl className="facts">
             <dt>State</dt>
             <dd>{label(STATE_LABELS, detail.record.state)}</dd>
+            <dt>Reserved</dt>
+            <dd>{day(detail.record.reserved)}</dd>
             <dt>Published</dt>
             <dd>{day(detail.record.published)}</dd>
             <dt>Last updated</dt>
@@ -101,13 +122,48 @@ export function Detail({
             )}
           </dl>
 
+          {/* SSVC (D-070). Rendered as one group with all three points, and
+              **always rendered** — including when the record has no assessment
+              at all, which is what 51.9% of the corpus looks like. Hiding the
+              section for those would make "not assessed" and "we do not show
+              this" the same on screen. */}
+          <h4>Exploitation (SSVC)</h4>
+          <dl className="facts" data-ssvc={detail.record.ssvcExpl === null ? 'absent' : 'present'}>
+            <dt>Exploitation</dt>
+            <dd>{ssvc(SSVC_EXPL_LABELS, detail.record.ssvcExpl)}</dd>
+            <dt>Automatable</dt>
+            <dd>{ssvc(SSVC_AUTO_LABELS, detail.record.ssvcAuto)}</dd>
+            <dt>Technical impact</dt>
+            <dd>{ssvc(SSVC_IMPACT_LABELS, detail.record.ssvcImpact)}</dd>
+          </dl>
+          {detail.record.ssvcExpl === null &&
+            detail.record.ssvcAuto === null &&
+            detail.record.ssvcImpact === null && (
+              <p className="muted" data-ssvc-absent="1">
+                Nobody has published an SSVC assessment for this record. That is an absence, not a
+                finding of &ldquo;none&rdquo; — about half the corpus is in this state.
+              </p>
+            )}
+
+          {detail.record.reason !== null && (
+            <>
+              <h4>Reason for rejection</h4>
+              <p className="descr" data-detail-reason="1">
+                {detail.record.reason}
+              </p>
+            </>
+          )}
+
           <h4>Description</h4>
           {detail.record.description === null ? (
-            // D-023: 4.46% of records carry no English description at all.
-            // "No description" and "empty box" have to look different.
+            // D-023: 4.46% of records carry no English description at all —
+            // and every REJECTED record is one of them, which is what `reason`
+            // above exists to answer (D-070). "No description" and "empty box"
+            // have to look different.
             <p className="muted" data-no-description="1">
               This record carries no English description. The corpus stores English only, so a
               record described in another language imports with none.
+              {detail.record.reason !== null && ' The reason it was rejected is above.'}
             </p>
           ) : (
             <p className="descr">{detail.record.description}</p>
@@ -133,6 +189,12 @@ export function Detail({
                 {detail.products.map((entry, at) => (
                   <li key={`${entry.vendor}/${entry.product}/${at}`}>
                     {entry.vendor} / {entry.product}
+                    {entry.defaultStatus !== null && (
+                      <span className="muted">
+                        {' '}
+                        — everything else {VERSION_STATUS[entry.defaultStatus] ?? ''}
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -142,6 +204,15 @@ export function Detail({
           {detail.versions.length > 0 && (
             <>
               <h4>Version ranges</h4>
+              {/* Without the last column these rows cannot be read: a record
+                  whose default is `affected` lists its *fixed* versions as
+                  `unaffected`, so the listed rows are the exceptions rather
+                  than the vulnerable set (D-070). */}
+              <p className="muted">
+                Each row is one range the record listed. &ldquo;Everything else&rdquo; is the status
+                the record gives to versions it does not list — without it, a list of
+                &ldquo;unaffected&rdquo; rows can mean the opposite of what it looks like.
+              </p>
               <div className="scroll" tabIndex={0}>
                 <table className="results">
                   <thead>
@@ -151,6 +222,7 @@ export function Detail({
                       <th scope="col">Status</th>
                       <th scope="col">Versions</th>
                       <th scope="col">Scheme</th>
+                      <th scope="col">Everything else</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -165,6 +237,11 @@ export function Detail({
                         </td>
                         <td className="mono">{versionRange(entry)}</td>
                         <td>{entry.vtype ?? ''}</td>
+                        <td>
+                          {entry.defaultStatus === null
+                            ? '(not stated)'
+                            : (VERSION_STATUS[entry.defaultStatus] ?? entry.defaultStatus)}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -236,8 +313,10 @@ function Reference({ url, host }: { url: string; host: string }) {
  *
  * Formatted here rather than in SQL so that which of the four shapes a row is —
  * an exact version, a `<` bound, a `<=` bound, or a bare status — stays visible.
- * The ambiguity `affected[].defaultStatus` would resolve is not in the schema
- * until D-070 lands in M5, so this deliberately does not guess.
+ * What the row does *not* say is what governs versions outside it; that is
+ * `default_status`, and it is its own column rather than folded in here, so a
+ * record that states no default reads as "(not stated)" instead of as a guess
+ * (D-070).
  */
 function versionRange(entry: DetailVersion): string {
   const from =
@@ -249,6 +328,15 @@ function versionRange(entry: DetailVersion): string {
 
 function label(labels: Record<number, string>, code: number | null): string {
   return code === null ? '(not recorded)' : (labels[code] ?? String(code))
+}
+
+/**
+ * An SSVC decision point. Null is named "(not assessed)" rather than
+ * "(not recorded)": nobody looked, which is different from `none`, and it is
+ * the distinction D-070 turns on.
+ */
+function ssvc(labels: Record<number, string>, code: number | null): string {
+  return code === null ? NOT_ASSESSED_LABEL : (labels[code] ?? String(code))
 }
 
 function day(seconds: number | null): string {

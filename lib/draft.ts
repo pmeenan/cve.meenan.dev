@@ -21,14 +21,44 @@
  */
 
 import {
+  CODE_LABELS,
   CVSS_VERSIONS,
+  DIMENSION_LABELS,
   LOOKUP_AXES,
+  NOT_ASSESSED,
+  NOT_ASSESSED_LABEL,
   SEVERITIES,
+  SSVC_AUTO,
+  SSVC_EXPL,
+  SSVC_IMPACT,
+  type Dimension,
   type Filters,
   type LookupAxis,
   type SortKey,
   type StateFilter,
 } from './filters'
+
+/**
+ * The code axes the form offers as checkbox groups, each with its canonical
+ * order and whether "not assessed" is one of the boxes.
+ *
+ * One list rather than a branch per axis, so adding an axis cannot leave it
+ * with a form control and no chip, or a chip and no round trip — the failure
+ * that would make a permalink silently drop a filter (M4's round-trip property).
+ */
+export const CODE_AXES = [
+  { field: 'severity', codes: SEVERITIES, absence: false },
+  { field: 'cvssVersion', codes: CVSS_VERSIONS, absence: false },
+  // The SSVC axes offer "not assessed" as a box, because half the corpus is in
+  // that state and `IN (…)` cannot express it (D-070, `NOT_ASSESSED`).
+  { field: 'ssvcExpl', codes: SSVC_EXPL, absence: true },
+  { field: 'ssvcAuto', codes: SSVC_AUTO, absence: true },
+  { field: 'ssvcImpact', codes: SSVC_IMPACT, absence: true },
+] as const satisfies readonly {
+  field: keyof Draft & Dimension
+  codes: readonly number[]
+  absence: boolean
+}[]
 
 /** What the form holds before it becomes a `Filters`. All strings, because it is a form. */
 export interface Draft {
@@ -41,6 +71,10 @@ export interface Draft {
   host: string
   severity: number[]
   cvssVersion: number[]
+  /** SSVC codes, with `NOT_ASSESSED` for the records nobody assessed (D-070). */
+  ssvcExpl: number[]
+  ssvcAuto: number[]
+  ssvcImpact: number[]
   scoreMin: string
   scoreMax: string
   publishedFrom: string
@@ -62,6 +96,9 @@ export const EMPTY_DRAFT: Draft = {
   host: '',
   severity: [],
   cvssVersion: [],
+  ssvcExpl: [],
+  ssvcAuto: [],
+  ssvcImpact: [],
   scoreMin: '',
   scoreMax: '',
   publishedFrom: '',
@@ -92,8 +129,11 @@ export function draftToFilters(draft: Draft): Filters {
   // definition — a permalink and a saved report are compared by their encoding.
   // Ordered *semantically*, not numerically: 31 is v3.1 and 4 is v4.0, so
   // sorting the codes as magnitudes would list v4.0 first (D-047).
-  if (draft.severity.length) filters.severity = order(draft.severity, SEVERITIES)
-  if (draft.cvssVersion.length) filters.cvssVersion = order(draft.cvssVersion, CVSS_VERSIONS)
+  for (const axis of CODE_AXES) {
+    const selected = draft[axis.field]
+    // "Not assessed" sorts last, like the band it selects sits last on an axis.
+    if (selected.length) filters[axis.field] = order(selected, [...axis.codes, NOT_ASSESSED])
+  }
   for (const key of SCALARS) {
     const raw = draft[key]
     if (!raw.trim()) continue
@@ -123,8 +163,7 @@ export function filtersToDraft(filters: Filters): Draft {
     const names = filters[axis]
     if (names?.length) draft[axis] = names.join(', ')
   }
-  draft.severity = [...(filters.severity ?? [])]
-  draft.cvssVersion = [...(filters.cvssVersion ?? [])]
+  for (const axis of CODE_AXES) draft[axis.field] = [...(filters[axis.field] ?? [])]
   for (const key of SCALARS) {
     const value = filters[key]
     if (typeof value === 'number' && Number.isFinite(value)) draft[key] = String(value)
@@ -195,10 +234,7 @@ export interface Chip {
  * *implied* is a default nobody checks — so it is stated in the same row as
  * everything the user chose, and states which of the three it is.
  */
-export function describeDraft(
-  draft: Draft,
-  labels: { severity: Record<number, string>; cvssVersion: Record<number, string> }
-): Chip[] {
+export function describeDraft(draft: Draft): Chip[] {
   const chips: Chip[] = [
     {
       key: 'state',
@@ -231,18 +267,13 @@ export function describeDraft(
       chips.push({ key: axis, label: `${axisLabels[axis]}: ${names.join(', ')}`, clears: [axis] })
     }
   }
-  if (draft.severity.length) {
+  for (const axis of CODE_AXES) {
+    const selected = draft[axis.field]
+    if (!selected.length) continue
     chips.push({
-      key: 'severity',
-      label: `Severity: ${draft.severity.map((code) => labels.severity[code] ?? code).join(', ')}`,
-      clears: ['severity'],
-    })
-  }
-  if (draft.cvssVersion.length) {
-    chips.push({
-      key: 'cvssVersion',
-      label: `CVSS: ${draft.cvssVersion.map((code) => labels.cvssVersion[code] ?? code).join(', ')}`,
-      clears: ['cvssVersion'],
+      key: axis.field,
+      label: `${DIMENSION_LABELS[axis.field]}: ${selected.map((code) => codeLabel(axis.field, code)).join(', ')}`,
+      clears: [axis.field],
     })
   }
   pushRange(chips, 'score', 'CVSS score', draft.scoreMin, draft.scoreMax, ['scoreMin', 'scoreMax'])
@@ -256,6 +287,12 @@ export function describeDraft(
   ])
   pushRange(chips, 'year', 'ID year', draft.yearFrom, draft.yearTo, ['yearFrom', 'yearTo'])
   return chips
+}
+
+/** A selected code as a word, with the sentinel naming the absence it selects. */
+function codeLabel(axis: Dimension, code: number): string {
+  if (code === NOT_ASSESSED) return NOT_ASSESSED_LABEL
+  return CODE_LABELS[axis]?.[code] ?? String(code)
 }
 
 function pushRange(

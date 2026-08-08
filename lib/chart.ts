@@ -21,9 +21,10 @@
  */
 
 import {
-  CVSS_VERSION_LABELS,
-  SEVERITY_LABELS,
-  STATE_LABELS,
+  ABSENCE_DIMENSIONS,
+  CODE_LABELS,
+  NOT_ASSESSED_LABEL,
+  SSVC_DIMENSIONS,
   TIME_DIMENSIONS,
   type Dimension,
 } from './filters'
@@ -40,6 +41,30 @@ export const CHART_SERIES_MAX = 8
 
 /** Severity has one band per code plus one for "never scored". */
 const SEVERITY_SERIES_MAX = 6
+
+/** The widest SSVC axis is Exploitation: none / poc / active, plus "not assessed". */
+const SSVC_SERIES_MAX = 4
+
+/**
+ * Where each SSVC code sits on the severity ramp.
+ *
+ * The SSVC axes are **scales**, not identities — none → poc → active is an
+ * escalation, and so is partial → total — so D-073's argument applies to them
+ * unchanged: an ordered encoding, because hue alone puts adjacent bands below
+ * the separation floor. Rather than build and contrast-check a second ramp in
+ * two themes, they reuse the one that is already checked, spaced across it so
+ * every adjacency is two ramp steps or more. The legend names the bands, so
+ * there is no reading in which a red band means "CRITICAL" here.
+ *
+ * `tests/unit/chart.test.ts` asserts the resulting adjacencies — including the
+ * neutral against the *top* band, which is where it lands on these axes and
+ * not where it lands on severity's.
+ */
+const SSVC_RAMP: Partial<Record<Dimension, Record<string, number>>> = {
+  ssvcExpl: { '0': 0, '1': 2, '2': 4 },
+  ssvcAuto: { '0': 0, '1': 4 },
+  ssvcImpact: { '0': 0, '1': 4 },
+}
 
 /**
  * The severity stack, bottom to top.
@@ -112,17 +137,33 @@ function orderSeries(dimension: Dimension, keys: Map<string, { label: string; to
       ([a], [b]) => (rank.get(a) ?? SEVERITY_STACK.length) - (rank.get(b) ?? SEVERITY_STACK.length)
     )
   }
-  if (dimension === 'cvssVersion' || dimension === 'state' || TIME_DIMENSIONS.has(dimension)) {
-    // The SQL emitted these in semantic order; the insertion order of the map
-    // preserves it, so re-sorting here would be second-guessing the query layer.
+  if (
+    dimension === 'cvssVersion' ||
+    dimension === 'state' ||
+    SSVC_DIMENSIONS.has(dimension) ||
+    TIME_DIMENSIONS.has(dimension)
+  ) {
+    // The SQL emitted these in semantic order — for the SSVC axes, codes
+    // ascending with the unassessed band last (D-070) — and the insertion order
+    // of the map preserves it, so re-sorting here would be second-guessing the
+    // query layer.
     return entries
   }
   return entries.sort(([, a], [, b]) => b.total - a.total)
 }
 
-/** How many series this dimension may draw. */
+/**
+ * How many series this dimension may draw.
+ *
+ * The capped dimensions are identities, where the cap is what keeps the colours
+ * meaningful. A scale's bands are all of it — dropping one would delete a band
+ * from a chart that is required to show every band it has (D-070, D-073) — so
+ * severity gets its six and the SSVC axes their four at most.
+ */
 function seriesCap(dimension: Dimension): number {
-  return dimension === 'severity' ? SEVERITY_SERIES_MAX : CHART_SERIES_MAX
+  if (dimension === 'severity') return SEVERITY_SERIES_MAX
+  if (SSVC_DIMENSIONS.has(dimension)) return SSVC_SERIES_MAX
+  return CHART_SERIES_MAX
 }
 
 /**
@@ -138,7 +179,13 @@ function seriesCap(dimension: Dimension): number {
  * Every other dimension is an identity, and identities get categorical slots.
  */
 export function seriesColor(dimension: Dimension, key: string, index: number): string {
-  if (dimension === 'severity') return key === '' ? 'var(--sev-x)' : `var(--sev-${key})`
+  // The absence band, on any axis where NULL means "nobody assessed this"
+  // rather than "no lookup row": the same off-ramp neutral, so an absence is
+  // never placeable on the scale beside the levels (D-070, D-073).
+  if (key === '' && ABSENCE_DIMENSIONS.has(dimension)) return 'var(--sev-x)'
+  if (dimension === 'severity') return `var(--sev-${key})`
+  const slot = SSVC_RAMP[dimension]?.[key]
+  if (slot !== undefined) return `var(--sev-${slot})`
   return `var(--cat-${(index % CHART_SERIES_MAX) + 1})`
 }
 
@@ -154,17 +201,16 @@ export function seriesColor(dimension: Dimension, key: string, index: number): s
 export function bucketLabel(dimension: Dimension, bucket: unknown, label: unknown): string {
   if (label !== bucket && typeof label === 'string' && label.length > 0) return label
   if (bucket === null || bucket === undefined) {
-    return dimension === 'severity'
-      ? '(not scored)'
-      : dimension === 'cvssVersion'
-        ? '(no CVSS)'
-        : '(none recorded)'
+    if (dimension === 'severity') return '(not scored)'
+    if (dimension === 'cvssVersion') return '(no CVSS)'
+    // "not assessed" rather than "none recorded": nobody recorded an SSVC
+    // assessment *and* `none` is one of the answers it could have recorded, so
+    // the two have to read differently (D-070).
+    if (SSVC_DIMENSIONS.has(dimension)) return NOT_ASSESSED_LABEL
+    return '(none recorded)'
   }
   const code = Number(bucket)
-  if (dimension === 'severity') return SEVERITY_LABELS[code] ?? String(bucket)
-  if (dimension === 'cvssVersion') return CVSS_VERSION_LABELS[code] ?? String(bucket)
-  if (dimension === 'state') return STATE_LABELS[code] ?? String(bucket)
-  return String(bucket)
+  return CODE_LABELS[dimension]?.[code] ?? String(bucket)
 }
 
 /**

@@ -48,6 +48,25 @@ def _metric(key: str, score: float, severity: str, vector: str) -> dict:
     return {key: {"baseScore": score, "baseSeverity": severity, "vectorString": vector}}
 
 
+def _ssvc(**options: str) -> dict:
+    """One Vulnrichment SSVC block (D-070), in the shape the corpus carries it.
+
+    `options` is a list of single-key objects rather than one object, which is
+    the detail a hand-written extractor gets wrong.
+    """
+    names = {"expl": "Exploitation", "auto": "Automatable", "impact": "Technical Impact"}
+    return {
+        "other": {
+            "type": "ssvc",
+            "content": {
+                "role": "CISA Coordinator",
+                "options": [{names[key]: value} for key, value in options.items()],
+                "version": "2.0.3",
+            },
+        }
+    }
+
+
 def corpus_v1() -> dict:
     return {
         "CVE-2026-1001": {
@@ -55,11 +74,16 @@ def corpus_v1() -> dict:
                 "cveId": "CVE-2026-1001",
                 "state": "PUBLISHED",
                 "assignerShortName": "acme-cna",
+                "dateReserved": "2026-01-01T00:00:00Z",
                 "datePublished": "2026-01-02T03:04:05.000Z",
                 "dateUpdated": "2026-01-03T00:00:00Z",
             },
             "containers": {
+                # SSVC arrives in an *adp* container in the real corpus (CISA's
+                # Vulnrichment), so it is mined from one here (D-070).
+                "adp": [{"metrics": [_ssvc(expl="poc", auto="no", impact="total")]}],
                 "cna": {
+                    "title": f"Widget path traversal — {HOSTILE_TEXT[:24]}",
                     "descriptions": [
                         {"lang": "en", "value": HOSTILE_TEXT},
                         {"lang": "fr", "value": "ignored — not English (D-023)"},
@@ -68,6 +92,7 @@ def corpus_v1() -> dict:
                         {
                             "vendor": "acme",
                             "product": "widget",
+                            "defaultStatus": "unaffected",
                             "versions": [
                                 {
                                     "status": "affected",
@@ -91,7 +116,11 @@ def corpus_v1() -> dict:
             },
         },
         # No English description, REJECTED, no metrics: the sparse record, whose
-        # wire form is mostly *absent* keys.
+        # wire form is mostly *absent* keys. Since schema 2 it is also the record
+        # that has a `cve_text` row with **no description in it** — every
+        # REJECTED record's only English text is its rejection reason (D-070), so
+        # this is the shape that breaks anything assuming `cve_text` implies
+        # `descr`, the full-text index included.
         "CVE-2026-1002": {
             "cveMetadata": {
                 "cveId": "CVE-2026-1002",
@@ -102,6 +131,10 @@ def corpus_v1() -> dict:
             "containers": {
                 "cna": {
                     "descriptions": [{"lang": "de", "value": "keine englische Beschreibung"}],
+                    "rejectedReasons": [
+                        {"lang": "de", "value": "nicht Englisch"},
+                        {"lang": "en-US", "value": "Withdrawn: duplicate of CVE-2026-1001."},
+                    ],
                     "affected": [{"vendor": "acme", "product": "gizmo"}],
                 }
             },
@@ -155,11 +188,13 @@ def corpus_v2() -> dict:
         },
         "containers": {
             "cna": {
+                "title": "Sprocket remote code execution",
                 "descriptions": [{"lang": "en", "value": "A new record, with a new vendor."}],
                 "affected": [
                     {
                         "vendor": "globex",
                         "product": "sprocket",
+                        "defaultStatus": "unaffected",
                         "versions": [
                             {
                                 "status": "affected",
@@ -168,11 +203,21 @@ def corpus_v2() -> dict:
                                 "versionType": "custom",
                             }
                         ],
-                    }
+                    },
+                    # The same `(vendor, product)` pair twice with disagreeing
+                    # defaults — 13,628 records in the real corpus do this. The
+                    # two collide on one `cve_prod` row, and the conservative
+                    # value has to win rather than the first one seen (D-070).
+                    {"vendor": "globex", "product": "sprocket", "defaultStatus": "affected"},
                 ],
                 "problemTypes": [{"descriptions": [{"cweId": "CWE-79", "description": "XSS"}]}],
                 "references": [{"url": "https://newhost.example.org/x"}],
-                "metrics": [_metric("cvssV4_0", 9.1, "CRITICAL", "CVSS:4.0/AV:N")],
+                "metrics": [
+                    _metric("cvssV4_0", 9.1, "CRITICAL", "CVSS:4.0/AV:N"),
+                    # A *partial* assessment: `Automatable` is absent, and has to
+                    # stay NULL rather than becoming a code (D-070).
+                    _ssvc(expl="active", impact="partial"),
+                ],
             }
         },
     }
@@ -198,8 +243,9 @@ def corpus_v3() -> dict:
         },
         "containers": {
             "cna": {
-                # No English description, no CWE, no reference, no CVSS, and a
-                # product with no versions: five sections that must disappear.
+                # No English description, no CWE, no reference, no CVSS, no
+                # title, no SSVC, no `defaultStatus`, and a product with no
+                # versions: eight sections that must disappear.
                 "descriptions": [{"lang": "fr", "value": "plus de description anglaise"}],
                 "affected": [{"vendor": "globex", "product": "sprocket"}],
             }

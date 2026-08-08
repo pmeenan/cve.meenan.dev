@@ -25,7 +25,7 @@
  */
 import { LOOKUP_ARITY } from './delta'
 import { LOOKUP_ORDER, type Delta, type DeltaRecord, type LookupTable } from './protocol'
-import { SEARCH_INDEXES, type SearchIndex } from './search'
+import { indexRowSelect, indexRowSql, SEARCH_INDEXES, type SearchIndex } from './search'
 
 /**
  * The database surface apply needs, and nothing else.
@@ -84,6 +84,19 @@ const FTS_BY_CONTENT = new Map<string, SearchIndex>(
 
 /** The description index, which every record change has to maintain. */
 const TEXT_INDEX = FTS_BY_CONTENT.get('cve_text')
+
+/**
+ * `cve_text`'s text columns, positionally — the same order `schema.sql` declares
+ * them, which is what makes the INSERT below positional.
+ *
+ * Not the same list as `TEXT_INDEX.columns`: `reason` is stored and *not*
+ * indexed, because every REJECTED record's reason is the same boilerplate and
+ * indexing it would put that in the same term space as the prose (the reasoning
+ * D-035 applied to reference URLs).
+ */
+const TEXT_COLUMNS = ['descr', 'title', 'reason'] as const
+
+type TextColumn = (typeof TEXT_COLUMNS)[number]
 
 /** How many ids one existence query carries. Well under any variable limit. */
 const PROBE_BATCH = 400
@@ -294,12 +307,13 @@ function applyLookups(db: SyncDb, delta: Delta): void {
       `INSERT OR REPLACE INTO ${table}(${columns.join(', ')}) ` +
       `VALUES(${columns.map(() => '?').join(', ')})`
     const index = FTS_BY_CONTENT.get(table)
-    // Where the indexed text sits in the tuple. -1 for a table with no index,
-    // which is never read.
-    const at = index ? columns.indexOf(index.column) : -1
-    if (index && at < 0) {
-      throw new Error(`${table} has no ${index.column} column to index`)
-    }
+    // Where each indexed column sits in the tuple. Empty for a table with no
+    // index, which is never read.
+    const at = (index?.columns ?? []).map((name) => {
+      const position = columns.indexOf(name)
+      if (position < 0) throw new Error(`${table} has no ${name} column to index`)
+      return position
+    })
 
     for (const row of rows) {
       // `parseDelta` has already checked this against the wire shape; checked
@@ -315,17 +329,17 @@ function applyLookups(db: SyncDb, delta: Delta): void {
         continue
       }
       const id = row[0]
-      const value = row[at]
-      const previous = db.row(`SELECT ${index.column} FROM ${table} WHERE ${index.rowid} = ?`, [id])
-      if (previous !== null && previous[0] === value) {
+      const values = at.map((position) => row[position])
+      const previous = db.row(indexRowSelect(index), [id])
+      if (previous !== null && previous.every((was, column) => was === values[column])) {
         // Byte-identical to what is indexed: the write is a no-op and so is the
         // index maintenance.
         db.run(sql, row)
         continue
       }
-      if (previous !== null) ftsDelete(db, index, id, previous[0])
+      if (previous !== null) ftsDelete(db, index, id, previous)
       db.run(sql, row)
-      db.run(`INSERT INTO ${index.fts}(rowid, ${index.column}) VALUES(?, ?)`, [id, value])
+      db.run(indexRowSql(index).insert, [id, ...values])
     }
   }
 }
@@ -353,7 +367,7 @@ function assertClosure(db: SyncDb, delta: Delta): void {
   for (const record of delta.upsert) {
     need('cna', record.cna)
     for (const id of record.cwe ?? []) need('cwe', id)
-    for (const id of record.prod ?? []) need('product', id)
+    for (const entry of record.prod ?? []) need('product', entry[0])
     for (const id of record.ref ?? []) need('url', id)
     for (const version of record.ver ?? []) {
       need('product', version[0])
@@ -414,7 +428,8 @@ function upsertRecord(db: SyncDb, record: DeltaRecord): void {
   dropRecord(db, record.id)
 
   const cvss = record.cvss ?? null
-  db.run('INSERT INTO cve VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+  const ssvc = record.ssvc ?? null
+  db.run('INSERT INTO cve VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
     record.id,
     record.cve,
     record.y,
@@ -426,19 +441,31 @@ function upsertRecord(db: SyncDb, record: DeltaRecord): void {
     cvss?.[1] ?? null,
     cvss?.[2] ?? null,
     cvss?.[3] ?? null,
+    record.res ?? null,
+    // `?? null` on each point, not on the tuple: a record can be assessed for
+    // exploitation and not for automatability, and the gap has to stay NULL
+    // rather than become a code (D-070).
+    ssvc?.[0] ?? null,
+    ssvc?.[1] ?? null,
+    ssvc?.[2] ?? null,
   ])
 
-  if (record.descr !== undefined) {
-    db.run('INSERT INTO cve_text VALUES(?, ?)', [record.id, record.descr])
+  // One row if the record carries any of the three, none if it carries none —
+  // which is what `dropText` and every LEFT JOIN over `cve_text` assume.
+  const text = TEXT_COLUMNS.map((key) => record[key] ?? null)
+  if (text.some((value) => value !== null)) {
+    db.run('INSERT INTO cve_text VALUES(?, ?, ?, ?)', [record.id, ...text])
     if (TEXT_INDEX) {
-      db.run(`INSERT INTO ${TEXT_INDEX.fts}(rowid, ${TEXT_INDEX.column}) VALUES(?, ?)`, [
+      db.run(indexRowSql(TEXT_INDEX).insert, [
         record.id,
-        record.descr,
+        ...TEXT_INDEX.columns.map((column) => record[column as TextColumn] ?? null),
       ])
     }
   }
   for (const id of record.cwe ?? []) db.run('INSERT INTO cve_cwe VALUES(?, ?)', [record.id, id])
-  for (const id of record.prod ?? []) db.run('INSERT INTO cve_prod VALUES(?, ?)', [record.id, id])
+  for (const entry of record.prod ?? []) {
+    db.run('INSERT INTO cve_prod VALUES(?, ?, ?)', [record.id, entry[0], entry[1]])
+  }
   for (const id of record.ref ?? []) db.run('INSERT INTO cve_ref VALUES(?, ?)', [record.id, id])
   for (const version of record.ver ?? []) {
     db.run('INSERT INTO cve_ver VALUES(?, ?, ?, ?, ?, ?, ?)', [record.id, ...version])
@@ -477,15 +504,32 @@ function dropRecord(db: SyncDb, rowid: number): void {
  */
 function dropText(db: SyncDb, rowid: number): void {
   if (!TEXT_INDEX) return
-  const existing = db.row(`SELECT ${TEXT_INDEX.column} FROM cve_text WHERE cve_id = ?`, [rowid])
+  const existing = db.row(indexRowSelect(TEXT_INDEX), [rowid])
+  // No row at all: nothing was indexed for this record, so there is nothing to
+  // un-index. A row whose indexed columns are *all* NULL still had a row
+  // inserted into fts5 (a REJECTED record with only a reason), so it is not the
+  // same case and must not be skipped.
   if (existing === null) return
-  ftsDelete(db, TEXT_INDEX, rowid, existing[0])
+  ftsDelete(db, TEXT_INDEX, rowid, existing)
 }
 
-/** fts5's explicit delete protocol for an external-content index. */
-function ftsDelete(db: SyncDb, index: SearchIndex, rowid: unknown, value: unknown): void {
-  db.run(`INSERT INTO ${index.fts}(${index.fts}, rowid, ${index.column}) VALUES('delete', ?, ?)`, [
-    rowid,
-    value,
-  ])
+/**
+ * fts5's explicit delete protocol for an external-content index.
+ *
+ * `values` is positional against `index.columns` and comes from reading the
+ * content table an instant before it changes — which is fts5's requirement, and
+ * why it cannot be reconstructed from the delta.
+ */
+function ftsDelete(
+  db: SyncDb,
+  index: SearchIndex,
+  rowid: unknown,
+  values: readonly unknown[]
+): void {
+  if (values.length !== index.columns.length) {
+    throw new Error(
+      `${index.fts} delete needs ${index.columns.length} column values, got ${values.length}`
+    )
+  }
+  db.run(indexRowSql(index).remove, [rowid, ...values])
 }

@@ -14,6 +14,7 @@ import {
   LOOKUP_AXES,
   LOOKUP_SQL,
   normalizeCwe,
+  NOT_ASSESSED,
   rowsSql,
   DIMENSIONS,
   GROUP_LIMIT,
@@ -24,6 +25,7 @@ import {
   type Resolved,
   type SqlParam,
 } from '../../lib/filters'
+import { RECORD_COLUMNS } from '../../lib/export'
 import { indexPlan, indexSql } from '../../lib/search'
 
 /**
@@ -74,6 +76,10 @@ function corpus(): DatabaseSync {
                      cvss_ver, cvss_score, cvss_sev, cvss_vec)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
+  /** SSVC codes for one record, or nothing at all — which is half the corpus. */
+  const ssvc = db.prepare(
+    'UPDATE cve SET ssvc_expl = ?2, ssvc_auto = ?3, ssvc_impact = ?4 WHERE id = ?1'
+  )
   // published/updated are unix seconds, as stored.
   const day = (iso: string) => Math.floor(Date.parse(`${iso}T00:00:00Z`) / 1000)
   cve.run(1, 'CVE-2021-44228', 2021, 1, 1, day('2021-12-10'), day('2022-01-05'), 31, 10, 4, 'AV:N')
@@ -99,6 +105,12 @@ function corpus(): DatabaseSync {
   // year embedded in a CVE ID.
   cve.run(5, 'CVE-2020-0005', 1999, 1, 3, day('2020-02-02'), day('2020-02-03'), 2, 3, 1, 'AV:L')
 
+  // Only two of the five carry an SSVC assessment; 3 and 5 carry none, and 4
+  // carries a *partial* one — the three states D-070 requires stay distinct.
+  ssvc.run(1, 0, 0, 0) // CVE-2021-44228: Exploitation *none* — a finding, not an absence
+  ssvc.run(2, 1, 1, 1) // CVE-2022-0002: poc / yes / total
+  ssvc.run(4, 2, null, 1) // CVE-2024-0004: active, Automatable never stated
+
   const text = db.prepare('INSERT INTO cve_text(cve_id, descr) VALUES (?, ?)')
   text.run(1, 'Remote code execution via JNDI lookup, a deserialization flaw in the logger')
   text.run(2, 'Cross-site scripting in the web console')
@@ -106,7 +118,8 @@ function corpus(): DatabaseSync {
   text.run(4, 'Buffer overflow in the packet parser')
 
   db.exec(`
-    INSERT INTO cve_prod(cve_id, product_id) VALUES (1,1), (2,2), (4,3), (4,4), (5,2);
+    INSERT INTO cve_prod(cve_id, product_id, default_status)
+      VALUES (1,1,1), (2,2,NULL), (4,3,2), (4,4,3), (5,2,NULL);
     INSERT INTO cve_cwe(cve_id, cwe_id) VALUES (1,1), (2,2), (4,2);
     INSERT INTO cve_ref(cve_id, url_id) VALUES (1,1), (1,2), (2,3), (4,2);
   `)
@@ -588,5 +601,85 @@ describe('caps', () => {
     const row = rows.find((entry) => entry[0] === 'CVE-2020-0005')
     expect(row).toBeDefined()
     expect(row?.[8]).toBeNull()
+  })
+})
+
+describe('the SSVC axes (D-070)', () => {
+  it('filters on a stored code', () => {
+    // CVE-2021-44228 is `Exploitation: none` — a finding, stored as 0.
+    expect(ids({ ssvcExpl: [0], state: 'all' })).toEqual(['CVE-2021-44228'])
+    expect(ids({ ssvcExpl: [2], state: 'all' })).toEqual(['CVE-2024-0004'])
+  })
+
+  it('can select the records nobody assessed, which `IN` alone cannot', () => {
+    // The one that matters. `x IN (…)` is never true for NULL, so without the
+    // sentinel this band — half the real corpus — would be selectable nowhere.
+    const unassessed = ids({ ssvcExpl: [NOT_ASSESSED], state: 'all' })
+    expect(unassessed).toEqual(['CVE-2020-0005', 'CVE-2023-0003'])
+  })
+
+  it('keeps "not assessed" and "none" apart', () => {
+    const none = ids({ ssvcExpl: [0], state: 'all' })
+    const absent = ids({ ssvcExpl: [NOT_ASSESSED], state: 'all' })
+    expect(none).not.toEqual(absent)
+    // And selecting both is the union, not one or the other.
+    expect(ids({ ssvcExpl: [0, NOT_ASSESSED], state: 'all' }).sort()).toEqual(
+      [...none, ...absent].sort()
+    )
+  })
+
+  it('does not widen the other filters when it is the only clause', () => {
+    // The parenthesisation check: `a AND b IS NULL OR c` would silently drop
+    // the state predicate and return REJECTED records too.
+    const built = compile({ ssvcExpl: [0, NOT_ASSESSED] })
+    expect(built.where).toContain('(c.ssvc_expl IN (?) OR c.ssvc_expl IS NULL)')
+    expect(ids({ ssvcExpl: [NOT_ASSESSED] })).not.toContain('CVE-2023-0003')
+  })
+
+  it('never binds the sentinel as a value', () => {
+    const built = compile({ ssvcExpl: [NOT_ASSESSED], ssvcAuto: [1, NOT_ASSESSED] })
+    expect(built.params).not.toContain(NOT_ASSESSED)
+    expect(built.params).toContain(1)
+  })
+
+  it('groups with the unassessed band present and last', () => {
+    const built = groupSql({ state: 'all' }, {}, 'ssvcExpl')
+    const rows = run(built.sql, built.params)
+    // Codes ascending, then the absence — the position D-073 reserves for a
+    // band that is not a level, so it cannot distort the trend beneath it.
+    expect(rows.map((row) => row[0])).toEqual([0, 1, 2, null])
+    expect(rows.map((row) => row[2])).toEqual([1, 1, 1, 2])
+  })
+
+  it('carries a partial assessment as a gap rather than a code', () => {
+    const built = groupSql({ state: 'all' }, {}, 'ssvcAuto')
+    const rows = run(built.sql, built.params)
+    // CVE-2024-0004 states Exploitation and Technical Impact and not
+    // Automatable, so it lands in the null band of *this* axis only.
+    expect(rows.find((row) => row[0] === null)?.[2]).toBe(3)
+    expect(rows.map((row) => row[0])).toEqual([0, 1, null])
+  })
+
+  it('cross-tabs against another axis without dropping the null band', () => {
+    const built = crossSql({ state: 'all' }, {}, 'severity', 'ssvcExpl')
+    const rows = run(built.sql, built.params)
+    expect(rows.some((row) => row[2] === null)).toBe(true)
+  })
+})
+
+describe('the export-only columns (D-070, D-071)', () => {
+  it('are absent from the record list and present in an export row', () => {
+    const screen = rowsSql({ state: 'all' }, {}, { sort: 'cve' })
+    expect(run(screen.sql, screen.params)[0]).toHaveLength(9)
+    const full = rowsSql({ state: 'all' }, {}, { sort: 'cve', full: true })
+    expect(run(full.sql, full.params)[0]).toHaveLength(RECORD_COLUMNS.length)
+  })
+
+  it('name their columns in the order the header claims', () => {
+    // A mismatch here would label every column after the first wrong one — a
+    // file that reads as a copy and is not one.
+    const full = rowsSql({ state: 'all' }, {}, { sort: 'cve', full: true })
+    const named = db.prepare(full.sql).all(...(full.params as (string | number)[]))
+    expect(Object.keys(named[0] as Record<string, unknown>)).toHaveLength(RECORD_COLUMNS.length)
   })
 })

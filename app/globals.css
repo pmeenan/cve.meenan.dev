@@ -201,7 +201,12 @@ button:disabled {
   }
 }
 
-.timings {
+/* `.timings` is the *import* timings table and nothing else: `tests/e2e/staged.spec.ts`
+   and `import.spec.ts` locate it by this class, and a second `.timings` on the
+   page turns those into strict-mode violations. Anything else wanting the same
+   two-column layout uses `.facts`. */
+.timings,
+.facts {
   display: grid;
   grid-template-columns: auto auto;
   gap: 0.25rem 1.5rem;
@@ -210,11 +215,13 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-.timings dt {
+.timings dt,
+.facts dt {
   color: var(--muted);
 }
 
-.timings dd {
+.timings dd,
+.facts dd {
   margin: 0;
 }
 
@@ -357,6 +364,26 @@ details.sql {
   margin-top: 0.75rem;
   font-size: 0.85rem;
   color: var(--muted);
+}
+
+/* The support channel (D-009). Closed by default and visually quiet, because
+   it is for the day something is wrong — but a real disclosure widget, so it
+   is keyboard-operable and announced without any code of ours. */
+details.diagnostics {
+  margin-top: 1.2rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+details.diagnostics > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+details.diagnostics dd {
+  overflow-wrap: anywhere;
 }
 
 details.sql pre {
@@ -664,6 +691,16 @@ button.link {
 
 .detail p.descr {
   white-space: pre-wrap;
+  max-width: 46rem;
+}
+
+/* The record's own title (D-070). Prominent because it carries the sink and
+   the vulnerability class the description buries, but not an <h*>: it is
+   record content, and a heading level is document structure. */
+.detail-title {
+  margin: 0.4rem 0 0.8rem;
+  font-size: 1.05rem;
+  font-weight: 600;
   max-width: 46rem;
 }
 

@@ -27,7 +27,11 @@ import time
 
 import normalize
 
-SCHEMA_VERSION = 1
+# 2 since 2026-08-08: D-070's five field additions, taken before public launch
+# because a bump invalidates every client's local copy with no in-place
+# migration (D-068), which is free now and a 63 MB re-download for every user
+# afterwards.
+SCHEMA_VERSION = 2
 
 # JSON numbers are IEEE doubles by the time a browser sees them, and SQLite will
 # store an int64 happily — so the bound belongs wherever a number enters the
@@ -516,6 +520,16 @@ def build(
         cve_rows, text_rows = [], []
         cwe_link, prod_link, ref_link, ver_rows = [], [], set(), []
 
+        # Read *before* the walk. `record_paths` is a lazy generator over
+        # `os.walk`, so reading the commit afterwards stamps the artifact with
+        # whatever the clone is at when the walk *ends* — which is the tree it
+        # only partly read if anything moved it in between. That defeats the one
+        # check `ingest.py init` has against exactly that race (a 04:17 daily
+        # cron `git reset --hard` during an operator's rebuild), because the
+        # recorded commit and the clone's commit then agree and the working tree
+        # is clean. Confirmed against the clone again once the walk is done.
+        commit_before = clone_commit(clone)
+
         started = time.time()
         records = 0
         minted_records = 0
@@ -558,6 +572,16 @@ def build(
                 continue
             seen_ids.add(proj["cve_id"])
 
+            # A record carrying an unpaired surrogate is legal JSON that SQLite
+            # cannot store, and left to the INSERT it raises a `UnicodeEncodeError`
+            # from inside `executemany` naming a codec rather than a file
+            # (RE-015). Routed through the same channel as every other record we
+            # cannot publish, so the operator gets the file name and D-047's
+            # fail-closed behaviour rather than a traceback.
+            if not normalize.storable(proj):
+                skipped.append(path)
+                continue
+
             # The record's id is interned like everything else: a walk counter
             # renumbered every record after an insertion, and deltas carry the id
             # (D-055, D-056). A record the seed never had appends above the
@@ -570,6 +594,7 @@ def build(
                 row_id = cve_hwm
                 cve_ids[proj["cve_id"]] = row_id
             score = proj["cvss"]
+            ssvc = proj["ssvc"]
             cve_rows.append(
                 (
                     row_id,
@@ -583,19 +608,37 @@ def build(
                     score[1] if score else None,
                     score[2] if score else None,
                     score[3] if score else None,
+                    proj["reserved"],
+                    # `.get`, so a decision point nobody assessed stores NULL
+                    # rather than a code. D-070 turns on that distinction.
+                    *(ssvc.get(column) for column in normalize.SSVC_COLUMNS),
                 )
             )
 
-            if proj["descr"]:
-                text_rows.append((row_id, proj["descr"]))
+            # One row if the record has any of the three, none if it has none —
+            # so `cve_text` still holds only records with text, and the LEFT
+            # JOINs that read it still mean what they meant at schema 1.
+            if proj["descr"] or proj["title"] or proj["reason"]:
+                text_rows.append(
+                    (
+                        row_id,
+                        proj["descr"] or None,
+                        proj["title"] or None,
+                        proj["reason"] or None,
+                    )
+                )
 
             for cwe_id, cwe_descr in proj["cwes"]:
                 cwe_link.append((row_id, cwe(cwe_id, cwe_id, cwe_descr)))
 
-            for vendor_name, product_name in proj["products"]:
+            for vendor_name, product_name, default_status in proj["products"]:
                 vendor_id = vendor(vendor_name, vendor_name)
                 prod_link.append(
-                    (row_id, product((vendor_id, product_name), vendor_id, product_name))
+                    (
+                        row_id,
+                        product((vendor_id, product_name), vendor_id, product_name),
+                        default_status,
+                    )
                 )
 
             for vendor_name, product_name, version in proj["versions"]:
@@ -624,6 +667,13 @@ def build(
                 break
 
         parsed = time.time() - started
+        commit_after = clone_commit(clone)
+        if commit_before != commit_after:
+            raise ValueError(
+                f"{clone} moved from {commit_before or '(unknown)'} to "
+                f"{commit_after or '(unknown)'} while it was being read; this artifact would "
+                "hold part of each tree and record a commit that describes neither"
+            )
 
         # Sorted by id, because seeding makes use-order and id-order differ: a
         # seeded row is written when the corpus first mentions it, which is not
@@ -633,10 +683,14 @@ def build(
         for table, columns in LOOKUP_COLUMNS.items():
             marks = ",".join("?" * len(columns))
             db.executemany(f"INSERT INTO {table} VALUES({marks})", sorted(interners[table].rows))
-        db.executemany("INSERT INTO cve VALUES(?,?,?,?,?,?,?,?,?,?,?)", sorted(cve_rows))
-        db.executemany("INSERT INTO cve_text VALUES(?,?)", text_rows)
+        db.executemany("INSERT INTO cve VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", sorted(cve_rows))
+        db.executemany("INSERT INTO cve_text VALUES(?,?,?,?)", text_rows)
         db.executemany("INSERT OR IGNORE INTO cve_cwe VALUES(?,?)", cwe_link)
-        db.executemany("INSERT OR IGNORE INTO cve_prod VALUES(?,?)", prod_link)
+        # OR IGNORE stays a backstop rather than the dedup: `normalize` already
+        # resolved a record's `(vendor, product)` collisions conservatively, and
+        # letting the first row win here would decide a correctness field by walk
+        # order instead (D-070).
+        db.executemany("INSERT OR IGNORE INTO cve_prod VALUES(?,?,?)", prod_link)
         db.executemany("INSERT OR IGNORE INTO cve_ref VALUES(?,?)", sorted(ref_link))
         db.executemany("INSERT INTO cve_ver VALUES(?,?,?,?,?,?,?)", ver_rows)
 
@@ -677,7 +731,7 @@ def build(
                 # Which tree this was built from, for `ingest.py init` to check
                 # a clone against. Not part of the ID space, and not hashed into
                 # the fingerprint — provenance, not identity.
-                ("commit", clone_commit(clone)),
+                ("commit", commit_before),
                 ("notice", NOTICE),
                 *space_record,
             ],
@@ -779,12 +833,27 @@ def main() -> int:
         "re-download, so this is a deliberate act, not a default.",
     )
     parser.add_argument(
+        "--idspace",
+        metavar="TOKEN",
+        default=None,
+        help="Name the ID space this bootstrap mints, instead of a random one. "
+        "Only valid with --bootstrap. It exists to make a bootstrap *repeatable*: "
+        "without it, re-running a build mints a fresh lineage token, so the "
+        "second artifact is a different ID space from the one that was published "
+        "and every check downstream refuses it (D-056). A fixed token makes the "
+        "safe re-run — same clone, same corpus — reproduce the same artifact, "
+        "while an unsafe one (the clone moved) is still caught by the ledger's "
+        "fingerprint.",
+    )
+    parser.add_argument(
         "--allow-skipped",
         action="store_true",
         help="Deliberate escape hatch for local debugging only: keep the "
         "artifact despite unparseable records.",
     )
     args = parser.parse_args()
+    if args.idspace and not args.bootstrap:
+        parser.error("--idspace names the space a --bootstrap mints; a seeded build inherits one")
 
     stats = build(
         args.clone,
@@ -793,6 +862,7 @@ def main() -> int:
         args.limit,
         seed=args.seed,
         bootstrap=args.bootstrap,
+        idspace=args.idspace,
         rev=args.rev,
     )
     skipped = stats["skipped"]

@@ -19,13 +19,12 @@
 
 import { useState } from 'react'
 
+import { bucketLabel as chartBucketLabel } from '@/lib/chart'
 import { draftToFilters, EMPTY_DRAFT, SORT_LABELS, type Draft } from '@/lib/draft'
 import {
-  CVSS_VERSION_LABELS,
   DIMENSION_LABELS,
   DIMENSIONS,
   SEVERITY_LABELS,
-  STATE_LABELS,
   type Dimension,
   type SortKey,
   type StateFilter,
@@ -290,15 +289,9 @@ function GroupTable({ result, dimension }: { result: QueryResult; dimension: Dim
  * query layer and still not cover a code we have never seen.
  */
 function bucketLabel(row: unknown[], dimension: Dimension): string {
-  const bucket = row[0]
-  const label = row[1]
-  if (label !== bucket && typeof label === 'string' && label.length > 0) return label
-  if (bucket === null) return '(none recorded)'
-  const code = Number(bucket)
-  if (dimension === 'severity') return SEVERITY_LABELS[code] ?? String(bucket)
-  if (dimension === 'cvssVersion') return CVSS_VERSION_LABELS[code] ?? String(bucket)
-  if (dimension === 'state') return STATE_LABELS[code] ?? String(bucket)
-  return String(bucket)
+  // The chart layer's, not a second copy: two namings of one bucket is how a
+  // table and the chart above it end up disagreeing about which band is which.
+  return chartBucketLabel(dimension, row[0], row[1])
 }
 
 function RecordTable({

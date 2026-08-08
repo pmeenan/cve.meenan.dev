@@ -436,25 +436,70 @@ class Recorded(unittest.TestCase):
         """A half-built file is one a later run can seed from or publish,
         carrying an ID space that was never finished.
 
-        The trigger is a lone surrogate in a description — legal JSON that
-        `sqlite3` refuses to encode, so the build dies *after* the file exists
-        (RE-015). That it dies with a traceback rather than through `skipped` is
-        RE-015's problem; that it leaves nothing behind is this one's.
+        The trigger is a record file the walk can list and cannot read: the ID
+        space loads, the output file is created, and the walk dies partway
+        through. What matters here is only that nothing is left on disk.
+        """
+        clone = fixtures.write_corpus(os.path.join(self.root, "unreadable"), fixtures.corpus_v1())
+        record = next(build.record_paths(clone))
+        os.chmod(record, 0o000)
+        out = os.path.join(self.root, "doomed.sqlite")
+        try:
+            with self.assertRaises(OSError):
+                build.build(clone, out, None, None, bootstrap=True)
+            self.assertFalse(os.path.exists(out))
+        finally:
+            os.chmod(record, 0o644)
+
+    def test_a_record_sqlite_cannot_store_is_skipped_by_name(self):
+        """A lone surrogate is legal JSON with no UTF-8 encoding, so it reaches
+        the INSERT and raises a `UnicodeEncodeError` naming a codec rather than
+        a record — one hostile record halting a build over 372k of them with
+        nothing to point at (RE-015).
+
+        The daily ingest catches it in the hash pass it already runs (D-058);
+        `build.py` computes no hash, and that is the path the schema-bump
+        runbook uses. So the check lives in the walk now, and the record goes
+        through D-047's `skipped` channel with its file name — which is what
+        `main` then fails closed on.
         """
         corpus = fixtures.corpus_v1()
         corpus["CVE-2026-1001"]["containers"]["cna"]["descriptions"] = [
             {"lang": "en", "value": json.loads('"\\ud800"')}
         ]
-        out = os.path.join(self.root, "doomed.sqlite")
-        with self.assertRaises(UnicodeEncodeError):
-            build.build(
-                fixtures.write_corpus(os.path.join(self.root, "surrogate"), corpus),
+        out = os.path.join(self.root, "surrogate.sqlite")
+        stats = build.build(
+            fixtures.write_corpus(os.path.join(self.root, "surrogate"), corpus),
+            out,
+            None,
+            None,
+            bootstrap=True,
+        )
+        self.assertEqual(len(stats["skipped"]), 1)
+        self.assertIn("CVE-2026-1001", stats["skipped"][0])
+        # And the *other* records still built, so one unpublishable record is a
+        # named refusal rather than a lost corpus.
+        self.assertEqual(stats["records"], len(corpus) - 1)
+
+    def test_the_surrogate_check_reaches_the_columns_schema_2_added(self):
+        """`title` and `reason` are two more attacker-influenced text columns
+        per record (D-070), so the check has to cover the whole projection
+        rather than the description it was first written for."""
+        for field, payload in (
+            ("title", json.loads('"\\ud800"')),
+            ("rejectedReasons", [{"lang": "en", "value": json.loads('"\\udfff"')}]),
+        ):
+            corpus = fixtures.corpus_v1()
+            corpus["CVE-2026-1001"]["containers"]["cna"][field] = payload
+            out = os.path.join(self.root, f"surrogate-{field}.sqlite")
+            stats = build.build(
+                fixtures.write_corpus(os.path.join(self.root, f"s-{field}"), corpus),
                 out,
                 None,
                 None,
                 bootstrap=True,
             )
-        self.assertFalse(os.path.exists(out))
+            self.assertEqual(len(stats["skipped"]), 1, field)
 
     def test_a_damaged_seed_fails_before_anything_is_written(self):
         out = os.path.join(self.root, "not-written.sqlite")
@@ -484,7 +529,7 @@ class Recorded(unittest.TestCase):
         mints a new lineage, which needs `publish.py --new-id-space`."""
         other = os.path.join(self.root, "other-schema.sqlite")
         shutil.copy(self.v1, other)
-        set_meta(other, {"schema": 2})
+        set_meta(other, {"schema": build.SCHEMA_VERSION + 1})
         with self.assertRaisesRegex(ValueError, "not the same ID space"):
             build.build(
                 self._corpus("c6"), os.path.join(self.root, "x.sqlite"), None, None, seed=other
@@ -956,6 +1001,54 @@ class Lineage(unittest.TestCase):
         )
         with self.assertRaisesRegex(SystemExit, "different ID space|immutable"):
             publish_module.publish(different, self.pub, quality=5, jobs=2)
+
+    def test_a_crashed_new_id_space_publish_can_be_retried(self):
+        """The same crash window, on the flag the schema-bump runbook uses.
+
+        `--new-id-space` writes the ledger before the manifest, so a kill in
+        between leaves `published_head` reading the ledger's new revision while
+        the manifest still advertises the old one. The retry then met the
+        "needs a revision above the published head" guard — at the revision it
+        had itself just published — and there was no exit but hand-editing the
+        ledger, with both crons stopped on the manifest/ledger disagreement.
+        The byte-identity resume that exists for exactly this crash sits far
+        further down and was never reached (M5's data-plane review).
+        """
+        fresh = fixtures.build_artifact(
+            self.root,
+            fixtures.corpus_v2(),
+            "newspace",
+            rev=9,
+            generated=fixtures.FIXED_GENERATED + 3,
+        )
+        real_save = manifest_module.save
+        manifest_module.save = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("crash"))
+        try:
+            with self.assertRaises(RuntimeError):
+                publish_module.publish(fresh, self.pub, quality=5, jobs=2, new_id_space=True)
+        finally:
+            manifest_module.save = real_save
+        # The ledger now records rev 9; the manifest does not.
+        self.assertIsNotNone(ledger.space_at(self.pub, 9))
+        self.assertLess(manifest_module.head_rev(manifest_module.load(self.pub)), 9)
+
+        # The identical command completes it.
+        publish_module.publish(fresh, self.pub, quality=5, jobs=2, new_id_space=True)
+        after = manifest_module.load(self.pub)
+        self.assertEqual(after["snapshot"]["rev"], 9)
+        self.assertEqual(manifest_module.head_rev(after), 9)
+
+        # And the exemption is a *resume*, not a hole: a different artifact at
+        # that revision is still refused.
+        other = fixtures.build_artifact(
+            self.root,
+            fixtures.corpus_v3(),
+            "newspace-other",
+            rev=9,
+            generated=fixtures.FIXED_GENERATED + 4,
+        )
+        with self.assertRaisesRegex(SystemExit, "different ID space|immutable|above the published"):
+            publish_module.publish(other, self.pub, quality=5, jobs=2, new_id_space=True)
 
     def test_a_delta_landing_on_a_recorded_revision_must_agree_with_it(self):
         """A second delta can reach a revision another already published — a

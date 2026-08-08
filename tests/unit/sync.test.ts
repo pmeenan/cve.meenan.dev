@@ -96,7 +96,7 @@ function corpus(): DatabaseSync {
   const db = new DatabaseSync(':memory:')
   db.exec(readFileSync('pipeline/schema.sql', 'utf-8'))
   db.exec(`
-    INSERT INTO meta(k, v) VALUES ('rev', 1), ('schema', 1), ('generated', 1000),
+    INSERT INTO meta(k, v) VALUES ('rev', 1), ('schema', ${SCHEMA_VERSION}), ('generated', 1000),
                                   ('notice', '${NOTICE}');
     INSERT INTO cna(id, name) VALUES (1, 'acme-cna');
     INSERT INTO cwe(id, cwe, descr) VALUES (1, 'CWE-79', 'Cross-site Scripting');
@@ -106,12 +106,17 @@ function corpus(): DatabaseSync {
     INSERT INTO url(id, url, host_id) VALUES (1, 'https://example.org/a', 1);
     INSERT INTO vtype(id, name) VALUES (1, 'semver');
 
-    INSERT INTO cve VALUES (1, 'CVE-2026-0001', 2026, 1, 1, 100, 100, 31, 7.5, 3, 'CVSS:3.1/AV:N');
-    INSERT INTO cve VALUES (2, 'CVE-2026-0002', 2026, 1, 1, 200, 200, NULL, NULL, NULL, NULL);
-    INSERT INTO cve_text VALUES (1, 'alpha buffer overflow in the parser');
-    INSERT INTO cve_text VALUES (2, 'beta injection in the handler');
+    INSERT INTO cve VALUES (1, 'CVE-2026-0001', 2026, 1, 1, 100, 100, 31, 7.5, 3, 'CVSS:3.1/AV:N',
+                            50, 1, 0, 1);
+    -- No SSVC assessment at all, which is the state half the corpus is in and
+    -- the one a replacement must be able to leave alone (D-070).
+    INSERT INTO cve VALUES (2, 'CVE-2026-0002', 2026, 1, 1, 200, 200, NULL, NULL, NULL, NULL,
+                            NULL, NULL, NULL, NULL);
+    INSERT INTO cve_text VALUES (1, 'alpha buffer overflow in the parser',
+                                 'Widget parser overflow', NULL);
+    INSERT INTO cve_text VALUES (2, 'beta injection in the handler', NULL, NULL);
     INSERT INTO cve_cwe VALUES (1, 1);
-    INSERT INTO cve_prod VALUES (1, 1);
+    INSERT INTO cve_prod VALUES (1, 1, 2);
     INSERT INTO cve_ref VALUES (1, 1);
     INSERT INTO cve_ver VALUES (1, 1, 1, '1.0', NULL, '1.4', 1);
   `)
@@ -322,7 +327,15 @@ describe('applying a delta', () => {
           url: [[2, 'https://newhost.example.org/x', 2]],
         },
         upsert: [
-          { id: 3, cve: 'CVE-2026-0003', y: 2026, st: 1, prod: [3], ref: [2], descr: 'epsilon' },
+          {
+            id: 3,
+            cve: 'CVE-2026-0003',
+            y: 2026,
+            st: 1,
+            prod: [[3, 1]],
+            ref: [2],
+            descr: 'epsilon',
+          },
         ],
       })
     )
@@ -459,7 +472,18 @@ describe('a delta this copy must not apply', () => {
       applyDelta(
         adapt(db),
         delta(1, 2, {
-          upsert: [{ id: 3, cve: 'CVE-2026-0003', y: 2026, st: 1, prod: [1, 77] }],
+          upsert: [
+            {
+              id: 3,
+              cve: 'CVE-2026-0003',
+              y: 2026,
+              st: 1,
+              prod: [
+                [1, null],
+                [77, null],
+              ],
+            },
+          ],
         })
       )
     ).toThrow(/references 1 product row\(s\) this copy does not have \(77\)/)
@@ -574,6 +598,70 @@ describe('the index check every case above relies on', () => {
     // The damage is real, not theoretical: the row still matches a word its
     // text no longer contains.
     expect(matches(db, 'fts', 'alpha')).toEqual([1])
+    db.close()
+  })
+})
+
+describe('a cve_text row with nothing indexable in it', () => {
+  /**
+   * Every REJECTED record is this shape: a `cve_text` row whose `descr` and
+   * `title` are both NULL, carrying only the rejection reason. 17,842 records
+   * in the real corpus are like this (D-070), so it is the common case rather
+   * than an edge one — and it is the one where fts5's `'delete'` protocol has
+   * to be handed a pair of NULLs and accept them (RE-005).
+   */
+  function withRejected(): DatabaseSync {
+    const db = corpus()
+    applyDelta(
+      adapt(db),
+      delta(1, 2, {
+        upsert: [{ id: 3, cve: 'CVE-2026-0009', y: 2026, st: 2, reason: 'Withdrawn: duplicate.' }],
+      })
+    )
+    return db
+  }
+
+  it('is stored, and indexed as a row with no terms', () => {
+    const db = withRejected()
+    expect(value(db, 'SELECT count(*) FROM cve_text WHERE cve_id = 3')).toBe(1)
+    expect(value(db, 'SELECT descr FROM cve_text WHERE cve_id = 3')).toBeNull()
+    // The reason is deliberately *not* searchable: every rejection is the same
+    // boilerplate, and indexing it would put that in the same term space as the
+    // prose (the reasoning D-035 applied to reference URLs).
+    expect(matches(db, 'fts', 'Withdrawn')).toEqual([])
+    assertIndexesAgree(db)
+    db.close()
+  })
+
+  it('round-trips through replacement without corrupting the index', () => {
+    const db = withRejected()
+    applyDelta(
+      adapt(db),
+      delta(2, 3, {
+        upsert: [
+          {
+            id: 3,
+            cve: 'CVE-2026-0009',
+            y: 2026,
+            st: 1,
+            // Now described and no longer rejected — the transition that has to
+            // un-index a pair of NULLs and index a description in their place.
+            descr: 'restored and described',
+          },
+        ],
+      })
+    )
+    expect(matches(db, 'fts', 'restored')).toEqual([3])
+    expect(value(db, 'SELECT reason FROM cve_text WHERE cve_id = 3')).toBeNull()
+    assertIndexesAgree(db)
+    db.close()
+  })
+
+  it('survives being tombstoned', () => {
+    const db = withRejected()
+    applyDelta(adapt(db), delta(2, 3, { delete: ['CVE-2026-0009'] }))
+    expect(value(db, 'SELECT count(*) FROM cve_text WHERE cve_id = 3')).toBe(0)
+    assertIndexesAgree(db)
     db.close()
   })
 })

@@ -2,6 +2,10 @@ import { readFileSync } from 'node:fs'
 
 import { expect, test, type Browser, type Page } from '@playwright/test'
 
+import { skipWithoutLocalStorage } from './support'
+
+import { RECORD_COLUMNS } from '../../lib/export'
+
 /**
  * M4's exit criteria in a browser: the owner's motivating question answered
  * entirely through the UI, charted and exportable, with REJECTED excluded by
@@ -17,7 +21,13 @@ import { expect, test, type Browser, type Page } from '@playwright/test'
 const FORMULA_LEAD = /^[=+\-@\t\r]/
 
 async function openTab(page: Page, name: string): Promise<void> {
-  await page.getByRole('tab', { name, exact: true }).click()
+  // Enabled *first*. The tabs that need a corpus are disabled until the Worker
+  // reports one, and clicking across that transition landed a click the
+  // component had not wired up yet — reliably on Firefox, where the window is
+  // wider, and invisibly on Chromium.
+  const tab = page.getByRole('tab', { name, exact: true })
+  await expect(tab).toBeEnabled({ timeout: 120_000 })
+  await tab.click()
   await expect(page.getByRole('tab', { name, exact: true })).toHaveAttribute(
     'aria-selected',
     'true'
@@ -26,6 +36,7 @@ async function openTab(page: Page, name: string): Promise<void> {
 
 async function importCorpus(page: Page): Promise<void> {
   await page.goto('/')
+  await skipWithoutLocalStorage(page)
   await page.getByRole('button', { name: /Download data/ }).click()
   await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
 }
@@ -356,17 +367,14 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
         .filter((line) => !line.startsWith('# '))
         .join('\r\n')
     )
-    expect(records[0]).toEqual([
-      'cve',
-      'state',
-      'published',
-      'updated',
-      'cvss_version',
-      'cvss_score',
-      'severity',
-      'cna',
-      'description',
-    ])
+    // Named from the module the writer names them from, so a schema addition
+    // cannot leave the file's header and its rows describing different columns.
+    expect(records[0]).toEqual([...RECORD_COLUMNS])
+    // The six D-070 columns are in the *copy* even though they are not on
+    // screen — an export that dropped `rejection_reason` would hand back every
+    // REJECTED record with no text in it at all (D-071).
+    expect(records[0]).toContain('rejection_reason')
+    expect(records[0]).toContain('ssvc_exploitation')
     // The list on screen is capped at 100; the export is not. This is the
     // difference the feature exists for.
     expect(records.length - 1).toBe(matches)

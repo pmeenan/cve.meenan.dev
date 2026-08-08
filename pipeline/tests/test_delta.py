@@ -112,7 +112,7 @@ class WireShape(Corpus):
         payload = self.delta_v1_to_v2()
         self.assertEqual(list(payload), ENVELOPE_KEYS)
         self.assertEqual(payload["format"], delta.FORMAT_VERSION)
-        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["schema"], build.SCHEMA_VERSION)
         self.assertEqual((payload["from"], payload["to"]), (1, 2))
         self.assertEqual(payload["generated"], fixtures.FIXED_GENERATED)
 
@@ -140,23 +140,45 @@ class WireShape(Corpus):
 
     def test_absent_means_absent_for_a_sparse_record(self):
         """CVE-2026-1002 in v1 has no English description, no CWE, no
-        reference and no CVSS — the wire form says so by omission (D-031)."""
+        reference, no CVSS, no SSVC assessment and no title — the wire form says
+        so by omission (D-031). What it *does* have is a rejection reason, which
+        is the only English text any REJECTED record carries (D-070)."""
         record = _record(self.everything(self.v1), "CVE-2026-1002")
-        for key in ("descr", "cwe", "ref", "cvss", "upd"):
+        for key in ("descr", "cwe", "ref", "cvss", "upd", "ssvc", "title", "res"):
             self.assertNotIn(key, record)
         self.assertEqual(record["st"], 2)  # REJECTED, imported and filterable (D-022)
+        self.assertEqual(record["reason"], "Withdrawn: duplicate of CVE-2026-1001.")
         self.assertIn("prod", record)
 
     def test_a_full_record_carries_every_section_of_the_schema(self):
         record = _record(self.everything(self.v1), "CVE-2026-1001")
-        every_column = ["id", "cve", "y", "st", "cna", "pub", "upd", "cvss"]
-        every_column += ["descr", "cwe", "prod", "ref", "ver"]
+        every_column = ["id", "cve", "y", "st", "cna", "pub", "upd", "res", "cvss", "ssvc"]
+        every_column += ["descr", "title", "cwe", "prod", "ref", "ver"]
+        # `reason` is the one column no single record can carry beside the rest:
+        # only a REJECTED record has one, and this record is PUBLISHED.
         self.assertEqual(sorted(record), sorted(every_column))
         self.assertEqual(record["cvss"][0], 31)
         self.assertEqual(record["cvss"][1], 7.5)
         self.assertEqual(record["cvss"][2], 3)
+        self.assertEqual(record["ssvc"], [1, 0, 1])  # poc / no / total
         self.assertEqual(len(record["ver"]), 2)
         self.assertEqual(len(record["ref"]), 2)
+
+    def test_a_partial_ssvc_assessment_keeps_its_gaps(self):
+        """CVE-2026-1003 states Exploitation and Technical Impact and not
+        Automatable. The gap is NULL on the wire, because "not assessed" and
+        `no` are different findings and folding them understates every band
+        (D-070)."""
+        record = _record(self.everything(self.v2), "CVE-2026-1003")
+        self.assertEqual(record["ssvc"], [2, None, 0])  # active / not assessed / partial
+
+    def test_a_products_default_status_rides_with_its_id(self):
+        """`cve_prod` gained a column at schema 2, so `prod` carries a pair. The
+        two `globex/sprocket` entries collide on one row and the conservative
+        default wins — `affected`, not the `unaffected` seen first (D-070)."""
+        record = _record(self.everything(self.v2), "CVE-2026-1003")
+        self.assertEqual([len(entry) for entry in record["prod"]], [2])
+        self.assertEqual(record["prod"][0][1], 1)  # 1 affected, in cve_ver's vocabulary
 
     def test_cvss_version_codes_are_carried_not_compared(self):
         """v4.0 stores as 4 and v2.0 as 2; the wire carries the stored code, and
@@ -386,7 +408,7 @@ class Guards(Corpus):
         whose schema is not its own and re-downloads (D-025) — so emitting from
         an artifact this pipeline build did not produce would ship rows in the
         wrong shape inside a file nobody can apply."""
-        for stamped in (2, None):
+        for stamped in (build.SCHEMA_VERSION + 1, None):
             artifact = os.path.join(self.root, f"schema-{stamped}.sqlite")
             shutil.copy(self.v2, artifact)
             db = sqlite3.connect(artifact)
@@ -913,6 +935,31 @@ class Publication(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "roll it backwards"):
             publish_module.publish(self.published["snapshot"], self.pub, quality=5, jobs=2)
         self.assertEqual(manifest_module.load(self.pub)["snapshot"]["rev"], 2)
+
+    def test_an_older_revision_is_refused_even_when_its_bytes_are_still_there(self):
+        """The same refusal with the old generation's directory **retained**,
+        which is the shape retention actually leaves behind.
+
+        The test above deletes `snapshot-1` first, and that deletion is what
+        made `_same_bytes` false and let the guard fire. Under retention the
+        directory is still on disk holding exactly those bytes, so the resume
+        path matched and skipped the whole block — including this check — and a
+        flagless re-run of the older artifact rewrote the manifest at the old
+        revision with every delta dropped. Byte identity answers "are these the
+        same bytes at this URL"; it says nothing about "is this revision behind
+        head" (M5's data-plane review).
+        """
+        publish_module.publish(self.published["next"], self.pub, quality=5, jobs=2)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.pub, "snapshot-1")),
+            "retention should have kept the older generation — otherwise this "
+            "test is the one above",
+        )
+        with self.assertRaisesRegex(SystemExit, "roll it backwards"):
+            publish_module.publish(self.published["snapshot"], self.pub, quality=5, jobs=2)
+        after = manifest_module.load(self.pub)
+        self.assertEqual(after["snapshot"]["rev"], 2)
+        self.assertEqual(manifest_module.head_rev(after), 2)
 
     def test_a_manifest_without_snapshot_rev_still_blocks_republication(self):
         """The generation published before D-055 has no `snapshot.rev`, so the

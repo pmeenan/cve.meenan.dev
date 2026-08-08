@@ -20,6 +20,11 @@ commit — it leaves the checkout dirty on purpose, and
     # would retire every value outside it from the ID space, permanently
     python3 pipeline/build.py <clone> slice.sqlite --year-min 2026 --bootstrap
 
+    # the *previous* schema's slice, which `tests/e2e/bump.spec.ts` points an
+    # old client at. Build it from a checkout at the older schema and publish it
+    # to `pipeline/pub-schema1`; both directories are gitignored, and the spec
+    # skips itself when the second one is absent
+
     # chunk, compress and publish, writing manifest.json
     python3 pipeline/publish.py slice.sqlite pipeline/pub
 
@@ -143,6 +148,69 @@ from a moved tree it no longer matches the fingerprint the ledger recorded, so
 `--new-id-space`, which is a full re-download for every client. Re-running step 1
 against the same tree is safe: a seeded rebuild is deterministic, same
 fingerprint and same marks.
+
+### Landing a schema bump (D-070, D-075) — not yet run
+
+A schema change is the *other* thing that takes a data plane to a new
+generation, and it takes a different route from the adoption above: seeding
+across a schema change is refused by `build._seed_from`, deliberately. Ids are
+only meaningful against the shape that assigned them, and every client
+re-downloads at a bump anyway (D-013, D-068), so carrying id stability across
+one preserves something nobody can use. **A bump therefore bootstraps**, which
+mints a new lineage, which needs `--new-id-space`.
+
+`--new-id-space` also has to land *above* the published head, and that is what
+retires every pre-bump delta from the manifest in the same operation — so no
+schema-1 delta is ever advertised beside a schema-2 snapshot.
+
+Sequencing matters between the two halves, because a deployed client refuses a
+manifest whose schema it does not speak (`assertUsable`) and says to reload the
+page. **The artifact ships first and the app follows in the same window**: in
+between, every visitor is told to reload, which is true and actionable; the
+other order would have the new app announcing a bump against a data plane that
+has not moved. All of it from `cd /var/www/meenan.dev`, with `HEAD` the current
+published head from `ingest.py status`:
+
+    # 0. the checkout production runs from must be at the commit that bumps the
+    #    schema (D-059). Nothing below is safe from a half-updated pipeline.
+    git -C ~/src/meenan.dev/cve pull
+
+    # 1. bootstrap at a revision above the head. NOT --seed: see above.
+    #    --idspace is what makes this step *repeatable*: without it every run
+    #    mints a fresh lineage token, so a second run produces a different ID
+    #    space from the one step 2 published and steps 3 and 4 both refuse it.
+    #    Pick any token; write it down.
+    python3 <repo>/pipeline/build.py cve.data/git/cvelistV5 \
+        cve.data/state/artifacts/rev-<HEAD+1>.sqlite --bootstrap --rev <HEAD+1> \
+        --idspace <token>
+
+    # 2. publish it, retiring the old ID space and every delta cut against it
+    python3 <repo>/pipeline/publish.py cve.data/state/artifacts/rev-<HEAD+1>.sqlite \
+        cve.pub/data --new-id-space
+
+    # 3. re-adopt: the state describes a corpus behind a revision that no longer
+    #    exists, so `--force` is required and is what it is for
+    python3 <repo>/pipeline/ingest.py init cve.data/git/cvelistV5 cve.pub/data \
+        --state cve.data/state --artifact cve.data/state/artifacts/rev-<HEAD+1>.sqlite --force
+
+    # 4. deploy the app that speaks the new schema, immediately after
+    pnpm build && bash scripts/deploy.sh
+
+Two operational hazards, neither of which the tools can catch for you:
+
+- **Nothing here takes the ingest's `flock`.** `build.py` and `publish.py` are
+  operator tools; only `ingest.py` and `snapshot.py` take it. So the daily cron
+  can fire *during* steps 1–4, and its first act is a `git fetch` — which moves
+  the clone out from under step 3's "this is the tree the artifact was built
+  from" check, and can leave a pending run mid-sequence. **Comment the daily
+  cron out for the window, or run this well clear of 04:17.** `ingest.py status`
+  says whether a run is pending; finish or discard one before starting.
+- **The clone must not be fetched between steps 1 and 3**, for the reason the
+  adoption section gives. Re-running step 1 against the *same* clone is safe and
+  reproduces the same artifact byte for byte, which is what `--idspace` buys.
+  Re-running it after step 2 against a *moved* clone produces different ids under
+  the same token; the ledger's fingerprint refuses it, and the exit is a new
+  revision rather than a repair.
 
 A changeset is what the daily ingest computes and `delta.py` serializes:
 

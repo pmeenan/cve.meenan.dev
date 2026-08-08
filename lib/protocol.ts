@@ -6,11 +6,33 @@
  * drift.
  */
 
+import type { CapabilityReport } from './capabilities'
 import type { Dimension, Filters, SortKey, StateFilter } from './filters'
 import type { ExportFormat } from './export'
 import type { Report } from './report'
+import type { StorageReport } from './storage'
 
-export const SCHEMA_VERSION = 1
+/**
+ * The published *schema* — what columns the artifact carries. 2 since
+ * 2026-08-08 (D-070's five field additions).
+ *
+ * A bump invalidates every local copy with no in-place migration, deliberately
+ * (D-013, D-068), which is why D-070 timed the additions before public launch.
+ */
+export const SCHEMA_VERSION = 2
+
+/**
+ * The *envelope* format of the manifest and delta files — how the bytes are
+ * arranged, not what columns they carry.
+ *
+ * Deliberately **not** bumped by D-070's schema change, even though the delta
+ * record grew keys. The two numbers gate the same file and `assertUsable`
+ * checks this one first, so bumping both would replace D-068's actionable
+ * "reload the page to pick up the matching app" with "unsupported wire format",
+ * for a client whose real problem is the schema. Record columns ride
+ * `SCHEMA_VERSION`, because record columns *are* the schema; this moves when the
+ * envelope around them does.
+ */
 export const FORMAT_VERSION = 1
 
 /** Where the static data plane is mounted. No parameters are ever sent (D-032). */
@@ -117,6 +139,22 @@ export interface DeltaLookups {
  */
 export type DeltaCvss = [number, number | null, number | null, string]
 
+/**
+ * `[ssvc_expl, ssvc_auto, ssvc_impact]` — the stored codes, each null when that
+ * decision point was not assessed (D-070).
+ *
+ * A null here is *not* the same as a 0: `Exploitation: none` is someone having
+ * looked and found no known exploitation, and null is the absence of the
+ * assessment. The tuple is omitted entirely when all three are null.
+ */
+export type DeltaSsvc = [number | null, number | null, number | null]
+
+/**
+ * `[product_id, default_status]` — the container default that governs every
+ * version the record does not list, or null when it states none (D-070).
+ */
+export type DeltaProduct = [number, number | null]
+
 /** `[product_id, status, version, lessThan, lessThanOrEqual, vtype_id]`. */
 export type DeltaVersion = [
   number,
@@ -145,11 +183,22 @@ export interface DeltaRecord {
   /** Unix seconds, as stored. */
   pub?: number | null
   upd?: number | null
+  /** `dateReserved`, unix seconds (D-070). */
+  res?: number | null
   cvss?: DeltaCvss | null
+  /** Omitted when no decision point was assessed (D-070). */
+  ssvc?: DeltaSsvc | null
   /** English only (D-023); omitted when the record has none. */
   descr?: string
+  /** `containers.cna.title` (D-070); omitted when the record has none. */
+  title?: string
+  /**
+   * The first English `rejectedReasons[]` value (D-070) — the only English text
+   * a REJECTED record carries, so a record can have this and no `descr`.
+   */
+  reason?: string
   cwe?: number[]
-  prod?: number[]
+  prod?: DeltaProduct[]
   ref?: number[]
   ver?: DeltaVersion[]
 }
@@ -280,6 +329,29 @@ export interface ImportOptions {
    */
   schema?: number
   /**
+   * Force the capability probe's verdict, for the gate's own tests (M5, D-016).
+   *
+   * The condition it stands in for is a browser this project does not own —
+   * Safari 15.2–16.3, whose sync access handles are asynchronous — and the real
+   * probe runs inside the Worker, where a page-level `addInitScript` cannot
+   * reach it. So the *only* way to see what a user below the floor is told is
+   * to say so from here.
+   *
+   * It can only make the gate **stricter**, never permissive: there is no value
+   * that turns a failing capability into a passing one, so a crafted link can
+   * cost someone a refusal they did not deserve and can never let an
+   * unsupported browser through to an import that would fail deep inside WASM.
+   */
+  probe?: 'async' | 'unavailable'
+  /**
+   * Pretend the browser has this many bytes free, for the preflight's own test
+   * (M5). Same reason and same constraint as `probe`: the preflight reads
+   * `navigator.storage` inside the **Worker**, where a page-level override
+   * cannot reach it (RE-020), and a smaller number can only *refuse* a download
+   * — there is no value that makes one proceed that would not have anyway.
+   */
+  freeBytes?: number
+  /**
    * Virtual-machine instructions between SQLite progress callbacks, overriding
    * `PROGRESS_OPS`. **Zero installs no handler at all**, which is the only way
    * to measure what the handler costs — and what the M3 sweep compares against
@@ -360,6 +432,23 @@ export interface DetailRecord {
   cna: string | null
   /** Null when the record has no English description at all (4.46%, D-023). */
   description: string | null
+  /** `containers.cna.title` (D-070). Null for the 63% that carry none. */
+  title: string | null
+  /**
+   * Why a REJECTED identifier was withdrawn (D-070). Null for PUBLISHED
+   * records, and the *only* English text the 17,842 REJECTED ones carry — which
+   * is why they rendered blank until schema 2.
+   */
+  reason: string | null
+  /** `dateReserved`, unix seconds. 100% coverage. */
+  reserved: number | null
+  /**
+   * SSVC's decision points, as stored codes (D-070). **Null means nobody
+   * assessed this**, which is not the same as `Exploitation: none`.
+   */
+  ssvcExpl: number | null
+  ssvcAuto: number | null
+  ssvcImpact: number | null
 }
 
 export interface DetailCwe {
@@ -370,6 +459,12 @@ export interface DetailCwe {
 export interface DetailProduct {
   vendor: string
   product: string
+  /**
+   * `cve_prod.default_status`: the container default governing every version
+   * the record does not list — 1 affected, 2 unaffected, 3 unknown, null when
+   * the record states none (D-070).
+   */
+  defaultStatus: number | null
 }
 
 export interface DetailVersion {
@@ -381,6 +476,8 @@ export interface DetailVersion {
   lt: string | null
   lte: string | null
   vtype: string | null
+  /** The product's default, repeated per row so a row reads on its own (D-070). */
+  defaultStatus: number | null
 }
 
 /** A reference as stored. Nothing decides here whether it may become a link. */
@@ -428,6 +525,15 @@ export type Request =
   /** Stream an export, in batches, up to the disclosed cap (M4). */
   | { type: 'export'; request: ExportRequest }
   | { type: 'bench' }
+  /**
+   * What this browser can do and what its storage looks like (M5).
+   *
+   * Its own message rather than a field on `status`, because the two answer
+   * different questions on different schedules: `status` is about the copy on
+   * disk and is posted after every operation, while this is about the *browser*
+   * — probed once, and re-read on demand when the diagnostics panel is open.
+   */
+  | { type: 'probe' }
   | { type: 'reset' }
 
 /**
@@ -519,6 +625,12 @@ export type Response =
       /** The schema version this build speaks — `SCHEMA_VERSION`, or the override. */
       schema: number
     }
+  /**
+   * The capability gate's verdict and the storage picture behind it (M5,
+   * D-016). Posted unprompted once the Worker starts, so the gate is on screen
+   * before the Download button can be pressed, and again for every `probe`.
+   */
+  | { type: 'environment'; capabilities: CapabilityReport; storage: StorageReport }
   | { type: 'imported'; timings: Timings; notice: string }
   | { type: 'synced'; outcome: SyncOutcome }
   | {

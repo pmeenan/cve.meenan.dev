@@ -70,6 +70,49 @@ export const CVSS_VERSIONS = [2, 30, 31, 4] as const
 /** Severity codes low to high. `null` — never scored — is not one of them. */
 export const SEVERITIES = [0, 1, 2, 3, 4] as const
 
+/**
+ * SSVC's three decision points, as stored (D-070). Contributed by CISA's
+ * Vulnrichment ADP, and the corpus's only structured exploitation signal.
+ *
+ * NULL is not in any of these maps. A missing SSVC block is the absence of the
+ * assessment — 51.9% of the corpus — and `Exploitation: none` is a *finding*.
+ * Collapsing the two would understate every band, which is the failure D-073
+ * rejected for unscored CVSS and D-022 guards against for REJECTED records.
+ * `NOT_ASSESSED` below is how a filter names the absence without pretending it
+ * is a code.
+ */
+export const SSVC_EXPL_LABELS: Record<number, string> = {
+  0: 'None',
+  1: 'Proof of concept',
+  2: 'Active',
+}
+
+export const SSVC_AUTO_LABELS: Record<number, string> = { 0: 'No', 1: 'Yes' }
+
+export const SSVC_IMPACT_LABELS: Record<number, string> = { 0: 'Partial', 1: 'Total' }
+
+export const SSVC_EXPL = [0, 1, 2] as const
+export const SSVC_AUTO = [0, 1] as const
+export const SSVC_IMPACT = [0, 1] as const
+
+/**
+ * The value a *filter* uses to mean "this column is NULL".
+ *
+ * Filters bind their values into `IN (?, …)`, and SQL's `IN` is never true for
+ * NULL — so without a spelling for it, the one band D-070 requires always be
+ * visible would be the one band nobody could select. -1 rather than a separate
+ * boolean field because the report definition travels in a URL fragment and is
+ * emitted by a model (D-044, D-069): one list per axis is one thing to validate
+ * and one thing to get right.
+ *
+ * It is outside every stored code's range on purpose, so a definition written
+ * against a future build that added a code cannot collide with it.
+ */
+export const NOT_ASSESSED = -1
+
+/** What "not assessed" is called wherever a bucket or a chip names it. */
+export const NOT_ASSESSED_LABEL = '(not assessed)'
+
 export const STATE_LABELS: Record<number, string> = {
   [STATE_PUBLISHED]: 'PUBLISHED',
   [STATE_REJECTED]: 'REJECTED',
@@ -113,6 +156,13 @@ export interface Filters {
   severity?: number[]
   /** `cve.cvss_ver` codes — 2, 30, 31, 4. */
   cvssVersion?: number[]
+  /**
+   * SSVC decision points, as stored codes — with `NOT_ASSESSED` naming the
+   * records that carry no assessment at all (D-070).
+   */
+  ssvcExpl?: number[]
+  ssvcAuto?: number[]
+  ssvcImpact?: number[]
   scoreMin?: number
   scoreMax?: number
   /** Unix seconds, inclusive on both ends. */
@@ -229,6 +279,9 @@ export function compile(filters: Filters, resolved: Resolved = {}): Compiled {
 
   pushIn(clauses, params, 'c.cvss_sev', filters.severity)
   pushIn(clauses, params, 'c.cvss_ver', filters.cvssVersion)
+  pushNullable(clauses, params, 'c.ssvc_expl', filters.ssvcExpl)
+  pushNullable(clauses, params, 'c.ssvc_auto', filters.ssvcAuto)
+  pushNullable(clauses, params, 'c.ssvc_impact', filters.ssvcImpact)
   pushRange(clauses, params, 'c.cvss_score', filters.scoreMin, filters.scoreMax)
   pushRange(clauses, params, 'c.published', filters.publishedFrom, filters.publishedTo)
   pushRange(clauses, params, 'c.updated', filters.updatedFrom, filters.updatedTo)
@@ -278,6 +331,37 @@ function pushIn(
   if (!values?.length) return
   clauses.push(`${column} IN (${placeholders(values.length)})`)
   params.push(...values)
+}
+
+/**
+ * `column IN (?, ?)`, with `NOT_ASSESSED` compiling to `column IS NULL` beside
+ * it rather than into it.
+ *
+ * `IN` is never true for NULL, so selecting "not assessed" through `pushIn`
+ * would return nothing at all — and an empty table for a band that holds half
+ * the corpus reads as "there are none", not "this filter cannot say that"
+ * (D-070). The sentinel is stripped before anything is bound, so it never
+ * reaches SQL as a value.
+ */
+function pushNullable(
+  clauses: string[],
+  params: SqlParam[],
+  column: string,
+  values: number[] | undefined
+): void {
+  if (!values?.length) return
+  const codes = values.filter((value) => value !== NOT_ASSESSED)
+  const absent = values.length !== codes.length
+  const arms: string[] = []
+  if (codes.length) {
+    arms.push(`${column} IN (${placeholders(codes.length)})`)
+    params.push(...codes)
+  }
+  if (absent) arms.push(`${column} IS NULL`)
+  // Selecting *only* the sentinel is one arm, which needs no parentheses but
+  // gets them anyway: this clause is joined with AND, and an unparenthesised OR
+  // would bind looser than the join and widen every other filter.
+  if (arms.length) clauses.push(arms.length > 1 ? `(${arms.join(' OR ')})` : arms[0]!)
 }
 
 function pushExists(
@@ -434,9 +518,32 @@ export interface RowOptions {
    * silently cut every description at 400 characters would be wrong in a way
    * the file could not disclose. Only the export path sets this, and only
    * because it is bounded by batch rather than by result set (lib/export.ts).
+   *
+   * It also widens the row to `EXPORT_ONLY_COLUMNS` below, for the same reason:
+   * a copy that dropped the rejection reason would hand back 17,842 records
+   * with no text at all, which is precisely what D-070 exists to stop.
    */
   full?: boolean
 }
+
+/**
+ * The columns an export carries and the record table does not.
+ *
+ * Kept off the screen because a list of 100 records is a place to *find* a
+ * record, not to read one — the detail view renders these — and kept in the
+ * file because an export is a copy (D-071). `lib/export.ts`'s `RECORD_COLUMNS`
+ * names them in this order, and `tests/unit/export.test.ts` checks the two
+ * against each other, because a mismatch would silently label every column
+ * after the first one wrongly.
+ */
+export const EXPORT_ONLY_SQL = [
+  't.title',
+  't.reason',
+  'c.reserved',
+  'c.ssvc_expl',
+  'c.ssvc_auto',
+  'c.ssvc_impact',
+] as const
 
 /**
  * The record list: one row per matching CVE, with enough to identify it.
@@ -460,10 +567,11 @@ export function rowsSql(
   // it. The allowlist is the whole defence, so its miss case has to be safe.
   const sort = SORT_SQL[options.sort as SortKey] ?? SORT_SQL.published
   const description = options.full ? 't.descr' : 'substr(t.descr, 1, 400)'
+  const extra = options.full ? `, ${EXPORT_ONLY_SQL.join(', ')}` : ''
   return {
     sql:
       `SELECT c.cve_id AS cve, c.state, c.published, c.updated, c.cvss_ver, c.cvss_score, ` +
-      `c.cvss_sev, n.name AS cna, ${description} AS description ` +
+      `c.cvss_sev, n.name AS cna, ${description} AS description${extra} ` +
       `FROM cve c LEFT JOIN cna n ON n.id = c.cna_id LEFT JOIN cve_text t ON t.cve_id = c.id ` +
       `WHERE ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`,
     params: [...params, limit + 1, offset],
@@ -498,6 +606,9 @@ export const DIMENSIONS = [
   'month',
   'severity',
   'cvssVersion',
+  'ssvcExpl',
+  'ssvcAuto',
+  'ssvcImpact',
   'state',
   'cna',
   'vendor',
@@ -519,6 +630,9 @@ export const DIMENSION_LABELS: Record<Dimension, string> = {
   month: 'Month',
   severity: 'Severity',
   cvssVersion: 'CVSS version',
+  ssvcExpl: 'SSVC exploitation',
+  ssvcAuto: 'SSVC automatable',
+  ssvcImpact: 'SSVC technical impact',
   state: 'State',
   cna: 'CNA',
   vendor: 'Vendor',
@@ -532,7 +646,42 @@ export const DIMENSION_LABELS: Record<Dimension, string> = {
  * by the code, because they are scales (severity) or version identifiers, not
  * rankings.
  */
-const CODE_DIMENSIONS = new Set<Dimension>(['severity', 'cvssVersion', 'state'])
+const CODE_DIMENSIONS = new Set<Dimension>([
+  'severity',
+  'cvssVersion',
+  'ssvcExpl',
+  'ssvcAuto',
+  'ssvcImpact',
+  'state',
+])
+
+/**
+ * The code dimensions whose NULL bucket is a **missing assessment** rather than
+ * a missing lookup row — so it is always drawn, always named, and always last
+ * on the axis (D-070, D-073).
+ *
+ * Exported because the chart layer has to give it the off-ramp neutral: an
+ * absence must not be placeable on the scale beside the levels.
+ */
+export const ABSENCE_DIMENSIONS = new Set<Dimension>([
+  'severity',
+  'ssvcExpl',
+  'ssvcAuto',
+  'ssvcImpact',
+])
+
+/** The three SSVC axes, which share an encoding, an ordering and a NULL band. */
+export const SSVC_DIMENSIONS = new Set<Dimension>(['ssvcExpl', 'ssvcAuto', 'ssvcImpact'])
+
+/** Which label map a code dimension's buckets are named from. */
+export const CODE_LABELS: Partial<Record<Dimension, Record<number, string>>> = {
+  severity: SEVERITY_LABELS,
+  cvssVersion: CVSS_VERSION_LABELS,
+  state: STATE_LABELS,
+  ssvcExpl: SSVC_EXPL_LABELS,
+  ssvcAuto: SSVC_AUTO_LABELS,
+  ssvcImpact: SSVC_IMPACT_LABELS,
+}
 
 /**
  * The time grains, as SQL over `c.published` (unix seconds).
@@ -553,6 +702,19 @@ const CVSS_VERSION_ORDER =
   'CASE WHEN c.cvss_ver = 2 THEN 0 WHEN c.cvss_ver = 30 THEN 1 ' +
   'WHEN c.cvss_ver = 31 THEN 2 WHEN c.cvss_ver = 4 THEN 3 ' +
   'WHEN c.cvss_ver IS NULL THEN 5 ELSE 4 END'
+
+/**
+ * An SSVC axis in code order with the unassessed records **last**.
+ *
+ * SQLite sorts NULL first ascending, which would open every exploitation
+ * breakdown on the band that is an absence rather than a level, and put it at
+ * the baseline of a stack where its size distorts the trend above it — the
+ * position D-073 reserved for the series a reader can actually compare. The
+ * codes are this file's own; nothing caller-supplied reaches here.
+ */
+function absentLast(column: string): string {
+  return `CASE WHEN ${column} IS NULL THEN 99 ELSE ${column} END`
+}
 
 /**
  * The join chains a dimension can need, each declared **once** and shared by
@@ -644,6 +806,24 @@ const DIMENSION_SQL: Record<Dimension, DimensionSql> = {
     group: 'c.cvss_ver',
     order: CVSS_VERSION_ORDER,
   },
+  ssvcExpl: {
+    key: 'c.ssvc_expl',
+    label: 'c.ssvc_expl',
+    group: 'c.ssvc_expl',
+    order: absentLast('c.ssvc_expl'),
+  },
+  ssvcAuto: {
+    key: 'c.ssvc_auto',
+    label: 'c.ssvc_auto',
+    group: 'c.ssvc_auto',
+    order: absentLast('c.ssvc_auto'),
+  },
+  ssvcImpact: {
+    key: 'c.ssvc_impact',
+    label: 'c.ssvc_impact',
+    group: 'c.ssvc_impact',
+    order: absentLast('c.ssvc_impact'),
+  },
   state: { key: 'c.state', label: 'c.state', group: 'c.state' },
   cna: { key: 'c.cna_id', label: 'n.name', group: 'c.cna_id', join: 'cna' },
   vendor: { key: 'v.id', label: 'v.name', group: 'v.id', join: 'prod' },
@@ -673,9 +853,12 @@ export function groupSql(
   const shape = shapeOf(dimension)
   const { where, params } = compile(filters, resolved)
   const bounded = clampLimit(limit, GROUP_LIMIT, GROUP_LIMIT)
-  const ordered = TIME_DIMENSIONS.has(dimension)
-    ? `${axisOrder(shape)} ASC`
-    : dimension === 'cvssVersion'
+  // Scales and time read in their own order; identities read biggest-first,
+  // because "which are the top ones" is the question being asked of them.
+  // `state` is the exception among the codes: PUBLISHED before REJECTED is the
+  // reading order, and its stored codes run the other way.
+  const ordered =
+    TIME_DIMENSIONS.has(dimension) || dimension === 'cvssVersion' || SSVC_DIMENSIONS.has(dimension)
       ? `${axisOrder(shape)} ASC`
       : dimension === 'state'
         ? `${shape.key} DESC`

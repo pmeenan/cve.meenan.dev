@@ -66,12 +66,21 @@ function key(cveId: string): string {
   return cveId.trim().toLowerCase()
 }
 
-/** The record itself. `cve_text` is a LEFT JOIN: 4.46% have no English description (D-023). */
+/**
+ * The record itself. `cve_text` is a LEFT JOIN: 4.46% have no English
+ * description (D-023).
+ *
+ * `reason` is why the REJECTED half of that number stops rendering blank —
+ * every one of the 17,842 REJECTED records has its only English text there
+ * (D-070). `title` and the three SSVC codes come from the same row set, so the
+ * detail view costs the same one query it did at schema 1.
+ */
 export function recordSql(cveId: string): DetailQuery {
   return {
     sql:
       `SELECT c.cve_id, c.state, c.year, c.published, c.updated, c.cvss_ver, c.cvss_score, ` +
-      `c.cvss_sev, c.cvss_vec, n.name AS cna, t.descr ` +
+      `c.cvss_sev, c.cvss_vec, n.name AS cna, t.descr, t.title, t.reason, c.reserved, ` +
+      `c.ssvc_expl, c.ssvc_auto, c.ssvc_impact ` +
       `FROM cve c LEFT JOIN cna n ON n.id = c.cna_id LEFT JOIN cve_text t ON t.cve_id = c.id ` +
       `WHERE ${BY_ID} LIMIT 1`,
     params: [key(cveId)],
@@ -99,7 +108,7 @@ export function cwesSql(cveId: string): DetailQuery {
 export function productsSql(cveId: string): DetailQuery {
   return {
     sql:
-      `SELECT v.name AS vendor, p.name AS product FROM cve c ` +
+      `SELECT v.name AS vendor, p.name AS product, cp.default_status FROM cve c ` +
       `JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ` +
       `LEFT JOIN vendor v ON v.id = p.vendor_id WHERE ${BY_ID} ` +
       `ORDER BY v.name, p.name LIMIT ?`,
@@ -115,16 +124,25 @@ export function productsSql(cveId: string): DetailQuery {
  * may be an exact version, a `< x` bound, a `<= x` bound, or a status with
  * neither. All four columns are returned rather than pre-formatted, because
  * collapsing them into a sentence in SQL would hide which of the four shapes a
- * row actually is — and the ambiguity `defaultStatus` would resolve is not in
- * the schema until D-070 lands in M5.
+ * row actually is.
+ *
+ * `default_status` comes along since schema 2, and it is what makes the rows
+ * readable rather than merely present (D-070). It governs every version the
+ * record does *not* list, so with `defaultStatus: affected` the listed
+ * `unaffected` rows are the **fixed** versions and everything else is
+ * vulnerable — the inverse of the natural reading of the rows alone. It is
+ * joined from `cve_prod` rather than stored per version row, so a record whose
+ * product has no `cve_prod` row (impossible today, but the join is a LEFT one
+ * anyway) shows the rows without inventing a default.
  */
 export function versionsSql(cveId: string): DetailQuery {
   return {
     sql:
       `SELECT v.name AS vendor, p.name AS product, cv.status, cv.version, cv.lt, cv.lte, ` +
-      `t.name AS vtype FROM cve c JOIN cve_ver cv ON cv.cve_id = c.id ` +
+      `t.name AS vtype, cp.default_status FROM cve c JOIN cve_ver cv ON cv.cve_id = c.id ` +
       `LEFT JOIN product p ON p.id = cv.product_id ` +
       `LEFT JOIN vendor v ON v.id = p.vendor_id LEFT JOIN vtype t ON t.id = cv.vtype ` +
+      `LEFT JOIN cve_prod cp ON cp.cve_id = c.id AND cp.product_id = cv.product_id ` +
       `WHERE ${BY_ID} ORDER BY v.name, p.name, cv.status, cv.version LIMIT ?`,
     params: [key(cveId), DETAIL_LIMITS.versions + 1],
     limit: DETAIL_LIMITS.versions,

@@ -8,7 +8,7 @@ import {
   filtersToDraft,
   type Draft,
 } from '../../lib/draft'
-import { CVSS_VERSION_LABELS, SEVERITY_LABELS, type Filters } from '../../lib/filters'
+import { NOT_ASSESSED, type Filters } from '../../lib/filters'
 
 /**
  * The filter form's state and the two conversions around it (M4).
@@ -24,8 +24,6 @@ import { CVSS_VERSION_LABELS, SEVERITY_LABELS, type Filters } from '../../lib/fi
  * boundary by the reader's offset and quietly drops a day's records at each end.
  */
 
-const labels = { severity: SEVERITY_LABELS, cvssVersion: CVSS_VERSION_LABELS }
-
 const FULL: Draft = {
   text: 'buffer overflow',
   cveId: 'CVE-2021-44228',
@@ -36,6 +34,12 @@ const FULL: Draft = {
   host: 'github.com',
   severity: [3, 4],
   cvssVersion: [31, 4],
+  // Including the sentinel, which is the round trip's hardest case: it is not a
+  // stored code, so a conversion that filtered it out would look correct until
+  // a permalink to "not assessed" came back selecting nothing (D-070).
+  ssvcExpl: [2, NOT_ASSESSED],
+  ssvcAuto: [1],
+  ssvcImpact: [0, 1],
   scoreMin: '7',
   scoreMax: '10',
   publishedFrom: '2024-01-01',
@@ -121,37 +125,37 @@ describe('describeDraft', () => {
   it('always states the record-state default, and marks it as one (D-022)', () => {
     // The single filter that changes every number on screen. A default that is
     // implied is a default nobody checks.
-    const chips = describeDraft(EMPTY_DRAFT, labels)
+    const chips = describeDraft(EMPTY_DRAFT)
     expect(chips[0]!.key).toBe('state')
     expect(chips[0]!.label).toMatch(/PUBLISHED records only/)
     expect(chips[0]!.standing).toBe(true)
   })
 
   it('marks a deliberate widening as a choice, not a default', () => {
-    const chips = describeDraft({ ...EMPTY_DRAFT, state: 'all' }, labels)
+    const chips = describeDraft({ ...EMPTY_DRAFT, state: 'all' })
     expect(chips[0]!.standing).toBeFalsy()
     expect(chips[0]!.label).toMatch(/REJECTED included/)
   })
 
   it('names every filter that is set, and nothing that is not', () => {
-    const chips = describeDraft(FULL, labels)
+    const chips = describeDraft(FULL)
     const keys = chips.map((chip) => chip.key)
     expect(keys).toContain('vendor')
     expect(keys).toContain('severity')
     expect(keys).toContain('published')
     expect(keys).toContain('score')
-    expect(describeDraft(EMPTY_DRAFT, labels)).toHaveLength(1)
+    expect(describeDraft(EMPTY_DRAFT)).toHaveLength(1)
   })
 
   it('shows severity by name rather than by stored code', () => {
-    const chips = describeDraft({ ...EMPTY_DRAFT, severity: [4] }, labels)
+    const chips = describeDraft({ ...EMPTY_DRAFT, severity: [4] })
     expect(chips.find((chip) => chip.key === 'severity')!.label).toContain('CRITICAL')
   })
 
   it('describes a half-open range as half-open', () => {
-    const from = describeDraft({ ...EMPTY_DRAFT, scoreMin: '9' }, labels)
+    const from = describeDraft({ ...EMPTY_DRAFT, scoreMin: '9' })
     expect(from.find((chip) => chip.key === 'score')!.label).toBe('CVSS score from 9')
-    const to = describeDraft({ ...EMPTY_DRAFT, scoreMax: '3' }, labels)
+    const to = describeDraft({ ...EMPTY_DRAFT, scoreMax: '3' })
     expect(to.find((chip) => chip.key === 'score')!.label).toBe('CVSS score to 3')
   })
 })
@@ -159,7 +163,7 @@ describe('describeDraft', () => {
 describe('clearChip', () => {
   it('clears both ends of a range together', () => {
     const draft: Draft = { ...EMPTY_DRAFT, scoreMin: '7', scoreMax: '10' }
-    const chip = describeDraft(draft, labels).find((entry) => entry.key === 'score')!
+    const chip = describeDraft(draft).find((entry) => entry.key === 'score')!
     const cleared = clearChip(draft, chip)
     expect(cleared.scoreMin).toBe('')
     expect(cleared.scoreMax).toBe('')
@@ -167,7 +171,7 @@ describe('clearChip', () => {
 
   it('clears a list axis to an empty list, not to the shared constant', () => {
     const draft: Draft = { ...EMPTY_DRAFT, severity: [1, 2] }
-    const chip = describeDraft(draft, labels).find((entry) => entry.key === 'severity')!
+    const chip = describeDraft(draft).find((entry) => entry.key === 'severity')!
     const cleared = clearChip(draft, chip)
     expect(cleared.severity).toEqual([])
     expect(cleared.severity).not.toBe(EMPTY_DRAFT.severity)
@@ -175,7 +179,7 @@ describe('clearChip', () => {
 
   it('leaves every other axis alone', () => {
     const draft: Draft = { ...EMPTY_DRAFT, vendor: 'cisco', cwe: 'CWE-79' }
-    const chip = describeDraft(draft, labels).find((entry) => entry.key === 'vendor')!
+    const chip = describeDraft(draft).find((entry) => entry.key === 'vendor')!
     const cleared = clearChip(draft, chip)
     expect(cleared.vendor).toBe('')
     expect(cleared.cwe).toBe('CWE-79')

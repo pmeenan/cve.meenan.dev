@@ -2,11 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 
+import { gateMessage, SUPPORT_FLOOR, type CapabilityReport } from '@/lib/capabilities'
 import { newCancelFlag, requestCancel } from '@/lib/cancel'
+import { NO_SHELL, registerShell, shellVersion, type ShellState } from '@/lib/shell'
 import { draftToFilters, filtersToDraft } from '@/lib/draft'
 import { describeFreshness } from '@/lib/freshness'
 import type { ExportFormat } from '@/lib/export'
-import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
+import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS, SCHEMA_VERSION } from '@/lib/protocol'
 import type {
   BenchResult,
   CveDetail,
@@ -20,6 +22,12 @@ import type {
   Timings,
 } from '@/lib/protocol'
 import { emptyReport, fromFragment, REPORT_VERSION, type Report } from '@/lib/report'
+import {
+  bytes as formatBytes,
+  persistenceMessage,
+  requestPersistence,
+  type StorageReport,
+} from '@/lib/storage'
 import {
   clearRecent,
   emptyStore,
@@ -69,7 +77,9 @@ type TabId = 'data' | 'explore' | 'report' | 'saved' | 'sql'
  *
  * The knob to be wary of is **`vfs`**, not the others. `?stop=` ends a download
  * early, `?stall=` shortens the no-progress timeout, `?schema=` changes the
- * schema version this build claims to read (D-068), `?ops=` and `?analyze=`
+ * schema version this build claims to read (D-068), `?probe=` forces the
+ * capability gate's verdict downwards so the gate's own message can be tested
+ * (M5), `?ops=` and `?analyze=`
  * turn off the query progress handler and the statistics pass so the M3 sweep
  * can price them (D-066, D-067) — all of which leave the local copy where it
  * was by construction. `?vfs=` selects the `opfs-sahpool` path, which cannot
@@ -94,6 +104,12 @@ function importOptions(search: string): ImportOptions {
   const progressOps = ops !== null && /^\d+$/.test(ops.trim()) ? Number(ops) : null
   // `?analyze=0` only: anything else leaves the default, which is on.
   const analyze = params.get('analyze') === '0' ? false : null
+  // `?probe=` forces the capability gate's verdict, and only downwards (M5).
+  const probeRaw = params.get('probe')
+  const probe = probeRaw === 'async' || probeRaw === 'unavailable' ? probeRaw : null
+  // `?free=` makes the storage preflight see a smaller figure, never a larger.
+  const freeRaw = params.get('free')
+  const freeBytes = freeRaw !== null && /^\d+$/.test(freeRaw.trim()) ? Number(freeRaw.trim()) : null
   return {
     concurrency: positive(params.get('concurrency')) ?? DEFAULT_CONCURRENCY,
     cacheMib: positive(params.get('cache')) ?? DEFAULT_CACHE_MIB,
@@ -103,6 +119,8 @@ function importOptions(search: string): ImportOptions {
     ...(schema === null ? {} : { schema }),
     ...(progressOps === null ? {} : { progressOps }),
     ...(analyze === null ? {} : { analyze }),
+    ...(probe === null ? {} : { probe }),
+    ...(freeBytes === null ? {} : { freeBytes }),
   }
 }
 
@@ -193,6 +211,24 @@ export default function Home() {
     wasmHeapBytes: number
   } | null>(null)
 
+  // --- M5 ---------------------------------------------------------------
+  /**
+   * What this browser can do and what its storage looks like (D-016, M5).
+   *
+   * Null until the Worker has answered. The gate below is deliberately *not*
+   * rendered while it is null: a browser that turns out to be fine would
+   * otherwise flash a "cannot run" banner on every load, and a banner that
+   * appears and disappears is one nobody believes the next time.
+   */
+  const [environment, setEnvironment] = useState<{
+    capabilities: CapabilityReport
+    storage: StorageReport
+  } | null>(null)
+  /** What `navigator.storage.persist()` answered, once it has been asked. */
+  const [persisted, setPersisted] = useState<boolean | null>(null)
+  /** The offline app shell's own account of itself (D-048, D-009). */
+  const [shell, setShell] = useState<ShellState>(NO_SHELL)
+
   // --- M4 ---------------------------------------------------------------
   const [tab, setTab] = useState<TabId>('data')
   /** The report definition the builder is editing. One object, three consumers (D-069). */
@@ -264,6 +300,21 @@ export default function Home() {
   const [cancelFlag] = useState<Int32Array | null>(() => newCancelFlag())
 
   useEffect(() => {
+    // The offline shell (D-048). Its own effect, and deliberately not awaited by
+    // anything: registration failing must cost the offline *reopen* and nothing
+    // else, so no part of the app below waits on it.
+    let live = true
+    void registerShell(navigator.serviceWorker).then(async (state) => {
+      if (!live) return
+      const version = await shellVersion(navigator.serviceWorker)
+      if (live) setShell({ ...state, version })
+    })
+    return () => {
+      live = false
+    }
+  }, [])
+
+  useEffect(() => {
     const worker = new Worker(new URL('../workers/db.worker.ts', import.meta.url), {
       type: 'module',
     })
@@ -310,6 +361,9 @@ export default function Home() {
             setDetailId(null)
             setDetail(undefined)
           }
+          break
+        case 'environment':
+          setEnvironment({ capabilities: message.capabilities, storage: message.storage })
           break
         case 'imported':
           setStorage('ready')
@@ -416,6 +470,25 @@ export default function Home() {
           if (!importedThisRun.current) setTimings(null)
           break
       }
+    }
+
+    // A Worker that fails to *load* — a chunk that 404s, a module the browser
+    // refuses (RE-012's MIME type), an offline reopen whose shell cache is
+    // missing something — posts no message and throws nowhere this code can see
+    // it. Without this the app sits at "pending" forever with nothing on screen,
+    // which is precisely the silence D-052 forbids for anything that can fail.
+    worker.onerror = (event) => {
+      const detail = event instanceof ErrorEvent && event.message ? `: ${event.message}` : ''
+      setError(
+        `The database worker could not start${detail}. Reload the page; if you are offline, ` +
+          'reconnect once so the app can fetch the part it is missing.'
+      )
+      setStorage('unknown')
+    }
+    // And a module the worker itself fails to import rejects here rather than
+    // firing `onerror` in some browsers, which is the same silence.
+    worker.onmessageerror = () => {
+      setError('The database worker sent a message this page could not read. Reload the page.')
     }
 
     // The cancellation flag first: it has to be in the Worker's hands before
@@ -601,6 +674,14 @@ export default function Home() {
     () => DEFAULT_VFS
   )
 
+  /**
+   * The gate has fired, so the app cannot do the thing it exists to do.
+   *
+   * Only ever true once the Worker has *answered*: `environment === null` means
+   * "not asked yet", and treating that as unsupported would disable the button
+   * on every first paint.
+   */
+  const blocked = environment !== null && !environment.capabilities.supported
   const needsCorpus = ready ? undefined : 'Download the corpus first'
   const tabs: TabSpec[] = [
     { id: 'data', label: 'Data' },
@@ -657,6 +738,22 @@ export default function Home() {
             </p>
           )}
         </section>
+      )}
+
+      {/* The support gate (D-016, M5). Above every control, because the point
+          is that it arrives *before* a download rather than tens of seconds
+          into one — and there is no telemetry (D-009), so this sentence is the
+          entire support channel for a browser that lands here. */}
+      {environment && !environment.capabilities.supported && (
+        <p className="error" data-gate="unsupported">
+          {gateMessage(environment.capabilities)}
+        </p>
+      )}
+      {environment && environment.capabilities.degraded.length > 0 && (
+        <p className="stale" data-gate="degraded">
+          This browser is missing {environment.capabilities.degraded.join(', ')}. The app works; the
+          parts that depend on it do not.
+        </p>
       )}
 
       {/* A schema bump, announced (M3). The local database is a rebuildable
@@ -734,14 +831,21 @@ export default function Home() {
       <TabPanel id="data" active={active === 'data'}>
         <section className="controls">
           <button
-            onClick={() => send({ type: 'import', options: importOptions(location.search) })}
-            disabled={busy}
+            onClick={() => {
+              // Asked from the click, because Firefox prompts and a prompt
+              // outside a user gesture is a prompt that is dismissed. The
+              // *answer* is what gets reported — a request that "succeeded" and
+              // was refused looks identical from the call site otherwise.
+              void requestPersistence(navigator.storage).then(setPersisted)
+              send({ type: 'import', options: importOptions(location.search) })
+            }}
+            disabled={busy || blocked}
           >
             {ready ? 'Re-download data' : 'Download data'}
           </button>
           <button
             onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
-            disabled={!ready || busy}
+            disabled={!ready || busy || blocked}
           >
             Sync
           </button>
@@ -767,6 +871,96 @@ export default function Home() {
             Clear local copy
           </button>
         </section>
+
+        {/* The one support channel (D-009). Nothing is collected from users —
+            not analytics, not error reporting — so a bug report is whatever a
+            person can read off this panel and paste. A `<details>` rather than
+            a tab: it is closed by default because it is for the day something
+            is wrong, and it is keyboard-operable and screen-reader-labelled
+            without any code of ours. */}
+        <details
+          className="diagnostics"
+          data-diagnostics="1"
+          onToggle={(event) => {
+            // Re-probed on open rather than kept live: storage numbers move,
+            // and a panel showing what was true at page load is a panel that
+            // sends someone chasing a number that already changed.
+            if (!(event.currentTarget as HTMLDetailsElement).open) return
+            send({ type: 'probe' })
+            const controlling = Boolean(navigator.serviceWorker?.controller)
+            void shellVersion(navigator.serviceWorker).then((version) =>
+              setShell((current) => ({ ...current, version, controlling }))
+            )
+          }}
+        >
+          <summary>Diagnostics</summary>
+          <p className="muted">
+            Everything below is read from this browser. Nothing is sent anywhere — there is no
+            telemetry in this app at all, so if something is wrong, this panel is what to copy into
+            a bug report.
+          </p>
+          <dl className="facts" data-diagnostics-body="1">
+            <dt>Local copy</dt>
+            <dd data-diag="storage">
+              {storage}
+              {revision !== null && ` at revision ${revision}`}
+            </dd>
+            <dt>Schema</dt>
+            <dd data-diag="schema">
+              copy {schemas.local ?? '—'}, this app reads {schemas.speaks || SCHEMA_VERSION}
+            </dd>
+            <dt>Records</dt>
+            <dd data-diag="records">
+              {timings
+                ? timings.records.toLocaleString()
+                : ready
+                  ? 'not counted this session'
+                  : '—'}
+            </dd>
+            <dt>Data built</dt>
+            <dd data-diag="generated">
+              {generated === null ? '—' : new Date(generated * 1000).toISOString()}
+            </dd>
+            <dt>Last sync</dt>
+            <dd data-diag="sync">
+              {sync
+                ? `${sync.applied} delta${sync.applied === 1 ? '' : 's'} to revision ${sync.to}`
+                : 'not this session'}
+            </dd>
+            <dt>Storage used</dt>
+            <dd data-diag="usage">
+              {environment
+                ? `${formatBytes(environment.storage.usage)} of ${formatBytes(
+                    environment.storage.quota
+                  )}`
+                : '—'}
+            </dd>
+            <dt>Eviction</dt>
+            <dd data-diag="persisted">
+              {persistenceMessage(persisted ?? environment?.storage.persisted ?? null)}
+            </dd>
+            <dt>Offline shell</dt>
+            <dd data-diag="shell">
+              {!shell.supported
+                ? 'not supported by this browser'
+                : shell.error
+                  ? `registration failed: ${shell.error}`
+                  : `${shell.registered ? 'registered' : 'not registered'}, ${
+                      shell.controlling ? 'controlling this page' : 'not controlling this page yet'
+                    }${shell.version ? `, cache ${shell.version}` : ''}`}
+            </dd>
+            <dt>Browser support</dt>
+            <dd data-diag="capabilities">
+              {environment
+                ? environment.capabilities.capabilities
+                    .map((entry) => `${entry.label}: ${entry.ok ? 'yes' : 'no'}`)
+                    .join('; ')
+                : '—'}
+            </dd>
+            <dt>Support floor</dt>
+            <dd data-diag="floor">{SUPPORT_FLOOR}</dd>
+          </dl>
+        </details>
 
         {vfs !== DEFAULT_VFS && (
           <p className="error">

@@ -118,7 +118,8 @@ def _record(db: sqlite3.Connection, cve_id: str) -> dict:
     """One whole record, in wire shape. Absent means absent (D-031)."""
     row = db.execute(
         "SELECT id, cve_id, year, state, cna_id, published, updated, "
-        "cvss_ver, cvss_score, cvss_sev, cvss_vec FROM cve WHERE cve_id = ?",
+        "cvss_ver, cvss_score, cvss_sev, cvss_vec, reserved, "
+        "ssvc_expl, ssvc_auto, ssvc_impact FROM cve WHERE cve_id = ?",
         (cve_id,),
     ).fetchone()
     if row is None:
@@ -136,6 +137,10 @@ def _record(db: sqlite3.Connection, cve_id: str) -> dict:
         cvss_score,
         cvss_sev,
         cvss_vec,
+        reserved,
+        ssvc_expl,
+        ssvc_auto,
+        ssvc_impact,
     ) = row
 
     out: dict = {"id": rowid, "cve": canonical, "y": year, "st": state}
@@ -145,24 +150,49 @@ def _record(db: sqlite3.Connection, cve_id: str) -> dict:
         out["pub"] = published
     if updated is not None:
         out["upd"] = updated
+    if reserved is not None:
+        out["res"] = reserved
     if cvss_ver is not None:
         vector = cvss_vec if isinstance(cvss_vec, str) else ""
         out["cvss"] = [cvss_ver, cvss_score, cvss_sev, vector]
+    # One tuple rather than three keys, and present only when *something* was
+    # assessed. Inside it a null is a decision point nobody stated, which is not
+    # the same as `none` (D-070) — so the nulls are carried rather than dropped.
+    if (ssvc_expl, ssvc_auto, ssvc_impact) != (None, None, None):
+        out["ssvc"] = [ssvc_expl, ssvc_auto, ssvc_impact]
 
-    descr = db.execute("SELECT descr FROM cve_text WHERE cve_id = ?", (rowid,)).fetchone()
-    if descr and descr[0]:
-        out["descr"] = descr[0]
+    text = db.execute(
+        "SELECT descr, title, reason FROM cve_text WHERE cve_id = ?", (rowid,)
+    ).fetchone()
+    if text:
+        for key, value in zip(("descr", "title", "reason"), text):
+            # An empty string would insert a row that says something different
+            # from "this record has no title", so the key is omitted instead —
+            # and `lib/delta.ts` refuses an empty one for the same reason.
+            if value:
+                out[key] = value
 
     # Ordered so that re-emitting the same changeset produces the same bytes,
     # which is what makes a re-run of an interrupted ingest checkable.
     for key, sql in (
         ("cwe", "SELECT cwe_id FROM cve_cwe WHERE cve_id = ? ORDER BY cwe_id"),
-        ("prod", "SELECT product_id FROM cve_prod WHERE cve_id = ? ORDER BY product_id"),
         ("ref", "SELECT url_id FROM cve_ref WHERE cve_id = ? ORDER BY url_id"),
     ):
         values = [row[0] for row in db.execute(sql, (rowid,))]
         if values:
             out[key] = values
+
+    # `prod` carries a pair since schema 2: `cve_prod` gained a column, and a
+    # bare id list could no longer reproduce the row.
+    products = [
+        list(r)
+        for r in db.execute(
+            "SELECT product_id, default_status FROM cve_prod WHERE cve_id = ? ORDER BY product_id",
+            (rowid,),
+        )
+    ]
+    if products:
+        out["prod"] = products
 
     versions = [
         list(r)
@@ -242,11 +272,24 @@ def _check_wire_bounds(delta: dict) -> None:
             _counter(record[key], f"{where}.{key}")
         if "cna" in record:
             _row_id(record["cna"], f"{where}.cna")
-        for key in ("pub", "upd"):
+        for key in ("pub", "upd", "res"):
             if key in record:
                 _signed(record[key], f"{where}.{key}")
-        if record.get("descr") == "":
-            raise ValueError(f"{where}.descr: empty, which the client refuses — omit it instead")
+        for key in ("descr", "title", "reason"):
+            if record.get(key) == "":
+                raise ValueError(f"{where}.{key}: empty, which the client refuses — omit it instead")
+        if "ssvc" in record:
+            points = record["ssvc"]
+            if not isinstance(points, list) or len(points) != 3:
+                raise ValueError(f"{where}.ssvc: expected three decision points")
+            if all(point is None for point in points):
+                # All three null is a record with no assessment, which the
+                # emitter expresses by omitting the key. Shipping the tuple would
+                # be three bytes saying nothing, and two ways to spell one state.
+                raise ValueError(f"{where}.ssvc: no decision point set — omit the key instead")
+            for index, point in enumerate(points):
+                if point is not None:
+                    _counter(point, f"{where}.ssvc[{index}]")
         if "cvss" in record:
             version, score, severity, vector = record["cvss"]
             _counter(version, f"{where}.cvss version")
@@ -258,9 +301,15 @@ def _check_wire_bounds(delta: dict) -> None:
                 _counter(severity, f"{where}.cvss severity")
             if not isinstance(vector, str):
                 raise ValueError(f"{where}.cvss vector: expected a string")
-        for key in ("cwe", "prod", "ref"):
+        for key in ("cwe", "ref"):
             for value in record.get(key, ()):
                 _row_id(value, f"{where}.{key}")
+        for entry in record.get("prod", ()):
+            if not isinstance(entry, list) or len(entry) != 2:
+                raise ValueError(f"{where}.prod: expected [product_id, default_status]")
+            _row_id(entry[0], f"{where}.prod product_id")
+            if entry[1] is not None:
+                _counter(entry[1], f"{where}.prod default_status")
         for version in record.get("ver", ()):
             _row_id(version[0], f"{where}.ver product_id")
             _counter(version[1], f"{where}.ver status")
@@ -291,7 +340,7 @@ def _check_closure(db: sqlite3.Connection, delta: dict, floors: dict) -> None:
         if "cna" in record:
             referenced["cna"].add(record["cna"])
         referenced["cwe"].update(record.get("cwe", ()))
-        referenced["product"].update(record.get("prod", ()))
+        referenced["product"].update(entry[0] for entry in record.get("prod", ()))
         referenced["url"].update(record.get("ref", ()))
         for version in record.get("ver", ()):
             referenced["product"].add(version[0])

@@ -697,38 +697,82 @@ first means nothing downstream is verified twice. Cloudflare is the exception:
 it is independent of everything else and should be flipped early for soak time,
 in parallel with whatever task is current.
 
-- [ ] **The schema bump, pipeline half** (D-070). `schema.sql` gains the five
-      fields and a new schema version; `normalize.py` mines them — SSVC's three
-      decision points from `metrics[].other` where `type == "ssvc"`,
-      `dateReserved` as unix seconds, `defaultStatus` with the conservative
-      tie-break D-070 requires made explicit (affected beats unknown beats
-      unaffected, on the deduped `(vendor, product)` collision), `cna.title`,
-      and the first English `rejectedReasons[]` value. Full rebuild on the
-      recorded ID space (D-056 seeding is undisturbed — columns change, ids do
-      not), with the real marginal cost measured against D-033's table — a
-      number to record, not a gate; the owner settled `title` on the 2.58 MB
-      proxy (D-070). One thing to settle rather than discover: how the bump
-      lands on the wire — a fresh generation at the new version, with no delta
-      crossing the schema boundary and the ingest state advanced accordingly.
-- [ ] **The schema bump, client half.** The schema assertion learns the new
-      version; `lib/filters.ts` grows the three SSVC axes as filters, grouped
-      counts and report dimensions — with NULL as its own "not assessed"
-      band throughout, never folded into `none` (D-070); the detail view
-      renders `title`, the rejection reason (D-022's 17,822 records stop
-      rendering blank), `reserved`, and version ranges disambiguated by
-      `default_status`. Whether `title` joins the client-built FTS index
-      (D-035) is decided here by measurement — index bytes and build seconds
-      against recall on vulnerability-class terms — because D-070 left it open
-      deliberately.
-- [ ] **The bump exercised end to end** — the claim M3 and M4 deliberately
-      could not make (D-068), now that both builds exist for real: the old
-      client against the new data plane refuses before a byte is fetched, with
-      the reload message; the new client against an old local copy announces
-      `obsolete` with both versions, withdraws the query surfaces, keeps the
-      copy, and replaces it by ordinary download. Deploy sequencing is part of
-      the task: the deployed client refuses a new-schema manifest, so the
-      artifact and the app ship in one window, artifact first.
-- [ ] **Multi-tab, full support** (owner decision 2026-08-08). One writer at a
+- [x] **The schema bump, pipeline half** (D-070, D-075). `schema.sql` carries
+      the five fields at **schema 2**; `normalize.py` mines them, with the
+      conservative `defaultStatus` tie-break explicit — 13,628 records really do
+      state two different defaults for one deduped `(vendor, product)` pair, so
+      taking the first would have been a coin flip on a correctness field. The
+      SSVC extractor was written against a **full scan of the corpus** rather
+      than a sample (374,269 records, 172,041 blocks): exactly three option
+      names, exactly six values, one record with `options: null`, and 164
+      records carrying two blocks — which is why the merge rule is stated (first
+      block to supply a point wins, **adp then cna**, deliberately unlike
+      `cvss`) rather than discovered later.
+
+      **The marginal cost, measured with both schemas built from one clone**
+      (2026-08-08): the published artifact goes from 63,308,279 to **65,709,320
+      bytes — +2.40 MB, +3.8%**, against D-070's 2.65 MB proxy, so the owner's
+      call holds with room. Build time +1.4 s. Recorded, as D-070 asked, not
+      treated as a gate.
+
+      **How it lands on the wire is settled** (D-075): a **bootstrapped**
+      generation above the published head, `publish.py --new-id-space`, then
+      `ingest.py init --force`. Not seeded — `build._seed_from` refuses that
+      deliberately, and the guard stays: every client re-downloads at a bump
+      anyway, so carrying id stability across one preserves something nobody can
+      use. `--new-id-space` retires every pre-bump delta in the same operation,
+      which is what stops a schema-1 delta being advertised beside a schema-2
+      snapshot. `FORMAT_VERSION` deliberately does *not* move with it — it is
+      checked first, and bumping it would replace D-068's actionable "reload the
+      page" with "unsupported wire format". The runbook is in
+      [pipeline/README.md](../pipeline/README.md).
+- [x] **The schema bump, client half.** The three SSVC axes are filters,
+      grouped counts and report dimensions, and **NULL is selectable** — through
+      a `NOT_ASSESSED` sentinel that compiles to `IS NULL` beside the `IN`
+      rather than into it, because `IN (…)` is never true for NULL and without
+      it the band holding half the corpus would be visible on every chart and
+      selectable nowhere. On a chart those axes take the **ordinal ramp**,
+      spaced across it, since none → poc → active is an escalation and D-073's
+      argument applies unchanged; the unassessed band takes the off-ramp
+      neutral, and the adjacency test asserts the pairs *these* stacks have,
+      which are not severity's — the neutral sits above the highest band here,
+      not above NONE. The detail view renders the title, the rejection reason
+      (17,842 records stop rendering blank), `reserved`, and a version table
+      with an "Everything else" column, without which a list of `unaffected`
+      rows can mean the opposite of what it looks like. An export carries the
+      six new columns and the record table does not: an export is a copy
+      (D-071).
+
+      **`title` joins the full-text index** — D-070's open question, decided by
+      measurement (D-075). A second *column* on the existing index rather than a
+      fourth index, so a search stays one `MATCH` and the promotion gate keeps
+      counting three tables. 9,854,710 bytes of title text against 123,525,051
+      of descriptions — ~8% more indexed text — against a recall gain that is
+      the point: 83.3% of titled records have a title that is not a substring of
+      their own description, and the title is where the vulnerability class and
+      the sink live.
+- [x] **The bump exercised end to end** (D-068). `tests/e2e/bump.spec.ts` runs
+      an old client against the **real** new data plane — `pipeline/pub` is
+      schema 2 and `pipeline/pub-schema1` is the generation before it — and
+      asserts the refusal names both versions, says *reload* rather than
+      re-download, and leaves the origin with no chunk fetched and no file
+      written. Then the same browser at the plane's own schema downloads it and
+      the new columns answer through the SQL console, including that **both**
+      SSVC states exist: assessed records and unassessed ones, because a zero in
+      the second would mean the projection was inventing findings.
+
+      **The mirror half stays a rehearsal, and that is a finding rather than a
+      shortcut.** A build can claim another schema version (`?schema=`); it
+      cannot *be* another build. The full-text index definition is compiled in
+      and now covers `cve_text.title`, so this build downloading the schema-1
+      artifact fails on `no such column: title` — not because the announcement
+      is broken but because the two halves of a bump ship together. The
+      announcement path compares two numbers and never branches on them, which
+      is what makes `query.spec.ts`'s knob faithful to it. Deploy sequencing is
+      settled and written down (pipeline/README.md): artifact first, app in the
+      same window, because a deployed client refuses a new-schema manifest and
+      says to reload.
+- [x] **Multi-tab, full support** (owner decision 2026-08-08). One writer at a
       time via Web Locks — download and sync are exclusive, and a second tab
       asked to sync says who is already doing it — while every tab keeps
       querying throughout (the `opfs` VFS's concurrent-reader behaviour is why
@@ -739,39 +783,109 @@ in parallel with whatever task is current.
       reader present at the moment of promotion. Verified by a two-page e2e —
       tab B queries while tab A syncs; tab A replaces the database and tab B
       follows.
-- [ ] **Storage quota, persistence and eviction.** `navigator.storage.persist()`
-      requested and its answer surfaced, not assumed; a preflight estimate
-      before download against the real need — two slots plus staging (D-061) —
-      so a doomed download is refused up front rather than dying at 90%;
-      `QuotaExceededError` mid-download fails cleanly with the live copy intact
-      (D-061's guarantee, now tested under quota pressure specifically); an
-      evicted copy discovered at reopen reports as an honest empty origin, not
-      an error; and D-068's open question — whether a retained obsolete copy is
-      a quota problem — is decided here, where quota is owned.
-- [ ] **The capability gate** (D-016). Probes the *synchronous* forms of
-      `FileSystemSyncAccessHandle`'s methods specifically — the naive
-      interface check passes on Safari 15.2–16.3 and then fails deep inside the
-      import, which is the failure the gate exists to prevent — plus whatever
-      else the import path actually requires. Below the floor, the message
-      arrives before any download and is self-explanatory on first read,
-      because D-009 means no gate hit is ever observed remotely.
-- [ ] **Firefox and WebKit** (D-016, rule 3). Playwright projects for both
-      engines; the e2e suite green on both — or each trade recorded by name —
-      *before* the floor is claimed publicly; the full-corpus import measured
-      per engine and recorded in features.md beside the Chromium numbers,
-      because a support claim is a measurement claim.
-- [ ] **The offline app shell** (D-048, network-first per D-054). A hand-rolled
-      service worker, versioned per deploy, caching the exported shell, the
-      `/sqlite/` distribution and the brotli decoder — and structurally never
-      `/data/`, which passes through untouched so the manifest stays the
-      freshness signal. The e2e is a *reopen*: network killed, app reopened
-      cold, corpus queried (vision criterion 5), plus the stale-manifest check
-      that `/data/` is never answered from the SW cache.
-- [ ] **The diagnostics panel** (D-009). The one support channel: storage used
+
+      **Writing this found a real deadlock, and not in the part it was aimed
+      at.** The capability probe (below) opened a scratch OPFS file under a
+      *fixed* name, and a sync access handle is an exclusive lock whose release
+      outlives `close()` (RE-007) — so two tabs starting at once was one tab
+      hanging with no error, no timeout, and a page stuck at "pending". It
+      presented as three unrelated e2e failures. The probe now names its file
+      per call, and `isOurEntry` matches the prefix so a tab killed mid-probe
+      leaves nothing behind.
+- [x] **Storage quota, persistence and eviction.** `navigator.storage.persist()`
+      is requested from the Download **click** — Firefox prompts, and a prompt
+      outside a user gesture is dismissed — and the *answer* is what the page
+      reports, not the fact that the call returned. The preflight runs after the
+      manifest and before the first chunk, budgeting **two generations** when a
+      copy is already present, because staged replacement holds both (D-061); an
+      unknown quota proceeds rather than blocking, since refusing on "I don't
+      know" would block every browser that reports nothing. A retry credits the
+      staging allocation already counted in `usage`, so the preflight cannot
+      strand the resumable bytes it is meant to preserve. An evicted copy at
+      reopen is already an honest empty origin — that is what discovery reports
+      — which is why the preflight is a check rather than a reservation.
+
+      **D-068's open question is decided: the retained obsolete copy stays.** It
+      is one generation, the same bound a re-download already accepts, and it is
+      reclaimed by the next promotion's ordinary sweep. Deleting it would trade
+      a bounded, temporary cost for the one thing D-068 exists to prevent —
+      a user arriving to find their download gone with nothing saying why.
+- [x] **The capability gate** (D-016). `lib/capabilities.ts` **calls**
+      `getSize()` on a real handle and reads whether a number or a Promise came
+      back — the only probe that separates Safari 16.4 from 16.3, where the
+      interface exists and its methods are async and the import then dies inside
+      WASM. Beside it: WebAssembly, OPFS, cross-origin isolation and
+      `SharedArrayBuffer`, all required; streaming responses reported as
+      *narrowed* rather than blocking. The gate runs before the manifest, and
+      its message names the specific missing capability **and** the floor,
+      because "why does this not work" and "what do I do" are different
+      questions — and a stripped COOP header is a fixable case that has nothing
+      to do with the browser. D-009 means no gate hit is ever observed remotely,
+      so the sentence on screen is the whole support channel.
+
+      Testing it needed a knob: the probe runs in the Worker, and a page-level
+      `addInitScript` never reaches there (RE-020). `?probe=` forces the verdict
+      and `?free=` shrinks the reported quota; both can only make the checks
+      *stricter*, which is what makes them safe to leave reachable — unlike
+      `?vfs=` (D-051).
+- [x] **Firefox and WebKit** (D-016, rule 3), **with the WebKit half recorded
+      as a trade rather than claimed.** `playwright.config.ts` carries all three
+      engines, Chromium first so `--project=chromium` stays the fast loop and a
+      bare `pnpm e2e` runs the claim.
+
+      **Firefox runs the whole suite**, and found two things Chromium could not.
+      One was ours: a tab clicked across the enabled/disabled transition landed
+      before the component wired it up — invisible on Chromium, reliable on
+      Firefox. The other is an engine difference worth keeping (RE-023):
+      Firefox serves a `no-cache` response from its HTTP cache when offline, so
+      a sync attempted with no network reported **"already current"** instead of
+      failing. That is the confusion D-048 keeps the service worker away from
+      `/data/` to prevent, arriving one layer lower — the manifest is now
+      fetched `no-store`, which makes the freshness signal a network request or
+      nothing.
+
+      **WebKit cannot run the app at all, and that is a fact about the test
+      browser** (RE-022). Playwright's Linux WebKit 26.5 is cross-origin
+      isolated, has `SharedArrayBuffer`, Web Locks and service workers, and has
+      **no OPFS**: `navigator.storage.getDirectory` is `undefined`. D-016's
+      floor is Safari 16.4, which has it; the gap is between Safari and the
+      build Playwright ships, and no option closes it. So **the Safari half of
+      the floor is not verified by this suite and cannot be** — it rests on
+      documented feature availability plus the gate, which is weaker than the
+      other two claims and is written down rather than implied.
+
+      What that engine *does* verify is not nothing: the capability gate fires
+      there for real, naming the right missing capability — the first time it
+      has been exercised on a browser that genuinely fails rather than one told
+      to pretend. The suite states the limitation instead of failing twenty
+      times: `tests/e2e/support.ts` **measures** the browser rather than naming
+      it, so a later WebKit with OPFS starts running those specs by itself.
+- [x] **The offline app shell** (D-048, network-first per D-054). A hand-rolled
+      service worker **generated from the finished export** by
+      `scripts/build-sw.mjs`, so the precache list is derived rather than
+      maintained: Turbopack's chunk names change every build, and a hand-written
+      list is the version of this that ships caching nothing that matters and is
+      noticed only when the network is gone. Versioned by a hash of that list
+      plus every file's contents, which is what "versioned per deploy" means
+      with no build step on the server (D-003). `/data/` is not merely absent
+      from the list — the worker returns without calling `respondWith` for it,
+      so no later branch can reach one of those URLs. The e2e is a *reopen*:
+      network killed, app reopened cold, corpus queried (vision criterion 5),
+      plus a check that the shell cache holds no `/data/` entry at all.
+
+      One nginx location is **owner-applied and outstanding**: `/sw.js` needs
+      `Cache-Control: no-cache`, or the site's `expires max` static rule pins
+      the file that decides what everything *else* may be cached from. The block
+      is in architecture.md; `scripts/serve.mjs` already sends it, which is the
+      local server matching production rather than being looser (RE-012).
+- [x] **The diagnostics panel** (D-009). The one support channel: storage used
       against quota and whether persistence was granted, last sync and the
       copy's age, record counts, schema version, service-worker state
       (registered, version, controlling), and the capability probe's results —
-      the things a bug report needs and telemetry will never provide.
+      the things a bug report needs and telemetry will never provide. A
+      `<details>` on the Data tab, closed by default and re-probed on open,
+      because a panel showing what was true at page load sends someone chasing a
+      number that has already changed.
 - [x] **Cloudflare in front** (D-039, carried from M1). **Flipped and verified
       2026-08-08.** The flip surfaced two real defects, both fixed the same
       hour. First, the zone's SSL mode was *Flexible*, so Cloudflare spoke
@@ -793,13 +907,68 @@ in parallel with whatever task is current.
       milestones stale — which the first live-origin e2e failed against;
       the M4 app was deployed (D-003 rsync) and the full-corpus import e2e
       then passed against the proxied origin, 7.2 m end to end.
-- [ ] **The heavyweight data-plane review** (sanctioned 2026-08-08, per
-      workflow.md's "when to go heavy"). Multi-agent adversarial pass with
-      fix/verify rounds over the published data plane end to end: the pipeline
-      and its crons, retention and rotation, the wire contract, the nginx
-      configuration, and the now-Cloudflare fronting — the class of change that
-      can corrupt the artifact chain, reviewed as such before the public is
-      invited to depend on it.
+- [x] **The heavyweight data-plane review** (sanctioned 2026-08-08, run the
+      same day). Six reviewers over the dimensions the data plane actually has —
+      artifact-chain immutability, the ID space, the wire contract across the
+      bump, the crons and retention, the edge, and hostile record content —
+      each finding then put to **three independent skeptics** with different
+      lenses and kept only on a majority. **19 findings, 15 upheld, 33 verify
+      votes to refute.** A completeness critic then asked what fell between the
+      six.
+
+      What it found was not the browser code. It was the **launch runbook** and
+      the publisher underneath it, which is exactly the class workflow.md
+      reserves this for:
+
+      - **A crashed `--new-id-space` publish could not be retried** (critical,
+        reproduced). The ledger is written before the manifest, so a kill
+        between them left `published_head` reading the ledger's new revision
+        while the manifest advertised the old one — and the retry met the
+        "needs a revision above the published head" guard *at the revision it
+        had just published itself*, with both crons stopped on the
+        manifest/ledger disagreement and no exit but hand-editing the ledger.
+        This is step 2 of the schema-bump runbook.
+      - **Byte identity bypassed the roll-backwards guard** (high, reproduced
+        three ways including on the monthly rotation's own shape). Under
+        retention the older generation's directory is still on disk, so a
+        flagless re-run of that generation's artifact matched `_same_bytes`,
+        skipped the check, and rewrote the manifest at the old revision with
+        every delta dropped.
+      - **`publish.py` never checked the artifact's schema at all** — the one
+        publisher without the check `delta.extract` has always made, defaulting
+        a missing value to 1. Building before `git pull` and publishing after
+        would have published a schema-1 artifact while retiring the old ID
+        space, and the schema-2 app would then refuse the plane it had just
+        replaced.
+      - **A fixed `.staging-<rev>` name with an unconditional `rmtree`**, and no
+        lock: two publishes of one revision shared it, and the second deleted
+        the first's chunks between recording their digests and renaming the
+        directory into place.
+      - **The provenance commit was read after the walk**, so `init`'s "the tree
+        did not move" check could not see a mid-walk `git reset --hard` — the
+        exact race the instruction it enforces is about.
+      - **SSVC let a CNA's own container outrank CISA's**, handing the party
+        with the incentive to downplay exploitation control of the corpus's only
+        structured exploitation signal. Reversed, and the reversal is explained
+        against `cvss`'s opposite precedence.
+      - **The storage preflight was wrong in both directions**: it measured a
+        two-generation peak against *free* space, double-counting the copy
+        already inside `usage` — refusing re-downloads that would have succeeded
+        and pointing the user at the one action that destroys a working corpus —
+        while budgeting the *artifact* rather than the imported footprint, which
+        passes a browser that then runs out during the index build.
+      - **"Clear local copy" was the one writer outside the Web Lock**, so a
+        clear during another tab's download deleted the live copy, failed on the
+        slot the downloader held, told the user it had failed, and then watched
+        the downloader promote a full corpus anyway.
+      - Plus: the shell's install swallowed precache failures and then deleted
+        the previous, complete cache; a stray `%` in any URL killed the local
+        test server; and `kev.json` is documented `short` while the deployed
+        nginx block would serve it `immutable` for a year — recorded now so M6
+        does not inherit it.
+
+      Every fix has a regression test, and the two on the publisher were checked
+      **by removing them** and watching the test fail.
 - [ ] **Launch.** The flip, and nothing else ships with it: every criterion
       below verified, the status paragraph and this plan updated, and the site
       is public.

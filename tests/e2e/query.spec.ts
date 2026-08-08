@@ -1,5 +1,9 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { skipWithoutLocalStorage } from './support'
+
+import { SCHEMA_VERSION } from '../../lib/protocol'
+
 /**
  * M3's exit criteria in a browser: every confirmed filter axis answering, a
  * long query reporting and cancellable, hostile SQL refused by the database
@@ -48,6 +52,7 @@ async function openTab(page: Page, name: string): Promise<void> {
 /** Download the development slice and wait for the local copy to be queryable. */
 async function importCorpus(page: Page): Promise<void> {
   await page.goto('/')
+  await skipWithoutLocalStorage(page)
   await page.getByRole('button', { name: /Download data/ }).click()
   await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
   await openTab(page, 'Explore')
@@ -358,17 +363,23 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
   })
 
   /**
-   * A schema bump, end to end (M3). `?schema=2` is this build claiming to read
+   * A schema bump, rehearsed (M3). `?schema=N+1` is this build claiming to read
    * a version the local copy is not — which is precisely the position the next
    * build will be in on the day the schema changes, with every existing user's
    * copy at the old version.
+   *
+   * Version-relative, because the day arrived: schema 2 shipped in M5 (D-070),
+   * and a hard-coded `?schema=2` quietly stopped being a mismatch. The *real*
+   * bump — two data planes, one on each side — is exercised in `bump.spec.ts`;
+   * this remains the cheap rehearsal that needs neither.
    */
   await test.step('a schema bump is announced, not silent', async () => {
-    await page.goto('/?schema=2')
+    const ahead = SCHEMA_VERSION + 1
+    await page.goto(`/?schema=${ahead}`)
     const announcement = page.locator('[data-obsolete]')
     await expect(announcement).toBeVisible({ timeout: 120_000 })
-    await expect(announcement).toContainText('schema 1')
-    await expect(announcement).toContainText('schema 2')
+    await expect(announcement).toContainText(`schema ${SCHEMA_VERSION}`)
+    await expect(announcement).toContainText(`schema ${ahead}`)
     await expect(announcement).toContainText('Download the corpus again')
     // Not offered as a query surface: a copy this build cannot read must not be
     // queried, so the tabs that need one are disabled rather than opening onto
@@ -380,7 +391,8 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
   })
 
   await test.step('and the origin is refused too, naming the fix', async () => {
-    // The data plane is still at schema 1, so downloading again cannot help —
+    // The data plane is still at the version this build's copy came from, so
+    // downloading again cannot help —
     // and the app says the thing that can (reload for the matching build),
     // rather than sending the user round a loop.
     await page.getByRole('button', { name: 'Download data', exact: true }).click()

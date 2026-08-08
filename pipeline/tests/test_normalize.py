@@ -141,6 +141,183 @@ class Notice(unittest.TestCase):
         self.assertIn("AS IS", build.NOTICE)
 
 
+def ssvc_block(**options: str) -> dict:
+    names = {"expl": "Exploitation", "auto": "Automatable", "impact": "Technical Impact"}
+    return {
+        "other": {
+            "type": "ssvc",
+            "content": {"options": [{names[k]: v} for k, v in options.items()]},
+        }
+    }
+
+
+class Ssvc(unittest.TestCase):
+    """D-070's exploitation signal. Every shape here was observed in a full scan
+    of the corpus on 2026-08-08 (374,269 records, 172,041 blocks) except the
+    hostile ones, which are rule 5's floor."""
+
+    def test_all_three_decision_points(self):
+        adp = [{"metrics": [ssvc_block(expl="poc", auto="yes", impact="total")]}]
+        self.assertEqual(
+            normalize.ssvc({}, adp), {"ssvc_expl": 1, "ssvc_auto": 1, "ssvc_impact": 1}
+        )
+
+    def test_none_is_a_finding_and_stores_as_zero(self):
+        """`Exploitation: none` means someone looked. It must not be confused
+        with the 51.9% of the corpus that has no assessment at all, which is why
+        it is 0 rather than absent."""
+        adp = [{"metrics": [ssvc_block(expl="none", auto="no", impact="partial")]}]
+        self.assertEqual(
+            normalize.ssvc({}, adp), {"ssvc_expl": 0, "ssvc_auto": 0, "ssvc_impact": 0}
+        )
+
+    def test_a_decision_point_nobody_stated_is_absent(self):
+        adp = [{"metrics": [ssvc_block(expl="active")]}]
+        self.assertEqual(normalize.ssvc({}, adp), {"ssvc_expl": 2})
+
+    def test_no_assessment_at_all_is_an_empty_map(self):
+        self.assertEqual(normalize.ssvc({"metrics": [metric("cvssV4_0", 9.1, "HIGH")]}, []), {})
+
+    def test_cisas_assessment_outranks_the_cnas_own(self):
+        """164 records carry two blocks — a CNA's beside CISA's — and this is
+        the **opposite** precedence from `cvss`, deliberately.
+
+        A CVSS score is the CNA's assessment of its own product and the ADP's is
+        a second opinion, so cna-first is right there. SSVC exists in this
+        corpus only as CISA's Vulnrichment enrichment, and `containers.cna` is
+        written by the assigning CNA — usually the affected vendor. Letting a
+        vendor's `Exploitation: none` overwrite CISA's `active` would hand the
+        party with the incentive to downplay exploitation control of the
+        corpus's only structured exploitation signal, and the app would show the
+        result with nothing saying the two disagreed.
+        """
+        cna = {"metrics": [ssvc_block(expl="none")]}
+        adp = [{"metrics": [ssvc_block(expl="active", auto="yes")]}]
+        self.assertEqual(normalize.ssvc(cna, adp), {"ssvc_expl": 2, "ssvc_auto": 1})
+
+    def test_a_cna_block_still_fills_a_gap_cisa_left(self):
+        """Outranked is not ignored: a decision point only the CNA states is
+        still better than no answer."""
+        cna = {"metrics": [ssvc_block(expl="none", impact="total")]}
+        adp = [{"metrics": [ssvc_block(expl="active")]}]
+        self.assertEqual(normalize.ssvc(cna, adp), {"ssvc_expl": 2, "ssvc_impact": 1})
+
+    def test_option_names_and_values_are_matched_case_insensitively(self):
+        adp = [
+            {
+                "metrics": [
+                    {
+                        "other": {
+                            "type": "SSVC",
+                            "content": {"options": [{"EXPLOITATION": "PoC"}]},
+                        }
+                    }
+                ]
+            }
+        ]
+        self.assertEqual(normalize.ssvc({}, adp), {"ssvc_expl": 1})
+
+    def test_an_unrecognised_option_or_value_is_dropped(self):
+        """Storing an invented code would be worse than absence, which the
+        schema can express."""
+        adp = [{"metrics": [ssvc_block(expl="totally-owned"), {"other": {"type": "ssvc"}}]}]
+        adp[0]["metrics"].append(
+            {"other": {"type": "ssvc", "content": {"options": [{"Mission Impact": "high"}]}}}
+        )
+        self.assertEqual(normalize.ssvc({}, adp), {})
+
+    def test_hostile_shapes_do_not_raise(self):
+        """One real record carries `options: null` (rule 5)."""
+        adp = [
+            {
+                "metrics": [
+                    {"other": None},
+                    {"other": {"type": "ssvc", "content": None}},
+                    {"other": {"type": "ssvc", "content": {"options": None}}},
+                    {"other": {"type": "ssvc", "content": {"options": ["not a dict"]}}},
+                    {"other": {"type": "ssvc", "content": {"options": [{"Exploitation": 7}]}}},
+                    {"other": {"type": "cvss", "content": {"options": [{"Exploitation": "poc"}]}}},
+                ]
+            }
+        ]
+        self.assertEqual(normalize.ssvc({}, adp), {})
+
+
+class DefaultStatus(unittest.TestCase):
+    """D-070's correctness fix: `cve_ver` cannot be read unambiguously without
+    the container default that governs every version *not* listed."""
+
+    def test_the_conservative_value_wins_a_collision(self):
+        """13,628 records state two different defaults for one deduped
+        `(vendor, product)` pair. Affected beats unknown beats unaffected."""
+        cna = {
+            "affected": [
+                {"vendor": "acme", "product": "widget", "defaultStatus": "unaffected"},
+                {"vendor": "acme", "product": "widget", "defaultStatus": "unknown"},
+                {"vendor": "acme", "product": "widget", "defaultStatus": "affected"},
+            ]
+        }
+        self.assertEqual(normalize.default_statuses(normalize.affected(cna)), {("acme", "widget"): 1})
+
+    def test_unknown_beats_unaffected(self):
+        cna = {
+            "affected": [
+                {"vendor": "acme", "product": "widget", "defaultStatus": "unaffected"},
+                {"vendor": "acme", "product": "widget", "defaultStatus": "unknown"},
+            ]
+        }
+        self.assertEqual(normalize.default_statuses(normalize.affected(cna)), {("acme", "widget"): 3})
+
+    def test_a_pair_with_no_default_is_absent_rather_than_zero(self):
+        cna = {"affected": [{"vendor": "acme", "product": "widget"}]}
+        self.assertEqual(normalize.default_statuses(normalize.affected(cna)), {})
+        products = normalize.projection({"containers": {"cna": cna}}, "CVE-2026-1001")["products"]
+        self.assertEqual(products, [("acme", "widget", None)])
+
+    def test_it_rides_with_the_product_in_the_projection(self):
+        cna = {"affected": [{"vendor": "acme", "product": "widget", "defaultStatus": "Affected"}]}
+        products = normalize.projection({"containers": {"cna": cna}}, "CVE-2026-1001")["products"]
+        self.assertEqual(products, [("acme", "widget", 1)])
+
+
+class RejectionAndTitle(unittest.TestCase):
+    def test_the_first_english_rejection_reason_wins(self):
+        cna = {
+            "rejectedReasons": [
+                {"lang": "de", "value": "nicht Englisch"},
+                {"lang": "en_US", "value": "the reason"},
+                {"lang": "en", "value": "a second English reason"},
+            ]
+        }
+        self.assertEqual(normalize.rejection(cna), "the reason")
+
+    def test_a_record_with_no_english_reason_has_none(self):
+        self.assertEqual(normalize.rejection({"rejectedReasons": [{"lang": "fr", "value": "x"}]}), "")
+        self.assertEqual(normalize.rejection({}), "")
+
+    def test_a_title_is_stripped_text_or_nothing(self):
+        self.assertEqual(normalize.title({"title": "  Path traversal  "}), "Path traversal")
+        self.assertEqual(normalize.title({"title": None}), "")
+        self.assertEqual(normalize.title({}), "")
+
+
+class Reserved(unittest.TestCase):
+    def test_date_reserved_is_stored_as_unix_seconds(self):
+        record = {
+            "cveMetadata": {
+                "cveId": "CVE-2026-1001",
+                "state": "PUBLISHED",
+                "dateReserved": "2026-01-01T00:00:00Z",
+            }
+        }
+        self.assertEqual(normalize.projection(record, "CVE-2026-1001")["reserved"], 1_767_225_600)
+
+    def test_an_absent_or_unparseable_date_is_none(self):
+        self.assertIsNone(normalize.projection({"cveMetadata": {}}, "CVE-2026-1001")["reserved"])
+        record = {"cveMetadata": {"dateReserved": "yesterday"}}
+        self.assertIsNone(normalize.projection(record, "CVE-2026-1001")["reserved"])
+
+
 class ContentHash(unittest.TestCase):
     def test_projection_and_hash_are_deterministic(self):
         record = {

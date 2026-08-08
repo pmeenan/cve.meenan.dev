@@ -27,6 +27,104 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-075: Schema 2 lands as a bootstrapped generation, and the record's columns ride the schema version  (2026-08-08, status: accepted, implements D-070, refines D-055 and D-068)
+
+**Decision.** D-070's five fields ship as **schema 2**. Three things about *how*
+were left to the implementation and are settled here, because each is expensive
+to reverse once bytes are at an immutable URL.
+
+1. **The bump lands as a bootstrapped generation, not a seeded one.** The build
+   is `--bootstrap --idspace <token>`, published with
+   `publish.py --new-id-space` at a revision above the published head, and
+   adopted with `ingest.py init --force`. The explicit token is what makes step
+   one *repeatable*: a bootstrap otherwise mints a random lineage every run, so
+   re-running it produces a different ID space from the one that was published
+   and every check downstream refuses the result (M5's data-plane review). Seeding
+   across a schema change is *refused* by `build._seed_from`, and that guard
+   stays: ids are only meaningful against the shape that assigned them, every
+   client re-downloads at a bump anyway (D-013, D-068), so carrying id stability
+   across one is preserving something nobody can use. `--new-id-space` also
+   retires every pre-bump delta from the manifest in the same operation, which
+   is what stops a schema-1 delta being advertised beside a schema-2 snapshot.
+2. **`FORMAT_VERSION` does not move.** The delta record grew four keys and
+   `prod` became a pair, and `lib/delta.ts` says plainly that adding a field is
+   a version bump — but *which* version matters. `format` is checked before
+   `schema` in both `parseDelta` and `assertUsable`, so bumping it would replace
+   D-068's actionable "the published data is at schema 2 and this app reads
+   schema 1 — reload the page" with "unsupported wire format 2", for a client
+   whose actual problem is the schema. Record columns *are* the schema; the
+   format number is the envelope around them, and it moves when the envelope
+   does.
+3. **`cve_prod.default_status` uses `cve_ver.status`'s codes, and NULL for
+   absent.** D-070's text says "0 unknown / 1 affected / 2 unaffected, matching
+   `cve_ver.status`'s vocabulary", but that vocabulary is 1 affected, 2
+   unaffected, 3 unknown, with 0 reserved for a status the record did not state
+   in a form we recognise. Taking D-070 literally would have collapsed "unknown"
+   and "absent" into one code — contradicting its own rule that absent is not a
+   value. The implementation matches the vocabulary rather than the sentence.
+
+**Context.** Measured on the full corpus on 2026-08-08 (374,269 records), both
+schemas built from one clone so the only difference is the columns:
+
+| | schema 1 | schema 2 | delta |
+| --- | --- | --- | --- |
+| artifact | 379,736,064 B | 398,487,552 B | +18.75 MB (+4.9%) |
+| **published, brotli -q10, 12 chunks** | **63,308,279 B** | **65,709,320 B** | **+2.40 MB (+3.8%)** |
+| build wall | 24.2 s | 25.6 s | +1.4 s |
+
+D-070's proxy predicted +2.65 MB; the real artifact is **+2.40 MB**, so the
+owner's "the size is worth it" call holds with room. By table: `cve_text`
++15.04 MB raw (titles and reasons), `cve` +3.06 MB (four integer columns ×
+374,269 rows), `cve_prod` +0.65 MB. **No new indexes** — the SSVC columns are
+low-cardinality codes on the corpus table, so every grouping over them is a scan
+of `cve` however it is written, exactly as `cvss_sev` already is, and an index
+would cost download bytes for every user to save none of them (D-033's trade).
+
+Coverage in the built artifact: `reserved` 374,269 (100%), SSVC 171,877 (45.9%),
+`title` 137,888, `reason` 17,842, `default_status` on 149,067 of 526,283
+`cve_prod` rows. **17,842 rows now have a `cve_text` row with no description in
+it** — the REJECTED records whose only English text is the rejection reason,
+which is the shape that breaks anything assuming `cve_text` implies `descr`.
+
+**`title` joins the full-text index** — the question D-070 left open, decided by
+measurement. It is a second *column* on the existing index rather than a fourth
+index, so a search stays one `MATCH` and the promotion gate keeps counting three
+tables. Cost: 9,854,710 bytes of title text against 123,525,051 of descriptions,
+so ~8% more indexed text. Recall: 83.3% of titled records have a title that is
+not a substring of their own description, and the title is where the
+vulnerability class and the sink live (`almosteffortless secure-files Plugin …
+path traversal` against `A vulnerability, which was classified as critical, was
+found in…`). fts5's external-content `'delete'` protocol takes column values
+positionally, so `lib/search.ts` builds both statements from one column list —
+handing it the wrong one is RE-005's failure, which reports nothing.
+
+**Consequences.** The SSVC axes are filters, grouped counts and report
+dimensions, and NULL is selectable through a `NOT_ASSESSED` sentinel that
+compiles to `IS NULL` beside the `IN` rather than into it — without it, the band
+holding half the corpus would be the one band visible on a chart and selectable
+nowhere. On a chart the SSVC axes take the **ordinal ramp**, spaced across it
+(codes at `--sev-0`/`--sev-2`/`--sev-4`), because none → poc → active is an
+escalation and D-073's argument applies unchanged; the unassessed band takes the
+off-ramp neutral, and `tests/unit/chart.test.ts` asserts the adjacencies these
+stacks actually have, which are not severity's — the neutral sits above the
+*highest* band here. An export carries the six new columns and the record table
+does not: an export is a copy (D-071), and one that dropped `reason` would hand
+back 17,842 rows with no text in them at all.
+
+**D-068's open question is answered while we are here: the retained obsolete
+copy stays.** D-068 left it to M5, "where quota is owned". Keeping it costs one
+generation until the user acts — the same bound a re-download already accepts
+(D-061) — and it is reclaimed by the next promotion's ordinary sweep. Deleting
+it would trade a bounded, temporary cost for precisely the experience D-068
+exists to prevent: arriving to find a 441 MB download gone with nothing on
+screen saying why. M5's preflight makes the cost visible rather than surprising,
+since it budgets two generations before a byte is fetched.
+
+**Reopen if.** A later schema change needs to preserve ids across it for a
+reason this one did not have — at which point the guard in `_seed_from` is what
+to argue with, not this entry. Or the envelope genuinely changes, which is what
+`FORMAT_VERSION` is still for.
+
 ## D-074: Link-table joins are pinned with `CROSS JOIN`, because statistics invert them  (2026-08-07, status: accepted, amends D-067's consequences)
 
 **Decision.** The three link-table join chains in `lib/filters.ts` — products,

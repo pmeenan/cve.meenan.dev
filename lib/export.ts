@@ -62,6 +62,16 @@ export const RECORD_COLUMNS = [
   'severity',
   'cna',
   'description',
+  // Schema 2 (D-070). The last six are what `RowOptions.full` widens the query
+  // to, in that order — `EXPORT_ONLY_SQL` in lib/filters.ts. `title` and
+  // `reason` in particular: without `reason` an export of REJECTED records is
+  // 17,842 rows with no text in them at all.
+  'title',
+  'rejection_reason',
+  'reserved',
+  'ssvc_exploitation',
+  'ssvc_automatable',
+  'ssvc_technical_impact',
 ] as const
 
 /** The columns an aggregate export carries. `series` is empty on a one-axis report. */

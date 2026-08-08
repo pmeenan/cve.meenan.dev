@@ -151,7 +151,9 @@ describe('the delta the pipeline emitted', () => {
       'prod',
       'pub',
       'ref',
+      'ssvc',
       'st',
+      'title',
       'upd',
       'ver',
       'y',
@@ -163,7 +165,14 @@ describe('the delta the pipeline emitted', () => {
     expect(record!.cvss).toEqual([4, 9.1, 4, 'CVSS:4.0/AV:N'])
     expect(record!.ver).toEqual([[4, 1, '0', null, '4.2', 2]])
     expect(record!.ref).toEqual([3])
-    expect(record!.prod).toEqual([4])
+    // `[product_id, default_status]` since schema 2. The fixture states the
+    // pair twice with disagreeing defaults, and the conservative one — 1,
+    // affected — is what crossed (D-070).
+    expect(record!.prod).toEqual([[4, 1]])
+    // A partial assessment: Automatable was never stated, and the gap stays
+    // null rather than arriving as `no`.
+    expect(record!.ssvc).toEqual([2, null, 0])
+    expect(record!.title).toBe('Sprocket remote code execution')
 
     // The lookup rows those ids point at ship in the same file, since the
     // client's snapshot predates them.

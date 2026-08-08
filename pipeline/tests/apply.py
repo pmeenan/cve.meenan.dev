@@ -87,8 +87,9 @@ def apply(db: sqlite3.Connection, payload: dict) -> None:
             _drop_record(db, record["id"])
 
             cvss = record.get("cvss") or (None, None, None, None)
+            ssvc = record.get("ssvc") or (None, None, None)
             db.execute(
-                "INSERT INTO cve VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cve VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record["id"],
                     record["cve"],
@@ -101,17 +102,29 @@ def apply(db: sqlite3.Connection, payload: dict) -> None:
                     cvss[1],
                     cvss[2],
                     cvss[3],
+                    record.get("res"),
+                    ssvc[0],
+                    ssvc[1],
+                    ssvc[2],
                 ),
             )
-            if record.get("descr"):
-                db.execute("INSERT INTO cve_text VALUES(?,?)", (record["id"], record["descr"]))
+            if record.get("descr") or record.get("title") or record.get("reason"):
+                db.execute(
+                    "INSERT INTO cve_text VALUES(?,?,?,?)",
+                    (
+                        record["id"],
+                        record.get("descr"),
+                        record.get("title"),
+                        record.get("reason"),
+                    ),
+                )
             db.executemany(
                 "INSERT INTO cve_cwe VALUES(?,?)",
                 [(record["id"], value) for value in record.get("cwe", ())],
             )
             db.executemany(
-                "INSERT INTO cve_prod VALUES(?,?)",
-                [(record["id"], value) for value in record.get("prod", ())],
+                "INSERT INTO cve_prod VALUES(?,?,?)",
+                [(record["id"], *entry) for entry in record.get("prod", ())],
             )
             db.executemany(
                 "INSERT INTO cve_ref VALUES(?,?)",

@@ -1,5 +1,9 @@
 import { expect, test } from '@playwright/test'
 
+import { skipWithoutLocalStorage } from './support'
+
+import { SEARCH_INDEXES } from '../../lib/search'
+
 /**
  * M1's exit criterion, as a test: the deployed export fetches the published
  * chunks, decompresses them itself, writes them into OPFS, builds its indexes,
@@ -31,6 +35,7 @@ test('imports, queries, and survives a reload', async ({ page }) => {
   })
 
   await page.goto('/')
+  await skipWithoutLocalStorage(page)
   await expect(page.getByRole('heading', { name: 'cve.meenan.dev' })).toBeVisible()
 
   await test.step('import', async () => {
@@ -43,7 +48,14 @@ test('imports, queries, and survives a reload', async ({ page }) => {
     // while the user is looking at it. Not a race at either scale — the phase
     // lasts seconds and reports about 96 times inside it.
     const progress = page.locator('.progress')
-    await expect(progress).toContainText(/[\d,]+ descriptions indexed/, { timeout: 300_000 })
+    // The label comes from `SEARCH_INDEXES` rather than being spelled out: the
+    // description index covers titles too since schema 2 (D-070), and the
+    // property under test is that the count is *countable*, not what the rows
+    // are called.
+    await expect(progress).toContainText(
+      new RegExp(`[\\d,]+ ${SEARCH_INDEXES[0]!.label} indexed`),
+      { timeout: 300_000 }
+    )
     // And a determinate bar while it does: a fraction, not the full-width
     // placeholder an unmeasurable phase renders.
     await expect(page.locator('.progress .fill')).toHaveAttribute('data-indeterminate', 'false')

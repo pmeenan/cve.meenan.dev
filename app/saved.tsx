@@ -15,7 +15,7 @@
  */
 
 import { describeDraft, filtersToDraft } from '@/lib/draft'
-import { CVSS_VERSION_LABELS, DIMENSION_LABELS, SEVERITY_LABELS } from '@/lib/filters'
+import { DIMENSION_LABELS } from '@/lib/filters'
 import type { Report } from '@/lib/report'
 import type { ReportStore, SavedReport } from '@/lib/saved'
 
@@ -140,9 +140,6 @@ function describe(report: Report): string {
  * the form it opens into cannot describe the report differently.
  */
 function summary(report: Report): string {
-  const chips = describeDraft(filtersToDraft(report.filters), {
-    severity: SEVERITY_LABELS,
-    cvssVersion: CVSS_VERSION_LABELS,
-  })
+  const chips = describeDraft(filtersToDraft(report.filters))
   return `${describe(report)} · ${chips.map((chip) => chip.label).join(' · ')}`
 }

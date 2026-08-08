@@ -118,6 +118,23 @@ describe('the severity ramp is ordinal, in both themes', () => {
         expect(contrast(unscored, background)).toBeGreaterThanOrEqual(MIN_BACKGROUND)
       })
 
+      it('separates every adjacency an SSVC stack actually has (D-070)', () => {
+        // These axes are scales too, so they reuse the ramp — spaced across it
+        // — rather than taking categorical slots. The adjacencies are different
+        // from severity's: the neutral lands on *top of the highest* band here,
+        // not above NONE, so that pair needs its own assertion.
+        const stacks: string[][] = [
+          ['--sev-0', '--sev-2', '--sev-4', '--sev-x'], // Exploitation
+          ['--sev-0', '--sev-4', '--sev-x'], // Automatable, Technical impact
+        ]
+        for (const stack of stacks) {
+          for (let at = 1; at < stack.length; at += 1) {
+            const ratio = contrast(colors[stack[at]!]!, colors[stack[at - 1]!]!)
+            expect(ratio, `${stack[at]} vs ${stack[at - 1]}`).toBeGreaterThanOrEqual(MIN_STEP)
+          }
+        }
+      })
+
       it('keeps every categorical slot visible too', () => {
         for (let slot = 1; slot <= 8; slot += 1) {
           const hex = colors[`--cat-${slot}`]
@@ -135,6 +152,31 @@ describe('seriesColor', () => {
     expect(seriesColor('severity', '', 5)).toBe('var(--sev-x)')
     expect(seriesColor('vendor', 'cisco', 0)).toBe('var(--cat-1)')
     expect(seriesColor('vendor', 'other', 7)).toBe('var(--cat-8)')
+  })
+
+  it('gives every absence band the same off-ramp neutral (D-070)', () => {
+    // Not just severity's. "Nobody assessed this" is an absence on the SSVC
+    // axes too, and a categorical slot there would put it on the scale.
+    for (const dimension of ['ssvcExpl', 'ssvcAuto', 'ssvcImpact'] as const) {
+      expect(seriesColor(dimension, '', 3)).toBe('var(--sev-x)')
+    }
+    // And the coded bands take the ramp, spaced — these are scales, so D-073's
+    // ordinal argument applies to them as it does to severity.
+    expect(seriesColor('ssvcExpl', '0', 0)).toBe('var(--sev-0)')
+    expect(seriesColor('ssvcExpl', '1', 1)).toBe('var(--sev-2)')
+    expect(seriesColor('ssvcExpl', '2', 2)).toBe('var(--sev-4)')
+    expect(seriesColor('ssvcAuto', '1', 1)).toBe('var(--sev-4)')
+    // A missing *lookup* row is a different thing and keeps its slot: there is
+    // no scale for it to be mistaken for.
+    expect(seriesColor('vendor', '', 0)).toBe('var(--cat-1)')
+  })
+
+  it('names an unassessed bucket rather than blanking it', () => {
+    expect(bucketLabel('ssvcExpl', null, null)).toBe('(not assessed)')
+    // And a stated `none` reads as the finding it is, not as the absence.
+    expect(bucketLabel('ssvcExpl', 0, 0)).toBe('None')
+    expect(bucketLabel('ssvcAuto', 1, 1)).toBe('Yes')
+    expect(bucketLabel('ssvcImpact', 1, 1)).toBe('Total')
   })
 
   it('wraps rather than producing a colour that is not defined', () => {

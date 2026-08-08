@@ -25,6 +25,7 @@
  * Everything here is pure so it can be tested without a browser; the OPFS calls
  * live in the Worker.
  */
+import { PROBE_PREFIX } from './capabilities'
 import { chunkUrl, isRevision, type ChunkEntry, type Manifest } from './protocol'
 import { SEARCH_INDEXES } from './search'
 
@@ -60,6 +61,10 @@ export const DB_FILES: readonly string[] = [LEGACY_DB_FILE, ...SLOT_FILES]
  */
 export function isOurEntry(name: string): boolean {
   if (name === STAGING_RECORD_FILE) return true
+  // The capability probe's scratch files (M5). Named per call so two tabs never
+  // contend for one exclusive handle (RE-007), which means a tab closed
+  // mid-probe leaves one behind — swept here rather than accumulating.
+  if (name.startsWith(PROBE_PREFIX)) return true
   return DB_FILES.some((file) => name === file || isSidecarOf(name, file))
 }
 

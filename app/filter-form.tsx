@@ -17,12 +17,13 @@
 
 import { useId } from 'react'
 
-import { clearChip, describeDraft, type Chip, type Draft } from '@/lib/draft'
+import { clearChip, CODE_AXES, describeDraft, type Chip, type Draft } from '@/lib/draft'
 import {
-  CVSS_VERSION_LABELS,
-  CVSS_VERSIONS,
-  SEVERITIES,
-  SEVERITY_LABELS,
+  CODE_LABELS,
+  DIMENSION_LABELS,
+  NOT_ASSESSED,
+  NOT_ASSESSED_LABEL,
+  type Dimension,
   type StateFilter,
 } from '@/lib/filters'
 
@@ -35,10 +36,7 @@ export function FilterChips({
   onChange: (draft: Draft) => void
   disabled?: boolean
 }) {
-  const chips = describeDraft(draft, {
-    severity: SEVERITY_LABELS,
-    cvssVersion: CVSS_VERSION_LABELS,
-  })
+  const chips = describeDraft(draft)
   return (
     <ul className="chips" data-chips={chips.length}>
       {chips.map((chip) => (
@@ -149,32 +147,13 @@ export function FilterForm({
       </div>
 
       <div className="row">
-        <fieldset>
-          <legend>Severity</legend>
-          {SEVERITIES.map((code) => (
-            <Check
-              key={code}
-              label={SEVERITY_LABELS[code]!}
-              checked={draft.severity.includes(code)}
-              onChange={(on) => set('severity', toggle(draft.severity, code, on))}
-            />
-          ))}
-        </fieldset>
-        <fieldset>
-          <legend>CVSS version</legend>
-          {/* `CVSS_VERSIONS`, not the label map's keys: JavaScript orders
-              integer-like keys numerically, so iterating the map renders
-              v2.0, v4.0, v3.0, v3.1 — D-047's "codes are not magnitudes"
-              confusion showing up in a checkbox list. */}
-          {CVSS_VERSIONS.map((code) => (
-            <Check
-              key={code}
-              label={CVSS_VERSION_LABELS[code]!}
-              checked={draft.cvssVersion.includes(code)}
-              onChange={(on) => set('cvssVersion', toggle(draft.cvssVersion, code, on))}
-            />
-          ))}
-        </fieldset>
+        {/* Iterated from `CODE_AXES`, whose order is the *canonical* one, never
+            a label map's keys: JavaScript orders integer-like keys numerically,
+            so iterating the map renders v2.0, v4.0, v3.0, v3.1 — D-047's "codes
+            are not magnitudes" confusion showing up in a checkbox list. */}
+        {CODE_AXES.map((axis) => (
+          <Codes key={axis.field} axis={axis} draft={draft} set={set} />
+        ))}
         <fieldset>
           {/* D-022: the default is PUBLISHED only, and including REJECTED
               changes the denominator of everything above — so it is a
@@ -318,6 +297,44 @@ function Names({
       />
     </Field>
   )
+}
+
+/**
+ * One code axis as a checkbox group.
+ *
+ * The "not assessed" box is not decoration: `IN (…)` is never true for NULL, so
+ * without it the band that holds half the corpus would be the one band a reader
+ * can see on a chart and cannot select (D-070).
+ */
+function Codes({
+  axis,
+  draft,
+  set,
+}: {
+  axis: (typeof CODE_AXES)[number]
+  draft: Draft
+  set: <K extends keyof Draft>(key: K, value: Draft[K]) => void
+}) {
+  const selected = draft[axis.field]
+  const codes = axis.absence ? [...axis.codes, NOT_ASSESSED] : [...axis.codes]
+  return (
+    <fieldset>
+      <legend>{DIMENSION_LABELS[axis.field]}</legend>
+      {codes.map((code) => (
+        <Check
+          key={code}
+          label={codeLabel(axis.field, code)}
+          checked={selected.includes(code)}
+          onChange={(on) => set(axis.field, toggle(selected, code, on))}
+        />
+      ))}
+    </fieldset>
+  )
+}
+
+function codeLabel(axis: Dimension, code: number): string {
+  if (code === NOT_ASSESSED) return NOT_ASSESSED_LABEL
+  return CODE_LABELS[axis]?.[code] ?? String(code)
 }
 
 function Check({

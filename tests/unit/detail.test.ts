@@ -48,15 +48,24 @@ function corpus(): DatabaseSync {
     INSERT INTO vtype(id, name) VALUES (1, 'semver'), (2, 'custom');
 
     INSERT INTO cve(id, cve_id, year, state, cna_id, published, updated,
-                    cvss_ver, cvss_score, cvss_sev, cvss_vec)
-      VALUES (1, 'CVE-2021-44228', 2021, 1, 1, 1639094400, 1641340800, 31, 10, 4, 'AV:N/AC:L'),
-             (2, 'CVE-2022-0002', 2022, 1, 2, 1646092800, 1646179200, NULL, NULL, NULL, NULL),
-             (3, 'CVE-2022-0003', 2022, 2, 2, 1646092800, 1646179200, NULL, NULL, NULL, NULL);
+                    cvss_ver, cvss_score, cvss_sev, cvss_vec,
+                    reserved, ssvc_expl, ssvc_auto, ssvc_impact)
+      VALUES (1, 'CVE-2021-44228', 2021, 1, 1, 1639094400, 1641340800, 31, 10, 4, 'AV:N/AC:L',
+              1638000000, 2, 1, 1),
+             -- No SSVC assessment and no description: the sparse record.
+             (2, 'CVE-2022-0002', 2022, 1, 2, 1646092800, 1646179200, NULL, NULL, NULL, NULL,
+              1645000000, NULL, NULL, NULL),
+             (3, 'CVE-2022-0003', 2022, 2, 2, 1646092800, 1646179200, NULL, NULL, NULL, NULL,
+              1645000000, NULL, NULL, NULL);
 
-    INSERT INTO cve_text(cve_id, descr) VALUES (1, 'Remote code execution in Log4j.');
+    INSERT INTO cve_text(cve_id, descr, title) VALUES
+      (1, 'Remote code execution in Log4j.', 'Log4j JNDI remote code execution');
+    -- A REJECTED record: its only English text is the rejection reason, which is
+    -- what stops it rendering blank (D-070).
+    INSERT INTO cve_text(cve_id, reason) VALUES (3, 'Withdrawn by its CNA as a duplicate.');
 
     INSERT INTO cve_cwe(cve_id, cwe_id) VALUES (1, 1), (1, 2);
-    INSERT INTO cve_prod(cve_id, product_id) VALUES (1, 1), (1, 2);
+    INSERT INTO cve_prod(cve_id, product_id, default_status) VALUES (1, 1, 1), (1, 2, NULL);
     INSERT INTO cve_ref(cve_id, url_id) VALUES (1, 1), (1, 2), (1, 3);
     INSERT INTO cve_ver(cve_id, product_id, status, version, lt, lte, vtype)
       VALUES (1, 1, 1, '2.0', '2.15.0', NULL, 1),
@@ -69,7 +78,7 @@ function corpus(): DatabaseSync {
       `'${HOSTILE_PRODUCT.replace(/'/g, "''")}'`
     )
   )
-  db.exec('INSERT INTO cve_prod(cve_id, product_id) VALUES (2, 3)')
+  db.exec('INSERT INTO cve_prod(cve_id, product_id, default_status) VALUES (2, 3, 2)')
   return db
 }
 
@@ -119,10 +128,35 @@ describe('the sections', () => {
 
   it('returns affected products with their vendors', () => {
     const rows = run(corpus(), productsSql('CVE-2021-44228'))
+    // The third column is `default_status`: 1 (affected) for Log4j, and NULL
+    // for IOS XE, whose record states no default. Absent is not a value (D-070).
     expect(rows).toEqual([
-      ['Apache Software Foundation', 'Log4j'],
-      ['Cisco', 'IOS XE'],
+      ['Apache Software Foundation', 'Log4j', 1],
+      ['Cisco', 'IOS XE', null],
     ])
+  })
+
+  it('carries the container default beside every version row (D-070)', () => {
+    // Without it the rows cannot be read: with `defaultStatus: affected`, the
+    // `unaffected` row below is the *fixed* version, not an exemption.
+    const rows = run(corpus(), versionsSql('CVE-2021-44228'))
+    const log4j = rows.filter((row) => row[1] === 'Log4j')
+    expect(log4j).toHaveLength(2)
+    for (const row of log4j) expect(row[7]).toBe(1)
+    expect(rows.find((row) => row[1] === 'IOS XE')![7]).toBeNull()
+  })
+
+  it('returns the rejection reason, which is a REJECTED record’s only text', () => {
+    const row = run(corpus(), recordSql('CVE-2022-0003'))[0]!
+    expect(row[10]).toBeNull() // no description at all
+    expect(row[12]).toBe('Withdrawn by its CNA as a duplicate.')
+  })
+
+  it('keeps "not assessed" distinct from a code', () => {
+    const scored = run(corpus(), recordSql('CVE-2021-44228'))[0]!
+    expect([scored[14], scored[15], scored[16]]).toEqual([2, 1, 1])
+    const unassessed = run(corpus(), recordSql('CVE-2022-0002'))[0]!
+    expect([unassessed[14], unassessed[15], unassessed[16]]).toEqual([null, null, null])
   })
 
   it('reaches the version ranges nothing has rendered until now (D-033)', () => {

@@ -22,6 +22,161 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-023: Firefox serves a `no-cache` response from its HTTP cache when offline, so a sync reported "already current"  (2026-08-08, status: worked-around)
+
+**Environment.** Firefox 153 via Playwright 1.62 on Linux, 2026-08-08. Chromium
+151 does not do this.
+
+**Repro.** `tests/e2e/offline.spec.ts`: import the corpus, register the service
+worker, `context.setOffline(true)`, reopen the app, press **Sync**. `/data/` is
+deliberately outside the service worker's scope (D-048) and the test asserts the
+shell cache holds no `/data/` entry, so the manifest request goes to the network.
+The Worker fetched it with `cache: 'no-cache'`.
+
+**Observed.** On Firefox the sync *succeeded*: the page read
+`Local copy at revision 1 — already current at the last check`. Chromium fails
+the fetch and reports a network error, which is the correct answer with no
+network. `no-cache` means **revalidate**, not "do not store", and with nothing
+to revalidate against Firefox serves the stored response.
+
+**Expected.** Not that it errors *because* of a header — a browser is entitled
+to that reading — but that the app does not tell a user its copy is current when
+it could not ask. The freshness line still showed the true age (1 hour), so
+nothing claimed the data was fresh; the *sync outcome* was the misleading part.
+
+**Impact and workaround.** The manifest is the freshness signal (D-042), so
+reading it from any cache defeats its purpose — this is the same confusion D-048
+keeps the service worker away from `/data/` to prevent, arriving one layer
+lower. Fixed by fetching it with `cache: 'no-store'`, which makes it a network
+request or nothing. The file is a few kilobytes, so the cost is nothing and the
+behaviour is now identical across engines. Delta files are untouched: they are
+immutable at their URLs and the ordinary cache is right for them.
+
+**Links.** `workers/db.worker.ts` (`fetchManifest`), D-042, D-048, D-054.
+
+## RE-022: Playwright's Linux WebKit ships no OPFS, so the Safari half of the support floor cannot be tested there  (2026-08-08, status: open)
+
+**Environment.** Playwright 1.62's bundled WebKit 26.5 on Ubuntu 24.04,
+2026-08-08.
+
+**Measurement.** Against the app's own origin, in that browser:
+
+| | value |
+| --- | --- |
+| `crossOriginIsolated` | `true` |
+| `SharedArrayBuffer` | `function` |
+| `navigator.locks` | `object` |
+| `navigator.serviceWorker` | `object` |
+| **`navigator.storage.getDirectory`** | **`undefined`** |
+| **`FileSystemFileHandle.prototype.createSyncAccessHandle`** | **absent** |
+
+**Observed.** Everything cross-origin isolation buys is present and the storage
+layer is simply not there, so the app cannot run: the capability gate fires with
+"the corpus is a 441 MB SQLite database stored in the browser's private file
+system. Without it there is nowhere to put it." Which is *correct* — and is the
+first time the gate has been exercised on a browser that genuinely fails rather
+than one told to pretend (`?probe=`, RE-020).
+
+**Expected.** D-016's floor is Safari 16.4, which has OPFS and synchronous
+access handles; real Safari on macOS and iOS is not what this is about. The gap
+is between Safari and the Linux WebKit build Playwright ships, and there is no
+Playwright option that closes it.
+
+**Impact.** **The Safari half of the D-016 floor is not verified by this suite
+and cannot be.** It rests on the documented feature availability plus the gate,
+which is weaker than the Chromium and Firefox claims and is recorded here rather
+than left implied. The suite states it rather than failing: the specs that need a
+corpus call `skipWithoutLocalStorage` (`tests/e2e/support.ts`), which **measures
+the browser** instead of naming it — so a later Playwright WebKit with OPFS
+starts running them by itself. The gate's own spec deliberately does not skip,
+because that browser is precisely what it is for.
+
+**Links.** `tests/e2e/support.ts`, `lib/capabilities.ts`, D-016.
+
+## RE-021: A `Response` served from a `Cache` becomes the worker's `location`, dropping the fragment its bootstrap config was in  (2026-08-08, status: worked-around)
+
+**Environment.** Chromium 151 via Playwright 1.62, Linux, 2026-08-08. Next.js
+16 / Turbopack static export, hand-rolled service worker (D-048).
+
+**Repro.** Turbopack compiles `new Worker(new URL('../workers/db.worker.ts',
+import.meta.url), { type: 'module' })` into a request for a shared bootstrap
+chunk with the worker's chunk list in the **URL fragment**:
+
+```
+/_next/static/chunks/turbopack-worker-<hash>.js#params=<urlencoded json>
+```
+
+The bootstrap reads it back with `new URL(location.href)` — `searchParams.get('params')`,
+falling back to `location.hash.startsWith('#params=')` — and throws
+`Missing worker bootstrap config` if neither is there.
+
+With the service worker installed, kill the network and open the app in a new
+tab. The SW's network-first fetch fails, it falls back to
+`caches.match(request)`, and returns that `Response` directly.
+
+**Observed.** The worker's `self.location.href` is the *cached response's* URL —
+no fragment — so the bootstrap throws immediately. The database worker never
+starts. The app's shell renders perfectly, and then sits at
+`data-status="pending"` forever: the page had no `worker.onerror` handler, so
+nothing appeared on screen at all. Two hundred lines of correct offline
+plumbing, defeated silently.
+
+**Expected.** A worker's `location` to be the URL it was constructed with. The
+fragment is never sent to the network and is not part of any `Response`'s URL,
+so there is nowhere for a cache to preserve it — which makes this unfixable
+*inside* the cache and only fixable by not letting the cached response's URL
+become the worker's.
+
+**Impact and workaround.** Fixed by re-wrapping: `new Response(cached.body,
+{ status, statusText, headers })` has no URL of its own, so the worker keeps the
+URL it was constructed with, fragment included. Online this never bit, because
+the network path returns `fetch`'s own response — it appears only when the cache
+is the one answering, which is exactly the case the offline shell exists for.
+Two other things came out of it: the page now handles `worker.onerror` (a Worker
+that cannot load must not be silent, D-052), and the cache fallback tries an
+exact match *before* `ignoreSearch`, because `ignoreSearch` alone answers one URL
+with another's bytes — and this app really does request
+`sqlite3-opfs-async-proxy.js?vfs=opfs` and `?vfs=opfs-wl`.
+
+**Links.** `scripts/sw.template.js`, `tests/e2e/offline.spec.ts`, D-048, D-054.
+
+## RE-020: `page.addInitScript` does not reach a dedicated Worker's global scope  (2026-08-08, status: worked-around)
+
+**Environment.** Playwright 1.62, Chromium 151, Linux, 2026-08-08.
+
+**Repro.** M5's capability gate probes `FileSystemSyncAccessHandle.getSize()`
+and reads whether it returned a number or a Promise (D-016) — the only way to
+tell Safari 16.4 from 16.3, where the same interface exists and its methods are
+async. To test the gate's message, the obvious move is to patch the prototype:
+
+```ts
+await page.addInitScript(() => {
+  const original = FileSystemFileHandle.prototype.createSyncAccessHandle
+  FileSystemFileHandle.prototype.createSyncAccessHandle = async function () { … }
+})
+await page.goto('/')
+```
+
+**Observed.** The patch applies to the page and its iframes. The probe runs
+inside `workers/db.worker.ts` — a *dedicated Worker*, with its own global scope
+and its own copy of every built-in — and sees the unpatched prototype. The gate
+therefore passed and the test failed with no indication that the patch had
+simply not arrived anywhere it mattered.
+
+**Expected.** Nothing in the documentation promises worker coverage; the surprise
+is only that a page-level init script is the reflex, and this app puts almost
+everything worth faking inside a Worker. Playwright has no equivalent hook for
+dedicated workers created by page script.
+
+**Impact.** Any Worker-side condition this project wants to force in a test —
+capabilities, storage, SQLite behaviour — has to be forced *through the
+message protocol*, not by patching globals. M5 added `ImportOptions.probe`
+alongside the existing `?schema=`, `?vfs=` and `?stall=` knobs for exactly this,
+and constrained it so it can only make the gate stricter: a diagnostic that can
+loosen a safety check is a different kind of thing from one that cannot.
+
+**Links.** `lib/capabilities.ts`, `tests/e2e/resilience.spec.ts`, D-016.
+
 ## RE-019: An accessible name includes the value of the control its label wraps  (2026-08-05, status: worked-around)
 
 **Environment.** Chromium 151 via Playwright 1.62 on Linux, 2026-08-05.
@@ -160,7 +315,7 @@ reproduction covers the race itself.
 
 **Links:** D-061, RE-017.
 
-## RE-015: A lone surrogate in a CVE description is legal JSON that SQLite cannot store  (2026-08-02, status: worked-around for the daily ingest 2026-08-03; still open for a direct `build.py` run)
+## RE-015: A lone surrogate in a CVE description is legal JSON that SQLite cannot store  (2026-08-02, status: worked-around for the daily ingest 2026-08-03; closed for `build.py` 2026-08-08)
 
 **Environment.** Python 3.12.3 `sqlite3` (SQLite 3.45.1) on Linux; reachable
 from any record in cvelistV5, which is attacker-influenced input (AGENTS.md
@@ -202,10 +357,15 @@ tombstone guard needs anyway). So `ingest.scan` catches the `UnicodeEncodeError`
 and routes the record through the `skipped` channel, naming the file; the run
 then aborts before building, as it does for any unpublishable record.
 
-Still open for `build.py` invoked directly, which computes no content hash and
-would need a scan of its own to get one. That is the path the migration's step 1
-uses, so it is not hypothetical — but it is operator-run and one traceback away
-from `ingest.scan`, which will name the file.
+**Closed for `build.py` (2026-08-08, M5).** The cost estimate above was
+pessimistic: it assumed the check needed a *hash*, and it does not — encoding
+the projection's strings is C-speed and the strings are being read anyway.
+`normalize.storable` walks the projection and encodes every string; the walk
+routes a failure through D-047's `skipped` channel with the file name, which
+`main` then fails closed on. Two things forced the issue rather than leaving it
+recorded: the schema-bump runbook uses `build.py` directly on the full corpus,
+and schema 2 added `title` and `reason` — two more attacker-influenced text
+columns per record, so the surface grew at the same time as the exposure.
 
 ## RE-014: `FileSystemSyncAccessHandle.write()` may write fewer bytes than asked  (2026-08-01, status: worked-around)
 

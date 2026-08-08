@@ -144,32 +144,47 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M4 closed 2026-08-07** — the corpus is analysable, and every analysis surface
-is a producer or consumer of one validated report definition rather than of each
-other (D-069). That definition travels only in the URL fragment, so a report's
-predicates never reach the server's request line (D-014, D-032). Charts are
-hand-rolled SVG whose severity ramp is an *ordinal* encoding, checked in both
-themes by a test that reads the stylesheet, with the never-scored half of the
-corpus always its own band (D-073); an export is a copy, so no writer can be
-built without MITRE's notice and every cell is neutralized against spreadsheet
-formula injection, to a cap the file discloses (D-071); saved reports live
-outside the rebuildable corpus copy, because a schema bump destroys that copy
-and D-070 schedules one (D-072). Accessibility is asserted rather than inspected
-— axe-core on every tab plus hand-written keyboard tests — which is how three
-real defects were found. A fourth came from measuring `crossSql` at full scale
-rather than on the development slice: two ordinary reports took **42 seconds**,
-because query statistics invert the CWE join chain, and pinning the link-table
-joins with `CROSS JOIN` takes them to under a second (D-074). Every report shape
-is now 0.1–1.4 s warm over 372,322 records.
+**M5 in progress.** The published schema is at **2** (D-070, D-075): SSVC's
+three decision points, `dateReserved`, `defaultStatus`, `cna.title` and the
+rejection reason for the 17,842 REJECTED records that used to render blank.
+Measured against a schema-1 build of the *same* clone, it costs **+2.40 MB
+compressed (+3.8%)** — better than the proxy the owner took the trade on. NULL
+is a value throughout: "not assessed" is filterable through a sentinel that
+compiles to `IS NULL` beside the `IN`, sits last on every axis, and takes the
+off-ramp neutral on a chart, because `Exploitation: none` is a finding and half
+the corpus has no assessment at all. `title` joins the client-built full-text
+index as a second column, on 83.3% of titles not being substrings of their own
+description. The bump lands as a **bootstrapped** generation above the head with
+`--new-id-space`, which is what retires every pre-bump delta in the same
+operation; the runbook is in pipeline/README.md and has not been run.
 
-Behind it: M3 made the query surface safe by structure rather than by inspection
-(D-065 – D-068), M2 closed the server half in production on `plex` (daily ingest
-D-058, monthly rotation D-060 — whose first unattended firing, 1 September, is
-still unobserved), and M1 proved the browser data path end to end (D-049 –
-D-051). **M5 is next**: Cloudflare (carried from M1), resilience, and D-070's
-five schema fields, which must ship *before* public launch because a bump after
-it costs every user a 63 MB re-download. The AI ladder was re-ordered 2026-08-03
-so the first model tier is site-hosted Ollama behind a restricted same-origin
-relay (D-057). Process was rightsized for MVP scale 2026-08-04 (D-062). Details
-live in plan.md and the decision log; keep this paragraph short and current when
+Around it: a capability gate that *calls* a synchronous access-handle method
+rather than looking for one — the only check that separates Safari 16.4 from
+16.3; a storage preflight that budgets two generations before a byte is fetched;
+one writer across tabs via Web Locks, with promotions announced so a tab that
+did not perform the replacement reopens rather than answering from a generation
+nobody else can see; an offline app shell generated from the finished export;
+and the diagnostics panel D-009 makes the only support channel. **Four defects
+came out of building it, none of which a passing test would have shown**: a
+fixed probe filename that deadlocked two tabs on an exclusive handle (RE-007), a
+cached `Response` whose URL became the worker's and dropped the fragment its
+bootstrap config lived in (RE-021), a Worker load failure with no `onerror`
+handler anywhere, and RE-015 sitting live on the launch path — now closed for
+`build.py`. Cloudflare is in front and verified from response headers
+(2026-08-08), which itself surfaced two live defects the day it was flipped.
+
+**Left in M5**: Firefox and WebKit runs before the D-016 floor is claimed
+publicly, the full-corpus measurement, the heavyweight data-plane review's
+confirmed findings, and the launch — which needs a human commit first, because
+the crons run from the git checkout on `plex` (D-059).
+
+Behind it: M4 made the corpus analysable through one validated report definition
+carried only in the URL fragment (D-069 – D-074), M3 made the query surface safe
+by structure rather than by inspection (D-065 – D-068), M2 closed the server half
+in production (daily ingest D-058, monthly rotation D-060 — whose first
+unattended firing, 1 September, is still unobserved), and M1 proved the browser
+data path end to end (D-049 – D-051). The AI ladder was re-ordered 2026-08-03 so
+the first model tier is site-hosted Ollama behind a restricted same-origin relay
+(D-057). Process was rightsized for MVP scale 2026-08-04 (D-062). Details live in
+plan.md and the decision log; keep this paragraph short and current when
 milestone status changes (rule 5).

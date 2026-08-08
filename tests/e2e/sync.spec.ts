@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { skipWithoutLocalStorage } from './support'
+
 import { DATA_ROOT } from '../../lib/protocol'
 
 /**
@@ -43,6 +45,7 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
   })
 
   await page.goto('/')
+  await skipWithoutLocalStorage(page)
 
   // What the origin is offering, read from the browser rather than from Node:
   // this is the same request, same origin and same cache policy the Worker makes.

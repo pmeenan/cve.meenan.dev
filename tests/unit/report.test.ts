@@ -94,13 +94,30 @@ describe('parseReport', () => {
     expect(parsed(good({ filters: { state: 'all' } })).filters.state).toBe('all')
   })
 
-  it('refuses severity and CVSS-version codes this schema does not have', () => {
+  it('preserves every code filter and refuses codes this schema does not have', () => {
     expect(parseReport(good({ filters: { severity: [4, 99] } as never })).ok).toBe(false)
     // 31 is v3.1 and 4 is v4.0 — codes, not magnitudes (D-047). 40 is neither.
     expect(parseReport(good({ filters: { cvssVersion: [31, 40] } as never })).ok).toBe(false)
-    expect(parsed(good({ filters: { severity: [4, 2], cvssVersion: [31, 4] } })).filters).toEqual({
+    expect(parseReport(good({ filters: { ssvcExpl: [0, 3] } as never })).ok).toBe(false)
+    expect(parseReport(good({ filters: { ssvcAuto: [-2] } as never })).ok).toBe(false)
+    expect(
+      parsed(
+        good({
+          filters: {
+            severity: [4, 2],
+            cvssVersion: [31, 4],
+            ssvcExpl: [2, -1],
+            ssvcAuto: [1],
+            ssvcImpact: [0, -1],
+          },
+        })
+      ).filters
+    ).toEqual({
       severity: [4, 2],
       cvssVersion: [31, 4],
+      ssvcExpl: [2, -1],
+      ssvcAuto: [1],
+      ssvcImpact: [0, -1],
       state: 'published',
     })
   })
@@ -153,6 +170,7 @@ describe('permalink fragments', () => {
           state: 'all',
           vendor: ['cisco'],
           text: 'overflow',
+          ssvcExpl: [2, -1],
           publishedFrom: 1_700_000_000,
         },
       })
