@@ -27,6 +27,366 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-074: Link-table joins are pinned with `CROSS JOIN`, because statistics invert them  (2026-08-07, status: accepted, amends D-067's consequences)
+
+**Decision.** The three link-table join chains in `lib/filters.ts` — products,
+CWEs and references — are written with `CROSS JOIN` rather than `JOIN`. In
+SQLite that is an inner join *whose order the optimizer may not change*: the
+documented way to pin a driving table. Every one of these chains must start from
+the `cve` rows the `WHERE` clause already narrowed and expand through the link
+table by `cve_id`, which is exactly the access path `schema.sql` was built for
+(link tables are WITHOUT ROWID with `cve_id` leading the primary key).
+
+**Context.** Measured while closing M4, on the full corpus (372,322 records,
+snapshot rev 2) rather than the development slice every other M4 test runs
+against — which is why it had not been seen. With statistics present the
+planner drives the CWE cross-tab from `cwe`'s 797 rows instead, turning one
+covering-index scan into roughly 190,000 random lookups into the corpus table:
+
+| report | free (ms) | pinned (ms) |
+| --- | --- | --- |
+| CWE × Severity | 41,718 | 364 |
+| Vendor × CWE | 41,946 | 633 |
+| Month × Severity | 362 | 343 |
+| Year × Severity | 389 | 396 |
+| Vendor × Severity | 544 | 624 |
+| Product × Severity | 474 | 575 |
+| CNA × Severity | 241 | 244 |
+| Reference host × Severity | 1,332 | 1,348 |
+
+Warm, in a browser, 256 MiB page cache. Two shapes go from **42 seconds to
+under a second** — 115× and 66× — and nothing else moves beyond the ~20% of
+run-to-run variance this file's own report warns about. Reproduced natively
+first, against the reassembled artifact with `node:sqlite`: 24.1 s free versus
+239 ms pinned, and **256 ms with no statistics at all**, which is what
+identifies the cause rather than merely the cure.
+
+**This is not an argument against `ANALYZE`, and D-067 stands.** Statistics
+leave every other shape unchanged or slightly better, including the
+reference-host scan D-067 bought them for. What they do is give the planner
+enough information to make a locally reasonable choice that is catastrophic for
+this one join shape. The published artifact measured here carries no
+`sqlite_stat1` at all — it predates D-067 — so the statistics involved were the
+ones the *client* derives at import, which means the regression reaches every
+user whether or not the pipeline ships them.
+
+**Consequences.** `CROSS JOIN` in this file is load-bearing and must not be
+"cleaned up" into `JOIN`; the comment above `JOIN_SQL` says so, and this entry
+is here because a comment is easy to lose an argument with. It cannot change an
+answer — the two are semantically identical in SQLite — and
+`tests/unit/filters.test.ts` executes the compiled SQL against the real schema,
+so correctness is checked rather than asserted. The full-scale numbers are
+re-runnable: `tests/e2e/measure.spec.ts` grows an `M4 report shapes` case, so
+the next person to doubt this can produce the table rather than the argument.
+
+**Reopen if.** A filter combination turns up where driving from the lookup side
+is genuinely better — the obvious candidate is a report filtered to one CWE,
+though that compiles to an `EXISTS` on `c` and so keeps `c` as the right
+driver — or SQLite's planner changes such that the free form no longer inverts.
+Either way the answer is a measurement, not a revert.
+
+## D-073: Severity is an ordinal encoding, and every absence is its own band  (2026-08-07, status: accepted, implements M4's charting scope)
+
+**Decision.** Charts are hand-rolled inline SVG with a palette that lives in
+`app/globals.css` and is **checked by a test that reads that file**
+(`tests/unit/chart.test.ts`). Three commitments:
+
+- **Severity is ordinal, not categorical.** LOW → CRITICAL is an ordered scale,
+  so lightness carries the order and hue only reinforces it. Hue alone puts
+  MEDIUM and HIGH — the two largest bands — below the separation floor, which is
+  the specific failure a default categorical palette produces on this corpus.
+  The floors are stated in the test: strictly ordered luminance, ≥1.4:1 between
+  adjacent bands (they touch in a stacked bar, so that is the contrast that
+  decides whether the boundary is visible), and ≥2:1 against the background each
+  ramp is actually drawn on. The 2:1 is deliberately below WCAG's 3:1 for
+  graphical objects and is **not** a claim to meet it: a six-step ramp cannot
+  both span a useful range and hold 3:1 at the end nearest the page. What
+  carries the boundary against the background is the hairline stroke in `--bg`
+  on every bar; this floor keeps the fill from vanishing into it.
+- **Absence is its own band, never a zero and never a drop.** About half the
+  corpus has never been scored (189,742 of 372,322). A severity chart that
+  excluded them would understate every bucket while looking complete — the same
+  failure D-022 guards against for REJECTED records. The unscored band is a
+  *neutral*, deliberately off the ramp, because it is an absence rather than a
+  level and a reader must not be able to place it on the scale. `crossSql`
+  carries an explicit NULL arm for the same reason: `x IN (SELECT …)` is never
+  true for NULL and a plain `IN` would delete exactly that band (D-069).
+- **Every chart ships its numbers as a table.** Not a fallback — always
+  rendered, with real `<th scope>` headers. It is the accessibility channel and
+  the audit channel at once: an SVG of sixty `<rect>`s is not made accessible by
+  labelling it, and a surprising bar is checked by reading the number.
+
+**Context.** Both themes were solved numerically rather than by eye, because
+"it looked fine" is not re-checkable and the dark ramp is the one that would
+quietly regress. The values were derived by binary-searching hue/saturation
+pairs to target luminances, then verified against the constraints above; the
+test now re-derives that verification from the stylesheet on every run, so a
+restyle that breaks ordinality fails rather than ships.
+
+**Consequences.** Restyling the app cannot silently turn severity categorical.
+Adding a dimension gets categorical slots automatically and is capped at eight,
+with the drop *reported* rather than silent (D-052). The palette is the one
+piece of visual design in this project with a machine-checked contract, which is
+the right place for it: it is the one where being wrong produces a plausible
+chart of the wrong thing.
+
+**Reopen if.** A colour-vision-deficiency simulation shows two ramp steps
+merging despite the luminance floors, the app gains a theme these values were
+not solved against, or the unscored share falls far enough that a band is no
+longer the honest presentation (it will not — D-070 adds SSVC's "not assessed"
+as a second one).
+
+## D-072: Saved reports live outside the corpus, because the corpus is a cache  (2026-08-07, status: accepted, applies D-013 and D-068)
+
+**Decision.** Saved reports and the automatic history live in `localStorage`
+(`lib/saved.ts`), **not** in the SQLite copy — and everything read back out of
+it goes through `parseReport`, the same validation a permalink gets (D-069).
+
+**Context.** The local database is a rebuildable cache (D-013): a re-download
+replaces it and a schema bump invalidates it with no in-place migration
+(D-068) — and D-070 already schedules a bump before launch. Reports are the one
+thing in this app the user actually authored, so putting them in the corpus copy
+would mean a schema bump silently destroying a week of someone's work. That is
+precisely the quiet wrongness vision criterion 7 rules out, and it is the kind
+of "simplification" a future agent would reach for: the database is right there,
+it is already durable, and the damage would not surface until the next bump.
+
+Two consequences of *where* it lives are load-bearing rather than incidental. A
+`localStorage` entry is stranger-supplied in the sense that matters — written by
+an older build, editable from the console — so it is validated entry by entry,
+and one report naming a dimension this build dropped costs the user that report
+rather than the other nineteen. And a write can simply fail: storage is blocked
+for some origins and quota is finite, so `writeStore` returns whether it landed
+and the Saved tab says so. A report that appears to save and is gone on reload
+is worse than one that says it cannot be saved.
+
+**Consequences.** Saved reports survive a re-download, a schema bump and
+"Clear local copy". They do not survive clearing site data, which is correct —
+that is the user asking. The store carries its own version in its key, so a
+future envelope change is a new key rather than a migration, and a downgrade
+still finds its own entries.
+
+**Reopen if.** Reports need to be shared between devices (they cannot be, under
+D-009 and D-007 — the answer is a permalink), or the store outgrows what
+`localStorage` holds, at which point IndexedDB is the move and the reasoning
+above is unchanged.
+
+## D-071: An export is a copy — hardened at the boundary, notice-bearing, and capped out loud  (2026-08-07, status: accepted, extends D-008/D-047 and applies rule 4)
+
+**Decision.** CSV and JSON exports are streamed from the Worker in batches, and
+three properties are structural rather than remembered per format:
+
+- **Every export carries MITRE's notice, or it is not produced.** D-008 grants
+  reuse on one condition — each copy reproduces the copyright designation and
+  the license — and a file the user hands to someone else is exactly the copy
+  that condition is about. So `csvWriter`/`jsonWriter` take the notice as an
+  argument and **throw** on an empty one, and it is read out of the local
+  copy's own `meta` rather than being a constant in this build. It is a
+  functional requirement of the feature, not a footer (D-047).
+- **The hostile-input handling is at the boundary, in one place**
+  (`lib/sanitize.ts`). React's escaping and SQLite's bound parameters cover the
+  two boundaries this app already had; an export crosses a third, into a program
+  with neither. A cell beginning `=`, `+`, `-`, `@`, tab or CR is a *formula* in
+  every major spreadsheet — `=HYPERLINK`, `=WEBSERVICE` and DDE turn an export
+  into a request the exporter never made — and quoting does not help, because
+  the spreadsheet strips the quoting before deciding what the cell is. Control
+  characters are stripped (C0, C1, and the bidirectional overrides that make
+  Trojan Source work), which also stops a description's stray newline splitting
+  one record into two. Fields are **always** quoted, so escaping is one rule
+  rather than a decision per value.
+- **The cap is disclosed twice** — in the file's own preamble and in the UI —
+  because a file that stops at 50,000 records and does not say so is read as
+  complete. Exports cover the whole match set, not the page: that is the
+  difference the feature exists for.
+
+The same allowlist governs anything that becomes a link. A reference URL in a
+CVE record is attacker-supplied, so it is parsed with the URL parser (not a
+regular expression, which whitespace and `java\tscript:` defeat), held to
+`http`/`https`, rendered with its host beside it, and never auto-fetched — with
+`rel="noreferrer noopener"` and `referrerPolicy="no-referrer"` so that following
+one does not tell the destination which record the reader was on (D-011).
+
+**Context.** M4 is the first milestone where CVE text leaves the browser in a
+form another program executes, and the first where a record's URL becomes an
+`href`. Both were named in M4's scope; what this entry fixes is that the guards
+are *structural* — an export cannot be built without a notice, and a cell cannot
+be written without passing through the neutralizer — rather than applied
+correctly by each caller. The unit tests supply the hostile records; the e2e
+test asserts the property over real corpus text, which is what catches a guard
+that exists but is not in the path.
+
+**Consequences.** Adding an export format means implementing `ExportWriter`,
+which cannot be constructed without a notice and whose row path goes through
+`csvField`/`jsonText`. The batching bound is the page's as well as the Worker's:
+chunks are appended as `Blob` parts, which the browser may spill to disk, so
+neither side holds the file.
+
+**Reopen if.** A format is needed whose consumers do not execute cells and for
+which the apostrophe guard corrupts values (this is already why JSON does not
+get it), or the cap turns out to be the wrong number — in which case it moves,
+and stays disclosed.
+
+## D-070: Five field additions to the published schema, taken before public launch  (2026-08-06, status: accepted, extends D-024 and D-033)
+
+**Decision.** The published schema gains five fields. Four are effectively free;
+one costs real download bytes and is taken anyway, on a measured distinctness
+result. **The timing is part of the decision:** this lands in M5, *before*
+public launch, because a schema bump invalidates every client's local copy and
+there is no in-place migration, deliberately (D-068). Before launch that costs
+nobody anything. After launch it costs every user a full re-download of a 63 MB
+artifact, which turns a cheap column into an expensive one — so the deadline for
+schema additions is the launch, not a milestone boundary.
+
+**In:**
+
+- **SSVC decision points** — `cve.ssvc_expl`, `cve.ssvc_auto`,
+  `cve.ssvc_impact`: three nullable small integers mined from
+  `metrics[].other` where `type == "ssvc"`, contributed by CISA's Vulnrichment
+  ADP. `ssvc_expl` 0 none / 1 poc / 2 active; `ssvc_auto` 0 no / 1 yes;
+  `ssvc_impact` 0 partial / 1 total. Separate columns rather than one packed
+  integer, because each is a filter axis that `lib/filters.ts` binds and indexes
+  on its own terms, and bit math in SQL would put the D-022 default's company —
+  the things a reader must be able to check — behind an encoding.
+- **`cve.reserved`** — `cveMetadata.dateReserved` as unix seconds, matching
+  `published` and `updated`. 100% coverage, one integer, and it is the only date
+  in the corpus that supports a reserved → published lag.
+- **`cve_prod.default_status`** — `affected[].defaultStatus`, 0 unknown /
+  1 affected / 2 unaffected, matching `cve_ver.status`'s vocabulary.
+- **`cve_text.title`** — `containers.cna.title`.
+- **`cve_text.reason`** — the first `rejectedReasons[]` English value, for
+  REJECTED records.
+
+**`default_status` is a correctness fix, not an enrichment.** `cve_ver` stores a
+per-version status but not the container default that governs every version
+*not* listed, so today the table cannot be read unambiguously. The distribution
+is `unaffected` 127,366 / `unknown` 91,825 / `affected` 71,421, and it is the
+71,421 that bite: with `defaultStatus: affected`, the listed `unaffected`
+entries are the *fixed* versions and everything else is vulnerable — the inverse
+of the natural reading of the rows we ship. One wrinkle the implementation must
+settle rather than discover: our `products` projection dedups `(vendor,
+product)` pairs, so two `affected` entries can collide on one `cve_prod` row
+carrying different defaults. Resolve toward the conservative value — affected
+beats unknown beats unaffected — and make the tie-break explicit in
+`normalize.py`, because silently taking the first is a coin flip on a
+correctness field.
+
+**NULL means "not assessed", and reports must show it as its own band.**
+`Exploitation: none` is a *finding* — someone looked and found no known
+exploitation. A missing SSVC block is the absence of the assessment entirely,
+and 51.9% of the corpus is in that state. Collapsing the two would understate
+every band, which is the same failure M4 already rejected for unscored CVSS and
+D-022 guards against for REJECTED records. The same applies to `title` and
+`default_status`: absent is not a value.
+
+**Context.** Measured on the full corpus on 2026-08-06 — 373,558 records,
+355,736 PUBLISHED, 17,822 REJECTED, 525,362 distinct `(cve_id, vendor,
+product)` triples. Coverage is reported per publication year because CISA's
+Vulnrichment ADP only became material in 2023, and a corpus-wide average of a
+field that did not exist for two thirds of the corpus's life is a misleading
+number to decide on.
+
+| Field | Corpus | 2023 | 2024 | 2025 | 2026 |
+| --- | --- | --- | --- | --- | --- |
+| SSVC | 48.1% | 83.6% | 99.6% | 91.1% | 92.7% |
+| `dateReserved` | **100%** | 100% | 100% | 100% | 100% |
+| `defaultStatus` | 29.4% | 48.1% | 83.9% | 63.6% | 52.6% |
+| `title` | 38.6% | 51.2% | 70.4% | 77.6% | 80.2% |
+| `rejectedReasons` | 100% of REJECTED | — | — | — | — |
+
+SSVC's values, which are what make it worth more than its bytes:
+`Exploitation` none 129,781 / **poc 39,874** / **active 1,666**; `Automatable`
+no 131,943 / yes 39,378; `Technical Impact` partial 113,002 / total 58,319.
+This is the corpus's only structured exploitation signal, and it arrived after
+D-024 and D-033 were written.
+
+Cost, brotli -q5 over the extracted text in isolation — a proxy for the marginal
+artifact cost, not a substitute for it; the build must produce the real number
+against D-033's table before this is called done:
+
+| Addition | Raw | brotli -q5 |
+| --- | --- | --- |
+| `title` (137,262 values, 71.4 chars avg) | 9.95 MB | **2.58 MB** |
+| `reason` (17,822 values, 149.4 chars avg) | 2.68 MB | **0.07 MB** |
+| SSVC + `reserved` + `default_status` (integers) | ~5 MB | *unmeasured, expected under 1 MB* |
+
+`title` is the only addition carrying a non-trivial cost — roughly 4% on a 63 MB
+artifact, against four that round to nothing — and **the owner settled it on
+2026-08-06: the size is worth it.** It is not contingent on what the build
+reports, and it does not get re-argued on bytes; the measurement below is a
+number to record, not a gate to clear. What made it an easy call is that it is
+**not a duplicate of the description**, which was the live objection and is now
+answered: of 137,262 titled records, 83.3% have a title that is *not* a
+substring of their own description; only 3.3% are identical and 2.6% are a
+prefix. The distinctness is qualitative too — titles read
+`almosteffortless secure-files Plugin secure-files.php sf_downloads path
+traversal` where the description reads `A vulnerability, which was classified as
+critical, was found in…`. The title carries the sink and the vulnerability class
+that the prose buries, which is exactly what a report table and a chat tool
+result need. Whether it also joins the client-built FTS index (D-035) is left to
+the implementation, and is a real question rather than a formality: it would
+improve recall on the vulnerability class, and it would add to an index that
+already costs 35.1 MB.
+
+`reason` is taken because **0% of REJECTED records carry any English
+description** — all 17,822 have their text only in `rejectedReasons`. D-022
+imports and keeps them filterable, so today every one of them is a row the
+detail view renders blank. At 0.07 MB compressed this is the cheapest honesty
+in the schema. It goes in its own column rather than into `descr`, so the
+rejection boilerplate stays out of the description index.
+
+**Measured and declined.** Recorded so the next agent doesn't re-measure:
+
+- **CPE stays out, and D-033's reopen condition is now answered rather than
+  pending.** D-033 said reopen if coverage improves materially. It improved and
+  then regressed — 0.5% (2022), 9.8% (2023), **46.0% (2024), 3.9% (2025), 10.2%
+  (2026)**. Coverage is not merely low, it is *non-monotonic by year*, so any
+  time series drawn through a CPE filter would track Vulnrichment's backfill
+  schedule rather than the corpus. That is a worse failure than the one D-033
+  named, because it looks like a trend.
+- **`cna.tags` — 1.8%.** `disputed` 1,494 and `unsupported-when-assigned` 1,156
+  are qualitatively interesting (a disputed record is one the vendor contests),
+  and a bitmask column would be nearly free. Declined on coverage for now, but
+  this is the most likely of the declined set to be worth revisiting, because a
+  flag is not a filter axis and does not carry D-033's silent-discard hazard.
+- **`impacts[].capecId` 7.3%** (14–21% recent) — a second taxonomy beside CWE at
+  a fraction of its coverage.
+- **`source.discovery` 21.6%**, but `UNKNOWN` 41,641 swamps `EXTERNAL` 28,596 /
+  `INTERNAL` 5,778 / `USER` 747, leaving roughly 10% of records with a usable
+  value. The field is also visibly unvalidated upstream — one record carries a
+  raw Jira API blob as its discovery value, which is rule 4 in miniature.
+- **`packageName` 6.1% / `collectionURL` 6.4%** — an ecosystem axis
+  (`wordpress.org/plugins` 16,057, Red Hat containers 43,894, maven, cpan)
+  concentrated in a handful of CNAs, so it would describe those CNAs' filing
+  habits rather than the ecosystem.
+- **Free-text `problemTypes` — 55.6% of records, of which 143,900 are literally
+  `n/a`.** The tail contains records that put the CWE in the description while
+  leaving `cweId` empty (`cwe-79 cross-site scripting (xss)` 1,641, `cwe-352 …`
+  412), so our 39.3% CWE coverage undercounts by some low-thousands. A regex
+  salvage is plausible and unquantified; measure before building.
+- **Dead on arrival:** `taxonomyMappings` **4 records**, `programRoutines` 0.2%,
+  `modules` 2.3%, `version_changes` 3.1%, `platforms` 3.6%, `programFiles` 4.1%,
+  `repo` 4.9%. `supportingMedia` 13.6% is HTML alternates of descriptions and
+  stays out on rule 4 grounds, not size.
+
+One number worth carrying into M4's reporting work even though it changes no
+schema: **only 52.1% of PUBLISHED records carry any CVSS at all** (94% for
+2024+). That is not a missing field — D-024 already mines the ADP containers for
+it — but it is a denominator that makes a chart lie if a report doesn't disclose
+it.
+
+**Reopen if.** CPE coverage becomes monotonic across three consecutive years, at
+which point it is a filter rather than a trap. CISA's Vulnrichment ADP stops
+being contributed, which would freeze SSVC at whatever coverage it reached and
+turn a filter axis into a historical artifact — detectable as a coverage cliff
+in a recent-year build, and worth an explicit check rather than a discovery. A
+KEV overlay (M6) or any later schema change arrives after launch — the first one
+to do so pays the full re-download this entry was timed to avoid, and should be
+batched with anything else pending rather than shipped alone.
+
+**Not a reopen condition:** `title`'s measured cost in the built artifact. The
+owner took that trade with the 2.58 MB proxy in hand, and a larger real number
+is a fact to record, not grounds to revisit.
+
 ## D-069: The report definition — one validated object, carried only in the URL fragment  (2026-08-05, status: accepted, implements D-044's shared primitive)
 
 **Decision.** M4's report definition (`lib/report.ts`) is the single

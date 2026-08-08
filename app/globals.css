@@ -5,6 +5,43 @@
   --muted: #5b6070;
   --line: #dfe2ea;
   --accent: #1f6feb;
+
+  /* --- The severity ramp (M4) ------------------------------------------
+     An *ordinal* encoding, not a categorical one: LOW → CRITICAL is an
+     ordered scale, and hue alone puts MEDIUM and HIGH — the two largest
+     bands — below the separation floor. So lightness carries the order and
+     hue only reinforces it.
+
+     `--sev-x` is off the ramp on purpose. It is the band for records that
+     have never been scored (about half the corpus), which is an *absence*
+     rather than a level, so it is a neutral a reader cannot place on the
+     scale.
+
+     Both ramps are checked by `tests/unit/chart.test.ts`, which reads this
+     file: strictly ordered luminance, at least 1.4:1 between adjacent
+     bands, and at least 2:1 against the background they are drawn on. The
+     dark ramp runs the other way in absolute lightness for the same reason
+     the light one runs this way — the most severe band is the one furthest
+     from the page. */
+  --sev-4: #5b131f;
+  --sev-3: #872320;
+  --sev-2: #a34826;
+  --sev-1: #c16e25;
+  --sev-0: #df9e1c;
+  --sev-x: #7f899e;
+
+  /* Categorical slots for identity dimensions — vendor, product, CWE, CNA,
+     reference host. Eight, because past that two slots are close enough
+     that a reader has to consult the legend for every segment (lib/chart.ts
+     caps the series count to match). */
+  --cat-1: #0f6fb4;
+  --cat-2: #c1521d;
+  --cat-3: #0a7d5e;
+  --cat-4: #a2478c;
+  --cat-5: #8a6d1f;
+  --cat-6: #4b6ea8;
+  --cat-7: #7a3b3b;
+  --cat-8: #4a4f5c;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -14,6 +51,22 @@
     --muted: #9aa1b1;
     --line: #262a33;
     --accent: #6ea8ff;
+
+    --sev-4: #faa080;
+    --sev-3: #ed6f4c;
+    --sev-2: #dc4025;
+    --sev-1: #ad3429;
+    --sev-0: #82292c;
+    --sev-x: #737f96;
+
+    --cat-1: #7cbdf5;
+    --cat-2: #ff9d5c;
+    --cat-3: #57cfa4;
+    --cat-4: #e2a0cf;
+    --cat-5: #e0bb52;
+    --cat-6: #a8bef0;
+    --cat-7: #e08d8d;
+    --cat-8: #b7bece;
   }
 }
 
@@ -133,6 +186,19 @@ button:disabled {
   .stale {
     color: #e0a44a;
   }
+
+  /* Two colours that pass on white and fail on near-black, found by measuring
+     rather than by looking (M4's accessibility criterion). #b3261e on #101216
+     is 2.87:1 against the 4.5:1 text floor; white on the dark accent is 2.41:1,
+     which is the primary button's own label. */
+  .error {
+    color: #ff9d94;
+    border-left-color: #ff9d94;
+  }
+
+  button {
+    color: #0d1017;
+  }
 }
 
 .timings {
@@ -152,6 +218,9 @@ button:disabled {
   margin: 0;
 }
 
+/* Focusable (`tabIndex={0}` at every use site) because it scrolls: a region a
+   mouse can pan but a keyboard cannot reach is a table whose right-hand columns
+   are unreadable without one — axe's scrollable-region-focusable, WCAG 2.1.1. */
 .scroll {
   overflow-x: auto;
 }
@@ -310,4 +379,299 @@ details.sql pre {
   max-width: 40rem;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* --- M4: the tabbed workspace, reports, charts and the detail view ------- */
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  margin: 1.5rem 0 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  color: var(--muted);
+  padding: 0.45rem 0.9rem;
+  margin-bottom: -1px;
+}
+
+.tab.selected {
+  color: var(--fg);
+  border-color: var(--line);
+  background: var(--bg);
+  font-weight: 600;
+}
+
+/* Focus has to be visible on a tablist: the roving tabindex means the browser's
+   own outline is the only thing telling a keyboard user where they are. */
+.tab:focus-visible,
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[role='tabpanel']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.tab-badge {
+  margin-left: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+[role='tabpanel'] {
+  padding-top: 0.5rem;
+}
+
+/* --- Filter chips ------------------------------------------------------- */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.15rem 0.3rem 0.15rem 0.65rem;
+  max-width: 32rem;
+}
+
+.chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The standing chip is the D-022 default. It reads as a statement rather than
+   as a control, because it is not one — clearing it would widen the corpus. */
+.chip.standing {
+  border-style: dashed;
+  color: var(--muted);
+  padding-right: 0.65rem;
+}
+
+.chip-clear {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 0 0.35rem;
+  font-size: 1rem;
+  line-height: 1;
+  border-radius: 999px;
+}
+
+.filter-disclosure {
+  font-size: 0.9rem;
+}
+
+.filter-disclosure summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.filters-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  padding-top: 0.75rem;
+}
+
+.field.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.export-actions {
+  margin-top: 0.9rem;
+}
+
+.permalink {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  width: min(100%, 46rem);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.25rem 0.4rem;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+/* --- Charts ------------------------------------------------------------- */
+
+.chart {
+  margin: 1rem 0 0;
+}
+
+.chart svg {
+  width: 100%;
+  height: auto;
+  max-height: 26rem;
+}
+
+.chart .grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.chart .axis-line {
+  stroke: var(--muted);
+  stroke-width: 1;
+}
+
+.chart text.axis {
+  fill: var(--muted);
+  font-size: 12px;
+  font-family: inherit;
+}
+
+/* A hairline in the page background separates adjacent stacked bands even
+   where two ramp steps are closest, and lifts a bar off the gridlines. */
+.chart .bar {
+  stroke: var(--bg);
+  stroke-width: 0.75;
+}
+
+.chart .series-line {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1rem;
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.swatch {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 2px;
+  border: 1px solid var(--line);
+}
+
+.chart-data caption {
+  text-align: left;
+  padding-bottom: 0.35rem;
+}
+
+.chart-data th[scope='row'] {
+  font-weight: 400;
+  white-space: nowrap;
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chart-data td.total {
+  font-weight: 600;
+}
+
+/* --- Saved reports ------------------------------------------------------ */
+
+ul.plain {
+  list-style: none;
+  padding: 0;
+  margin: 0.4rem 0;
+}
+
+ul.plain.columns {
+  columns: 3 14rem;
+}
+
+.saved-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 0.9rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.saved-entry .muted {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 34rem;
+}
+
+/* A button that reads as a link: it opens a panel in this page rather than
+   navigating, so it must not be an anchor with a fake href. */
+button.link {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  padding: 0;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+}
+
+/* --- The per-CVE detail view -------------------------------------------- */
+
+.detail {
+  margin: 1rem 0;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.detail h3 {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.detail h4 {
+  margin: 1.2rem 0 0.3rem;
+  font-size: 0.95rem;
+}
+
+.detail p.descr {
+  white-space: pre-wrap;
+  max-width: 46rem;
+}
+
+.refs li {
+  padding: 0.15rem 0;
+  word-break: break-all;
+}
+
+.refs a {
+  color: var(--accent);
 }

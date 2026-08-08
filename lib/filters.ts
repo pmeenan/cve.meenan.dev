@@ -55,6 +55,21 @@ export const CVSS_VERSION_LABELS: Record<number, string> = {
   4: 'v4.0',
 }
 
+/**
+ * The version codes in the order a person reads them — v2.0, v3.0, v3.1, v4.0.
+ *
+ * An explicit list because the object above cannot carry it: JavaScript orders
+ * integer-like keys numerically whatever the source says, so
+ * `Object.keys(CVSS_VERSION_LABELS)` is `2, 4, 30, 31` and any UI built from it
+ * renders v4.0 between v2.0 and v3.0. That is D-047's confusion — the codes are
+ * identifiers, not magnitudes — resurfacing in a checkbox list rather than in a
+ * comparison.
+ */
+export const CVSS_VERSIONS = [2, 30, 31, 4] as const
+
+/** Severity codes low to high. `null` — never scored — is not one of them. */
+export const SEVERITIES = [0, 1, 2, 3, 4] as const
+
 export const STATE_LABELS: Record<number, string> = {
   [STATE_PUBLISHED]: 'PUBLISHED',
   [STATE_REJECTED]: 'REJECTED',
@@ -411,6 +426,16 @@ export interface RowOptions {
   limit?: number
   offset?: number
   sort?: SortKey
+  /**
+   * Return the whole description rather than the first 400 characters.
+   *
+   * On screen the truncation is right — a table cell is not a place to read
+   * 4,000 characters — but an export is a copy of the record, and a copy that
+   * silently cut every description at 400 characters would be wrong in a way
+   * the file could not disclose. Only the export path sets this, and only
+   * because it is bounded by batch rather than by result set (lib/export.ts).
+   */
+  full?: boolean
 }
 
 /**
@@ -434,10 +459,11 @@ export function rowsSql(
   // outside — and `ORDER BY undefined` would be a broken statement built from
   // it. The allowlist is the whole defence, so its miss case has to be safe.
   const sort = SORT_SQL[options.sort as SortKey] ?? SORT_SQL.published
+  const description = options.full ? 't.descr' : 'substr(t.descr, 1, 400)'
   return {
     sql:
       `SELECT c.cve_id AS cve, c.state, c.published, c.updated, c.cvss_ver, c.cvss_score, ` +
-      `c.cvss_sev, n.name AS cna, substr(t.descr, 1, 400) AS description ` +
+      `c.cvss_sev, n.name AS cna, ${description} AS description ` +
       `FROM cve c LEFT JOIN cna n ON n.id = c.cna_id LEFT JOIN cve_text t ON t.cve_id = c.id ` +
       `WHERE ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`,
     params: [...params, limit + 1, offset],
@@ -544,14 +570,41 @@ const CVSS_VERSION_ORDER =
  */
 type JoinGroup = 'prod' | 'cwe' | 'ref' | 'cna'
 
+/**
+ * **`CROSS JOIN` is load-bearing, not a synonym.** In SQLite it is an inner
+ * join whose *order the optimizer may not change* — the documented way to pin a
+ * driving table — and it is what makes these aggregates usable at full scale.
+ *
+ * Every one of these chains must be walked the same way: start from the `cve`
+ * rows the `WHERE` clause already narrowed, then expand through the link table
+ * by `cve_id`. That is precisely the access path `schema.sql` was built for —
+ * link tables are WITHOUT ROWID with `cve_id` leading the primary key — and it
+ * is a seek per record rather than a scan.
+ *
+ * Left free, the planner inverts it once statistics exist (D-067 ships them,
+ * and the client derives them when an artifact predates that). Measured at full
+ * scale, 372,322 records: driving from `cwe`'s 797 rows instead makes
+ * `CWE × Severity` **24.1 s** and `Vendor × CWE` **24.4 s**, against **239 ms**
+ * and **383 ms** pinned — 101× and 64×. The same statistics leave every other
+ * shape unchanged, so this is not an argument against `ANALYZE`; it is the
+ * planner making a locally reasonable choice that is catastrophic here, because
+ * it turns one covering-index scan into ~190,000 random lookups into the
+ * corpus table.
+ *
+ * It cannot change an answer — `CROSS JOIN` and `JOIN` are semantically
+ * identical in SQLite — and `tests/unit/filters.test.ts` executes these against
+ * the real schema, so the correctness claim is checked rather than asserted.
+ */
 const JOIN_SQL: Record<JoinGroup, string> = {
   prod:
-    'JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ' +
+    'CROSS JOIN cve_prod cp ON cp.cve_id = c.id JOIN product p ON p.id = cp.product_id ' +
     'JOIN vendor v ON v.id = p.vendor_id',
-  cwe: 'JOIN cve_cwe x ON x.cve_id = c.id JOIN cwe w ON w.id = x.cwe_id',
+  cwe: 'CROSS JOIN cve_cwe x ON x.cve_id = c.id JOIN cwe w ON w.id = x.cwe_id',
   ref:
-    'JOIN cve_ref r ON r.cve_id = c.id JOIN url u ON u.id = r.url_id ' +
+    'CROSS JOIN cve_ref r ON r.cve_id = c.id JOIN url u ON u.id = r.url_id ' +
     'JOIN host h ON h.id = u.host_id',
+  // Not pinned, and not a link table: a scalar foreign key reached by a LEFT
+  // JOIN, where there is no join order to get wrong.
   cna: 'LEFT JOIN cna n ON n.id = c.cna_id',
 }
 

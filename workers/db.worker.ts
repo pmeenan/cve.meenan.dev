@@ -32,6 +32,7 @@ import {
 import { parseDelta } from '../lib/delta'
 import {
   countSql,
+  crossSql,
   groupSql,
   lookupKey,
   LOOKUP_AXES,
@@ -43,6 +44,25 @@ import {
   type Resolved,
   type SqlParam,
 } from '../lib/filters'
+import {
+  cwesSql,
+  isCveId,
+  productsSql,
+  recordSql,
+  referencesSql,
+  versionsSql,
+  type DetailQuery,
+} from '../lib/detail'
+import {
+  CELL_COLUMNS,
+  EXPORT_BATCH,
+  EXPORT_LIMIT,
+  exportFilename,
+  exportWriter,
+  RECORD_COLUMNS,
+  type ExportHeader,
+} from '../lib/export'
+import { CHART_ROWS, parseReport, TABLE_ROWS } from '../lib/report'
 import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
 import {
@@ -102,6 +122,12 @@ import {
   // Aliased so `Response` still means the platform's here: this module is
   // mostly fetch code, and shadowing the global in a file that reads response
   // bodies is a trap.
+  type CveDetail,
+  type DetailReference,
+  type DetailVersion,
+  type ExportRequest,
+  type QueryKind,
+  type ReportRequest,
   type Response as WorkerMessage,
   type SearchRequest,
   type SyncOutcome,
@@ -2020,11 +2046,7 @@ function clearAuthorizer(handle: number): void {
 }
 
 /** Post a finished result, or the fact that the user stopped it. */
-function finishQuery(
-  kind: 'demo' | 'console' | 'search',
-  work: () => void,
-  onCancel?: () => void
-): void {
+function finishQuery(kind: QueryKind, work: () => void, onCancel?: () => void): void {
   // Once per top-level request, not once per SQL statement. A structured
   // search may run its result query and then a count; clearing between them can
   // erase a click that landed in that narrow gap and leave the count running.
@@ -2127,17 +2149,9 @@ function search(request: SearchRequest): void {
   report('query', null, 'Running query')
 
   finishQuery('search', () => {
-    const resolved: Resolved = {}
-    const unmatched: Unmatched[] = []
-    for (const axis of LOOKUP_AXES) {
-      const outcome = resolveAxis(database, axis, filters[axis])
-      // Preserve an empty resolution when names were requested. `undefined`
-      // means no filter; `[]` means the requested names do not exist and compiles
-      // to false in the shared layer. Dropping the empty array would return the
-      // whole corpus for a typo.
-      if (filters[axis]?.some((value) => value.trim())) resolved[axis] = outcome.ids
-      if (outcome.unmatched.length) unmatched.push({ axis, values: outcome.unmatched })
-    }
+    // Preserving an empty resolution is what keeps "no vendor is called that"
+    // and "no CVE matches that vendor" different answers (`resolveFilters`).
+    const { resolved, unmatched } = resolveFilters(database, filters)
 
     const groupBy = request.groupBy ?? null
     const state =
@@ -2173,6 +2187,328 @@ function search(request: SearchRequest): void {
       `${result.rows.length.toLocaleString()} rows in ${result.ms} ms${result.truncated ? ' (capped)' : ''}`
     )
     post({ type: 'result', kind: 'search', result, matches, unmatched, groupBy, state })
+  })
+}
+
+/**
+ * Resolve every lookup axis a `Filters` names, once.
+ *
+ * Shared by `search`, `report` and `export` so the three cannot disagree about
+ * what an unmatched name means: `undefined` is "no filter on this axis" and an
+ * empty array is "these names exist nowhere in this copy", which compiles to
+ * false rather than to nothing (lib/filters.ts).
+ */
+function resolveFilters(
+  database: Database,
+  filters: Filters
+): { resolved: Resolved; unmatched: Unmatched[] } {
+  const resolved: Resolved = {}
+  const unmatched: Unmatched[] = []
+  for (const axis of LOOKUP_AXES) {
+    const outcome = resolveAxis(database, axis, filters[axis])
+    if (filters[axis]?.some((value) => value.trim())) resolved[axis] = outcome.ids
+    if (outcome.unmatched.length) unmatched.push({ axis, values: outcome.unmatched })
+  }
+  return { resolved, unmatched }
+}
+
+/**
+ * Run a report definition (M4).
+ *
+ * The definition is **re-validated here**, not trusted because the page sent
+ * it. The page may have built it from a URL fragment a stranger wrote, from an
+ * older build's `localStorage`, and from M7 from a model's tool call — and the
+ * Worker is the last place before SQL. `parseReport` refuses an unknown
+ * dimension by name rather than defaulting past it (D-069), so a definition
+ * this build cannot honour produces an error the user can read instead of a
+ * chart of something else.
+ */
+function runReport(request: ReportRequest): void {
+  const database = requireDb()
+  const parsed = parseReport(request.report)
+  if (!parsed.ok) throw new Error(parsed.error)
+  const definition = parsed.report
+  const filters: Filters = definition.filters ?? {}
+  report('query', null, 'Running report')
+
+  finishQuery('report', () => {
+    const { resolved, unmatched } = resolveFilters(database, filters)
+    const rowCap = definition.limit ?? (definition.chart === 'table' ? TABLE_ROWS : CHART_ROWS)
+    const built = crossSql(filters, resolved, definition.rows, definition.series, { rows: rowCap })
+    const result = runSql(database, built.sql, { params: built.params, limit: built.limit })
+
+    let matches: number | null = null
+    if (request.count !== false) {
+      const counted = countSql(filters, resolved)
+      const rows = runSql(database, counted.sql, { params: counted.params, limit: 1, quiet: true })
+      const value = rows.rows[0]?.[0]
+      matches = typeof value === 'number' ? value : null
+    }
+
+    report(
+      'ready',
+      1,
+      `${result.rows.length.toLocaleString()} buckets in ${result.ms} ms${result.truncated ? ' (capped)' : ''}`
+    )
+    post({
+      type: 'result',
+      kind: 'report',
+      result,
+      matches,
+      unmatched,
+      report: definition,
+      state: filters.state === 'rejected' || filters.state === 'all' ? filters.state : 'published',
+    })
+  })
+}
+
+/** One bounded detail section, with the sentinel row turned into a truncation flag. */
+function section(
+  database: Database,
+  query: DetailQuery
+): { rows: unknown[][]; truncated: boolean } {
+  const result = runSql(database, query.sql, {
+    params: query.params,
+    limit: query.limit,
+    quiet: true,
+  })
+  return { rows: result.rows, truncated: result.truncated }
+}
+
+function text(value: unknown): string {
+  return typeof value === 'string'
+    ? value
+    : value === null || value === undefined
+      ? ''
+      : String(value)
+}
+
+function num(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * One record in full (M4).
+ *
+ * Five queries rather than one join, each bounded (lib/detail.ts). A record
+ * that does not exist is `detail: null` rather than an error: "no record has
+ * that id" is an answer, and reporting it as a failure would send the reader
+ * looking for a broken app instead of a typo.
+ */
+function detail(cveId: string): void {
+  const database = requireDb()
+  // Shaped before it becomes a query, because this arrives from a URL fragment
+  // and, in M7, from a model. Not a claim that the record exists.
+  if (!isCveId(cveId)) throw new Error(`not a CVE identifier: ${String(cveId).slice(0, 40)}`)
+  report('query', null, 'Reading record')
+
+  finishQuery('detail', () => {
+    const started = performance.now()
+    const found = section(database, recordSql(cveId))
+    const row = found.rows[0]
+    if (!row) {
+      report('ready', 1, 'no such record')
+      post({ type: 'detail', cveId, detail: null })
+      return
+    }
+
+    const cwes = section(database, cwesSql(cveId))
+    const products = section(database, productsSql(cveId))
+    const versions = section(database, versionsSql(cveId))
+    const references = section(database, referencesSql(cveId))
+    const truncated: string[] = []
+    for (const [name, part] of [
+      ['CWEs', cwes],
+      ['affected products', products],
+      ['version ranges', versions],
+      ['references', references],
+    ] as const) {
+      if (part.truncated) truncated.push(name)
+    }
+
+    const payload: CveDetail = {
+      record: {
+        cve: text(row[0]),
+        state: num(row[1]),
+        year: num(row[2]),
+        published: num(row[3]),
+        updated: num(row[4]),
+        cvssVersion: num(row[5]),
+        score: num(row[6]),
+        severity: num(row[7]),
+        vector: row[8] === null ? null : text(row[8]),
+        cna: row[9] === null ? null : text(row[9]),
+        // Kept as null rather than '': a record with no English description is
+        // a fact the UI has to state, and an empty string would render as a
+        // blank box indistinguishable from a layout bug (D-023).
+        description: row[10] === null || row[10] === undefined ? null : text(row[10]),
+      },
+      cwes: cwes.rows.map((entry) => ({ cwe: text(entry[0]), descr: text(entry[1]) })),
+      products: products.rows.map((entry) => ({
+        vendor: text(entry[0]),
+        product: text(entry[1]),
+      })),
+      versions: versions.rows.map((entry): DetailVersion => ({
+        vendor: text(entry[0]),
+        product: text(entry[1]),
+        status: num(entry[2]),
+        version: entry[3] === null ? null : text(entry[3]),
+        lt: entry[4] === null ? null : text(entry[4]),
+        lte: entry[5] === null ? null : text(entry[5]),
+        vtype: entry[6] === null ? null : text(entry[6]),
+      })),
+      references: references.rows.map((entry): DetailReference => ({
+        url: text(entry[0]),
+        host: text(entry[1]),
+      })),
+      truncated,
+      ms: Math.round(performance.now() - started),
+    }
+
+    report('ready', 1, `${payload.record.cve} in ${payload.ms} ms`)
+    post({ type: 'detail', cveId, detail: payload })
+  })
+}
+
+/** MITRE's notice, out of the copy's own `meta` — never a constant in this build (D-008). */
+function localNotice(database: Database): string {
+  const value = database.selectValue("SELECT v FROM meta WHERE k = 'notice'")
+  return typeof value === 'string' ? value : ''
+}
+
+function localRevision(database: Database): number | null {
+  const value = database.selectValue("SELECT v FROM meta WHERE k = 'rev'")
+  return typeof value === 'number' ? value : null
+}
+
+/**
+ * Write an export, in batches (M4).
+ *
+ * The loop is the point. Each pass runs one bounded query, serializes it, posts
+ * the text and drops it — so the Worker's live set is one batch of records
+ * rather than the match set, the same bound the import holds itself to (D-041).
+ * Nothing here accumulates the file.
+ *
+ * The cap is disclosed twice: in the file's own preamble and in the `exported`
+ * message the UI reports from. A truncated export that looked complete would be
+ * read as complete, which is worse than no export.
+ */
+function exportData(request: ExportRequest): void {
+  const database = requireDb()
+  const parsed = parseReport(request.report)
+  if (!parsed.ok) throw new Error(parsed.error)
+  const definition = parsed.report
+  const filters: Filters = definition.filters ?? {}
+  const cells = request.kind === 'cells'
+  report('export', null, 'Preparing export')
+
+  finishQuery('export', () => {
+    const started = performance.now()
+    const { resolved } = resolveFilters(database, filters)
+
+    // The count comes first because the header has to be able to say whether
+    // the file is the whole answer, and the header is written before any row.
+    const counted = countSql(filters, resolved)
+    const countRows = runSql(database, counted.sql, {
+      params: counted.params,
+      limit: 1,
+      quiet: true,
+    })
+    const countValue = countRows.rows[0]?.[0]
+    const matches = typeof countValue === 'number' ? countValue : null
+
+    const first = cells
+      ? crossSql(filters, resolved, definition.rows, definition.series, {
+          rows: definition.limit ?? (definition.chart === 'table' ? TABLE_ROWS : CHART_ROWS),
+        })
+      : rowsSql(filters, resolved, { limit: EXPORT_BATCH, sort: definition.sort, full: true })
+    const truncated = !cells && matches !== null && matches > EXPORT_LIMIT
+
+    // A cell export is small enough to run before its header is emitted. That
+    // ordering is load-bearing: unlike a record export, its bound is a cell
+    // cap rather than EXPORT_LIMIT, so a dense cross-tab can hit the sentinel.
+    // Refuse before writing any bytes instead of producing a partial file whose
+    // ordinary record-cap preamble would incorrectly call it complete.
+    const cellResult = cells
+      ? runSql(database, first.sql, { params: first.params, limit: first.limit })
+      : null
+    // A one-axis group uses its sentinel to say there are more buckets than
+    // the report explicitly requested; exporting those requested rows is
+    // exactly what "these numbers" promises. In a two-axis result, by contrast,
+    // the sentinel can only be the independent hard cell cap.
+    if (definition.series !== null && cellResult?.truncated) {
+      throw new Error(
+        'This aggregate reached the cell cap and cannot be exported as a complete table. ' +
+          'Use fewer buckets or narrower filters, then run the report again.'
+      )
+    }
+
+    const header: ExportHeader = {
+      notice: localNotice(database),
+      columns: cells ? [...CELL_COLUMNS] : [...RECORD_COLUMNS],
+      title: request.title,
+      revision: localRevision(database),
+      sql: first.sql,
+      params: first.params,
+      matches,
+      truncated,
+    }
+    const writer = exportWriter(request.format, header)
+    post({ type: 'exportChunk', text: writer.begin() })
+
+    let written = 0
+    if (cells) {
+      // A cross-tab cell is [bucket, label, series, series_label, cves] or
+      // [bucket, label, cves]; the file carries the *labels* and the count,
+      // because an interned id means nothing outside the artifact that issued
+      // it (D-055).
+      const rows = cellResult!.rows.map((row) =>
+        definition.series === null
+          ? [row[1] ?? row[0], '', row[2]]
+          : [row[1] ?? row[0], row[3] ?? row[2], row[4]]
+      )
+      post({ type: 'exportChunk', text: writer.rows(rows) })
+      written = rows.length
+    } else {
+      let offset = 0
+      for (;;) {
+        const batch = rowsSql(filters, resolved, {
+          limit: Math.min(EXPORT_BATCH, EXPORT_LIMIT - written),
+          offset,
+          sort: definition.sort,
+          full: true,
+        })
+        const result = runSql(database, batch.sql, {
+          params: batch.params,
+          limit: batch.limit,
+          quiet: true,
+        })
+        if (result.rows.length === 0) break
+        post({ type: 'exportChunk', text: writer.rows(result.rows) })
+        written += result.rows.length
+        offset += result.rows.length
+        report(
+          'export',
+          matches ? Math.min(1, written / Math.min(matches, EXPORT_LIMIT)) : null,
+          `${written.toLocaleString()} records written`
+        )
+        if (written >= EXPORT_LIMIT) break
+        if (!result.truncated) break
+      }
+    }
+
+    post({ type: 'exportChunk', text: writer.end() })
+    const ms = Math.round(performance.now() - started)
+    report('ready', 1, `${written.toLocaleString()} rows exported in ${ms} ms`)
+    post({
+      type: 'exported',
+      filename: exportFilename(request.title, writer.extension),
+      mime: writer.mime,
+      records: written,
+      matches,
+      truncated: truncated && written >= EXPORT_LIMIT,
+      ms,
+    })
   })
 }
 
@@ -2356,6 +2692,15 @@ async function handle(request: Request): Promise<void> {
       case 'search':
         search(request.request)
         break
+      case 'report':
+        runReport(request.request)
+        break
+      case 'detail':
+        detail(request.cveId)
+        break
+      case 'export':
+        exportData(request.request)
+        break
       case 'bench':
         bench()
         break
@@ -2365,14 +2710,20 @@ async function handle(request: Request): Promise<void> {
     }
   } catch (error) {
     report('error', null, '')
-    const kind =
+    const kind: QueryKind | undefined =
       request.type === 'console'
         ? 'console'
         : request.type === 'search'
           ? 'search'
-          : request.type === 'query' || request.type === 'bench'
-            ? 'demo'
-            : undefined
+          : request.type === 'report'
+            ? 'report'
+            : request.type === 'detail'
+              ? 'detail'
+              : request.type === 'export'
+                ? 'export'
+                : request.type === 'query' || request.type === 'bench'
+                  ? 'demo'
+                  : undefined
     post({
       type: 'error',
       message: error instanceof Error ? error.message : String(error),

@@ -30,24 +30,43 @@ function watchConsole(page: Page): string[] {
   return failures
 }
 
+/**
+ * Open one of M4's tabs.
+ *
+ * The app is a tabbed workspace on one route (M4), so a surface is only in the
+ * accessibility tree — and only reachable by a role query — once its tab is
+ * selected. Everything else about these tests is unchanged.
+ */
+async function openTab(page: Page, name: string): Promise<void> {
+  await page.getByRole('tab', { name, exact: true }).click()
+  await expect(page.getByRole('tab', { name, exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true'
+  )
+}
+
 /** Download the development slice and wait for the local copy to be queryable. */
 async function importCorpus(page: Page): Promise<void> {
   await page.goto('/')
   await page.getByRole('button', { name: /Download data/ }).click()
   await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+  await openTab(page, 'Explore')
   await expect(page.getByRole('heading', { name: 'Explore' })).toBeVisible()
 }
 
 /**
- * The filter form, as a scope for every field lookup.
+ * Explore's filter form, as a scope for every field lookup.
  *
- * Scoped rather than page-wide because the console's textarea holds SQL, and an
- * accessible name includes the value of the control a label wraps — so a
- * `GROUP BY` in the example query makes the textarea answer to
- * `getByLabel('Group by')`.
+ * Scoped twice over. Page-wide, the console's textarea would answer to
+ * `getByLabel('Group by')`, because an accessible name includes the value of
+ * the control a label wraps and the example query contains a `GROUP BY`. And
+ * since M4 there are *two* copies of this form — Explore's and the report
+ * builder's — so the panel has to be named as well: `getByRole` skips the four
+ * hidden panels because they are out of the accessibility tree, but `getByLabel`
+ * is a DOM query and sees both.
  */
 function filterForm(page: Page) {
-  return page.locator('form.filters')
+  return page.locator('#panel-explore form.filters')
 }
 
 /**
@@ -235,6 +254,7 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
   })
 
   await test.step('the console reads', async () => {
+    await openTab(page, 'SQL')
     await page.getByRole('button', { name: 'What the schema looks like' }).click()
     await page.getByRole('button', { name: 'Run SQL' }).click()
     await expect(page.locator('[data-console-rows]')).toBeVisible({ timeout: 120_000 })
@@ -283,9 +303,11 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     // removed afterwards, on the connection that also applies deltas. If
     // removal failed, this is where it would show: sync would be refused by the
     // guard the console left behind.
+    await openTab(page, 'Data')
     await page.getByRole('button', { name: 'Sync' }).click()
     await expect(page.locator('.progress')).toBeHidden({ timeout: 300_000 })
     await expect(page.locator('[data-error]')).toHaveCount(0)
+    await openTab(page, 'SQL')
   })
 
   await test.step('the row cap is applied and reported', async () => {
@@ -349,7 +371,10 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     await expect(announcement).toContainText('schema 2')
     await expect(announcement).toContainText('Download the corpus again')
     // Not offered as a query surface: a copy this build cannot read must not be
-    // queried, and the buttons say so.
+    // queried, so the tabs that need one are disabled rather than opening onto
+    // an empty panel.
+    await expect(page.getByRole('tab', { name: 'Explore' })).toBeDisabled()
+    await expect(page.getByRole('tab', { name: 'SQL' })).toBeDisabled()
     await expect(page.getByRole('heading', { name: 'Explore' })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Download data', exact: true })).toBeVisible()
   })

@@ -301,7 +301,164 @@ test.describe('full-scale measurement', () => {
       }
     })
   }
+
+  /**
+   * M4's cross-tab, at full scale — the number the milestone closed without.
+   *
+   * `crossSql` is a query shape D-067's benchmark does not cover: two grouped
+   * axes, each narrowed by its own total in a CTE before the cross-tab is
+   * computed, over 372,322 records rather than the 39,196-record development
+   * slice every M4 test runs against. The shapes below are the ones the UI
+   * actually offers, chosen to span what makes them expensive: a time axis is a
+   * scan with a `strftime` per row, a lookup axis multiplies through a link
+   * table, and `Vendor × CWE` is the one pair that joins two independent chains
+   * at once (D-069).
+   *
+   * Two passes each, for the same reason `runBench` takes two: the first pays
+   * for whatever the 256 MiB page cache has not read yet, and only the second
+   * is the steady-state number a reader of the UI would experience. Both are
+   * recorded — the cold one is what someone meets after a reopen.
+   *
+   * Nothing is asserted but correctness. These numbers are being *set*, so a
+   * budget here would be circular (the same reasoning as the rest of this file).
+   */
+  test('M4 report shapes (D-069)', async ({ browser }) => {
+    const context = await browser.newContext()
+    try {
+      const page = await context.newPage()
+      const failures: string[] = []
+      page.on('pageerror', (error) => failures.push(String(error)))
+      const timings = await importInPage(page, {})
+
+      // Bounded and asserted before anything is clicked. An import is followed
+      // by a catch-up (M2), and a catch-up that fails leaves the query tabs
+      // disabled — at which point clicking one waits for the *case* timeout
+      // with no CPU and no output, which is half an hour spent learning
+      // nothing. Naming the state here turns that into a sentence.
+      const reportTab = page.getByRole('tab', { name: 'Report', exact: true })
+      await expect(reportTab, `page errors: ${failures.join('; ')}`).toBeEnabled({
+        timeout: 300_000,
+      })
+      // An error banner is *recorded*, not fatal. The copy is queryable at the
+      // snapshot's revision whether or not the catch-up that follows an import
+      // succeeded, and these numbers are about query cost — but an unexplained
+      // banner is exactly the thing a measurement run should not swallow, so it
+      // goes in the report beside the numbers it might explain.
+      const banner = (await page.locator('[data-error]').allInnerTexts()).join(' | ')
+      if (banner || failures.length) {
+        record({
+          kind: 'note',
+          key: 'm4:reports:state',
+          note:
+            `- **the app reported something during this run**: ` +
+            `${banner || '(no banner)'}${failures.length ? ` — page errors: ${failures.join('; ')}` : ''}`,
+        })
+      }
+      await reportTab.click()
+      // An import is followed by a catch-up (M2), and "Run report" is disabled
+      // while the Worker is busy — so without this the *first* shape's wall
+      // time is the sync's, not the query's. It read 284 s once, which is a
+      // number nobody would have questioned in a table headed "report".
+      await expect(page.locator('.progress')).toBeHidden({ timeout: 600_000 })
+
+      const lines: string[] = []
+      for (const [rows, series] of SHAPES) {
+        await page.locator('#report-rows').selectOption({ label: rows })
+        await page
+          .locator('#report-series')
+          .selectOption(series === null ? { value: '' } : { label: series })
+        const cold = await runOneReport(page)
+        const warm = await runOneReport(page)
+        lines.push(
+          `| ${rows}${series ? ` × ${series}` : ''} | ${cold.ms} | ${warm.ms} | ` +
+            `${cold.wallMs} | ${warm.cells}${warm.truncated ? ' (capped)' : ''} |`
+        )
+        // Written after *every* shape, under one key so the table stays whole:
+        // notes are last-write-wins, and this file's own header records what it
+        // cost to learn that a result set held only in memory dies with the
+        // worker that a timeout restarts.
+        record({ kind: 'note', key: 'm4:reports', note: reportNote(timings.records, lines) })
+      }
+    } finally {
+      await context.close()
+    }
+  })
 })
+
+/** The cross-tab table, rebuilt from every shape measured so far. */
+function reportNote(records: number, lines: string[]): string {
+  return (
+    `- **M4 cross-tabs over ${records.toLocaleString()} records**, ` +
+    `256 MiB page cache, statistics shipped:\n\n` +
+    `  | report | cold ms | warm ms | cold wall ms | cells |\n` +
+    `  | --- | --- | --- | --- | --- |\n` +
+    lines.map((line) => `  ${line}`).join('\n') +
+    `\n\n  \`ms\` is SQLite's own time for the cross-tab statement; ` +
+    `\`wall ms\` is click to rendered answer, which also carries the ` +
+    `\`count(*)\` the UI asks for beside every report.`
+  )
+}
+
+/** The report shapes the sweep times. `null` series is a one-axis aggregate. */
+const SHAPES: [string, string | null][] = [
+  ['Month', 'Severity'],
+  ['Year', 'Severity'],
+  ['Vendor', 'Severity'],
+  ['Product', 'Severity'],
+  ['CWE', 'Severity'],
+  ['CNA', 'Severity'],
+  ['Reference host', 'Severity'],
+  ['Vendor', 'CWE'],
+  ['Month', null],
+]
+
+/** This surface's answer counter, or null when it has not answered yet. */
+async function answeredRun(page: Page): Promise<string | null> {
+  const cell = page.locator('[data-report-matches]').first()
+  if ((await cell.count()) === 0) return null
+  return cell.getAttribute('data-run')
+}
+
+interface ReportRun {
+  ms: number
+  cells: number
+  truncated: boolean
+  wallMs: number
+}
+
+/**
+ * Run the report on screen and read the Worker's own timing back.
+ *
+ * Waits on the answer counter rather than on the progress bar: a report that
+ * finishes quickly may never render one, and the assertion would then read the
+ * previous shape's numbers — which is how a sweep records the same query nine
+ * times (the same trap `report.spec.ts` documents).
+ */
+async function runOneReport(page: Page): Promise<ReportRun> {
+  // Read through `count()` rather than straight off the locator. Before the
+  // first report has ever run the element does not exist, and `getAttribute`
+  // has no timeout of its own here — so it waits for the *case* timeout, with
+  // an idle CPU and no output. That is half an hour spent learning nothing, and
+  // it is how this helper was first written.
+  const before = await answeredRun(page)
+  const started = Date.now()
+  await page.getByRole('button', { name: 'Run report' }).click()
+  await expect
+    .poll(
+      async () => {
+        const after = await answeredRun(page)
+        return after !== null && after !== before
+      },
+      { timeout: CASE_TIMEOUT }
+    )
+    .toBe(true)
+  const wallMs = Date.now() - started
+  const payload = JSON.parse(
+    (await page.locator('[data-report-matches]').first().getAttribute('data-json')) ?? 'null'
+  ) as { ms: number; cells: number; truncated: boolean } | null
+  expect(payload, 'the report reported no numbers').not.toBeNull()
+  return { ...payload!, wallMs }
+}
 
 /** One import in a fresh context, so OPFS starts empty every time. */
 async function importOnce(

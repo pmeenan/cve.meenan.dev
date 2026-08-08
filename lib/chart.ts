@@ -1,0 +1,280 @@
+/**
+ * The chart model: cells from `crossSql` turned into ordered rows and series,
+ * with the colour each series gets (M4).
+ *
+ * Kept out of the component deliberately. Ordering and colour assignment are
+ * where a chart becomes wrong rather than ugly — a stack whose bands are in a
+ * different order per bar, a severity ramp that reads as categorical, an
+ * absence folded into a zero — and all three are testable as data. The SVG is
+ * then a rendering of a value this file already decided.
+ *
+ * Charts are hand-rolled inline SVG (M4's shape decision): no dependency to
+ * audit under D-002, and the accessibility story is ours rather than a
+ * library's defaults.
+ *
+ * **Colours are CSS custom properties, never literals.** The page renders in
+ * whatever colour scheme the reader's system asks for, so a hex value baked
+ * into a `fill` would be validated in one theme and shipped in two. The values
+ * behind these names live in `app/globals.css` — one block per scheme — and
+ * `tests/unit/chart.test.ts` reads that file and checks both ramps against the
+ * background they are actually drawn on.
+ */
+
+import {
+  CVSS_VERSION_LABELS,
+  SEVERITY_LABELS,
+  STATE_LABELS,
+  TIME_DIMENSIONS,
+  type Dimension,
+} from './filters'
+
+/**
+ * How many series a chart draws before the colours stop meaning anything.
+ *
+ * Eight is the categorical ceiling — beyond it, two slots are close enough that
+ * a reader has to consult the legend for every segment, which is not reading a
+ * chart. Severity is exempt because its six bands are an ordered ramp rather
+ * than eight arbitrary identities.
+ */
+export const CHART_SERIES_MAX = 8
+
+/** Severity has one band per code plus one for "never scored". */
+const SEVERITY_SERIES_MAX = 6
+
+/**
+ * The severity stack, bottom to top.
+ *
+ * CRITICAL sits at the baseline (M4 shape decision): stacked segments share
+ * only that edge, so the bottom series is the only one whose length a reader
+ * can compare accurately across buckets — and the founding question is about
+ * CRITICAL over time. The unscored band lands at the top, where it cannot
+ * distort the trend beneath it.
+ *
+ * `null` is in the list on purpose. About half the corpus has never been scored
+ * (189,742 of 372,322), so a severity chart that dropped those records would
+ * understate every bucket while looking complete — the same failure D-022
+ * guards against for REJECTED records.
+ */
+const SEVERITY_STACK: (number | null)[] = [4, 3, 2, 1, 0, null]
+
+export interface Cell {
+  row: string | number | null
+  rowLabel: string
+  series: string | number | null
+  seriesLabel: string
+  cves: number
+}
+
+export interface ChartSeries {
+  /** Stable identity for React keys and for matching cells; `''` is the null bucket. */
+  key: string
+  label: string
+  /** A `var(--…)` reference, resolved by the stylesheet in the reader's theme. */
+  color: string
+}
+
+export interface ChartRow {
+  key: string
+  label: string
+  /** One count per series, in `series` order. Absent cells are 0, not omitted. */
+  values: number[]
+  total: number
+}
+
+export interface ChartModel {
+  rows: ChartRow[]
+  series: ChartSeries[]
+  /** The largest single value, for a grouped chart's y-axis. */
+  max: number
+  /** The largest row total, for a stacked chart's y-axis. */
+  maxTotal: number
+  total: number
+  /** Series the cap dropped, named so the omission is reported rather than silent. */
+  droppedSeries: number
+  /** Rows the cap dropped. */
+  droppedRows: number
+}
+
+/**
+ * Order the series for a stack.
+ *
+ * Severity is the case with a required answer (above). The other code
+ * dimensions are identifiers rather than magnitudes — 31 is v3.1 and 4 is v4.0
+ * (D-047) — so they take the order the query layer already imposed, which is
+ * semantic. Everything else is an identity dimension and is ordered by size,
+ * because "which are the big ones" is the question being asked.
+ */
+function orderSeries(dimension: Dimension, keys: Map<string, { label: string; total: number }>) {
+  const entries = [...keys.entries()]
+  if (dimension === 'severity') {
+    const rank = new Map(SEVERITY_STACK.map((code, at) => [code === null ? '' : String(code), at]))
+    return entries.sort(
+      ([a], [b]) => (rank.get(a) ?? SEVERITY_STACK.length) - (rank.get(b) ?? SEVERITY_STACK.length)
+    )
+  }
+  if (dimension === 'cvssVersion' || dimension === 'state' || TIME_DIMENSIONS.has(dimension)) {
+    // The SQL emitted these in semantic order; the insertion order of the map
+    // preserves it, so re-sorting here would be second-guessing the query layer.
+    return entries
+  }
+  return entries.sort(([, a], [, b]) => b.total - a.total)
+}
+
+/** How many series this dimension may draw. */
+function seriesCap(dimension: Dimension): number {
+  return dimension === 'severity' ? SEVERITY_SERIES_MAX : CHART_SERIES_MAX
+}
+
+/**
+ * The colour for one series.
+ *
+ * Severity is an **ordinal** encoding — a lightness-ordered ramp — rather than a
+ * categorical one, because LOW → CRITICAL is an ordered scale and hue alone
+ * puts MEDIUM and HIGH, the two largest bands, below the separation floor. The
+ * unscored band is deliberately *off* the ramp: it is a neutral, because it is
+ * an absence rather than a level, and a reader must not be able to place it on
+ * the scale.
+ *
+ * Every other dimension is an identity, and identities get categorical slots.
+ */
+export function seriesColor(dimension: Dimension, key: string, index: number): string {
+  if (dimension === 'severity') return key === '' ? 'var(--sev-x)' : `var(--sev-${key})`
+  return `var(--cat-${(index % CHART_SERIES_MAX) + 1})`
+}
+
+/**
+ * What a bucket is called on screen.
+ *
+ * The code dimensions come back from SQL as the stored code in both the bucket
+ * and the label column, because a `CASE` in the query would put display strings
+ * in the query layer (lib/filters.ts makes the same call). NULL is named rather
+ * than blanked: "(not scored)" is a fact about the record, and an empty cell
+ * reads as a rendering bug.
+ */
+export function bucketLabel(dimension: Dimension, bucket: unknown, label: unknown): string {
+  if (label !== bucket && typeof label === 'string' && label.length > 0) return label
+  if (bucket === null || bucket === undefined) {
+    return dimension === 'severity'
+      ? '(not scored)'
+      : dimension === 'cvssVersion'
+        ? '(no CVSS)'
+        : '(none recorded)'
+  }
+  const code = Number(bucket)
+  if (dimension === 'severity') return SEVERITY_LABELS[code] ?? String(bucket)
+  if (dimension === 'cvssVersion') return CVSS_VERSION_LABELS[code] ?? String(bucket)
+  if (dimension === 'state') return STATE_LABELS[code] ?? String(bucket)
+  return String(bucket)
+}
+
+/**
+ * Build the model from the query layer's rows.
+ *
+ * `rows` are the raw result rows: `[bucket, label, cves]` for a one-dimension
+ * aggregate, `[bucket, label, series, series_label, cves]` for a cross-tab.
+ * Row order is taken from SQL, which already ordered it for reading — time
+ * ascending, everything else by the row's own total.
+ */
+export function buildChart(
+  rows: readonly unknown[][],
+  rowsDimension: Dimension,
+  seriesDimension: Dimension | null,
+  rowCap: number
+): ChartModel {
+  const cross = seriesDimension !== null
+  const rowOrder: string[] = []
+  const rowMeta = new Map<string, { label: string; total: number }>()
+  const seriesMeta = new Map<string, { label: string; total: number }>()
+  const cells = new Map<string, number>()
+
+  for (const raw of rows) {
+    const rowKey = keyOf(raw[0])
+    const rowLabel = bucketLabel(rowsDimension, raw[0], raw[1])
+    const seriesKey = cross ? keyOf(raw[2]) : ''
+    const seriesLabel = cross ? bucketLabel(seriesDimension, raw[2], raw[3]) : 'CVEs'
+    const count = Number(raw[cross ? 4 : 2] ?? 0)
+
+    if (!rowMeta.has(rowKey)) {
+      rowMeta.set(rowKey, { label: rowLabel, total: 0 })
+      rowOrder.push(rowKey)
+    }
+    rowMeta.get(rowKey)!.total += count
+    if (!seriesMeta.has(seriesKey)) seriesMeta.set(seriesKey, { label: seriesLabel, total: 0 })
+    seriesMeta.get(seriesKey)!.total += count
+    cells.set(`${rowKey} ${seriesKey}`, (cells.get(`${rowKey} ${seriesKey}`) ?? 0) + count)
+  }
+
+  const orderedSeries = orderSeries(seriesDimension ?? 'severity', seriesMeta)
+  const cap = cross ? seriesCap(seriesDimension) : 1
+  const keptSeries = orderedSeries.slice(0, cap)
+  const droppedSeries = orderedSeries.length - keptSeries.length
+
+  const series: ChartSeries[] = keptSeries.map(([key, meta], at) => ({
+    key,
+    label: meta.label,
+    color: cross ? seriesColor(seriesDimension, key, at) : 'var(--cat-1)',
+  }))
+
+  const keptRows = rowOrder.slice(0, Math.max(1, rowCap))
+  const droppedRows = rowOrder.length - keptRows.length
+
+  let max = 0
+  let maxTotal = 0
+  let total = 0
+  const model: ChartRow[] = keptRows.map((key) => {
+    const values = series.map((entry) => cells.get(`${key} ${entry.key}`) ?? 0)
+    // The row total is over the series *on the chart*, so the bar's height and
+    // its table row agree. A row whose total came from dropped series would
+    // draw shorter than its own label claims.
+    const rowTotal = values.reduce((sum, value) => sum + value, 0)
+    for (const value of values) max = Math.max(max, value)
+    maxTotal = Math.max(maxTotal, rowTotal)
+    total += rowTotal
+    return { key, label: rowMeta.get(key)!.label, values, total: rowTotal }
+  })
+
+  return { rows: model, series, max, maxTotal, total, droppedSeries, droppedRows }
+}
+
+/** A bucket value as a map key. `null` is its own bucket, spelled `''`. */
+function keyOf(value: unknown): string {
+  return value === null || value === undefined ? '' : String(value)
+}
+
+/**
+ * Axis ticks at values a reader can hold in their head.
+ *
+ * 1, 2, 5 × a power of ten, chosen so there are about `count` of them. Without
+ * this an axis reads 0 / 3,847 / 7,694, which is a scale nobody can use to
+ * estimate a bar they are looking at.
+ */
+export function niceTicks(max: number, count = 4): number[] {
+  if (!Number.isFinite(max) || max <= 0) return [0]
+  const magnitude = 10 ** Math.floor(Math.log10(max / Math.max(1, count)))
+  const candidates = [1, 2, 2.5, 5, 10].map((factor) => factor * magnitude)
+  // The smallest step that keeps the axis to about `count` intervals. Choosing
+  // the *smallest* matters: a larger one is always available and always coarser,
+  // and an axis of 0 / 5,000 / 10,000 for a maximum of 9,732 gives a reader two
+  // gridlines to estimate against.
+  const chosen = candidates.find((step) => Math.ceil(max / step) <= count) ?? candidates.at(-1)!
+  // Every value on these axes is a count of records, so a fractional step would
+  // put 0.25 CVEs on the scale.
+  const step = Math.max(chosen, 1)
+  const ticks: number[] = []
+  // Runs past `max` by construction rather than stopping near it: an axis whose
+  // last tick is below the largest bar draws that bar outside the plot.
+  for (let at = 0; ; at += step) {
+    ticks.push(at)
+    if (at >= max) break
+  }
+  return ticks
+}
+
+/** Big numbers on an axis, where four characters is all there is room for. */
+export function shortCount(value: number): string {
+  if (!Number.isFinite(value)) return ''
+  const abs = Math.abs(value)
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(abs >= 1e4 ? 0 : 1)}k`
+  return String(value)
+}

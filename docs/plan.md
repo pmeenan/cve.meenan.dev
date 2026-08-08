@@ -418,7 +418,7 @@ One thing is deliberately **not** claimed: the re-download at a *new* schema is
 not exercised end to end, because that needs a data plane at the new schema and
 a client that speaks it — two builds of the app (D-068).
 
-## M4 — Analysis and reporting  `in progress`
+## M4 — Analysis and reporting  `done`
 
 Scope: structured filtering UI, aggregate and trend reporting, charting, saved
 queries and history, shareable query permalinks, CSV/JSON export carrying the
@@ -473,7 +473,7 @@ D-032 keeps it structurally unable to. The fragment is never sent.
 Tasks in dependency order. The report definition comes first because everything
 after it is either a producer or a consumer of one.
 
-- [ ] **The report definition** (`lib/report.ts`). The serializable object
+- [x] **The report definition** (`lib/report.ts`). The serializable object
       D-044 calls the shared primitive: filters, rows, series, bucket, chart
       type, sort, limit, title. It arrives from a URL fragment written by a
       stranger and, in M7, from a model — so it is *validated*, not cast, and
@@ -481,63 +481,71 @@ after it is either a producer or a consumer of one.
       defaulted past. Carries a version, so a definition this build cannot read
       says so instead of rendering something subtly different from what its
       author saw.
-- [ ] **Two-axis aggregation and time buckets** in `lib/filters.ts`. `groupSql`
+- [x] **Two-axis aggregation and time buckets** in `lib/filters.ts`. `groupSql`
       grows a second dimension and a `year | quarter | month` bucket over
       `published`. Two properties have to survive the second axis: link-table
       dimensions still count `DISTINCT c.id`, so a record affecting eight
       products stays one record; and the cell count is bounded, because rows ×
       series is a product and a vendor × product cross-tab is not renderable at
       the corpus's cardinalities. Truncation is reported, never silent (D-052).
-- [ ] **The tabbed shell.** Data / Explore / Report / Saved / SQL on one route,
+- [x] **The tabbed shell.** Data / Explore / Report / Saved / SQL on one route,
       as an ARIA tablist with roving tabindex and arrow-key movement. The
       Worker stays mounted across tabs — remounting costs the 3.4 s reopen
       measured in D-049 — and the freshness line and MITRE notice stay visible
       from every tab, since D-008 attaches to the copy rather than to a view of
       it.
-- [ ] **The report builder.** Filters as removable chips over a disclosure
+- [x] **The report builder.** Filters as removable chips over a disclosure
       holding the full form, plus the rows/series/bucket/chart pickers. The M3
       filter form is refactored into a shared component rather than duplicated:
       Explore and Report must not drift into disagreeing about what an axis
       means. D-022's PUBLISHED-only default is shown as a chip rather than
       implied, because the one thing a report must never do is change its
       denominator quietly.
-- [ ] **Charts** — hand-rolled SVG: stacked and grouped bars, and lines over
-      time. Severity is an **ordinal** encoding (a lightness-ordered ramp,
-      validated in both themes against this app's own surfaces), not a
-      categorical one, because LOW→CRITICAL is an ordered scale and hue alone
-      puts MEDIUM and HIGH — the two largest bands — below the separation
-      floor. Identity dimensions (vendor, CWE, CNA) use categorical slots and
-      cap at what stays distinguishable. Every chart ships its numbers as a
-      table view, which is both the accessibility channel and the audit one.
-- [ ] **Permalinks.** Fragment-encoded report definitions, a Copy link action,
+- [x] **Charts** — hand-rolled SVG (D-073): stacked and grouped bars, and lines
+      over time. Severity is an **ordinal** encoding and the ramp is *checked
+      rather than eyeballed* — `tests/unit/chart.test.ts` reads
+      `app/globals.css` and asserts, for both themes, strictly ordered
+      luminance, ≥1.4:1 between adjacent bands and ≥2:1 against the background
+      each is drawn on. The unscored band is a neutral deliberately off the
+      ramp, because it is an absence rather than a level. Identity dimensions
+      get categorical slots, capped at eight with the drop reported rather than
+      silent. Every chart ships its numbers as a table view — always rendered,
+      with real `<th scope>` headers — which is both the accessibility channel
+      and the audit one.
+- [x] **Permalinks.** Fragment-encoded report definitions, a Copy link action,
       and restore-on-load. Bounded on the way in: a hostile fragment is a
       stranger's input, so length and structure are checked before anything is
       decoded. Verified on a **fresh browser profile** with its own local copy,
       which is the only test that proves the link carries the report and not a
       pointer into this browser's state.
-- [ ] **Saved reports and history.** Named saves plus an automatic recent list,
-      in `localStorage` — deliberately *not* in the SQLite copy, which is a
-      rebuildable cache (D-013) that a re-download or a schema bump destroys.
-      Losing a week of saved reports to a schema bump would be exactly the
-      "quiet wrongness" vision criterion 7 rules out. Versioned, and survives a
-      reload.
-- [ ] **Export, and the hardening it drags in.** CSV and JSON, streamed from
-      the Worker in batches so a large export is bounded by a batch rather than
-      by the result set, up to a disclosed cap. Every format carries the D-008
-      notice — an export is a copy, and the notice obligation is functional
-      rather than decorative (D-047). CVE text is hostile input (rule 4), so:
-      formula injection neutralized so a cell cannot execute in a spreadsheet,
-      control characters stripped, and any URL rendered as a link held to a
-      scheme allowlist. Tested with records built to carry each payload, not
-      with clean ones.
-- [ ] **The per-CVE detail view.** Description, CWEs, affected version ranges
+- [x] **Saved reports and history** (D-072). Named saves plus an automatic
+      recent list, in `localStorage` — deliberately *not* in the SQLite copy,
+      which is a rebuildable cache (D-013) that a re-download or a schema bump
+      destroys, and D-070 already schedules a bump. Everything read back is
+      re-validated through `parseReport`, entry by entry, so one report naming a
+      dimension this build dropped costs that report rather than the other
+      nineteen; and a write that does not stick is *reported*, because a report
+      that appears to save and is gone on reload is worse than one that says it
+      cannot be saved.
+- [x] **Export, and the hardening it drags in** (D-071). CSV and JSON, streamed
+      from the Worker in batches so a large export is bounded by a batch rather
+      than by the result set, up to a disclosed cap of 50,000 records — stated
+      in the file's own preamble as well as in the UI. The guards are
+      structural rather than per-caller: a writer **cannot be constructed
+      without the D-008 notice** (it throws), and every cell goes through
+      `lib/sanitize.ts`, which neutralizes the six spreadsheet formula leads,
+      strips C0/C1 and the Trojan Source bidi overrides, and always quotes.
+      Unit tests supply the hostile records; the e2e test asserts the property
+      over real corpus text, which is what catches a guard that exists but is
+      not in the path.
+- [x] **The per-CVE detail view.** Description, CWEs, affected version ranges
       and references for one record — the first surface to reach the two
       sections D-033 accepted into the schema and nothing has rendered since.
       References are the hostile part: a URL in a CVE record is
       attacker-supplied, so it is held to a scheme allowlist, rendered with its
       host shown, never auto-fetched, and never turned into a request by
       hovering it (rule 4, D-011's referrer concern).
-- [ ] **Accessibility as an acceptance criterion.** Keyboard operability and
+- [x] **Accessibility as an acceptance criterion.** Keyboard operability and
       labels across tabs, the filter form, tables and charts — asserted by
       tests rather than inspected once: `@axe-core/playwright` for labels, roles
       and contrast on every tab, hand-written tests for tab order, arrow-key
@@ -555,6 +563,89 @@ on a fresh browser profile; CSV/JSON exports carry the D-008 notice and
 neutralize formula injection (covered by tests with hostile records); charts
 and tables pass a keyboard-and-labels accessibility check.
 
+**Exit criteria — met 2026-08-07**, in a browser against the development slice
+(`tests/e2e/report.spec.ts`, `tests/e2e/a11y.spec.ts`). Each clause has evidence
+rather than a claim:
+
+- The founding question renders — severity by month, stacked, CRITICAL at the
+  baseline and the never-scored band present and on top — and benchmark item #2
+  answers through the same builder for **both** vendor and product over the last
+  two years. The cross-tab is checked for the failure that would be invisible:
+  no row's total exceeds the match count, which is what a join chain
+  double-counting a record affecting eight products would produce (D-069).
+- The chart and its table are reconciled row by row, so the drawing and the
+  numbers cannot disagree.
+- D-022's default is on screen as a chip rather than implied.
+- A CSV export carries the notice, is quoted throughout, and — over **real
+  corpus text**, not an invented payload — has no cell beginning with something
+  a spreadsheet executes and no control character that would split a record. A
+  JSON export parses and carries the notice and the backing query. A record
+  export writes exactly as many rows as matched, against 100 on screen, which is
+  the difference the feature exists for.
+- Saved reports and history survive a reload, a delete stays deleted, and
+  opening one runs it — including when it is opened before the Worker has
+  finished reopening the copy, which is a real window and silently did nothing
+  until it was tested.
+- A permalink reproduces its report **on a fresh browser context** — its own
+  OPFS and its own `localStorage`, so only the URL crosses — producing the same
+  table cell for cell. The link's query string is asserted empty; the definition
+  is entirely in the fragment (D-014, D-032). A damaged, smuggled or
+  from-the-future fragment is refused by name.
+- The detail view opens with focus, and every reference it links is `http(s)`
+  with `rel="noreferrer noopener"` and `referrerPolicy="no-referrer"`.
+- `@axe-core/playwright` is clean on **every** tab — first visit, Data, Explore,
+  Explore with a record open, the report builder, the chart, Saved and SQL —
+  scanned per tab, because four of five panels are `hidden` at any moment and a
+  single pass would report the app clean having looked at one fifth of it. The
+  hand-written half covers what no rule engine checks: arrow-key and Home/End
+  movement, the roving tabindex being one tab stop, the chart's table being a
+  real table, and a filter chip removable from the keyboard by a name that says
+  which filter it is.
+
+Three defects were found by writing those tests rather than by reading the code,
+and are fixed: the CVSS-version checkboxes rendered **v2.0, v4.0, v3.0, v3.1**,
+because JavaScript orders integer-like object keys numerically and 31 > 4 —
+D-047's "codes are not magnitudes" confusion resurfacing in a checkbox list; two
+colours that pass on white and fail on near-black (`.error` at 2.87:1 and the
+primary button's own label at 2.41:1); and every horizontally scrolling table
+was reachable by mouse and not by keyboard.
+
+**Measured at full scale 2026-08-07, and it found a 42-second defect** (D-074).
+The correctness tests run against the development slice, so `crossSql` was
+timed separately against a local mirror of the live data plane — 372,322
+records, snapshot rev 2, every chunk checksum verified. Warm, in a browser, with
+the 256 MiB page cache:
+
+| report | ms |
+| --- | --- |
+| Month × Severity (the founding question) | 343 |
+| Year × Severity | 396 |
+| Vendor × Severity | 624 |
+| Product × Severity | 575 |
+| CWE × Severity | 364 |
+| CNA × Severity | 244 |
+| Reference host × Severity | 1,348 |
+| Vendor × CWE | 633 |
+| Month, one axis | 116 |
+
+Every shape is under a second and a half. **Two of them were 42 seconds before
+this measurement.** With statistics present the planner inverts the CWE join
+chain and drives from `cwe`'s 797 rows, turning one covering-index scan into
+~190,000 random lookups; pinning the link-table chains with `CROSS JOIN` — the
+access path `schema.sql` was built for — takes `CWE × Severity` from 41,718 ms
+to 364 ms and `Vendor × CWE` from 41,946 ms to 633 ms, 115× and 66×, with no
+other shape moving beyond run-to-run variance (D-074). It was invisible on the
+39,196-record slice, which is the whole reason this number was worth taking.
+
+Cold, the reference-host shape is 13.0 s and everything else is 0.4–5.4 s; that
+is the page cache filling, and it is the same cold-first-query behaviour D-067
+chose to *show* rather than hide. The sweep is re-runnable —
+`tests/e2e/measure.spec.ts`, case `M4 report shapes`.
+
+One thing is deliberately **not** claimed: the runs are Chromium-only, as every
+milestone's have been. Firefox and WebKit are M5's, before the D-016 floor is
+claimed publicly.
+
 ## M5 — Resilience and public launch  `pending`
 
 Scope: **putting `cve.meenan.dev` behind Cloudflare and applying D-039's cache
@@ -571,6 +662,22 @@ caching the shell, Worker, WASM, and brotli decoder — scoped to never touch
 `/data/` or model weights — so vision criterion 5 covers reopening the app
 offline, not just an already-open tab.
 
+**The last schema additions, and they land here for a timing reason** (D-070).
+Five fields the corpus has been carrying that the projection drops: SSVC's three
+decision points from CISA's Vulnrichment ADP — the corpus's only structured
+exploitation signal, on 91–99% of everything published since 2023 —
+`dateReserved` at 100%, `affected[].defaultStatus`, `cna.title`, and the
+rejection reason for the 17,822 REJECTED records that currently import with no
+text at all. This is M5 work rather than M6 or later because a schema bump
+invalidates every client's local copy with no in-place migration (D-068): before
+launch that is free, after launch it is a 63 MB re-download for every user. Two
+of the five are not enrichment — `default_status` makes `cve_ver` readable
+without ambiguity, and `reason` stops D-022's rejected records rendering blank.
+The pipeline half is `normalize.py`, `schema.sql` and a rebuild; the client half
+is the schema assertion, the `lib/filters.ts` axes for the SSVC enums, and the
+detail view. Absence stays visible throughout: a record with no SSVC assessment
+is its own band, never folded into `none`.
+
 **Exit criteria:** the origin is behind Cloudflare with the D-039 cache rules
 applied and verified from a response header; the app degrades honestly on an
 unsupported browser, under quota pressure, and in a second tab — each verified by a test, with the
@@ -578,8 +685,11 @@ capability gate exercised in real Firefox and WebKit runs; the diagnostics
 panel reports storage used, last sync, record counts, and schema version; the
 data plane survives an adversarial pass; an offline *reopen* e2e test passes —
 network killed, app reopened, corpus queried — and a stale-manifest check
-confirms the service worker never serves `/data/` from cache (D-048); public
-launch.
+confirms the service worker never serves `/data/` from cache (D-048); D-070's
+five fields are in the built artifact with their real marginal cost measured
+against D-033's table, filterable where they are axes, and reported with
+"not assessed" as a visible band rather than a silent zero — **and the bump
+ships before launch, not after**; public launch.
 
 ## M6 — CISA KEV overlay  `pending`
 

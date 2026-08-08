@@ -1,7 +1,25 @@
 'use client'
 
+/**
+ * The filter surface: every confirmed filter axis, in one form (M3, refactored
+ * for M4).
+ *
+ * What M3 owed was that each axis is *queryable* and that a person can see it
+ * answering, so this was a form and two tables. M4 kept the shape and moved two
+ * things out: the form's fields are now the shared `FilterForm` that the Report
+ * tab also uses, and the draft-to-`Filters` conversion is `lib/draft.ts`. Both
+ * moved for the same reason — Explore and Report must not drift into
+ * disagreeing about what an axis means, and a permalink has to be able to
+ * populate a form as well as read one.
+ *
+ * What M4 added here is the drill-in: a CVE id in the record list is a button
+ * that opens the per-CVE detail view, which is the only surface that reaches
+ * the references and version ranges D-033 put in the schema.
+ */
+
 import { useState } from 'react'
 
+import { draftToFilters, EMPTY_DRAFT, SORT_LABELS, type Draft } from '@/lib/draft'
 import {
   CVSS_VERSION_LABELS,
   DIMENSION_LABELS,
@@ -9,74 +27,14 @@ import {
   SEVERITY_LABELS,
   STATE_LABELS,
   type Dimension,
-  type Filters,
   type SortKey,
   type StateFilter,
 } from '@/lib/filters'
-import type { QueryResult, SearchRequest, Unmatched } from '@/lib/protocol'
+import { EXPORT_LIMIT, type ExportFormat } from '@/lib/export'
+import type { CveDetail, QueryResult, SearchRequest, Unmatched } from '@/lib/protocol'
 
-/**
- * The filter surface: every confirmed filter axis, in one form (M3).
- *
- * Deliberately plain. M4 owns the structured filtering UI, charts, saved
- * queries and permalinks; what this milestone owes is that each axis is
- * *queryable* and that a person can see it answering. So this is a form and two
- * tables, and the interesting code is all in `lib/filters.ts` — which is also
- * what M4 will build on, since a `Filters` object is exactly what a permalink
- * and a chat-emitted report definition will carry (D-044).
- *
- * Lookup axes take names rather than ids, comma-separated. Names are what a
- * person has and what a saved query can survive an artifact rebuild with; ids
- * are the server's and mean nothing outside the generation that issued them
- * (D-055, D-056).
- */
-
-/** What the form holds, before it becomes a `Filters`. All strings: this is a form. */
-interface Draft {
-  text: string
-  cveId: string
-  vendor: string
-  product: string
-  cna: string
-  cwe: string
-  host: string
-  severity: number[]
-  cvssVersion: number[]
-  scoreMin: string
-  scoreMax: string
-  publishedFrom: string
-  publishedTo: string
-  updatedFrom: string
-  updatedTo: string
-  yearFrom: string
-  yearTo: string
-  state: StateFilter
-  groupBy: '' | Dimension
-  sort: SortKey
-}
-
-const EMPTY: Draft = {
-  text: '',
-  cveId: '',
-  vendor: '',
-  product: '',
-  cna: '',
-  cwe: '',
-  host: '',
-  severity: [],
-  cvssVersion: [],
-  scoreMin: '',
-  scoreMax: '',
-  publishedFrom: '',
-  publishedTo: '',
-  updatedFrom: '',
-  updatedTo: '',
-  yearFrom: '',
-  yearTo: '',
-  state: 'published',
-  groupBy: '',
-  sort: 'published',
-}
+import { Detail } from './detail'
+import { Field, FilterForm } from './filter-form'
 
 /** How many records a list asks for. Bounded again in the Worker (D-052 §4). */
 const PAGE_ROWS = 100
@@ -92,180 +50,62 @@ export interface SearchOutcome {
 export function Explore({
   disabled,
   onRun,
+  onOpenRecord,
+  onExport,
   outcome,
   cancelledMs,
   run,
+  detailId,
+  detail,
+  onCloseDetail,
+  exportNote,
 }: {
   disabled: boolean
   onRun: (request: SearchRequest) => void
+  onOpenRecord: (cveId: string) => void
+  onExport: (format: ExportFormat, request: SearchRequest) => void
   outcome: SearchOutcome | null
   cancelledMs: number | null
   /** Answer counter — rendered as `data-run` so a test can wait for *this* one. */
   run: number
+  detailId: string | null
+  detail: CveDetail | null | undefined
+  onCloseDetail: () => void
+  exportNote: string
 }) {
-  const [draft, setDraft] = useState<Draft>(EMPTY)
-  const set = <K extends keyof Draft>(key: K, value: Draft[K]) =>
-    setDraft((current) => ({ ...current, [key]: value }))
+  const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT)
+  const [groupBy, setGroupBy] = useState<'' | Dimension>('')
+  const [sort, setSort] = useState<SortKey>('published')
+  const [format, setFormat] = useState<ExportFormat>('csv')
+  const request = (): SearchRequest => ({
+    filters: draftToFilters(draft),
+    groupBy: groupBy === '' ? null : groupBy,
+    sort,
+    limit: PAGE_ROWS,
+    // The count is a second query — over the whole corpus with no filters it is
+    // a scan — so it is asked for deliberately. It is worth it: "100 shown" of
+    // an unknown total is not an answer.
+    count: true,
+  })
 
   return (
-    <section>
-      <h2>Explore</h2>
+    <section aria-labelledby="explore-heading">
+      <h2 id="explore-heading">Explore</h2>
       <form
         className="filters"
         onSubmit={(event) => {
           event.preventDefault()
-          onRun(toRequest(draft))
+          onRun(request())
         }}
       >
-        <div className="row">
-          <Field label="Search descriptions">
-            <input
-              type="search"
-              value={draft.text}
-              placeholder="buffer overflow"
-              onChange={(event) => set('text', event.target.value)}
-            />
-          </Field>
-          <Field label="CVE ID">
-            <input
-              value={draft.cveId}
-              placeholder="CVE-2021-44228"
-              onChange={(event) => set('cveId', event.target.value)}
-            />
-          </Field>
-        </div>
+        <FilterForm draft={draft} onChange={setDraft} idPrefix="explore" />
 
         <div className="row">
-          <Names label="Vendor" draft={draft} field="vendor" set={set} placeholder="cisco" />
-          <Names label="Product" draft={draft} field="product" set={set} placeholder="ios xe" />
-          <Names label="CNA" draft={draft} field="cna" set={set} placeholder="mitre" />
-          <Names label="CWE" draft={draft} field="cwe" set={set} placeholder="CWE-79, 787" />
-          <Names
-            label="Reference host"
-            draft={draft}
-            field="host"
-            set={set}
-            placeholder="github.com"
-          />
-        </div>
-
-        <div className="row">
-          <fieldset>
-            <legend>Severity</legend>
-            {Object.entries(SEVERITY_LABELS).map(([code, label]) => (
-              <Check
-                key={code}
-                label={label}
-                checked={draft.severity.includes(Number(code))}
-                onChange={(on) => set('severity', toggle(draft.severity, Number(code), on))}
-              />
-            ))}
-          </fieldset>
-          <fieldset>
-            <legend>CVSS version</legend>
-            {Object.entries(CVSS_VERSION_LABELS).map(([code, label]) => (
-              <Check
-                key={code}
-                label={label}
-                checked={draft.cvssVersion.includes(Number(code))}
-                onChange={(on) => set('cvssVersion', toggle(draft.cvssVersion, Number(code), on))}
-              />
-            ))}
-          </fieldset>
-          <fieldset>
-            {/* D-022: the default is PUBLISHED only, and including REJECTED
-                changes the denominator of everything above — so it is a
-                deliberate choice with a warning, not a checkbox that quietly
-                shifts the numbers. */}
-            <legend>Records</legend>
-            {(['published', 'rejected', 'all'] as StateFilter[]).map((value) => (
-              <label key={value} className="check">
-                <input
-                  type="radio"
-                  name="state"
-                  checked={draft.state === value}
-                  onChange={() => set('state', value)}
-                />
-                {value === 'published'
-                  ? 'PUBLISHED only'
-                  : value === 'rejected'
-                    ? 'REJECTED only'
-                    : 'All records'}
-              </label>
-            ))}
-          </fieldset>
-        </div>
-
-        <div className="row">
-          <Field label="CVSS score from">
-            <input
-              type="number"
-              min="0"
-              max="10"
-              step="0.1"
-              value={draft.scoreMin}
-              onChange={(event) => set('scoreMin', event.target.value)}
-            />
-          </Field>
-          <Field label="to">
-            <input
-              type="number"
-              min="0"
-              max="10"
-              step="0.1"
-              value={draft.scoreMax}
-              onChange={(event) => set('scoreMax', event.target.value)}
-            />
-          </Field>
-          <Field label="Published from">
-            <input
-              type="date"
-              value={draft.publishedFrom}
-              onChange={(event) => set('publishedFrom', event.target.value)}
-            />
-          </Field>
-          <Field label="to">
-            <input
-              type="date"
-              value={draft.publishedTo}
-              onChange={(event) => set('publishedTo', event.target.value)}
-            />
-          </Field>
-          <Field label="Updated from">
-            <input
-              type="date"
-              value={draft.updatedFrom}
-              onChange={(event) => set('updatedFrom', event.target.value)}
-            />
-          </Field>
-          <Field label="to">
-            <input
-              type="date"
-              value={draft.updatedTo}
-              onChange={(event) => set('updatedTo', event.target.value)}
-            />
-          </Field>
-          <Field label="Year from">
-            <input
-              type="number"
-              value={draft.yearFrom}
-              onChange={(event) => set('yearFrom', event.target.value)}
-            />
-          </Field>
-          <Field label="to">
-            <input
-              type="number"
-              value={draft.yearTo}
-              onChange={(event) => set('yearTo', event.target.value)}
-            />
-          </Field>
-        </div>
-
-        <div className="row">
-          <Field label="Group by">
+          <Field label="Group by" id="explore-group">
             <select
-              value={draft.groupBy}
-              onChange={(event) => set('groupBy', event.target.value as '' | Dimension)}
+              id="explore-group"
+              value={groupBy}
+              onChange={(event) => setGroupBy(event.target.value as '' | Dimension)}
             >
               <option value="">No grouping — list records</option>
               {DIMENSIONS.map((dimension) => (
@@ -275,16 +115,18 @@ export function Explore({
               ))}
             </select>
           </Field>
-          <Field label="Sort records by">
+          <Field label="Sort records by" id="explore-sort">
             <select
-              value={draft.sort}
-              disabled={draft.groupBy !== ''}
-              onChange={(event) => set('sort', event.target.value as SortKey)}
+              id="explore-sort"
+              value={sort}
+              disabled={groupBy !== ''}
+              onChange={(event) => setSort(event.target.value as SortKey)}
             >
-              <option value="published">Published, newest first</option>
-              <option value="updated">Updated, newest first</option>
-              <option value="score">CVSS score, highest first</option>
-              <option value="cve">CVE ID, descending</option>
+              {(Object.keys(SORT_LABELS) as SortKey[]).map((key) => (
+                <option key={key} value={key}>
+                  {SORT_LABELS[key]}
+                </option>
+              ))}
             </select>
           </Field>
           <div className="actions">
@@ -295,13 +137,46 @@ export function Explore({
               type="button"
               className="quiet"
               disabled={disabled}
-              onClick={() => setDraft(EMPTY)}
+              onClick={() => {
+                setDraft(EMPTY_DRAFT)
+                setGroupBy('')
+                setSort('published')
+              }}
             >
               Reset filters
+            </button>
+            <label className="field inline" htmlFor="explore-format">
+              <span>Export as</span>
+              <select
+                id="explore-format"
+                value={format}
+                onChange={(event) => setFormat(event.target.value as ExportFormat)}
+              >
+                <option value="csv">CSV</option>
+                <option value="json">JSON</option>
+              </select>
+            </label>
+            <button
+              type="button"
+              className="quiet"
+              disabled={disabled}
+              onClick={() => onExport(format, request())}
+            >
+              Export records
             </button>
           </div>
         </div>
       </form>
+
+      <p className="muted">
+        An export covers the whole match set up to {EXPORT_LIMIT.toLocaleString()} records — not
+        just what is on screen — and carries MITRE&rsquo;s notice (D-008).
+      </p>
+      {exportNote && (
+        <p className="muted" data-export-note="1">
+          {exportNote}
+        </p>
+      )}
 
       {cancelledMs !== null && (
         <p className="muted" data-search-cancelled="1">
@@ -309,12 +184,22 @@ export function Explore({
         </p>
       )}
 
-      {outcome && <Results outcome={outcome} run={run} />}
+      {detailId && <Detail cveId={detailId} detail={detail} onClose={onCloseDetail} />}
+
+      {outcome && <Results outcome={outcome} run={run} onOpenRecord={onOpenRecord} />}
     </section>
   )
 }
 
-function Results({ outcome, run }: { outcome: SearchOutcome; run: number }) {
+function Results({
+  outcome,
+  run,
+  onOpenRecord,
+}: {
+  outcome: SearchOutcome
+  run: number
+  onOpenRecord: (cveId: string) => void
+}) {
   const { result, matches, unmatched, groupBy, state } = outcome
   return (
     <div className="outcome">
@@ -343,11 +228,11 @@ function Results({ outcome, run }: { outcome: SearchOutcome; run: number }) {
         {result.rows.length.toLocaleString()} shown in {result.ms} ms
         {result.truncated && ' (capped)'}
       </p>
-      <div className="scroll">
+      <div className="scroll" tabIndex={0}>
         {groupBy ? (
           <GroupTable result={result} dimension={groupBy} />
         ) : (
-          <RecordTable result={result} />
+          <RecordTable result={result} onOpenRecord={onOpenRecord} />
         )}
       </div>
       {/* The query behind the numbers, always available. Deterministic today;
@@ -367,9 +252,9 @@ function GroupTable({ result, dimension }: { result: QueryResult; dimension: Dim
     <table className="results groups">
       <thead>
         <tr>
-          <th>Value</th>
-          <th>CVEs</th>
-          <th>Share</th>
+          <th scope="col">Value</th>
+          <th scope="col">CVEs</th>
+          <th scope="col">Share</th>
         </tr>
       </thead>
       <tbody>
@@ -416,34 +301,54 @@ function bucketLabel(row: unknown[], dimension: Dimension): string {
   return String(bucket)
 }
 
-function RecordTable({ result }: { result: QueryResult }) {
+function RecordTable({
+  result,
+  onOpenRecord,
+}: {
+  result: QueryResult
+  onOpenRecord: (cveId: string) => void
+}) {
   return (
     <table className="results records">
       <thead>
         <tr>
-          <th>CVE</th>
-          <th>Published</th>
-          <th>Severity</th>
-          <th>Score</th>
-          <th>CNA</th>
-          <th>Description</th>
+          <th scope="col">CVE</th>
+          <th scope="col">Published</th>
+          <th scope="col">Severity</th>
+          <th scope="col">Score</th>
+          <th scope="col">CNA</th>
+          <th scope="col">Description</th>
         </tr>
       </thead>
       <tbody>
-        {result.rows.map((row, index) => (
-          <tr key={index}>
-            {/* Every cell is record content: attacker-influenced text rendered
-                as text, never as markup, and no URL from a record is turned
-                into a link here (rule 4). React escapes it; the point is that
-                nothing downstream un-escapes it. */}
-            <td className="mono">{String(row[0] ?? '')}</td>
-            <td className="mono">{day(row[2])}</td>
-            <td>{severity(row[6])}</td>
-            <td className="mono">{row[5] === null ? '' : String(row[5])}</td>
-            <td>{String(row[7] ?? '')}</td>
-            <td className="descr">{String(row[8] ?? '')}</td>
-          </tr>
-        ))}
+        {result.rows.map((row, index) => {
+          const cve = String(row[0] ?? '')
+          return (
+            <tr key={index}>
+              {/* Every cell is record content: attacker-influenced text rendered
+                  as text, never as markup, and no URL from a record is turned
+                  into a link here (rule 4). React escapes it; the point is that
+                  nothing downstream un-escapes it. The id is a button rather
+                  than a link because it opens a panel in this page — a real
+                  `href` would promise a navigation that does not happen. */}
+              <td className="mono">
+                <button
+                  type="button"
+                  className="quiet link"
+                  aria-label={`Open record ${cve}`}
+                  onClick={() => onOpenRecord(cve)}
+                >
+                  {cve}
+                </button>
+              </td>
+              <td className="mono">{day(row[2])}</td>
+              <td>{severity(row[6])}</td>
+              <td className="mono">{row[5] === null ? '' : String(row[5])}</td>
+              <td>{String(row[7] ?? '')}</td>
+              <td className="descr">{String(row[8] ?? '')}</td>
+            </tr>
+          )
+        })}
       </tbody>
     </table>
   )
@@ -457,131 +362,4 @@ function severity(value: unknown): string {
 function day(value: unknown): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return ''
   return new Date(value * 1000).toISOString().slice(0, 10)
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="field">
-      <span>{label}</span>
-      {children}
-    </label>
-  )
-}
-
-function Names({
-  label,
-  draft,
-  field,
-  set,
-  placeholder,
-}: {
-  label: string
-  draft: Draft
-  field: 'vendor' | 'product' | 'cna' | 'cwe' | 'host'
-  set: <K extends keyof Draft>(key: K, value: Draft[K]) => void
-  placeholder: string
-}) {
-  return (
-    <Field label={label}>
-      <input
-        value={draft[field]}
-        placeholder={placeholder}
-        onChange={(event) => set(field, event.target.value)}
-      />
-    </Field>
-  )
-}
-
-function Check({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string
-  checked: boolean
-  onChange: (on: boolean) => void
-}) {
-  return (
-    <label className="check">
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(event) => onChange(event.target.checked)}
-      />
-      {label}
-    </label>
-  )
-}
-
-function toggle(values: number[], value: number, on: boolean): number[] {
-  return on ? [...values, value] : values.filter((entry) => entry !== value)
-}
-
-/** The form as the Worker's request. Empty fields are omitted, not sent empty. */
-function toRequest(draft: Draft): SearchRequest {
-  const filters: Filters = { state: draft.state }
-  if (draft.text.trim()) filters.text = draft.text.trim()
-  if (draft.cveId.trim()) filters.cveId = draft.cveId.trim()
-  for (const axis of ['vendor', 'product', 'cna', 'cwe', 'host'] as const) {
-    const names = splitNames(draft[axis])
-    if (names.length) filters[axis] = names
-  }
-  if (draft.severity.length) filters.severity = draft.severity
-  if (draft.cvssVersion.length) filters.cvssVersion = draft.cvssVersion
-  assignNumber(filters, 'scoreMin', draft.scoreMin)
-  assignNumber(filters, 'scoreMax', draft.scoreMax)
-  assignNumber(filters, 'yearFrom', draft.yearFrom)
-  assignNumber(filters, 'yearTo', draft.yearTo)
-  assignDay(filters, 'publishedFrom', draft.publishedFrom, 'start')
-  assignDay(filters, 'publishedTo', draft.publishedTo, 'end')
-  assignDay(filters, 'updatedFrom', draft.updatedFrom, 'start')
-  assignDay(filters, 'updatedTo', draft.updatedTo, 'end')
-
-  return {
-    filters,
-    groupBy: draft.groupBy === '' ? null : draft.groupBy,
-    sort: draft.sort,
-    limit: PAGE_ROWS,
-    // The count is a second query — over the whole corpus with no filters it is
-    // a scan — so it is asked for deliberately. It is worth it: "100 shown" of
-    // an unknown total is not an answer.
-    count: true,
-  }
-}
-
-function splitNames(raw: string): string[] {
-  return raw
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean)
-}
-
-function assignNumber(
-  filters: Filters,
-  key: 'scoreMin' | 'scoreMax' | 'yearFrom' | 'yearTo',
-  raw: string
-): void {
-  if (!raw.trim()) return
-  const value = Number(raw)
-  if (Number.isFinite(value)) filters[key] = value
-}
-
-/**
- * A `<input type="date">` value as unix seconds.
- *
- * Parsed as UTC and the `to` end taken to the last second of the day, because
- * the corpus stores UTC timestamps: reading the box as local time would move
- * every boundary by the reader's offset and quietly drop a day's records at
- * each end.
- */
-function assignDay(
-  filters: Filters,
-  key: 'publishedFrom' | 'publishedTo' | 'updatedFrom' | 'updatedTo',
-  raw: string,
-  edge: 'start' | 'end'
-): void {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return
-  const at = Date.parse(`${raw}T00:00:00Z`)
-  if (Number.isNaN(at)) return
-  filters[key] = Math.floor(at / 1000) + (edge === 'end' ? 86_399 : 0)
 }

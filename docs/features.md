@@ -55,8 +55,16 @@ the decision log, not by editing a row. The AI chat layer section was added
 | Filter references by host rather than full-text | `confirmed (amends D-011)` | D-033, D-035. Indexing reference URLs pollutes the term space with hosts, slugs and file names; host interning costs 2.0 MB and answers the question exactly. |
 | Affected version ranges | `confirmed` | D-033. 95.0% prevalence, +14.4 MB compressed. |
 | References, as interned URLs | `confirmed` | D-033. 95.1% prevalence, +23.0 MB compressed including host interning. |
-| CPE applicability | `rejected (D-033)` | Present on 2.2% of records — a filter that would look like it works and silently discard 97.8% of the corpus. |
-| Credits, timeline, solutions, workarounds, exploits | `rejected (D-033)` | 0.3–20.1% prevalence; per-record prose no confirmed aggregate consumes. |
+| CPE applicability | `rejected (D-033, re-confirmed D-070)` | 2.2% at D-033. Re-measured 2026-08-06 by year: 46.0% (2024), 3.9% (2025), 10.2% (2026) — non-monotonic, so a time series through a CPE filter tracks Vulnrichment's backfill, not the corpus. Worse than the original objection, because it looks like a trend. |
+| Credits, timeline, solutions, workarounds, exploits | `rejected (D-033)` | 0.3–20.1% prevalence; per-record prose no confirmed aggregate consumes. Re-confirmed by D-070 for the dates question: none of them carries a patch or mitigation *date*, so they cannot answer "public before patched". |
+| SSVC decision points (exploitation, automatable, technical impact) | `confirmed (D-070)` | M5. From CISA's Vulnrichment ADP: 48.1% corpus-wide but 91–99% since 2023. `poc` 39,874 / `active` 1,666 — the corpus's only structured exploitation signal. Three small ints; NULL means *not assessed* and is shown as its own band. |
+| Reserved date (`dateReserved`) | `confirmed (D-070)` | M5. 100% coverage, one integer. The only date supporting a reserved → published lag. |
+| Affected-container `defaultStatus` | `confirmed (D-070)` | M5. A correctness fix, not enrichment: without it `cve_ver` is ambiguous for the 71,421 containers defaulting to `affected`, where listed `unaffected` versions are the *fixed* ones. |
+| Per-record title (`cna.title`) | `confirmed (D-070)` | M5. 38.6% overall, 80.2% for 2026. Owner call 2026-08-06: the 2.58 MB compressed is worth it, and not contingent on the build's number. 83.3% of titles are not a substring of their own description — they carry the sink and vulnerability class the prose buries. |
+| Rejection reason (`rejectedReasons`) | `confirmed (D-070)` | M5. 0.07 MB compressed. 0% of REJECTED records carry an English description, so D-022's filterable rejected records render blank today. |
+| Discovery / mitigation / patch dates | `rejected (D-070)` | Not in the record format. Discovery survives only as `timeline` free text (7.8%, ~1.0% discovery-ish); no dated patch or mitigation field exists at all — a `patch`-tagged reference (2.7%) and a fixed version (31.2%) are both undated. Revision history does not rescue it: the clone is `--depth 1`, and cvelistV5's history would date the CNA's edit, not the vendor's fix. |
+| Disclosure-to-catalog lag (`datePublished − cna.datePublic`) | `proposed` | `datePublic` is on 43.9% of published records; median lag 3 days, 6.7% negative (embargo dates filed ahead). One nullable integer. The closest answerable relative of the patch-lag question — not in D-070's bundle; raise if the reporting work wants it. |
+| CAPEC, `source.discovery`, `packageName`/`collectionURL`, `cna.tags` | `rejected (D-070)` | 7.3% / 21.6% (but `UNKNOWN` swamps it) / ~6% and CNA-skewed / 1.8%. `cna.tags` is the likeliest to be revisited — `disputed` is a flag, not a filter axis, so it avoids the silent-discard hazard. |
 | Interned lookup tables for CWE, CNA, vendor, product | `confirmed` | D-024. 797 CWEs and 479 CNAs replace text repeated across 372k records; the corpus drops 16× to 272.8 MB. |
 | Published and last-modified dates | `confirmed` | D-020. Sourced from `cveMetadata.datePublished` / `dateUpdated` in the record JSON — 98.4% / 100% coverage — not from git. |
 | Record state (`PUBLISHED` / `REJECTED`) as a queryable column | `confirmed` | D-022. ~4.9% of the corpus is REJECTED; excluded from counts by default, filterable on request. |
@@ -81,11 +89,11 @@ as of the 2026-07-30 triage** — additions go through the decision log.
 | Search across CVE records | `confirmed` | Stated in the repository description. Shipped in M3: full-text over descriptions plus every filter axis, through one shared query layer (`lib/filters.ts`). |
 | Structured filtering (date, severity, CNA, CWE, product) | `confirmed` | The concrete form of "analyzing"; the axes follow from the extraction rows above. **Queryable as of M3** — every axis compiles to bound parameters with D-022's default inside the compiler, and counts by any dimension come from the same predicate. The filtering *UI* is M4; M3 ships a plain form over it. |
 | Aggregate reporting and trend views over time | `confirmed` | The main thing a local corpus enables over a search box — the reason the project exists. |
-| Charting for report output | `confirmed` | Aggregates without visualization push users back to a spreadsheet. |
+| Charting for report output | `confirmed` | D-073. Aggregates without visualization push users back to a spreadsheet. Hand-rolled SVG, no dependency; severity is an ordinal ramp checked against both themes by test, and every chart ships its numbers as a table. |
 | Raw SQL console | `confirmed` | Nearly free given D-004, and the escape hatch for every question the UI did not anticipate. Shipped in M3 (D-065): read-only by SQLite authorizer rather than by inspecting the text, capped at 1,000 rows, and cancellable. |
-| Saved queries and query history | `confirmed` | Analysis is iterative; losing a refined query on reload is a real cost. |
+| Saved queries and query history | `confirmed` | D-072. Analysis is iterative; losing a refined query on reload is a real cost. In `localStorage`, never in the SQLite copy — that copy is a rebuildable cache a schema bump destroys (D-013, D-068). |
 | Shareable query/report permalinks (query only, never data) | `confirmed` | Supports vision criterion 6 while preserving the privacy property. |
-| Export result sets (CSV / JSON) | `confirmed` | Makes the tool a step in a workflow rather than a dead end. Exports are "copies" under D-008, so the notice travels with them. |
+| Export result sets (CSV / JSON) | `confirmed` | D-071. Makes the tool a step in a workflow rather than a dead end. Exports are "copies" under D-008, so the notice travels with them — a writer cannot be built without one. Whole match set to a disclosed 50,000-record cap, formula injection neutralized, control characters stripped. |
 | Visible attribution and warranty disclaimer | `confirmed` | D-008 obligation plus plain honesty: the terms disclaim all warranties on data people use for security decisions. |
 | Per-revision diff view | `rejected (D-020)` | Rejected first in D-012 as too heavy, then removed entirely with the revision count. Rebuilding it needs D-021 reopened, since a shallow clone has no history. |
 
@@ -195,6 +203,13 @@ Ordered by how much rework a late answer would cause.
    it came in at 66 s, and D-035's "progress-bar concern rather than a gate"
    holds — but only because of the page cache (D-050). At SQLite's stock 2 MiB
    the same index build takes **247 s** and the import 255 s.
+
+   **M4's cross-tabs, same corpus and cache** (`tests/e2e/measure.spec.ts`, case
+   `M4 report shapes`, 2026-08-07), warm: **116 ms – 1.35 s across the nine
+   report shapes the UI offers**, the slowest being reference host × severity.
+   Cold, 0.4–13.0 s, which is the page cache filling. Two of those shapes were
+   **42 s** until D-074 pinned the link-table join order — a regression
+   statistics introduce and the development slice cannot show.
 
    Query latency at full scale, warm, over the ten shapes in `lib/queries.ts`:
    **680–954 ms worst across runs (a full scan of the reference tables),

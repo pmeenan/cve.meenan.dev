@@ -7,6 +7,8 @@
  */
 
 import type { Dimension, Filters, SortKey, StateFilter } from './filters'
+import type { ExportFormat } from './export'
+import type { Report } from './report'
 
 export const SCHEMA_VERSION = 1
 export const FORMAT_VERSION = 1
@@ -190,6 +192,13 @@ export type Phase =
   /** Fetching and applying catch-up deltas (D-031). */
   | 'sync'
   | 'query'
+  /**
+   * Writing an export (M4). Its own phase rather than `query`, because it is
+   * the one long operation with a *countable* fraction — records written of
+   * records matched — and D-052 §3 asks for progress wherever the work can be
+   * counted rather than only for a spinner.
+   */
+  | 'export'
   | 'ready'
   | 'error'
 
@@ -307,6 +316,90 @@ export interface SearchRequest {
   count?: boolean
 }
 
+/**
+ * What a report asks for (M4).
+ *
+ * The definition itself rather than a flattened copy of it: `lib/report.ts` is
+ * the shared primitive (D-069), and re-deriving `rows`/`series`/`filters` into a
+ * second message shape would give the permalink and the Worker two ideas of
+ * what a report is. The Worker validates it again on arrival, because the page
+ * may have built it from a URL fragment a stranger wrote.
+ */
+export interface ReportRequest {
+  report: Report
+  /** Also run `count(*)` under the same filters — what a capped cross-tab cannot say. */
+  count?: boolean
+}
+
+/**
+ * What an export asks for (M4).
+ *
+ * `records` streams the match set row by row; `cells` writes the report's own
+ * cross-tab. Both carry the same definition, so an export is provably of the
+ * thing on screen rather than of a second query built beside it.
+ */
+export interface ExportRequest {
+  format: ExportFormat
+  kind: 'records' | 'cells'
+  report: Report
+  /** What the file calls itself. The user's words, never rendered as markup. */
+  title: string
+}
+
+/** One record, in full — the per-CVE detail view's payload (M4). */
+export interface DetailRecord {
+  cve: string
+  state: number | null
+  year: number | null
+  published: number | null
+  updated: number | null
+  cvssVersion: number | null
+  score: number | null
+  severity: number | null
+  vector: string | null
+  cna: string | null
+  /** Null when the record has no English description at all (4.46%, D-023). */
+  description: string | null
+}
+
+export interface DetailCwe {
+  cwe: string
+  descr: string
+}
+
+export interface DetailProduct {
+  vendor: string
+  product: string
+}
+
+export interface DetailVersion {
+  vendor: string
+  product: string
+  /** `cve_ver.status`: 1 affected, 2 unaffected, 3 unknown. */
+  status: number | null
+  version: string | null
+  lt: string | null
+  lte: string | null
+  vtype: string | null
+}
+
+/** A reference as stored. Nothing decides here whether it may become a link. */
+export interface DetailReference {
+  url: string
+  host: string
+}
+
+export interface CveDetail {
+  record: DetailRecord
+  cwes: DetailCwe[]
+  products: DetailProduct[]
+  versions: DetailVersion[]
+  references: DetailReference[]
+  /** Sections whose per-section cap was reached, so the omission is reported (D-052). */
+  truncated: string[]
+  ms: number
+}
+
 export type Request =
   | { type: 'status'; options?: ImportOptions }
   /**
@@ -328,6 +421,12 @@ export type Request =
   /** Whatever the user typed. Runs under the authorizer and the row cap (M3). */
   | { type: 'console'; sql: string }
   | { type: 'search'; request: SearchRequest }
+  /** A report definition, run as a one- or two-axis aggregate (M4, D-069). */
+  | { type: 'report'; request: ReportRequest }
+  /** One record in full, by canonical id (M4). */
+  | { type: 'detail'; cveId: string }
+  /** Stream an export, in batches, up to the disclosed cap (M4). */
+  | { type: 'export'; request: ExportRequest }
   | { type: 'bench' }
   | { type: 'reset' }
 
@@ -425,7 +524,7 @@ export type Response =
   | {
       type: 'result'
       /** Which surface asked, so the page renders it in the right place. */
-      kind: 'demo' | 'console' | 'search'
+      kind: QueryKind
       result: QueryResult
       /** `count(*)` under the same filters, when the request asked for it. */
       matches?: number | null
@@ -435,19 +534,59 @@ export type Response =
       groupBy?: Dimension | null
       /** The effective record-state scope used for this answer. */
       state?: StateFilter
+      /**
+       * The definition this answer is of, echoed back (M4).
+       *
+       * Echoed rather than read from the page's current state, because the two
+       * drift the moment someone edits the builder while a query is running —
+       * and a chart labelled with axes it was not grouped by is the quiet
+       * wrongness vision criterion 7 rules out.
+       */
+      report?: Report
+    }
+  /** One record in full (M4). `detail` is null when no record carries that id. */
+  | { type: 'detail'; cveId: string; detail: CveDetail | null }
+  /**
+   * One serialized batch of an export, in order (M4).
+   *
+   * The Worker never holds the whole file and neither does this message: the
+   * page appends each chunk to a `Blob` part list, so peak memory is a batch on
+   * both sides.
+   */
+  | { type: 'exportChunk'; text: string }
+  | {
+      type: 'exported'
+      filename: string
+      mime: string
+      /** Records actually written. */
+      records: number
+      /** Records that matched, when counted — which may be more than were written. */
+      matches: number | null
+      /** The cap stopped it short, and the file says so too. */
+      truncated: boolean
+      ms: number
     }
   /**
    * The user stopped a running query (M3). A result, not an error: nothing is
    * wrong, and the page must not show it in red next to a stack of failures.
    */
-  | { type: 'cancelled'; kind: 'demo' | 'console' | 'search'; ms: number }
+  | { type: 'cancelled'; kind: QueryKind; ms: number }
   | { type: 'bench'; results: BenchResult[]; wasmHeapBytes: number }
   | {
       type: 'error'
       message: string
       /** Present when the failed request belonged to a query surface. */
-      kind?: 'demo' | 'console' | 'search'
+      kind?: QueryKind
     }
+
+/**
+ * Which surface a query, a cancellation or a failure belongs to.
+ *
+ * One union rather than three copies: M4 added three surfaces, and the page
+ * routes every one of these messages by this field — a kind that exists in one
+ * union and not another is a message rendered in the wrong panel or nowhere.
+ */
+export type QueryKind = 'demo' | 'console' | 'search' | 'report' | 'detail' | 'export'
 
 /** One benchmark query's outcome. `ms` is wall-clock inside the Worker. */
 export interface BenchResult {

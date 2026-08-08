@@ -144,26 +144,32 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M3 closed 2026-08-05** — the corpus is queryable, and the query surface is
-safe by structure rather than by inspection. Every confirmed filter axis goes
-through one shared layer that binds its values and carries D-022's
-PUBLISHED-only default (`lib/filters.ts`); the raw SQL console is read-only
-because a SQLite authorizer refuses every other action from inside the parser
-(D-065); a long query reports itself and can be cancelled, through SQLite's
-progress handler and a `SharedArrayBuffer` — the only channel that reaches a
-Worker sitting inside SQLite (D-066); query statistics ship in the artifact and cut the
-slowest shape in the benchmark by a third, at no cost to the import (D-067);
-and a
-schema bump announces itself and keeps the copy it invalidated instead of
-sweeping it (D-068). **M4 is in progress** — analysis and reporting — decomposed
-into tasks 2026-08-05 around four owner shape calls: a tabbed workspace on one
-route, a report definition carrying rows × series × time bucket, hand-rolled SVG
-charts, and exports covering the whole match set to a disclosed cap. Permalinks
-go in the URL fragment, never the query string, so a report's predicates never
-reach the server's request line (D-014, D-032). M2 closed the server half in production on `plex` (daily
-ingest D-058, monthly rotation D-060); the monthly's first unattended firing is
-1 September, still unobserved. The AI ladder was re-ordered 2026-08-03: the
-first model tier is site-hosted Ollama behind a restricted same-origin relay,
-re-scoping M7/M8 (D-057). Process was rightsized for MVP scale 2026-08-04
-(D-062). Details live in plan.md and the decision log; keep this paragraph short
-and current when milestone status changes (rule 5).
+**M4 closed 2026-08-07** — the corpus is analysable, and every analysis surface
+is a producer or consumer of one validated report definition rather than of each
+other (D-069). That definition travels only in the URL fragment, so a report's
+predicates never reach the server's request line (D-014, D-032). Charts are
+hand-rolled SVG whose severity ramp is an *ordinal* encoding, checked in both
+themes by a test that reads the stylesheet, with the never-scored half of the
+corpus always its own band (D-073); an export is a copy, so no writer can be
+built without MITRE's notice and every cell is neutralized against spreadsheet
+formula injection, to a cap the file discloses (D-071); saved reports live
+outside the rebuildable corpus copy, because a schema bump destroys that copy
+and D-070 schedules one (D-072). Accessibility is asserted rather than inspected
+— axe-core on every tab plus hand-written keyboard tests — which is how three
+real defects were found. A fourth came from measuring `crossSql` at full scale
+rather than on the development slice: two ordinary reports took **42 seconds**,
+because query statistics invert the CWE join chain, and pinning the link-table
+joins with `CROSS JOIN` takes them to under a second (D-074). Every report shape
+is now 0.1–1.4 s warm over 372,322 records.
+
+Behind it: M3 made the query surface safe by structure rather than by inspection
+(D-065 – D-068), M2 closed the server half in production on `plex` (daily ingest
+D-058, monthly rotation D-060 — whose first unattended firing, 1 September, is
+still unobserved), and M1 proved the browser data path end to end (D-049 –
+D-051). **M5 is next**: Cloudflare (carried from M1), resilience, and D-070's
+five schema fields, which must ship *before* public launch because a bump after
+it costs every user a 63 MB re-download. The AI ladder was re-ordered 2026-08-03
+so the first model tier is site-hosted Ollama behind a restricted same-origin
+relay (D-057). Process was rightsized for MVP scale 2026-08-04 (D-062). Details
+live in plan.md and the decision log; keep this paragraph short and current when
+milestone status changes (rule 5).

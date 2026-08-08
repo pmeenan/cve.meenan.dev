@@ -3,10 +3,13 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 
 import { newCancelFlag, requestCancel } from '@/lib/cancel'
+import { draftToFilters, filtersToDraft } from '@/lib/draft'
 import { describeFreshness } from '@/lib/freshness'
+import type { ExportFormat } from '@/lib/export'
 import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
 import type {
   BenchResult,
+  CveDetail,
   ImportOptions,
   Progress,
   QueryResult,
@@ -16,9 +19,23 @@ import type {
   SyncOutcome,
   Timings,
 } from '@/lib/protocol'
+import { emptyReport, fromFragment, REPORT_VERSION, type Report } from '@/lib/report'
+import {
+  clearRecent,
+  emptyStore,
+  loadStore,
+  recordRecent,
+  removeSaved,
+  saveNamed,
+  writeStore,
+  type ReportStore,
+} from '@/lib/saved'
 
 import { Console } from './console'
 import { Explore, type SearchOutcome } from './explore'
+import { ReportTab, type ReportOutcome } from './report-tab'
+import { SavedTab } from './saved'
+import { Tabs, TabPanel, type TabSpec } from './tabs'
 
 /**
  * M1's end-to-end path: download the published chunks, decompress them in
@@ -36,6 +53,8 @@ ORDER BY cves DESC
 LIMIT 15`
 
 const IDLE: Progress = { phase: 'idle', fraction: null, detail: '' }
+
+type TabId = 'data' | 'explore' | 'report' | 'saved' | 'sql'
 
 /**
  * Import knobs from the query string, for the Q-003/Q-004 sweep and the
@@ -57,6 +76,11 @@ const IDLE: Progress = { phase: 'idle', fraction: null, detail: '' }
  * stage (D-051) and so clears local storage — both slots included — *before*
  * fetching anything: one click on a crafted link costs a working local copy. It
  * stays reachable because `pnpm measure` needs it to re-run Q-004.
+ *
+ * Note what is *not* here: a report never travels in the query string. It is
+ * made of predicates, and a query string reaches nginx's request line and its
+ * access log (D-014, D-032). Reports arrive in the fragment, which is never
+ * sent — read once on mount, below.
  */
 function importOptions(search: string): ImportOptions {
   const params = new URLSearchParams(search)
@@ -168,6 +192,67 @@ export default function Home() {
     results: BenchResult[]
     wasmHeapBytes: number
   } | null>(null)
+
+  // --- M4 ---------------------------------------------------------------
+  const [tab, setTab] = useState<TabId>('data')
+  /** The report definition the builder is editing. One object, three consumers (D-069). */
+  const [report, setReport] = useState<Report>(() => emptyReport())
+  const [reportOutcome, setReportOutcome] = useState<ReportOutcome | null>(null)
+  const [store, setStore] = useState<ReportStore>(() => emptyStore())
+  /**
+   * The same value as `store`, readable synchronously.
+   *
+   * Saving, deleting and recording a run all have to *persist* the result, and
+   * a `setStore(current => …)` updater is not the place to do it: React may
+   * invoke an updater more than once, and an updater that writes to storage and
+   * sets other state is not a pure function of its argument. So the next value
+   * is computed here, written, and then handed to React — `updateStore` below.
+   */
+  const storeRef = useRef<ReportStore>(emptyStore())
+  const [storable, setStorable] = useState(true)
+  const [detailId, setDetailId] = useState<string | null>(null)
+  /** `undefined` is loading, `null` is the Worker's "no such record" answer. */
+  const [detail, setDetail] = useState<CveDetail | null | undefined>(undefined)
+  /** The latest detail request still wanted by the UI; stale replies are ignored. */
+  const detailRequest = useRef<string | null>(null)
+  const [exportNote, setExportNote] = useState('')
+  /**
+   * The export being assembled, as `Blob` parts.
+   *
+   * A ref rather than state: chunks arrive faster than React would render, and
+   * nothing on screen depends on how many have landed. Blob parts rather than
+   * one string, because the browser is free to spill a `Blob` to disk, which is
+   * what keeps a 25 MB export off the JS heap — the page's half of the bound
+   * the Worker holds on its side (lib/export.ts).
+   */
+  // Convert each transient message string to a Blob immediately. Keeping the
+  // strings themselves in this array would retain the entire export on the JS
+  // heap and then duplicate it when the final Blob is constructed; Blob parts
+  // can instead be backed or spilled by the browser and are composed without
+  // re-serializing their contents.
+  const exportParts = useRef<Blob[]>([])
+  /**
+   * A report waiting for a database.
+   *
+   * Two things put one here: a URL fragment read on mount, and a saved report
+   * opened before the Worker has finished reopening the copy — which is a real
+   * window, because the Saved tab is readable from `localStorage` immediately
+   * and the corpus takes seconds (D-049). Both need the same answer: hold the
+   * definition, run it the moment a copy exists, and forget it if none ever
+   * does. Without this the click silently does nothing.
+   */
+  const pendingReport = useRef<Report | null>(null)
+  const [linkError, setLinkError] = useState('')
+  /**
+   * A report is waiting on a corpus.
+   *
+   * Rendered rather than left silent: someone who followed a report link, or
+   * opened a saved report, onto a browser with no readable copy lands on the
+   * Data tab with the Report tab disabled — and without this the app looks like
+   * it ignored the click.
+   */
+  const [linkPending, setLinkPending] = useState(false)
+
   /**
    * The shared cancellation flag (lib/cancel.ts). Created once here, because
    * the page owns the button; null on a browser with no `SharedArrayBuffer`,
@@ -220,6 +305,10 @@ export default function Home() {
             setConsoleResult(null)
             setBenchmark(null)
             setSync(null)
+            setReportOutcome(null)
+            detailRequest.current = null
+            setDetailId(null)
+            setDetail(undefined)
           }
           break
         case 'imported':
@@ -240,7 +329,16 @@ export default function Home() {
           setRunSeq((seq) => seq + 1)
           setStopping(false)
           if (message.kind === 'console') setConsoleResult(message.result)
-          else if (message.kind === 'search') {
+          else if (message.kind === 'report') {
+            if (message.report) {
+              setReportOutcome({
+                result: message.result,
+                matches: message.matches ?? null,
+                unmatched: message.unmatched ?? [],
+                report: message.report,
+              })
+            }
+          } else if (message.kind === 'search') {
             setSearch({
               result: message.result,
               matches: message.matches ?? null,
@@ -250,12 +348,44 @@ export default function Home() {
             })
           } else setResult(message.result)
           break
+        case 'detail':
+          // The reader may close a detail panel, or open another record, while
+          // SQLite is still answering. A late reply must not reopen the panel
+          // they dismissed or replace the newer record.
+          if (detailRequest.current !== message.cveId) break
+          detailRequest.current = null
+          setRunSeq((seq) => seq + 1)
+          setDetailId(message.cveId)
+          setDetail(message.detail)
+          break
+        case 'exportChunk':
+          exportParts.current.push(new Blob([message.text]))
+          break
+        case 'exported': {
+          const blob = new Blob(exportParts.current, { type: message.mime })
+          exportParts.current = []
+          download(blob, message.filename)
+          setExportNote(
+            `${message.records.toLocaleString()} rows written to ${message.filename} in ` +
+              `${(message.ms / 1000).toFixed(1)} s.` +
+              (message.truncated
+                ? ` This is the cap, not the whole match set — ${(message.matches ?? 0).toLocaleString()} records matched.`
+                : '')
+          )
+          break
+        }
         case 'cancelled':
           // Not an error and not shown as one: the user asked for it, the
           // database is untouched, and the surface that was running says so.
           setRunSeq((seq) => seq + 1)
           setStopping(false)
           setCancelled({ kind: message.kind, ms: message.ms })
+          if (message.kind === 'export') exportParts.current = []
+          if (message.kind === 'detail') {
+            detailRequest.current = null
+            setDetailId(null)
+            setDetail(undefined)
+          }
           break
         case 'bench':
           setBenchmark({ results: message.results, wasmHeapBytes: message.wasmHeapBytes })
@@ -269,6 +399,12 @@ export default function Home() {
             setConsoleError(message.message)
             setConsoleResult(null)
             break
+          }
+          if (message.kind === 'export') exportParts.current = []
+          if (message.kind === 'detail') {
+            detailRequest.current = null
+            setDetailId(null)
+            setDetail(undefined)
           }
           setError(message.message)
           // The Import panel describes a run that succeeded. After a failed
@@ -309,6 +445,54 @@ export default function Home() {
     return () => clearInterval(timer)
   }, [])
 
+  /**
+   * Saved reports and history, and the permalink in the fragment.
+   *
+   * Both are read once, on mount, and both are stranger-supplied in the sense
+   * that matters: `localStorage` was written by some build of this app and the
+   * fragment was written by whoever sent the link. They go through the same
+   * validation (`lib/saved.ts`, `fromFragment`), which is what makes a hostile
+   * link and a stale entry fail the same way (D-069).
+   */
+  useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect --
+       Both reads are of things that do not exist during render. This page is a
+       static export, so it is prerendered at build time: reading `localStorage`
+       or `location.hash` in the render body would produce markup the server
+       could not have produced, which is a hydration mismatch rather than a
+       performance question. Once, on mount, is the only correct time — the same
+       reasoning as the `now` sample above. */
+    const local = safeStorage()
+    const loaded = loadStore(local)
+    storeRef.current = loaded
+    setStore(loaded)
+    setStorable(local !== null)
+    if (!location.hash || location.hash === '#') return
+    const parsed = fromFragment(location.hash)
+    if (parsed.ok) {
+      setReport(parsed.report)
+      pendingReport.current = parsed.report
+      setLinkPending(true)
+      setTab('report')
+    } else {
+      setLinkError(`That report link could not be opened: ${parsed.error}`)
+      setTab('report')
+    }
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [])
+
+  /**
+   * Apply a change to the saved-report store, persist it, and report whether it
+   * stuck. A write that silently failed would leave a report that looks saved
+   * and is gone on reload (D-072).
+   */
+  const updateStore = useCallback((change: (current: ReportStore) => ReportStore) => {
+    const next = change(storeRef.current)
+    storeRef.current = next
+    setStore(next)
+    setStorable(writeStore(safeStorage(), next))
+  }, [])
+
   const send = useCallback((request: Request) => {
     setError('')
     setCancelled(null)
@@ -325,8 +509,70 @@ export default function Home() {
       setConsoleResult(null)
     }
     if (request.type === 'search') setSearch(null)
+    if (request.type === 'report') setReportOutcome(null)
+    if (request.type === 'detail') {
+      detailRequest.current = request.cveId
+      setDetail(undefined)
+    }
+    if (request.type === 'export') {
+      // Any bytes from an abandoned export must not be prepended to this one.
+      exportParts.current = []
+      setExportNote('')
+    }
     workerRef.current?.postMessage(request)
   }, [])
+
+  /**
+   * Run a report, and record it in the history.
+   *
+   * The history entry is written when the report is *run* rather than when it
+   * returns: what the user did is the thing worth remembering, and a report
+   * that took twenty seconds and was cancelled is still a report they built.
+   */
+  const runReport = useCallback(
+    (definition: Report) => {
+      setReport(definition)
+      setLinkError('')
+      send({ type: 'report', request: { report: definition, count: true } })
+      const at = Date.now()
+      updateStore((current) => recordRecent(current, definition, at))
+    },
+    [send, updateStore]
+  )
+
+  /**
+   * Open a report in the builder and run it — or queue it, if there is nothing
+   * to run it against yet.
+   *
+   * The queueing arm is not hypothetical: the Saved tab renders from
+   * `localStorage` the instant the page mounts, while the Worker is still
+   * reopening the database, so a fast click lands in that window.
+   */
+  const openReport = useCallback(
+    (definition: Report) => {
+      setReport(definition)
+      setTab('report')
+      setLinkError('')
+      if (ready) {
+        runReport(definition)
+        return
+      }
+      pendingReport.current = definition
+      setLinkPending(true)
+    },
+    [ready, runReport]
+  )
+
+  useEffect(() => {
+    // A link opened on a browser with no local copy waits for one rather than
+    // failing: the definition is complete, it is only the corpus that is
+    // missing. Runs exactly once — the ref is cleared as it fires.
+    if (!ready || !pendingReport.current) return
+    const pending = pendingReport.current
+    pendingReport.current = null
+    setLinkPending(false)
+    runReport(pending)
+  }, [ready, runReport])
 
   /**
    * Stop the running query.
@@ -355,6 +601,22 @@ export default function Home() {
     () => DEFAULT_VFS
   )
 
+  const needsCorpus = ready ? undefined : 'Download the corpus first'
+  const tabs: TabSpec[] = [
+    { id: 'data', label: 'Data' },
+    { id: 'explore', label: 'Explore', disabled: !ready, disabledReason: needsCorpus },
+    { id: 'report', label: 'Report', disabled: !ready, disabledReason: needsCorpus },
+    {
+      id: 'saved',
+      label: 'Saved',
+      badge: store.saved.length ? String(store.saved.length) : undefined,
+    },
+    { id: 'sql', label: 'SQL', disabled: !ready, disabledReason: needsCorpus },
+  ]
+  // A tab can stop being usable underneath the reader — "Clear local copy" does
+  // exactly that. Falling back to Data is the only honest destination.
+  const active = tabs.find((entry) => entry.id === tab && !entry.disabled) ? tab : 'data'
+
   return (
     <main data-status={storage}>
       <h1>cve.meenan.dev</h1>
@@ -362,39 +624,6 @@ export default function Home() {
         Browser-based search and analysis over the CVE List. Everything below runs locally: the
         server hands over static files and never sees a query.
       </p>
-
-      <section className="controls">
-        <button
-          onClick={() => send({ type: 'import', options: importOptions(location.search) })}
-          disabled={busy}
-        >
-          {ready ? 'Re-download data' : 'Download data'}
-        </button>
-        <button
-          onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
-          disabled={!ready || busy}
-        >
-          Sync
-        </button>
-        <button onClick={() => send({ type: 'query', sql: DEMO_QUERY })} disabled={!ready || busy}>
-          Run query
-        </button>
-        <button
-          onClick={() => {
-            // Drop the previous table before re-running: the Worker reports no
-            // progress for this, so a stale result on screen is indistinguishable
-            // from a finished one — to a reader and to the sweep alike.
-            setBenchmark(null)
-            send({ type: 'bench' })
-          }}
-          disabled={!ready || busy}
-        >
-          Measure query latency
-        </button>
-        <button onClick={() => send({ type: 'reset' })} disabled={busy} className="quiet">
-          Clear local copy
-        </button>
-      </section>
 
       {busy && (
         <section className="progress" aria-live="polite">
@@ -413,7 +642,7 @@ export default function Home() {
               answer to "this is taking too long" — the stall watch (D-064) —
               and stopping one part way is what staged replacement already
               makes safe without a button. */}
-          {progress.phase === 'query' && (
+          {(progress.phase === 'query' || progress.phase === 'export') && (
             <p className="muted">
               {cancelFlag === null ? (
                 <span data-cancel="unavailable">
@@ -428,15 +657,6 @@ export default function Home() {
             </p>
           )}
         </section>
-      )}
-
-      {vfs !== DEFAULT_VFS && (
-        <p className="error">
-          Diagnostic mode: <code>{vfs}</code>. This VFS cannot stage a download (D-051), so
-          “Re-download data” <strong>deletes the local copy before fetching anything</strong> — a
-          failure part-way leaves nothing. Remove <code>?vfs=</code> from the URL to use the normal
-          path.
-        </p>
       )}
 
       {/* A schema bump, announced (M3). The local database is a rebuildable
@@ -464,6 +684,25 @@ export default function Home() {
         </p>
       )}
 
+      {/* Both link banners are page-level rather than inside the Report panel.
+          A link that arrives before there is a local copy leaves that panel
+          disabled, so a message inside it would be a message nobody sees. */}
+      {linkError && (
+        <p className="error" data-link-error="1">
+          {linkError}
+        </p>
+      )}
+      {linkPending && !ready && (
+        <p className="stale" data-link-pending="1">
+          A report is waiting for a local copy of the corpus. Download it and the report will run by
+          itself — a permalink carries its whole definition in the URL fragment, which is never sent
+          to the server.
+        </p>
+      )}
+
+      {/* Both of these stay outside the panels: the revision a number came from
+          and MITRE's notice attach to the *copy*, not to a view of it (D-008),
+          so switching tabs must not take either off the screen. */}
       {ready && revision !== null && (
         <p className="muted" data-revision={revision}>
           Local copy at revision {revision}
@@ -490,146 +729,322 @@ export default function Home() {
         </p>
       )}
 
-      {timings && (
-        <section>
-          <h2>Import</h2>
-          {/* The rendered rows are rounded for reading; the sweep in
-              tests/e2e/measure.spec.ts reads this instead, so a recorded number
-              is the Worker's, not a re-parsed label. */}
-          <dl className="timings" data-json={JSON.stringify(timings)}>
-            <Timing label="Records" value={timings.records.toLocaleString()} />
-            <Timing
-              label="Chunks fetched"
-              value={
-                // Fewer than the total means this run resumed a staged download
-                // (D-061) — worth saying out loud, because it is also why the
-                // elapsed time will not match a fresh import's.
-                timings.chunksFetched === timings.chunksTotal
-                  ? `${timings.chunksTotal}`
-                  : `${timings.chunksFetched} of ${timings.chunksTotal} (resumed)`
-              }
-            />
-            {/* "Snapshot size", not "Downloaded": this is the whole published
-                snapshot, and a resumed run may have fetched none of it. The
-                row above says what this run actually did. */}
-            <Timing
-              label="Snapshot size"
-              value={`${(timings.compressedBytes / 1e6).toFixed(1)} MB`}
-            />
-            <Timing label="Expanded to" value={`${(timings.rawBytes / 1e6).toFixed(1)} MB`} />
-            <Timing label="Fetch" value={`${timings.fetchMs} ms`} />
-            <Timing label="Decompress" value={`${timings.decompressMs} ms`} />
-            <Timing label="Write to OPFS" value={`${timings.writeMs} ms`} />
-            <Timing label="Build indexes" value={`${timings.indexMs} ms`} />
-            <Timing label="Verify and promote" value={`${timings.verifyMs} ms`} />
-            <Timing label="Total" value={`${(timings.totalMs / 1000).toFixed(1)} s`} />
-            <Timing
-              label="OPFS footprint"
-              value={
-                timings.opfsBytes === null
-                  ? 'could not be measured'
-                  : `${(timings.opfsBytes / 1e6).toFixed(1)} MB`
-              }
-            />
-            <Timing
-              label="SQLite WASM heap"
-              value={`${(timings.wasmHeapBytes / 1e6).toFixed(1)} MB`}
-            />
-            <Timing
-              label="VFS"
-              value={`${timings.vfs} × ${timings.concurrency}, ${timings.cacheMib} MiB cache`}
-            />
-          </dl>
+      <Tabs tabs={tabs} active={active} onSelect={(id) => setTab(id as TabId)} />
+
+      <TabPanel id="data" active={active === 'data'}>
+        <section className="controls">
+          <button
+            onClick={() => send({ type: 'import', options: importOptions(location.search) })}
+            disabled={busy}
+          >
+            {ready ? 'Re-download data' : 'Download data'}
+          </button>
+          <button
+            onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
+            disabled={!ready || busy}
+          >
+            Sync
+          </button>
+          <button
+            onClick={() => send({ type: 'query', sql: DEMO_QUERY })}
+            disabled={!ready || busy}
+          >
+            Run query
+          </button>
+          <button
+            onClick={() => {
+              // Drop the previous table before re-running: the Worker reports no
+              // progress for this, so a stale result on screen is indistinguishable
+              // from a finished one — to a reader and to the sweep alike.
+              setBenchmark(null)
+              send({ type: 'bench' })
+            }}
+            disabled={!ready || busy}
+          >
+            Measure query latency
+          </button>
+          <button onClick={() => send({ type: 'reset' })} disabled={busy} className="quiet">
+            Clear local copy
+          </button>
         </section>
-      )}
 
-      {ready && (
-        <Explore
-          disabled={busy}
-          onRun={(request: SearchRequest) => send({ type: 'search', request })}
-          outcome={search}
-          run={runSeq}
-          cancelledMs={cancelled?.kind === 'search' ? cancelled.ms : null}
-        />
-      )}
-
-      {ready && (
-        <Console
-          disabled={busy}
-          onRun={(sql: string) => send({ type: 'console', sql })}
-          result={consoleResult}
-          run={runSeq}
-          error={consoleError}
-          cancelledMs={cancelled?.kind === 'console' ? cancelled.ms : null}
-        />
-      )}
-
-      {benchmark && (
-        <section>
-          <h2>Query latency</h2>
-          <p className="muted">
-            SQLite WASM heap after these queries: {(benchmark.wasmHeapBytes / 1e6).toFixed(1)} MB
+        {vfs !== DEFAULT_VFS && (
+          <p className="error">
+            Diagnostic mode: <code>{vfs}</code>. This VFS cannot stage a download (D-051), so
+            “Re-download data” <strong>deletes the local copy before fetching anything</strong> — a
+            failure part-way leaves nothing. Remove <code>?vfs=</code> from the URL to use the
+            normal path.
           </p>
-          <div className="scroll">
-            <table className="bench" data-json={JSON.stringify(benchmark)}>
-              <thead>
-                <tr>
-                  <th>Query</th>
-                  <th>ms</th>
-                  <th>rows</th>
-                </tr>
-              </thead>
-              <tbody>
-                {benchmark.results.map((entry) => (
-                  <tr key={entry.name}>
-                    <td>{entry.name}</td>
-                    <td>{entry.ms}</td>
-                    <td>{entry.rows}</td>
+        )}
+
+        {timings && (
+          <section>
+            <h2>Import</h2>
+            {/* The rendered rows are rounded for reading; the sweep in
+                tests/e2e/measure.spec.ts reads this instead, so a recorded number
+                is the Worker's, not a re-parsed label. */}
+            <dl className="timings" data-json={JSON.stringify(timings)}>
+              <Timing label="Records" value={timings.records.toLocaleString()} />
+              <Timing
+                label="Chunks fetched"
+                value={
+                  // Fewer than the total means this run resumed a staged download
+                  // (D-061) — worth saying out loud, because it is also why the
+                  // elapsed time will not match a fresh import's.
+                  timings.chunksFetched === timings.chunksTotal
+                    ? `${timings.chunksTotal}`
+                    : `${timings.chunksFetched} of ${timings.chunksTotal} (resumed)`
+                }
+              />
+              {/* "Snapshot size", not "Downloaded": this is the whole published
+                  snapshot, and a resumed run may have fetched none of it. The
+                  row above says what this run actually did. */}
+              <Timing
+                label="Snapshot size"
+                value={`${(timings.compressedBytes / 1e6).toFixed(1)} MB`}
+              />
+              <Timing label="Expanded to" value={`${(timings.rawBytes / 1e6).toFixed(1)} MB`} />
+              <Timing label="Fetch" value={`${timings.fetchMs} ms`} />
+              <Timing label="Decompress" value={`${timings.decompressMs} ms`} />
+              <Timing label="Write to OPFS" value={`${timings.writeMs} ms`} />
+              <Timing label="Build indexes" value={`${timings.indexMs} ms`} />
+              <Timing label="Verify and promote" value={`${timings.verifyMs} ms`} />
+              <Timing label="Total" value={`${(timings.totalMs / 1000).toFixed(1)} s`} />
+              <Timing
+                label="OPFS footprint"
+                value={
+                  timings.opfsBytes === null
+                    ? 'could not be measured'
+                    : `${(timings.opfsBytes / 1e6).toFixed(1)} MB`
+                }
+              />
+              <Timing
+                label="SQLite WASM heap"
+                value={`${(timings.wasmHeapBytes / 1e6).toFixed(1)} MB`}
+              />
+              <Timing
+                label="VFS"
+                value={`${timings.vfs} × ${timings.concurrency}, ${timings.cacheMib} MiB cache`}
+              />
+            </dl>
+          </section>
+        )}
+
+        {benchmark && (
+          <section>
+            <h2>Query latency</h2>
+            <p className="muted">
+              SQLite WASM heap after these queries: {(benchmark.wasmHeapBytes / 1e6).toFixed(1)} MB
+            </p>
+            <div className="scroll" tabIndex={0}>
+              <table className="bench" data-json={JSON.stringify(benchmark)}>
+                <thead>
+                  <tr>
+                    <th scope="col">Query</th>
+                    <th scope="col">ms</th>
+                    <th scope="col">rows</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      )}
-
-      {cancelled?.kind === 'demo' && (
-        <p className="muted">Query cancelled after {(cancelled.ms / 1000).toFixed(1)} s.</p>
-      )}
-
-      {result && (
-        <section>
-          <h2>Most-reported vendors</h2>
-          <p className="muted">
-            {result.rows.length} rows in {result.ms} ms. PUBLISHED records only — REJECTED are
-            excluded by default.
-          </p>
-          <div className="scroll">
-            <table className="results">
-              <thead>
-                <tr>
-                  {result.columns.map((column) => (
-                    <th key={column}>{column}</th>
+                </thead>
+                <tbody>
+                  {benchmark.results.map((entry) => (
+                    <tr key={entry.name}>
+                      <td>{entry.name}</td>
+                      <td>{entry.ms}</td>
+                      <td>{entry.rows}</td>
+                    </tr>
                   ))}
-                </tr>
-              </thead>
-              <tbody>
-                {result.rows.map((row, index) => (
-                  <tr key={index}>
-                    {row.map((cell, cellIndex) => (
-                      <td key={cellIndex}>{String(cell ?? '')}</td>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {cancelled?.kind === 'demo' && (
+          <p className="muted">Query cancelled after {(cancelled.ms / 1000).toFixed(1)} s.</p>
+        )}
+
+        {result && (
+          <section>
+            <h2>Most-reported vendors</h2>
+            <p className="muted">
+              {result.rows.length} rows in {result.ms} ms. PUBLISHED records only — REJECTED are
+              excluded by default.
+            </p>
+            <div className="scroll" tabIndex={0}>
+              <table className="results">
+                <thead>
+                  <tr>
+                    {result.columns.map((column) => (
+                      <th scope="col" key={column}>
+                        {column}
+                      </th>
                     ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      )}
+                </thead>
+                <tbody>
+                  {result.rows.map((row, index) => (
+                    <tr key={index}>
+                      {row.map((cell, cellIndex) => (
+                        <td key={cellIndex}>{String(cell ?? '')}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+      </TabPanel>
+
+      <TabPanel id="explore" active={active === 'explore'}>
+        {ready && (
+          <Explore
+            disabled={busy}
+            onRun={(request: SearchRequest) => send({ type: 'search', request })}
+            onOpenRecord={(cveId) => {
+              setDetailId(cveId)
+              send({ type: 'detail', cveId })
+            }}
+            onExport={(format, request) =>
+              send({
+                type: 'export',
+                request: {
+                  format,
+                  kind: 'records',
+                  report: reportFor(request),
+                  title: 'CVE records',
+                },
+              })
+            }
+            outcome={search}
+            run={runSeq}
+            cancelledMs={cancelled?.kind === 'search' ? cancelled.ms : null}
+            detailId={detailId}
+            detail={detail}
+            onCloseDetail={() => {
+              detailRequest.current = null
+              setDetailId(null)
+              setDetail(undefined)
+            }}
+            exportNote={exportNote}
+          />
+        )}
+      </TabPanel>
+
+      <TabPanel id="report" active={active === 'report'}>
+        {ready && (
+          <ReportTab
+            report={report}
+            onChange={setReport}
+            onRun={runReport}
+            onExport={(format, kind, definition) =>
+              send({
+                type: 'export',
+                request: {
+                  format,
+                  kind,
+                  // Export the definition that produced the visible result,
+                  // not edits made in the builder since that run.
+                  report: definition,
+                  title: definition.title?.trim() || 'CVE report',
+                },
+              })
+            }
+            onSave={(name) =>
+              updateStore((current) => saveNamed(current, name, report, Date.now()))
+            }
+            outcome={reportOutcome}
+            disabled={busy}
+            run={runSeq}
+            cancelledMs={cancelled?.kind === 'report' ? cancelled.ms : null}
+            exportNote={exportNote}
+          />
+        )}
+      </TabPanel>
+
+      <TabPanel id="saved" active={active === 'saved'}>
+        <SavedTab
+          store={store}
+          storable={storable}
+          onOpen={openReport}
+          onRemove={(id) => updateStore((current) => removeSaved(current, id))}
+          onClearRecent={() => updateStore((current) => clearRecent(current))}
+        />
+      </TabPanel>
+
+      <TabPanel id="sql" active={active === 'sql'}>
+        {ready && (
+          <Console
+            disabled={busy}
+            onRun={(sql: string) => send({ type: 'console', sql })}
+            result={consoleResult}
+            run={runSeq}
+            error={consoleError}
+            cancelledMs={cancelled?.kind === 'console' ? cancelled.ms : null}
+          />
+        )}
+      </TabPanel>
 
       {notice && <footer className="notice">{notice}</footer>}
     </main>
   )
+}
+
+/**
+ * A search request as a report definition, for the export path.
+ *
+ * An export takes a `Report` because that is the shared primitive (D-069) and
+ * because the Worker re-validates it before any of it reaches SQL. A record
+ * export uses only the filters and the sort; `rows` is filled with a valid
+ * dimension because the definition has to be a whole one, not a partial.
+ */
+function reportFor(request: SearchRequest): Report {
+  return {
+    v: REPORT_VERSION,
+    // Round-tripped through the draft conversions so an exported set is
+    // provably the same predicate set the form describes.
+    filters: draftToFilters(filtersToDraft(request.filters)),
+    rows: 'year',
+    series: null,
+    chart: 'table',
+    sort: request.sort,
+  }
+}
+
+/**
+ * Hand a finished export to the browser.
+ *
+ * An object URL and a synthetic click, revoked immediately after: the blob is a
+ * local file this page produced, it never touches the network, and the name is
+ * one `exportFilename` reduced to characters a filesystem cannot misread.
+ */
+function download(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+  // A revoke on the next turn rather than immediately: Safari has historically
+  // needed the URL to outlive the click that started the download.
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+/**
+ * `localStorage`, or null where it is not usable.
+ *
+ * Touching it can throw outright — a browser with storage blocked for this
+ * origin does exactly that — so the access is guarded rather than assumed, and
+ * the UI is told, because a report that appears to save and is gone on reload
+ * is worse than one that says it cannot be saved.
+ */
+function safeStorage(): Storage | null {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -692,6 +1107,8 @@ function phaseLabel(phase: Progress['phase']): string {
       return 'Finishing up'
     case 'query':
       return 'Running query'
+    case 'export':
+      return 'Writing export'
     default:
       return 'Working'
   }

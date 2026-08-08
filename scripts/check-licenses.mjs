@@ -113,6 +113,17 @@ const EXCEPTIONS = new Map([
   ],
   ['axe-core', { license: 'MPL-2.0', reason: 'Playwright accessibility tooling, test-only.' }],
   [
+    '@axe-core/playwright',
+    {
+      license: 'MPL-2.0',
+      reason:
+        'the Playwright binding for the above (M4 accessibility criterion). Same terms and ' +
+        'the same reasoning: a devDependency invoked from tests/e2e, whose code never ' +
+        'reaches dist/. MPL-2.0 is file-level copyleft on distribution, and we distribute ' +
+        'none of it.',
+    },
+  ],
+  [
     'lightningcss',
     {
       license: 'MPL-2.0',

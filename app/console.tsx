@@ -129,7 +129,7 @@ export function Console({
             {result.truncated &&
               ` — capped at ${CONSOLE_ROW_LIMIT.toLocaleString()}; there may be more.`}
           </p>
-          <div className="scroll">
+          <div className="scroll" tabIndex={0}>
             <table className="results console">
               <thead>
                 <tr>
