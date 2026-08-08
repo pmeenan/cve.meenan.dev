@@ -21,12 +21,14 @@
  */
 
 import {
+  absenceLabel,
   CODE_LABELS,
   CVSS_VERSIONS,
   DIMENSION_LABELS,
+  KEV_CODES,
+  KEV_RANSOMWARE_CODES,
   LOOKUP_AXES,
   NOT_ASSESSED,
-  NOT_ASSESSED_LABEL,
   SEVERITIES,
   SSVC_AUTO,
   SSVC_EXPL,
@@ -54,6 +56,12 @@ export const CODE_AXES = [
   { field: 'ssvcExpl', codes: SSVC_EXPL, absence: true },
   { field: 'ssvcAuto', codes: SSVC_AUTO, absence: true },
   { field: 'ssvcImpact', codes: SSVC_IMPACT, absence: true },
+  // KEV membership has **no** "not assessed" box: absence from the catalog is
+  // itself one of the two codes — *not known-exploited, per CISA* — rather than
+  // a missing assessment (D-076). Ransomware use does have one, for a listed
+  // record whose value this build does not recognise.
+  { field: 'kev', codes: KEV_CODES, absence: false },
+  { field: 'kevRansomware', codes: KEV_RANSOMWARE_CODES, absence: true },
 ] as const satisfies readonly {
   field: keyof Draft & Dimension
   codes: readonly number[]
@@ -75,6 +83,9 @@ export interface Draft {
   ssvcExpl: number[]
   ssvcAuto: number[]
   ssvcImpact: number[]
+  /** KEV membership and ransomware use (M6). */
+  kev: number[]
+  kevRansomware: number[]
   scoreMin: string
   scoreMax: string
   publishedFrom: string
@@ -83,6 +94,11 @@ export interface Draft {
   updatedTo: string
   yearFrom: string
   yearTo: string
+  /** The catalog's own dates, as calendar days like the corpus ones. */
+  kevAddedFrom: string
+  kevAddedTo: string
+  kevDueFrom: string
+  kevDueTo: string
   state: StateFilter
 }
 
@@ -99,6 +115,8 @@ export const EMPTY_DRAFT: Draft = {
   ssvcExpl: [],
   ssvcAuto: [],
   ssvcImpact: [],
+  kev: [],
+  kevRansomware: [],
   scoreMin: '',
   scoreMax: '',
   publishedFrom: '',
@@ -107,6 +125,10 @@ export const EMPTY_DRAFT: Draft = {
   updatedTo: '',
   yearFrom: '',
   yearTo: '',
+  kevAddedFrom: '',
+  kevAddedTo: '',
+  kevDueFrom: '',
+  kevDueTo: '',
   state: 'published',
 }
 
@@ -114,7 +136,16 @@ export const EMPTY_DRAFT: Draft = {
 const DAY_END = 86_399
 
 const SCALARS = ['scoreMin', 'scoreMax', 'yearFrom', 'yearTo'] as const
-const DATES = ['publishedFrom', 'publishedTo', 'updatedFrom', 'updatedTo'] as const
+const DATES = [
+  'publishedFrom',
+  'publishedTo',
+  'updatedFrom',
+  'updatedTo',
+  'kevAddedFrom',
+  'kevAddedTo',
+  'kevDueFrom',
+  'kevDueTo',
+] as const
 
 /** The form as a `Filters`. Empty fields are omitted, never sent as empty values. */
 export function draftToFilters(draft: Draft): Filters {
@@ -286,12 +317,26 @@ export function describeDraft(draft: Draft): Chip[] {
     'updatedTo',
   ])
   pushRange(chips, 'year', 'ID year', draft.yearFrom, draft.yearTo, ['yearFrom', 'yearTo'])
+  pushRange(chips, 'kevAdded', 'Added to KEV', draft.kevAddedFrom, draft.kevAddedTo, [
+    'kevAddedFrom',
+    'kevAddedTo',
+  ])
+  pushRange(chips, 'kevDue', 'KEV due date', draft.kevDueFrom, draft.kevDueTo, [
+    'kevDueFrom',
+    'kevDueTo',
+  ])
   return chips
 }
 
-/** A selected code as a word, with the sentinel naming the absence it selects. */
-function codeLabel(axis: Dimension, code: number): string {
-  if (code === NOT_ASSESSED) return NOT_ASSESSED_LABEL
+/**
+ * A selected code as a word, with the sentinel naming the absence it selects.
+ *
+ * Exported because the filter form renders the same labels on its checkboxes,
+ * and the two drifting apart is how one band ends up with two names — which is
+ * how a reader concludes they are two bands.
+ */
+export function codeLabel(axis: Dimension, code: number): string {
+  if (code === NOT_ASSESSED) return absenceLabel(axis)
   return CODE_LABELS[axis]?.[code] ?? String(code)
 }
 

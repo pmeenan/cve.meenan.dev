@@ -40,6 +40,7 @@ import {
   LOOKUP_SQL,
   rowsSql,
   ROW_LIMIT,
+  usesKev,
   type Filters,
   type LookupAxis,
   type Resolved,
@@ -48,6 +49,7 @@ import {
 import {
   cwesSql,
   isCveId,
+  kevSql,
   productsSql,
   recordSql,
   referencesSql,
@@ -60,9 +62,22 @@ import {
   EXPORT_LIMIT,
   exportFilename,
   exportWriter,
-  RECORD_COLUMNS,
+  recordColumns,
   type ExportHeader,
 } from '../lib/export'
+import {
+  insertParams,
+  isNewerCatalog,
+  parseCwes,
+  KEV_DDL,
+  KEV_INSERT,
+  KEV_META,
+  KEV_URL,
+  MAX_KEV_BYTES,
+  parseCatalog,
+  type KevCatalog,
+  type KevStatus,
+} from '../lib/kev'
 import { CHART_ROWS, parseReport, TABLE_ROWS } from '../lib/report'
 import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
@@ -394,13 +409,38 @@ async function digest(bytes: Uint8Array): Promise<string> {
  */
 const MAX_MANIFEST_BYTES = 1_048_576
 
-async function readManifest(response: Response, beat: () => void): Promise<Manifest> {
+/**
+ * Stream a JSON body whose length nobody published, bounded by `limit`.
+ *
+ * The two responses in this app that are not named by the manifest — the
+ * manifest itself, and the KEV catalog (D-076 §2, deliberately outside it) —
+ * so `readBody`'s exact-length contract does not apply and a bound has to stand
+ * in for it. Streamed rather than `.json()`ed so the stall watch gets a beat per
+ * network read: a body delivered slowly but continuously must not be reported
+ * as stalled (D-052).
+ *
+ * Returns the byte count alongside the text, because the validator's message is
+ * more useful when it can name it.
+ */
+async function readBoundedText(
+  response: Response,
+  limit: number,
+  label: string,
+  beat: () => void
+): Promise<{ text: string; bytes: number }> {
   const body = response.body
-  if (!body) return (await response.json()) as Manifest
+  if (!body) {
+    const text = await response.text()
+    beat()
+    // No stream to measure, so the bound is applied to what arrived. UTF-16
+    // length is a lower bound on UTF-8 bytes, which is the safe direction.
+    if (text.length > limit) throw new Error(`${label}: exceeds the ${limit} byte client limit`)
+    return { text, bytes: text.length }
+  }
 
   const reader = body.getReader()
   const decoder = new TextDecoder()
-  let json = ''
+  let text = ''
   let received = 0
   for (;;) {
     const { done, value } = await reader.read()
@@ -409,15 +449,20 @@ async function readManifest(response: Response, beat: () => void): Promise<Manif
     // about bytes received, not callbacks delivered.
     if (value.length === 0) continue
     received += value.length
-    if (received > MAX_MANIFEST_BYTES) {
+    if (received > limit) {
       await reader.cancel().catch(() => undefined)
-      throw new Error(`manifest: exceeds the ${MAX_MANIFEST_BYTES} byte client limit`)
+      throw new Error(`${label}: exceeds the ${limit} byte client limit`)
     }
-    json += decoder.decode(value, { stream: true })
+    text += decoder.decode(value, { stream: true })
     beat()
   }
-  json += decoder.decode()
-  return JSON.parse(json) as Manifest
+  text += decoder.decode()
+  return { text, bytes: received }
+}
+
+async function readManifest(response: Response, beat: () => void): Promise<Manifest> {
+  const { text } = await readBoundedText(response, MAX_MANIFEST_BYTES, 'manifest', beat)
+  return JSON.parse(text) as Manifest
 }
 
 async function fetchManifest(
@@ -1680,6 +1725,240 @@ async function syncToHead(options: ImportOptions = {}): Promise<void> {
   await status()
 }
 
+// --- The KEV overlay (M6, D-076) -----------------------------------------
+
+/**
+ * Whether this copy holds a KEV catalog.
+ *
+ * The table is created by the apply that fills it, so its absence is the signal
+ * — but the *table* is not the whole answer: an apply is one transaction that
+ * writes the rows and the `meta` keys together, so `kev_version` being present
+ * is what says a complete catalog is there. Both are checked, because a table
+ * with no meta row is a state nothing should query and nothing should report.
+ */
+function localKev(database: Database): KevStatus | null {
+  const present = database.selectValue(
+    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'kev'"
+  )
+  if (present !== 1) return null
+  const version = database.selectValue('SELECT v FROM meta WHERE k = ?', [KEV_META.version])
+  if (typeof version !== 'string' || !version) return null
+  const num = (key: string): number | null => {
+    const value = database.selectValue('SELECT v FROM meta WHERE k = ?', [key])
+    return typeof value === 'number' ? value : null
+  }
+  return {
+    version,
+    released: String(database.selectValue('SELECT v FROM meta WHERE k = ?', [KEV_META.released])),
+    releasedAt: num(KEV_META.releasedAt),
+    fetched: num(KEV_META.fetched) ?? 0,
+    entries: num(KEV_META.entries) ?? 0,
+    unmatched: num(KEV_META.unmatched) ?? 0,
+  }
+}
+
+/**
+ * Refuse a KEV query on a copy that has no catalog, by name.
+ *
+ * Without this the query fails with `no such table: kev`, which tells a user
+ * nothing they can act on — and the alternative (creating the table empty on
+ * open) would be worse: every record would answer "not in KEV", which is a
+ * finding rather than a missing feature. This is reached from a permalink and,
+ * in M7, from a model's tool call, so it cannot be left to the UI to avoid.
+ */
+function assertKevLoaded(database: Database): void {
+  if (localKev(database) === null) {
+    throw new Error(
+      'this copy has no CISA KEV catalog yet, so it cannot answer a KEV question — ' +
+        'use Refresh KEV on the Data tab. Nothing else about your local copy is affected.'
+    )
+  }
+}
+
+/**
+ * Fetch the catalog, bounded and validated as the stranger input it is.
+ *
+ * `no-store`, not `no-cache`: `no-cache` means *revalidate*, and with no network
+ * there is nothing to revalidate against — Firefox then serves the stale file
+ * from its HTTP cache and a refresh attempted offline reports success having
+ * fetched nothing (RE-023, the same trap the manifest fell into). A KEV
+ * freshness line is a claim about what CISA currently lists; it has to be a
+ * network request or nothing.
+ */
+async function fetchKev(signal: AbortSignal, beat: () => void): Promise<KevCatalog> {
+  const response = await fetch(KEV_URL, { cache: 'no-store', signal })
+  if (!response.ok) throw new Error(`KEV catalog: HTTP ${response.status}`)
+  // Bounded and streamed: nothing publishes this file's length, so the bound
+  // stands in for the manifest's, and a slow response still beats the watch.
+  const { text, bytes } = await readBoundedText(response, MAX_KEV_BYTES, 'KEV catalog', beat)
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    // Deliberately not echoing the body: it is a stranger's bytes, and the
+    // useful fact is that the origin served something that is not a catalog.
+    throw new Error('the KEV catalog did not parse as JSON')
+  }
+  return parseCatalog(value, bytes)
+}
+
+/**
+ * Replace the local overlay with `catalog`, in one transaction.
+ *
+ * One transaction covering the table, the rows and the `meta` keys that
+ * describe them, so a failure anywhere leaves the previous catalog intact and
+ * answering — the same rule delta apply follows (D-063), and for the same
+ * reason: a half-applied known-exploited list is worse than a stale one.
+ *
+ * `cveID` resolves to `cve.id` here, at load, rather than at query time: it is
+ * 1,662 lookups once against 372,322 rows scanned per query. An entry naming a
+ * CVE this copy does not hold keeps its row with a null `cve_id` and is counted
+ * — dropping it would make the catalog look like it matched perfectly (D-076).
+ */
+function applyKev(database: Database, catalog: KevCatalog, fetchedAt: number): number {
+  database.exec('PRAGMA query_only=OFF')
+  try {
+    database.transaction(() => {
+      // Dropped rather than deleted-from: a schema this build changed later
+      // would otherwise be filled with rows shaped for the old one, and the
+      // table is 1,662 rows.
+      database.exec('DROP TABLE IF EXISTS kev')
+      for (const statement of KEV_DDL) database.exec(statement)
+      for (const entry of catalog.entries) {
+        database.exec({ sql: KEV_INSERT, bind: insertParams(entry) as SqlValue[] })
+      }
+      const unmatched =
+        (database.selectValue('SELECT count(*) FROM kev WHERE cve_id IS NULL') as number) ?? 0
+      const meta: [string, string | number][] = [
+        [KEV_META.version, catalog.version],
+        [KEV_META.released, catalog.released],
+        [KEV_META.releasedAt, catalog.releasedAt],
+        [KEV_META.fetched, fetchedAt],
+        [KEV_META.entries, catalog.entries.length],
+        [KEV_META.unmatched, unmatched],
+      ]
+      for (const [key, value] of meta) {
+        database.exec({ sql: 'INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)', bind: [key, value] })
+      }
+    })
+  } finally {
+    database.exec('PRAGMA query_only=ON')
+  }
+  return catalog.entries.length
+}
+
+/**
+ * Fetch and apply, reporting either outcome — and **never** failing the
+ * operation that called it.
+ *
+ * A download that fetched 372,322 records and then could not reach `kev.json`
+ * has downloaded the corpus. So this swallows its own failure into a `kev`
+ * message: the corpus operation reports success, the previous catalog stays,
+ * and its age is what the freshness line goes on reporting. The one thing that
+ * would be dishonest is silence, which is why the message is posted on both
+ * paths.
+ */
+async function refreshKev(options: ImportOptions = {}): Promise<void> {
+  const started = performance.now()
+  const database = db
+  if (!database) {
+    post({
+      type: 'kev',
+      kev: null,
+      error: 'no local copy — download the corpus first',
+      applied: null,
+      ms: 0,
+    })
+    return
+  }
+  // Nothing below may leave the phase anywhere but `ready`: the page derives
+  // *busy* from it, so an unreported ending disables every button in the app.
+
+  const transfers = new AbortController()
+  const watch = watchForStalls({
+    timeoutMs: stallTimeout(options.stallMs),
+    onStall: (idleMs) =>
+      transfers.abort(
+        stallError(
+          'The KEV catalog fetch',
+          idleMs,
+          'Your corpus and the catalog you already had are both untouched.'
+        )
+      ),
+  })
+  try {
+    report('sync', null, 'Reading the CISA KEV catalog')
+    const catalog = await fetchKev(transfers.signal, () => watch.beat())
+    watch.stop()
+    // Re-read rather than reusing the connection captured before the fetch:
+    // this runs under the writer lock so no other tab can have promoted, but a
+    // closed connection is not a thing to find out about mid-transaction.
+    const live = db ?? database
+    // **The client's own roll-backwards guard**, not just the pipeline's. This
+    // build validates the catalog again rather than trusting the server, and
+    // the ordering half is the half that defends against the thing that makes
+    // that necessary: a mutable URL with a cache in front of it. Without it one
+    // poisoned response replaces a current catalog with an old one, and because
+    // "Not in KEV" is a real value here rather than an absence, the app then
+    // positively asserts *not known-exploited, per CISA* for everything listed
+    // since — persisted, offline-honest, and agreeing across tabs (D-077 §3).
+    //
+    // Refusing is safe because it is not sticky in the dangerous direction:
+    // `parseCatalog` will not accept a future-dated catalog, so nothing can
+    // install a floor that real catalogs cannot clear. A copy that somehow
+    // holds one is repaired by "Clear local copy" and a fresh download, which
+    // the message says.
+    const held = localKev(live)
+    if (held && isNewerCatalog(catalog, held) === false) {
+      throw new Error(
+        `the origin served KEV catalog ${catalog.version}, which is older than the ` +
+          `${held.version} this copy already holds — keeping the one you have. If that is ` +
+          'wrong, clear the local copy and download again.'
+      )
+    }
+    // Applied unconditionally rather than only when `catalogVersion` moved,
+    // which is a deliberate widening of M6's shape decision. It is 1,662 rows —
+    // milliseconds — and the version is not the only thing that can go stale:
+    // `cve_id` is resolved at load, so a sync that brought in the records
+    // CISA listed last week turns unmatched entries into matched ones, and an
+    // unchanged catalog against a changed corpus is exactly when that happens.
+    const applied = applyKev(live, catalog, Math.floor(Date.now() / 1000))
+    const status = localKev(live)
+    // Back to `ready`, and this is not cosmetic: the page derives *busy* from
+    // the phase, and every button on the Data and Explore tabs is disabled
+    // while it is anything else. A refresh that finished without saying so left
+    // the whole app permanently unusable — found by `tests/e2e/kev.spec.ts`
+    // waiting ten minutes for a Run button that was never going to enable.
+    report('ready', 1, `KEV catalog ${status?.version ?? ''} — ${applied.toLocaleString()} entries`)
+    post({ type: 'kev', kev: status, error: null, applied, ms: performance.now() - started })
+    // Same file, new rows — like a sync rather than a promotion, so no tab has
+    // to reopen; what has to happen is that every tab's KEV freshness line
+    // stops disagreeing with the one next to it.
+    if (status) announce({ type: 'kev' })
+  } catch (error) {
+    const message = transfers.signal.aborted ? transfers.signal.reason : error
+    // `ready`, not `error`: the corpus operation that triggered this succeeded
+    // and the copy is queryable, so the app must not be left disabled or have
+    // its panels cleared. The failure is carried on the `kev` message instead,
+    // which is what the freshness line reports beside a catalog that still
+    // works (D-077 §2).
+    report('ready', 1, 'KEV catalog unchanged — the refresh failed')
+    post({
+      type: 'kev',
+      // The catalog that is still there, which is the point: reporting `null`
+      // would read as "you have no catalog" when what happened is "you still
+      // have yesterday's".
+      kev: localKev(database),
+      error: message instanceof Error ? message.message : String(message),
+      applied: null,
+      ms: performance.now() - started,
+    })
+  } finally {
+    watch.stop()
+    transfers.abort()
+  }
+}
+
 /** `meta.generated` of an open copy — the stamp the freshness line reads. */
 function localGenerated(database: Database): number | null {
   const value = database.selectValue("SELECT v FROM meta WHERE k = 'generated'")
@@ -2022,6 +2301,7 @@ function postUnknown(): void {
     notice: null,
     localSchema: null,
     schema: sessionSchema,
+    kev: null,
   })
 }
 
@@ -2063,6 +2343,7 @@ async function status(): Promise<void> {
         notice: null,
         localSchema: found.obsolete.schema,
         schema: sessionSchema,
+        kev: null,
       })
       return
     }
@@ -2080,6 +2361,7 @@ async function status(): Promise<void> {
         notice: null,
         localSchema: null,
         schema: sessionSchema,
+        kev: null,
       })
     } else {
       postUnknown()
@@ -2121,6 +2403,7 @@ async function status(): Promise<void> {
         notice: null,
         localSchema,
         schema: sessionSchema,
+        kev: null,
       })
       return
     }
@@ -2129,6 +2412,9 @@ async function status(): Promise<void> {
     // D-008 travels with the data, so it is read from the database rather
     // than remembered by the page that happened to import it.
     const notice = (db.selectValue("SELECT v FROM meta WHERE k = 'notice'") as string) ?? null
+    // Read from the copy for the same reason, which is also what makes the KEV
+    // freshness line work offline and agree across tabs (M6).
+    const kev = localKev(db)
     // Only here, and only on a conclusive look: the database discovery chose is
     // open and answering, so the keep list names a copy that demonstrably
     // exists — and nothing else on disk went unexamined.
@@ -2142,6 +2428,7 @@ async function status(): Promise<void> {
       notice,
       localSchema,
       schema: sessionSchema,
+      kev,
     })
   } catch {
     // Discovery named a file we then could not open or read. That is not an
@@ -2393,6 +2680,11 @@ function resolveAxis(
 function search(request: SearchRequest): void {
   const database = requireDb()
   const filters: Filters = request.filters ?? {}
+  // Before anything is compiled: the `kev` table only exists once a catalog has
+  // been loaded, and a KEV predicate against a copy that has none would fail
+  // with `no such table` — or, if the table were created empty on open, would
+  // quietly answer that nothing is known to be exploited (M6).
+  if (usesKev(filters, request.groupBy)) assertKevLoaded(database)
   report('query', null, 'Running query')
 
   finishQuery('search', () => {
@@ -2476,6 +2768,10 @@ function runReport(request: ReportRequest): void {
   if (!parsed.ok) throw new Error(parsed.error)
   const definition = parsed.report
   const filters: Filters = definition.filters ?? {}
+  // A report arrives from a URL fragment and, in M7, from a model, so this is
+  // the last place before SQL that can tell a KEV report from a KEV report this
+  // copy cannot answer (M6).
+  if (usesKev(filters, definition.rows, definition.series)) assertKevLoaded(database)
   report('query', null, 'Running report')
 
   finishQuery('report', () => {
@@ -2574,6 +2870,10 @@ function detail(cveId: string): void {
     const products = section(database, productsSql(cveId))
     const versions = section(database, versionsSql(cveId))
     const references = section(database, referencesSql(cveId))
+    // Only when this copy holds a catalog: without one the table does not
+    // exist, and a detail view that failed on `no such table` would make the
+    // overlay's absence look like a broken record (M6).
+    const kevRow = localKev(database) ? section(database, kevSql(cveId)).rows[0] : undefined
     const truncated: string[] = []
     for (const [name, part] of [
       ['CWEs', cwes],
@@ -2629,6 +2929,23 @@ function detail(cveId: string): void {
         url: text(entry[0]),
         host: text(entry[1]),
       })),
+      kev: kevRow
+        ? {
+            added: text(kevRow[0]),
+            due: text(kevRow[1]),
+            name: text(kevRow[2]),
+            description: text(kevRow[3]),
+            action: text(kevRow[4]),
+            // Null stays null: it means CISA stated something this build does
+            // not read, which is not the same as `Unknown` — that is CISA
+            // having looked (D-076).
+            ransomware: num(kevRow[5]),
+            notes: text(kevRow[6]),
+            cwes: parseCwes(kevRow[7]),
+            vendor: text(kevRow[8]),
+            product: text(kevRow[9]),
+          }
+        : null,
       truncated,
       ms: Math.round(performance.now() - started),
     }
@@ -2668,6 +2985,21 @@ function exportData(request: ExportRequest): void {
   const definition = parsed.report
   const filters: Filters = definition.filters ?? {}
   const cells = request.kind === 'cells'
+  if (usesKev(filters, definition.rows, definition.series)) assertKevLoaded(database)
+  // Whether the *file* carries KEV columns, which is a different question from
+  // whether the report filters on KEV: an export is a copy (D-071), so a copy
+  // made from a database that holds the catalog carries it. Absent columns say
+  // "this export does not cover KEV"; empty ones would say every record is not
+  // known-exploited, and which of those it is *is* the overlay's claim (M6).
+  const kevCatalog = localKev(database)
+  const withKev = kevCatalog !== null && !cells
+  // Provenance is a separate question from columns. A *cells* export of a
+  // report whose axis is `kev` consists of nothing but KEV assertions and
+  // carries no KEV columns — so gating the provenance line on `withKev` left
+  // the one export that is entirely about the catalog as the one that does not
+  // say which catalog. M6's exit criteria ask for provenance wherever KEV is
+  // asserted, and D-076 §1 grounds it in the rider CC0 does not waive.
+  const assertsKev = withKev || (cells && usesKev(filters, definition.rows, definition.series))
   report('export', null, 'Preparing export')
 
   finishQuery('export', () => {
@@ -2689,7 +3021,12 @@ function exportData(request: ExportRequest): void {
       ? crossSql(filters, resolved, definition.rows, definition.series, {
           rows: definition.limit ?? (definition.chart === 'table' ? TABLE_ROWS : CHART_ROWS),
         })
-      : rowsSql(filters, resolved, { limit: EXPORT_BATCH, sort: definition.sort, full: true })
+      : rowsSql(filters, resolved, {
+          limit: EXPORT_BATCH,
+          sort: definition.sort,
+          full: true,
+          kev: withKev,
+        })
     const truncated = !cells && matches !== null && matches > EXPORT_LIMIT
 
     // A cell export is small enough to run before its header is emitted. That
@@ -2713,13 +3050,21 @@ function exportData(request: ExportRequest): void {
 
     const header: ExportHeader = {
       notice: localNotice(database),
-      columns: cells ? [...CELL_COLUMNS] : [...RECORD_COLUMNS],
+      columns: cells ? [...CELL_COLUMNS] : [...recordColumns(withKev)],
       title: request.title,
       revision: localRevision(database),
       sql: first.sql,
       params: first.params,
       matches,
       truncated,
+      // Provenance travels with the assertion: CC0 requires no notice (D-076
+      // §1), but "listed in CISA's KEV" is a statement about a *dated* catalog,
+      // and a file that made it without saying which one invites the reader to
+      // treat it as current forever.
+      kev:
+        assertsKev && kevCatalog
+          ? { version: kevCatalog.version, released: kevCatalog.released }
+          : null,
     }
     const writer = exportWriter(request.format, header)
     post({ type: 'exportChunk', text: writer.begin() })
@@ -2745,6 +3090,7 @@ function exportData(request: ExportRequest): void {
           offset,
           sort: definition.sort,
           full: true,
+          kev: withKev,
         })
         const result = runSql(database, batch.sql, {
           params: batch.params,
@@ -2808,6 +3154,7 @@ async function reset(): Promise<void> {
     notice: null,
     localSchema: null,
     schema: sessionSchema,
+    kev: null,
   })
 }
 
@@ -2963,10 +3310,28 @@ async function handle(request: Request): Promise<void> {
           // this runs, so a catch-up that fails reports itself without
           // retracting a download that succeeded.
           await syncToHead(request.options)
+          // Then KEV, after the catch-up (D-063's ordering, M6's shape
+          // decision): a replacement destroyed the overlay along with the
+          // database it lived in, so a download ends by rebuilding it. It
+          // cannot fail this operation — `refreshKev` reports its own outcome.
+          await refreshKev(request.options)
         })
         break
       case 'sync':
-        await asWriter('sync', () => syncToHead(request.options))
+        await asWriter('sync', async () => {
+          await syncToHead(request.options)
+          // A sync refreshes the catalog too, because CISA's cadence is roughly
+          // the ingest's and "get me current" should mean both. The fetch is
+          // what compares versions: 1.5 MB is cheaper than a UI that makes the
+          // user decide which kind of current they meant.
+          await refreshKev(request.options)
+        })
+        break
+      case 'kev':
+        // Its own action as well, because a refresh that failed has to be
+        // retryable without re-running a download or a sync — and a copy
+        // imported before this build existed has no catalog at all.
+        await asWriter('kev', () => refreshKev(request.options))
         break
       case 'query':
         query(request.sql)

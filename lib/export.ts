@@ -74,6 +74,33 @@ export const RECORD_COLUMNS = [
   'ssvc_technical_impact',
 ] as const
 
+/**
+ * The KEV columns a record export carries when this copy holds a catalog (M6).
+ *
+ * In `EXPORT_KEV_SQL`'s order — `tests/unit/export.test.ts` checks the two
+ * against each other, because a mismatch silently labels every column after the
+ * first one wrongly.
+ *
+ * `kev_listed` leads and is computed rather than inferred: a consumer reading a
+ * file where `kev_date_added` is blank cannot tell "not in KEV" from "this
+ * export did not cover KEV", and which of those it is *is* the overlay's claim.
+ * Which is also why these columns are absent entirely when no catalog is
+ * loaded, rather than present and empty.
+ */
+export const KEV_COLUMNS = [
+  'kev_listed',
+  'kev_date_added',
+  'kev_due_date',
+  'kev_ransomware',
+  'kev_vulnerability_name',
+  'kev_required_action',
+] as const
+
+/** The record export's columns, with KEV only when the copy has a catalog. */
+export function recordColumns(withKev: boolean): readonly string[] {
+  return withKev ? [...RECORD_COLUMNS, ...KEV_COLUMNS] : RECORD_COLUMNS
+}
+
 /** The columns an aggregate export carries. `series` is empty on a one-axis report. */
 export const CELL_COLUMNS = ['rows', 'series', 'cves'] as const
 
@@ -109,6 +136,18 @@ export interface ExportHeader {
   matches: number | null
   /** Set when the cap stopped the export short of `matches`. */
   truncated: boolean
+  /**
+   * The KEV catalog this file's KEV columns came from, or null when it carries
+   * none (M6).
+   *
+   * Present so provenance travels with the assertion: CC0 requires no notice
+   * (D-076 §1), but "listed in CISA's KEV" is a statement about a *dated*
+   * catalog, and a file that made it without saying which one invites the
+   * reader to treat it as current forever. The rider CC0 does not waive is the
+   * endorsement one, and naming the source and date is how "per CISA, as of …"
+   * stays a description of a relationship rather than a claim of one.
+   */
+  kev?: { version: string; released: string } | null
 }
 
 function requireNotice(header: ExportHeader): string {
@@ -174,6 +213,7 @@ export function jsonWriter(header: ExportHeader): ExportWriter {
         matches: header.matches,
         truncated: header.truncated,
         limit: EXPORT_LIMIT,
+        kev: header.kev ?? null,
         sql: header.sql,
         params: [...header.params],
         columns: [...header.columns],
@@ -220,6 +260,13 @@ function preamble(header: ExportHeader, notice: string): string[] {
       ? 'Local copy revision: unknown'
       : `Local copy at revision ${header.revision}`,
   ]
+  if (header.kev) {
+    lines.push(
+      `KEV columns: CISA Known Exploited Vulnerabilities catalog ` +
+        `${stripControls(header.kev.version)}, released ${stripControls(header.kev.released)}. ` +
+        `Public domain (CC0 1.0); listing is CISA's, not an endorsement by CISA of this file.`
+    )
+  }
   if (header.matches !== null)
     lines.push(`Records matching: ${header.matches.toLocaleString('en-US')}`)
   if (header.truncated) {

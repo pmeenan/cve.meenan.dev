@@ -33,6 +33,19 @@ const DAY = 24 * HOUR
  */
 export const STALE_AFTER_MS = 2 * DAY
 
+/**
+ * The same question for the KEV catalog, and a different answer (M6).
+ *
+ * CISA publishes about *business*-daily, not daily, so a catalog released on a
+ * Friday is three days old by Monday morning with nothing wrong and nothing to
+ * fetch — and the corpus's two-day threshold would paint it red every weekend.
+ * A week plus slack is the point at which "CISA has published nothing" stops
+ * being an ordinary gap and starts being worth checking. Borrowing the corpus's
+ * number would have been the quiet kind of wrong: a warning that fires on
+ * schedule teaches people to ignore the warning.
+ */
+export const KEV_STALE_AFTER_MS = 8 * DAY
+
 export interface Freshness {
   /** Milliseconds since the data was built, clamped at zero. */
   ageMs: number
@@ -52,7 +65,11 @@ export interface Freshness {
  * negative age: a client clock behind the server's is ordinary, and there is
  * nothing to warn about — the data is newer than this machine thinks now is.
  */
-export function describeFreshness(generated: unknown, nowMs: number): Freshness | null {
+export function describeFreshness(
+  generated: unknown,
+  nowMs: number,
+  staleAfterMs: number = STALE_AFTER_MS
+): Freshness | null {
   if (typeof generated !== 'number' || !Number.isFinite(generated) || generated <= 0) return null
   const builtMs = generated * 1000
   if (!Number.isFinite(builtMs)) return null
@@ -61,7 +78,7 @@ export function describeFreshness(generated: unknown, nowMs: number): Freshness 
     ageMs,
     iso: new Date(builtMs).toISOString(),
     age: describeAge(ageMs),
-    stale: ageMs > STALE_AFTER_MS,
+    stale: ageMs > staleAfterMs,
   }
 }
 

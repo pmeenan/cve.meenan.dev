@@ -4,7 +4,7 @@ import { expect, test, type Browser, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
 
-import { RECORD_COLUMNS } from '../../lib/export'
+import { KEV_COLUMNS, RECORD_COLUMNS } from '../../lib/export'
 
 /**
  * M4's exit criteria in a browser: the owner's motivating question answered
@@ -377,7 +377,18 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
     )
     // Named from the module the writer names them from, so a schema addition
     // cannot leave the file's header and its rows describing different columns.
-    expect(records[0]).toEqual([...RECORD_COLUMNS])
+    // The record columns lead, in order. Since M6 an export made on a copy that
+    // holds a KEV catalog *also* carries the six KEV columns — absent when it
+    // does not, because empty ones would say every record is not
+    // known-exploited (D-077 §1). So this asserts the prefix and then which of
+    // the two shapes it is, rather than pinning one.
+    expect(records[0]!.slice(0, RECORD_COLUMNS.length)).toEqual([...RECORD_COLUMNS])
+    expect([RECORD_COLUMNS.length, RECORD_COLUMNS.length + KEV_COLUMNS.length]).toContain(
+      records[0]!.length
+    )
+    if (records[0]!.length > RECORD_COLUMNS.length) {
+      expect(records[0]!.slice(RECORD_COLUMNS.length)).toEqual([...KEV_COLUMNS])
+    }
     // The six D-070 columns are in the *copy* even though they are not on
     // screen — an export that dropped `rejection_reason` would hand back every
     // REJECTED record with no text in it at all (D-071).

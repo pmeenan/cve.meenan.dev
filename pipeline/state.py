@@ -82,8 +82,16 @@ class Busy(Exception):
 
 
 @contextlib.contextmanager
-def lock(state_dir: str, wait: float = 0.0):
+def lock(state_dir: str, wait: float = 0.0, name: str = LOCK_NAME):
     """Hold the pipeline lock for the duration, or raise `Busy` (D-042).
+
+    `name` exists for one caller — `kev.py`, which needs the same primitive and
+    must **not** share this lock (D-076): its cadence is CISA's, it publishes a
+    file the ingest never touches, and a KEV fetch blocking the daily corpus
+    ingest (or being blocked by it) would put two independent jobs in one
+    failure domain for no gain. Sharing the *code* is not sharing the lock —
+    what makes two jobs mutually exclusive is naming the same file, and they
+    deliberately do not.
 
     Non-blocking by default, and that default is the daily's. A daily run that
     finds the monthly snapshot in progress has nothing useful to wait for — the
@@ -107,7 +115,7 @@ def lock(state_dir: str, wait: float = 0.0):
     it through the kernel, so a stale lockfile never wedges the next run.
     """
     os.makedirs(state_dir, mode=0o755, exist_ok=True)
-    path = os.path.join(state_dir, LOCK_NAME)
+    path = os.path.join(state_dir, name)
     handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         deadline = time.monotonic() + max(0.0, float(wait))

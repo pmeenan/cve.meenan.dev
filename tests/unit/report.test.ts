@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { NOT_ASSESSED } from '../../lib/filters'
 import {
   CHART_TYPES,
   emptyReport,
@@ -145,9 +146,55 @@ describe('parseReport', () => {
   it('drops fields it does not know instead of refusing', () => {
     // Forward compatibility in the direction that matters: a definition from a
     // newer build at the same version opens here at the parts this one reads.
-    const report = parsed(good({ sparkline: true, filters: { kev: true } } as never))
+    // Genuinely unknown names. `kev` used to stand in for one and no longer
+    // can — it is a filter axis since M6, and `true` is not a list of codes,
+    // so a newer build sending one gets a refusal by name rather than a
+    // silently widened report.
+    const report = parsed(good({ sparkline: true, filters: { quantumRisk: true } } as never))
     expect(report.rows).toBe('month')
     expect('sparkline' in report).toBe(false)
+  })
+
+  it('validates the KEV axes, which nothing else would catch (M6)', () => {
+    // `parseFilters` drops unknown keys silently, so an axis missing from the
+    // allowlist is not an error — it is a permalink that answers a *wider*
+    // question than the one it asks, with nothing on screen saying so.
+    const kev = parsed(good({ filters: { kev: [1], kevRansomware: [1, 2, NOT_ASSESSED] } }))
+    expect(kev.filters.kev).toEqual([1])
+    expect(kev.filters.kevRansomware).toEqual([1, 2, NOT_ASSESSED])
+
+    // Membership has no "not assessed": a record CISA has not listed is *not
+    // known-exploited, per CISA*, which is one of the two codes rather than a
+    // missing assessment (D-076).
+    expect(parseReport(good({ filters: { kev: [NOT_ASSESSED] } })).ok).toBe(false)
+    expect(parseReport(good({ filters: { kev: [2] } })).ok).toBe(false)
+    expect(parseReport(good({ filters: { kevRansomware: [9] } })).ok).toBe(false)
+  })
+
+  it('carries the KEV date bounds rather than dropping them', () => {
+    // The four that would be silently discarded if they were missing from the
+    // numeric allowlist — a link that says "added to KEV since March" and
+    // answers about the whole catalog.
+    const report = parsed(
+      good({
+        filters: {
+          kevAddedFrom: 1_700_000_000,
+          kevAddedTo: 1_800_000_000,
+          kevDueFrom: 1_700_000_001,
+          kevDueTo: 1_800_000_001,
+        },
+      })
+    )
+    expect(report.filters.kevAddedFrom).toBe(1_700_000_000)
+    expect(report.filters.kevAddedTo).toBe(1_800_000_000)
+    expect(report.filters.kevDueFrom).toBe(1_700_000_001)
+    expect(report.filters.kevDueTo).toBe(1_800_000_001)
+  })
+
+  it('accepts the KEV dimensions on both axes', () => {
+    const report = parsed(good({ rows: 'kev', series: 'severity' }))
+    expect(report.rows).toBe('kev')
+    expect(parsed(good({ rows: 'month', series: 'kevRansomware' })).series).toBe('kevRansomware')
   })
 
   it('stamps the version it actually produced', () => {

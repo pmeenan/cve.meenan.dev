@@ -16,7 +16,9 @@ import {
   normalizeCwe,
   NOT_ASSESSED,
   rowsSql,
+  usesKev,
   DIMENSIONS,
+  EXPORT_KEV_SQL,
   GROUP_LIMIT,
   MAX_ROW_LIMIT,
   type Dimension,
@@ -25,7 +27,20 @@ import {
   type Resolved,
   type SqlParam,
 } from '../../lib/filters'
-import { RECORD_COLUMNS } from '../../lib/export'
+import { KEV_COLUMNS, RECORD_COLUMNS } from '../../lib/export'
+import {
+  daySeconds,
+  insertParams,
+  KEV_DDL,
+  KEV_INSERT,
+  KEV_LISTED,
+  KEV_NOT_LISTED,
+  RANSOMWARE_KNOWN,
+  RANSOMWARE_NOT_LISTED,
+  RANSOMWARE_UNKNOWN,
+  type KevEntry,
+} from '../../lib/kev'
+import { kevSql } from '../../lib/detail'
 import { indexPlan, indexSql } from '../../lib/search'
 
 /**
@@ -129,6 +144,56 @@ function corpus(): DatabaseSync {
     const sql = indexSql(index)
     db.exec(sql.create)
     db.exec(`INSERT INTO ${index.fts}(${index.fts}) VALUES('rebuild')`)
+  }
+
+  // The KEV overlay (M6): also client-built, also absent from `schema.sql`, and
+  // the reason a KEV query has to be gated on the table existing at all
+  // (`usesKev`). Three of the five records are listed, one of them the record
+  // that affects two products — which is what makes the DISTINCT-safety claim
+  // checkable rather than assumed — plus one entry for a CVE this corpus does
+  // **not** hold, because keeping those is a stated property (D-076).
+  for (const statement of KEV_DDL) db.exec(statement)
+  const kev = db.prepare(KEV_INSERT)
+  const entry = (over: Partial<KevEntry>): KevEntry => ({
+    cve: 'CVE-0000-0000',
+    vendor: 'Vendor',
+    product: 'Product',
+    name: 'Name',
+    descr: 'Description',
+    action: 'Apply updates per vendor instructions.',
+    added: '2022-03-25',
+    addedAt: daySeconds('2022-03-25')!,
+    due: '2022-04-15',
+    dueAt: daySeconds('2022-04-15')!,
+    ransomware: RANSOMWARE_UNKNOWN,
+    notes: '',
+    cwes: [],
+    ...over,
+  })
+  for (const row of [
+    entry({
+      cve: 'CVE-2021-44228',
+      ransomware: RANSOMWARE_KNOWN,
+      added: '2021-12-10',
+      addedAt: daySeconds('2021-12-10')!,
+      due: '2021-12-24',
+      dueAt: daySeconds('2021-12-24')!,
+    }),
+    entry({ cve: 'CVE-2022-0002', ransomware: RANSOMWARE_UNKNOWN }),
+    // The multi-product record, so "one CVE, not one per product" is testable.
+    entry({
+      cve: 'CVE-2024-0004',
+      ransomware: null,
+      added: '2024-10-01',
+      addedAt: daySeconds('2024-10-01')!,
+      due: '2024-10-22',
+      dueAt: daySeconds('2024-10-22')!,
+    }),
+    // Listed by CISA, absent from this copy: `cve_id` resolves to NULL and the
+    // row is kept. It must never be counted as "not in KEV".
+    entry({ cve: 'CVE-1999-0001' }),
+  ]) {
+    kev.run(...(insertParams(row) as (string | number | null)[]))
   }
   return db
 }
@@ -681,5 +746,271 @@ describe('the export-only columns (D-070, D-071)', () => {
     const full = rowsSql({ state: 'all' }, {}, { sort: 'cve', full: true })
     const named = db.prepare(full.sql).all(...(full.params as (string | number)[]))
     expect(Object.keys(named[0] as Record<string, unknown>)).toHaveLength(RECORD_COLUMNS.length)
+  })
+
+  it('grows the KEV columns only when the copy holds a catalog (M6)', () => {
+    // Absent columns say "this export does not cover KEV"; empty ones would say
+    // every record is not known-exploited, and which of those it is *is* the
+    // overlay's claim (D-076). So the flag is the caller's, not `full`'s.
+    const without = rowsSql({ state: 'all' }, {}, { sort: 'cve', full: true })
+    expect(run(without.sql, without.params)[0]).toHaveLength(RECORD_COLUMNS.length)
+    const withKev = rowsSql({ state: 'all' }, {}, { sort: 'cve', full: true, kev: true })
+    expect(run(withKev.sql, withKev.params)[0]).toHaveLength(
+      RECORD_COLUMNS.length + KEV_COLUMNS.length
+    )
+    expect(EXPORT_KEV_SQL).toHaveLength(KEV_COLUMNS.length)
+  })
+
+  it('writes ransomware use as words, because 0 does not mean "no"', () => {
+    // `kev_listed`'s 0/1 is a boolean. `ransomware`'s 0 is **Unknown, per
+    // CISA** — and a spreadsheet reader seeing a 0 beside a 1 reads "no". That
+    // is exactly the misreading `kev_listed` was computed to prevent, and the
+    // one this whole milestone is framed around (D-070's "unknown is not
+    // none", applied to a second source).
+    const built = rowsSql({ state: 'all' }, {}, { sort: 'cve', full: true, kev: true })
+    const rows = db.prepare(built.sql).all(...(built.params as (string | number)[]))
+    const byId = new Map(
+      rows.map((row) => [String((row as Record<string, unknown>).cve), Object.values(row)])
+    )
+    const at = RECORD_COLUMNS.length + KEV_COLUMNS.indexOf('kev_ransomware')
+    expect(byId.get('CVE-2021-44228')![at]).toBe('Known')
+    expect(byId.get('CVE-2022-0002')![at]).toBe('Unknown (per CISA)')
+    // Listed, but with a value this build does not read — not "Unknown".
+    expect(byId.get('CVE-2024-0004')![at]).toBe('not stated by CISA')
+    // Not listed at all: empty, so nothing about ransomware is asserted.
+    expect(byId.get('CVE-2023-0003')![at]).toBe('')
+  })
+
+  it('marks a listed record listed and an unlisted one unlisted', () => {
+    // The computed `kev_listed` column is the one a consumer can act on: a blank
+    // `kev_date_added` is ambiguous between "not in KEV" and "column not
+    // filled in", and this export exists to say which.
+    const built = rowsSql({ state: 'all' }, {}, { sort: 'cve', full: true, kev: true })
+    const rows = db.prepare(built.sql).all(...(built.params as (string | number)[]))
+    const byId = new Map(
+      rows.map((row) => {
+        const record = row as Record<string, unknown>
+        return [String(record.cve), record]
+      })
+    )
+    const listedAt = RECORD_COLUMNS.length
+    const values = (cve: string) => Object.values(byId.get(cve) as Record<string, unknown>)
+    expect(values('CVE-2021-44228')[listedAt]).toBe(KEV_LISTED)
+    expect(values('CVE-2023-0003')[listedAt]).toBe(KEV_NOT_LISTED)
+  })
+})
+
+/**
+ * The KEV overlay as a query surface (M6, D-076).
+ *
+ * Two properties carry the milestone's exit criteria and neither is visible in
+ * a type check. **A filtered count has to agree with its grouped count** — the
+ * M3 pattern, and what would catch a filter and an aggregate disagreeing about
+ * what "in KEV" means. And **a record must count once**, not once per product:
+ * the catalog is 1:1 by CVE, but the whole point of asserting it is that
+ * nothing in the query layer depends on remembering that.
+ */
+describe('CISA KEV', () => {
+  const bucketCounts = (dimension: Dimension, filters: Filters = { state: 'all' }) => {
+    const built = groupSql(filters, {}, dimension)
+    return new Map(run(built.sql, built.params).map((row) => [row[0], Number(row[2])]))
+  }
+
+  it('filters to the listed records and to their complement', () => {
+    expect(ids({ state: 'all', kev: [KEV_LISTED] })).toEqual([
+      'CVE-2021-44228',
+      'CVE-2022-0002',
+      'CVE-2024-0004',
+    ])
+    expect(ids({ state: 'all', kev: [KEV_NOT_LISTED] })).toEqual(['CVE-2020-0005', 'CVE-2023-0003'])
+  })
+
+  it('agrees with its own grouped count (M3’s pattern)', () => {
+    const counts = bucketCounts('kev')
+    expect(counts.get(KEV_LISTED)).toBe(ids({ state: 'all', kev: [KEV_LISTED] }).length)
+    expect(counts.get(KEV_NOT_LISTED)).toBe(ids({ state: 'all', kev: [KEV_NOT_LISTED] }).length)
+    // And the two buckets have to be the whole corpus — a complement that does
+    // not complement is a chart whose denominator moved.
+    expect((counts.get(KEV_LISTED) ?? 0) + (counts.get(KEV_NOT_LISTED) ?? 0)).toBe(5)
+  })
+
+  it('selecting both membership codes is every record, not none', () => {
+    expect(ids({ state: 'all', kev: [KEV_LISTED, KEV_NOT_LISTED] })).toEqual(ids({ state: 'all' }))
+  })
+
+  it('never counts a record once per affected product', () => {
+    // CVE-2024-0004 affects two products and is in KEV. A join that multiplied
+    // would report it twice here and inflate every KEV number on a product
+    // cross-tab — the failure that stays invisible because the total still
+    // looks plausible.
+    const cross = crossSql({ state: 'all' }, {}, 'kev', 'product')
+    const rows = run(cross.sql, cross.params)
+    const listed = rows.filter((row) => row[0] === KEV_LISTED)
+    // Three listed records, spread across the products they affect; no single
+    // cell may exceed the number of records in it.
+    for (const row of listed) expect(Number(row[4])).toBeLessThanOrEqual(3)
+    const total = bucketCounts('kev').get(KEV_LISTED)
+    expect(total).toBe(3)
+  })
+
+  it('an entry for a CVE this copy does not hold is never “not in KEV”', () => {
+    // The catalog holds CVE-1999-0001, which this corpus does not. Grouping on
+    // `k.cve_id` instead of `k.cve` would file it under the complement — the one
+    // place the two nulls mean opposite things.
+    const counts = bucketCounts('kev')
+    expect((counts.get(KEV_LISTED) ?? 0) + (counts.get(KEV_NOT_LISTED) ?? 0)).toBe(5)
+    const kept = db.prepare('SELECT count(*) AS n FROM kev WHERE cve_id IS NULL').get() as {
+      n: number
+    }
+    expect(kept.n).toBe(1)
+  })
+
+  it('ransomware use has four buckets, complement included', () => {
+    const counts = bucketCounts('kevRansomware')
+    expect(counts.get(RANSOMWARE_KNOWN)).toBe(1)
+    expect(counts.get(RANSOMWARE_UNKNOWN)).toBe(1)
+    expect(counts.get(RANSOMWARE_NOT_LISTED)).toBe(2)
+    // A *listed* record whose value this build does not read. Not `Unknown`,
+    // which is CISA having looked, and not the complement.
+    expect(counts.get(null)).toBe(1)
+  })
+
+  it('filters each ransomware bucket, including the two that are not stored codes', () => {
+    expect(ids({ state: 'all', kevRansomware: [RANSOMWARE_KNOWN] })).toEqual(['CVE-2021-44228'])
+    expect(ids({ state: 'all', kevRansomware: [RANSOMWARE_NOT_LISTED] })).toEqual([
+      'CVE-2020-0005',
+      'CVE-2023-0003',
+    ])
+    // `IN (…)` is never true for NULL, so without the `IS NULL` arm this band
+    // would be visible on every chart and selectable nowhere — the same gap
+    // `NOT_ASSESSED` closes for the SSVC axes (D-070).
+    expect(ids({ state: 'all', kevRansomware: [NOT_ASSESSED] })).toEqual(['CVE-2024-0004'])
+  })
+
+  it('filters on the catalog’s own dates, which imply membership', () => {
+    const from = daySeconds('2024-01-01')!
+    expect(ids({ state: 'all', kevAddedFrom: from })).toEqual(['CVE-2024-0004'])
+    // A due-date window that excludes everything is empty rather than
+    // everything — a range filter that quietly dropped its axis would return
+    // the whole corpus.
+    expect(ids({ state: 'all', kevDueFrom: daySeconds('2030-01-01')! })).toEqual([])
+  })
+
+  it('combines with the corpus axes with AND', () => {
+    expect(ids({ state: 'all', kev: [KEV_LISTED], severity: [4] })).toEqual([
+      'CVE-2021-44228',
+      'CVE-2024-0004',
+    ])
+  })
+
+  it('binds every KEV value rather than interpolating it', () => {
+    const compiled = compile({
+      state: 'all',
+      kevRansomware: [RANSOMWARE_KNOWN, RANSOMWARE_UNKNOWN],
+      kevAddedFrom: 1_700_000_000,
+      kevDueTo: 1_800_000_000,
+    })
+    expect(compiled.where).not.toContain('1700000000')
+    expect(compiled.where).not.toContain('1800000000')
+    expect(compiled.params).toContain(1_700_000_000)
+    expect(compiled.params).toContain(1_800_000_000)
+  })
+
+  it('is recognised by usesKev, and nothing else is', () => {
+    // The gate that keeps a KEV query off a copy with no catalog. A false
+    // negative is `no such table`; a false positive refuses a query that would
+    // have worked.
+    expect(usesKev({ kev: [KEV_LISTED] })).toBe(true)
+    expect(usesKev({ kevRansomware: [RANSOMWARE_NOT_LISTED] })).toBe(true)
+    expect(usesKev({ kevAddedFrom: 1 })).toBe(true)
+    expect(usesKev({ kevDueTo: 1 })).toBe(true)
+    expect(usesKev({}, 'kev')).toBe(true)
+    expect(usesKev({}, 'month', 'kevRansomware')).toBe(true)
+    expect(usesKev({ severity: [4], vendor: ['cisco'] }, 'month', 'severity')).toBe(false)
+    expect(usesKev({ kev: [] })).toBe(false)
+  })
+
+  it('cross-tabs KEV against severity with both bands present', () => {
+    // The exit criterion's report shape. Every cell has to be reconcilable with
+    // its row, and both membership bands have to be on the chart — a KEV chart
+    // showing only the listed band is a chart with no denominator.
+    const built = crossSql({ state: 'all' }, {}, 'kev', 'severity')
+    const rows = run(built.sql, built.params)
+    const buckets = new Set(rows.map((row) => row[0]))
+    expect(buckets.has(KEV_LISTED)).toBe(true)
+    expect(buckets.has(KEV_NOT_LISTED)).toBe(true)
+    const total = rows.reduce((sum, row) => sum + Number(row[4]), 0)
+    expect(total).toBe(5)
+  })
+
+  it('puts the listed band first on the axis, by the axis and not by size', () => {
+    // D-073's argument for CRITICAL at the baseline, applied to the band that
+    // matters here: "In KEV" is 0.4% of the real corpus, and the baseline is
+    // the only position whose length a reader can compare across buckets.
+    //
+    // The fixture has listed as the *majority*, so a data assertion alone would
+    // pass under `ORDER BY cves DESC` too — which is exactly the inversion this
+    // is meant to prevent, and at the corpus's real ratio it is the one that
+    // would happen. So the ordering clause itself is asserted.
+    const built = groupSql({ state: 'all' }, {}, 'kev')
+    expect(built.sql).not.toContain('ORDER BY cves DESC')
+    expect(built.sql).toContain('CASE WHEN k.cve IS NULL THEN 1 ELSE 0 END ASC')
+    expect(run(built.sql, built.params)[0]?.[0]).toBe(KEV_LISTED)
+    // And ransomware use reads Known → Unknown → Not in KEV → unread, not by
+    // size, for the same reason.
+    const ransomware = groupSql({ state: 'all' }, {}, 'kevRansomware')
+    expect(ransomware.sql).not.toContain('ORDER BY cves DESC')
+    expect(run(ransomware.sql, ransomware.params).map((row) => row[0])).toEqual([
+      RANSOMWARE_KNOWN,
+      RANSOMWARE_UNKNOWN,
+      RANSOMWARE_NOT_LISTED,
+      null,
+    ])
+  })
+
+  it('compiles an unrecognised code to false rather than dropping the filter', () => {
+    // A definition from a future build, or a hand-edited fragment. Dropping the
+    // axis would return the whole corpus for a filter nobody can satisfy —
+    // the rule `pushResolvedIn` follows for a lookup name that matched nothing.
+    expect(compile({ kev: [7] }).where).toContain('0')
+    expect(ids({ state: 'all', kev: [7] })).toEqual([])
+    expect(ids({ state: 'all', kevRansomware: [99] })).toEqual([])
+    // And selecting *both* membership codes is every record, not none.
+    expect(compile({ state: 'all', kev: [KEV_LISTED, KEV_NOT_LISTED] }).where).toBe('1')
+  })
+
+  it('binds a date range in the order the clause consumes it', () => {
+    // Reversed, both bounds are still bound and the query still runs — it just
+    // answers a different question, and only a range with two *distinguishable*
+    // ends can tell. Both ends here are real dates in the fixture.
+    const from = daySeconds('2021-01-01')!
+    const to = daySeconds('2022-12-31')!
+    const built = compile({ state: 'all', kevAddedFrom: from, kevAddedTo: to })
+    expect(built.params).toEqual([from, to])
+    expect(ids({ state: 'all', kevAddedFrom: from, kevAddedTo: to })).toEqual([
+      'CVE-2021-44228',
+      'CVE-2022-0002',
+    ])
+  })
+
+  it('keeps the entry for a CVE this copy lacks, with a null cve_id', () => {
+    // The claim D-076 makes: an entry the corpus does not hold is kept by
+    // string and counted, not dropped. It is `KEV_INSERT`'s nullable `cve_id`
+    // that preserves it — the membership expression cannot, because a row with
+    // no `cve_id` never satisfies the join at all.
+    const kept = db.prepare('SELECT cve, cve_id FROM kev WHERE cve_id IS NULL').all() as {
+      cve: string
+      cve_id: number | null
+    }[]
+    expect(kept.map((row) => row.cve)).toEqual(['CVE-1999-0001'])
+  })
+
+  it('reaches one KEV row per record from the detail query', () => {
+    const built = kevSql('CVE-2021-44228')
+    const rows = run(built.sql, built.params)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.[5]).toBe(RANSOMWARE_KNOWN)
+    // A record the catalog does not list gets no row rather than a blank one.
+    expect(run(kevSql('CVE-2023-0003').sql, kevSql('CVE-2023-0003').params)).toHaveLength(0)
   })
 })

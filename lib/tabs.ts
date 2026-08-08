@@ -40,7 +40,7 @@ export const TAB_CHANNEL = 'cve-tabs'
 export const WRITER_LOCK = 'cve-writer'
 
 /** Which write operation a tab is performing. */
-export type WriterOp = 'download' | 'sync' | 'reset'
+export type WriterOp = 'download' | 'sync' | 'reset' | 'kev'
 
 export type TabMessage =
   /** A writer started or finished, so other tabs can say what is happening. */
@@ -53,6 +53,15 @@ export type TabMessage =
   | { type: 'promoted'; rev: number | null }
   /** A sync advanced the shared copy. Same file, new rows and a new watermark. */
   | { type: 'synced'; rev: number; generated: number | null }
+  /**
+   * A KEV refresh replaced the overlay table in the shared copy (M6).
+   *
+   * Announced for the same reason a sync is: the rows in the file this tab has
+   * open have changed, and a freshness line that disagreed with the tab next to
+   * it is the confusion multi-tab support exists to remove. Not a promotion —
+   * nothing was replaced, so no tab has to reopen.
+   */
+  | { type: 'kev' }
 
 /**
  * Validate a message off the channel.
@@ -69,10 +78,14 @@ export function parseTabMessage(value: unknown): TabMessage | null {
   if (raw.type === 'writer') {
     const op = raw.op
     const state = raw.state
-    if (op !== 'download' && op !== 'sync' && op !== 'reset') return null
+    if (op !== 'download' && op !== 'sync' && op !== 'reset' && op !== 'kev') return null
     if (state !== 'start' && state !== 'end') return null
     return { type: 'writer', op, state }
   }
+  // No payload: what a listening tab does is re-read its own copy, and a
+  // version carried here would be a second authority about what is on disk —
+  // validated, ignored, and read by the next person as load-bearing.
+  if (raw.type === 'kev') return { type: 'kev' }
   if (raw.type === 'promoted') {
     return { type: 'promoted', rev: typeof raw.rev === 'number' ? raw.rev : null }
   }
@@ -96,7 +109,9 @@ export function busyMessage(op: WriterOp | null): string {
         ? 'Another tab is syncing'
         : op === 'reset'
           ? 'Another tab is clearing the local copy'
-          : 'Another tab is downloading or syncing'
+          : op === 'kev'
+            ? 'Another tab is refreshing the KEV catalog'
+            : 'Another tab is downloading or syncing'
   return (
     `${what}. Only one tab can write to the local copy at a time, so this one is ` +
     'leaving it alone. You can keep querying here while it finishes; when it does, this tab ' +

@@ -17,15 +17,8 @@
 
 import { useId } from 'react'
 
-import { clearChip, CODE_AXES, describeDraft, type Chip, type Draft } from '@/lib/draft'
-import {
-  CODE_LABELS,
-  DIMENSION_LABELS,
-  NOT_ASSESSED,
-  NOT_ASSESSED_LABEL,
-  type Dimension,
-  type StateFilter,
-} from '@/lib/filters'
+import { clearChip, codeLabel, CODE_AXES, describeDraft, type Chip, type Draft } from '@/lib/draft'
+import { DIMENSION_LABELS, NOT_ASSESSED, type StateFilter } from '@/lib/filters'
 
 export function FilterChips({
   draft,
@@ -250,6 +243,45 @@ export function FilterForm({
           />
         </Field>
       </div>
+
+      {/* The catalog's own dates (M6). Separate from the corpus's because they
+          are CISA's timeline rather than the CVE Program's: when a record was
+          added to the known-exploited list, and when federal agencies had to
+          have acted on it. Either one implies membership. */}
+      <div className="row">
+        <Field label="Added to KEV from" id={`${prefix}-kev-added-from`}>
+          <input
+            id={`${prefix}-kev-added-from`}
+            type="date"
+            value={draft.kevAddedFrom}
+            onChange={(event) => set('kevAddedFrom', event.target.value)}
+          />
+        </Field>
+        <Field label="to" id={`${prefix}-kev-added-to`}>
+          <input
+            id={`${prefix}-kev-added-to`}
+            type="date"
+            value={draft.kevAddedTo}
+            onChange={(event) => set('kevAddedTo', event.target.value)}
+          />
+        </Field>
+        <Field label="KEV due date from" id={`${prefix}-kev-due-from`}>
+          <input
+            id={`${prefix}-kev-due-from`}
+            type="date"
+            value={draft.kevDueFrom}
+            onChange={(event) => set('kevDueFrom', event.target.value)}
+          />
+        </Field>
+        <Field label="to" id={`${prefix}-kev-due-to`}>
+          <input
+            id={`${prefix}-kev-due-to`}
+            type="date"
+            value={draft.kevDueTo}
+            onChange={(event) => set('kevDueTo', event.target.value)}
+          />
+        </Field>
+      </div>
     </>
   )
 }
@@ -330,11 +362,6 @@ function Codes({
       ))}
     </fieldset>
   )
-}
-
-function codeLabel(axis: Dimension, code: number): string {
-  if (code === NOT_ASSESSED) return NOT_ASSESSED_LABEL
-  return CODE_LABELS[axis]?.[code] ?? String(code)
 }
 
 function Check({

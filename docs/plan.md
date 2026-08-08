@@ -1028,7 +1028,7 @@ band rather than a silent zero — **and the bump ships before launch, not
 after**, with D-068's announcement path exercised end to end across the real
 bump; public launch.
 
-## M6 — CISA KEV overlay  `pending`
+## M6 — CISA KEV overlay  `in progress`
 
 Scope: server-side KEV fetch and cache (D-010), joined to the corpus
 client-side. Small and self-contained. The gate the original scope set —
@@ -1073,63 +1073,225 @@ place — the M5 finding this milestone would otherwise inherit.
       stating the relationship instead of implying one. D-008's second-source
       reopen is exercised and closed; MITRE's notice still governs the CVE rows
       KEV columns appear beside.
-- [ ] **The nginx location** (owner-applied). `location = /data/kev.json`
-      with a short/revalidating cache policy — never `immutable` — with the
-      security headers repeated (`add_header` does not merge, D-053) and no
-      `always` on the Cache-Control line, so error responses stay uncached at
-      the edge (the M5 404-poisoning fix applies to this block from birth).
-      Verified from response headers through Cloudflare, including that a 404
-      for the not-yet-published file is `BYPASS`/uncached — *then* the first
-      catalog may publish. architecture.md's contract table drops its "not yet
-      true" caveat in the same change.
-- [ ] **The pipeline half.** `pipeline/kev.py` on its own cron, its own
-      failure domain: it takes no ingest lock, touches no ingest state, and a
-      failure of either cron leaves the other's outputs untouched. Fetch from
-      cisa.gov (the official `cisagov/kev-data` mirror is the sanctioned
-      fallback, D-076 §3); validate fail-closed before anything is published —
-      parse, required fields per CISA's published JSON schema,
-      `count == len(vulnerabilities)`, well-formed `cveID`s, and a
-      roll-backwards guard refusing a `catalogVersion` older than the one
-      already published (the M5 review's lesson applied in advance); publish
-      the verbatim bytes by atomic rename, keep-last-good on *any* failure. A
-      `status` subcommand reports the published version and last successful
-      fetch, beside `ingest.py status`. Validation refusals and the guard get
-      pipeline tests.
-- [ ] **The client fetch and the local `kev` table.** Fetched same-origin with
+- [ ] **The nginx location** (owner-applied, **outstanding**). The block is
+      written and in [architecture.md](architecture.md): `location =
+      /data/kev.json` at `no-cache` — an exact match, so it outranks
+      `^~ /data/`; the security headers repeated (`add_header` does not merge,
+      D-053); and no `always` on the Cache-Control line, so error responses
+      stay uncached at the edge (the M5 404-poisoning fix applies to this block
+      from birth). `no-cache` rather than a small `max-age`, which is the other
+      reading of "short": the client fetches `no-store` anyway (RE-023), so
+      only the edge is affected, and this is the policy the manifest has
+      already proved behaves correctly through the proxy.
+
+      `scripts/serve.mjs` matches it locally — and matches it on the *resolved
+      file path*, because nginx decodes and merges slashes before selecting a
+      location, so comparing raw pathnames would serve `/data/%6Bev.json`
+      `immutable` and be looser than production (RE-012's rule, in the
+      direction that rule forbids). `tests/e2e/headers.spec.ts` asserts the
+      policy and that a 404 is not cacheable for a year; **the 404 half only
+      means anything against the real origin** — the local server has no
+      `always` flag to model — so it is confirmed with
+      `BASE_URL=https://cve.meenan.dev pnpm e2e headers`.
+
+      **Nothing may publish a catalog until this is applied and verified**: the
+      first fetch through Cloudflare pins whatever policy is in place, and
+      correcting it afterwards needs a purge. architecture.md's contract table
+      keeps an "owner-applied, unverified" caveat until then.
+- [x] **The pipeline half.** `pipeline/kev.py` on its own cron (`41 */6 * * *`),
+      its own failure domain: its own lock file and its own state directory, so
+      the two jobs share a `flock` helper and nothing else. Fetch from cisa.gov
+      with the `cisagov/kev-data` mirror as the fallback (D-076 §3) — both
+      exercised, and both served **byte-identical** content on 2026-08-08
+      (1,662 entries, 1,577,762 bytes, sha256 `2a6c54ce…`). Validation is
+      fail-closed and everything published is checked; the bytes are published
+      verbatim by atomic rename, and a refusal leaves the previous catalog
+      serving. `status` reports what is served beside when the job last ran and
+      last succeeded. **52 pipeline tests, and every guard was checked by
+      removing it and watching a test fail.**
+
+      **The two reviews found more than the tasking anticipated, and the
+      findings compounded into one story**: a hostile or merely broken upstream
+      could freeze the catalog *permanently* while `kev.py status`, the exit
+      code and the cron log all reported success. Four things had to change.
+      Only `Refuse` recorded an outcome, so a run that died any other way — a
+      full disk, a `ValueError` from `int()` on an unbounded `catalogVersion` —
+      left the state reading healthy. The socket timeout bounded each read
+      rather than the transfer, and the job holds its lock across the fetch, so
+      a peer dribbling one byte per timeout was a permanent freeze (reproduced:
+      a 2 s timeout held a connection for 12 s and scaled linearly). The
+      roll-backwards guard *defends whatever it is holding*, so one catalog
+      claiming `99999999.1.1` was published once and then protected against
+      every real one, rendering as fresh because the same party chose
+      `dateReleased` (D-077 §3). And `Infinity`/`NaN` — which Python parses and
+      `JSON.parse` refuses — would have shipped verbatim and taken the overlay
+      down for every user while the cron reported success.
+
+      Smaller, same class: `http.client.HTTPException` is not an `OSError`, so
+      a truncated response never reached the mirror the fallback exists for;
+      lone surrogates (RE-015, for the second untrusted source) reached SQLite;
+      dates were shape-checked but not calendar-checked; a failed publish left a
+      `.tmp` file in the **web-served** directory for `^~ /data/` to serve
+      `immutable`; and `state.lock`'s new `name` argument was **dead code**, so
+      every job took `pipeline.lock` and the failure-domain claim rested on the
+      directories differing rather than on the mechanism the docs described.
+      Two of the four `FailureDomain` tests passed with the mechanism removed;
+      they now observe the lock file on disk and hold the *corpus* lock while a
+      KEV run completes.
+- [x] **The client fetch and the local `kev` table.** Fetched same-origin with
       `no-store` (RE-023 — the freshness signal is a network request or
-      nothing), validated as stranger input with size and structure bounds
-      before a row is written. Applied in one transaction — rows plus the meta
-      that describes them (`catalogVersion`, `dateReleased`, fetched-at) — so
-      a failure leaves the previous catalog intact and answering. `cveID`
-      resolves to `cve.id` at load; an entry the corpus lacks is kept by
-      string and counted in diagnostics, not dropped. Runs as a writer under
-      the Web Lock, announced like promotions so other tabs' KEV freshness
-      agrees; a download ends by fetching KEV (after catch-up, D-063), a sync
-      refreshes it when `catalogVersion` moved, and a replacement rebuilds it
-      by refetch. The failure path is honest and non-fatal: the corpus
-      operation still succeeds, the old catalog stays, and its age is
-      reported — covered by a `page.route` test like M2's.
-- [ ] **The query surface.** KEV membership and ransomware use as filter axes
-      with grouped counts, and as rows/series dimensions in the report
-      builder — categorical slots per D-073, the complement labeled per the
-      framing note above. `dateAdded` and `dueDate` join the date-range axes.
-      Counts stay DISTINCT-safe (the join is 1:1 by record, but the test
-      asserts it rather than assumes it). D-022's default is untouched: a KEV
-      entry whose CVE is REJECTED surfaces the same way any REJECTED record
-      does. Record exports grow the KEV columns — an export is a copy (D-071),
-      and CC0 adds nothing to carry. The SQL console reaches the table
-      through the same read-only authorizer with no new work.
-- [ ] **The detail view, freshness, and diagnostics.** The per-CVE detail
-      gains a KEV block: `dateAdded`, `dueDate`, `requiredAction`, ransomware
-      use, and the `notes` URLs — attacker-adjacent text like everything else
-      (rule 4), so the same scheme allowlist, visible host,
-      `noreferrer`/`no-referrer`, and never auto-fetched treatment the
-      reference list already has, with sanitization asserted over a hostile
-      KEV fixture. Freshness is its own line, beside but distinct from the
-      corpus's: `catalogVersion`, `dateReleased` age, and when this browser
-      fetched it — honest offline (stored values with age) and agreeing
-      across tabs. The diagnostics panel adds the KEV rows: version, entry
-      count, unmatched count, fetched-at.
+      nothing), streamed and bounded like every other body, and validated again
+      in the browser rather than trusted: a client that took the server's word
+      would be trusting a check it cannot see, through a mutable URL with a
+      cache in front of it. Applied in one transaction — the table, the rows,
+      and the `meta` keys that describe them — so a failure leaves the previous
+      catalog intact and answering. `cveID` resolves to `cve.id` at load; an
+      entry the corpus lacks keeps its row and is counted rather than dropped.
+      Runs as a writer under the Web Lock and is announced, so other tabs'
+      freshness lines agree. A download ends by fetching KEV **after** the
+      catch-up (D-063's ordering), a sync refreshes it, and `Refresh KEV` is
+      its own action so a failure is retryable without re-running either.
+
+      **It also aged an M2 assumption out from under three staged-replacement
+      tests.** `imported` is no longer the end of a download — it continues into
+      a catch-up and now a KEV refresh, both writing to the *live* database — so
+      `tests/e2e/staged.spec.ts`'s exact OPFS entry-set assertions were listing
+      the origin mid-transaction and finding a rollback journal beside the live
+      file, and navigating away at that moment left one behind for real. Not a
+      leaked generation, but enough to fail the assertion, and it failed on
+      Firefox where Chromium's timing had hidden it. Every such assertion now
+      waits for the app to report itself idle first, and the audit that found
+      the rest of them is written down beside the helper.
+
+      **And the e2e found a second one that no unit test could ever see**
+      (RE-028): the *bundler* dropped a literal segment out of a template
+      carrying `${…}` that was concatenated with `+` across two lines, so the
+      browser ran `k.ransomware = 1WHEN k.ransomware = 0` — SQL the source never
+      had — and SQLite refused it. `pnpm check` was green,
+      `tests/unit/filters.test.ts` executed the affected expression against real
+      SQLite and passed, and the failure surfaced as an export download event
+      that never fired, several steps from the cause. Unit tests import the
+      source; only the browser runs the bundle. Every interpolated SQL fragment
+      is now one literal, and `scripts/check-bundle.mjs` runs on every build and
+      refuses a bundle with a SQL keyword glued to a digit — checked by
+      re-splitting the literal and watching it fail.
+
+      **Writing the e2e found the defect the unit tests could not see.** A KEV
+      refresh reported its own start and then never reported an ending, and the
+      page derives *busy* from the Worker's progress phase — so after a download
+      every button in the app was disabled, permanently, with the catalog
+      correctly loaded and the freshness line correctly rendered above them.
+      Every unit test passed, `pnpm check` was green, and the app was unusable.
+      It presented as this spec waiting ten minutes for a Run button that was
+      never going to enable; the fix is a terminal `report('ready', …)` on
+      **both** paths — a failed refresh must also return to `ready`, because the
+      corpus operation succeeded and the copy is queryable — plus an assertion
+      right after the download so the next occurrence is thirty seconds and a
+      sentence rather than a test timeout with no obvious cause.
+
+      **The client-half reviews found that the client had validated the wrong
+      half.** It re-implements the pipeline's *shape* checks — deliberately,
+      because a client that trusted the server would be trusting a check it
+      cannot see — and had none of the *ordering* ones, which are the half that
+      defends against the thing that makes the re-validation necessary: a
+      mutable URL with a cache in front of it. One poisoned response could
+      therefore replace a current catalog with a 2019 one, and because "Not in
+      KEV" is a real value here rather than an absence, the app would then
+      positively assert *not known-exploited, per CISA* for everything listed
+      since — persisted in OPFS, honest-looking offline, agreeing across tabs,
+      and rendering as maximally fresh, because `describeFreshness` clamps a
+      future stamp to zero and the same party chose `dateReleased`. The client
+      now carries its own roll-backwards guard and its own future ceiling
+      (D-077 §3); the ceiling is what makes the guard safe to have, since
+      nothing can install a floor real catalogs cannot clear.
+
+      Beside it: `catalogVersion` and `dateReleased` were the only catalog
+      strings reaching the DOM on *every* session and the only two nothing
+      bounded, so a hostile catalog could wedge a multi-megabyte string onto the
+      front page permanently; a refusal echoed up to 20,000 characters of
+      attacker-authored prose back in the app's own voice; `splitNotes` was
+      quadratic on a long part with no match (~0.3 s of main thread *per
+      render*); and the notes' label was validated, tested, and then dropped by
+      the component that was supposed to render it — with the e2e's own
+      assertion iterating **zero** links and reporting the hardening verified,
+      which is the RE-024 shape exactly.
+
+      **And three places where the prose was wrong rather than the code.** The
+      `k.cve` vs `k.cve_id` distinction the comment called "the one place the
+      difference matters" does not exist given that ON clause — a row with a
+      null `cve_id` never reaches the join at all — so the unmatched entries are
+      preserved by the nullable column and the unmatched count, not by the
+      grouping expression. The `kevRansomware` NULL band was called an absence
+      in prose and given a categorical slot in code; the code is right (there is
+      no scale for an absence to be misplaced on) and the prose now says so.
+      And that band had **three different names** across four surfaces —
+      "(not stated by CISA)" on the chart and in the detail view, "(not
+      assessed)" on its own filter checkbox and chip — which is how a reader
+      concludes they are three bands. One `absenceLabel(axis)` now serves all
+      four. KEV also stopped borrowing the corpus's two-day staleness
+      threshold, whose justification is "the pipeline publishes daily": CISA is
+      *business*-daily, so a Friday catalog was painted stale every weekend with
+      nothing wrong and nothing to fetch.
+
+      One thing is deliberately **not** built: the overlay gets no storage
+      preflight of its own, unlike a download (M5). The bounds are what stand in
+      for it — 32 MB of body, 100,000 entries, every string capped — and the
+      apply is one transaction, so a quota failure rolls back and leaves the
+      previous catalog answering. Budgeting a megabyte-scale write against a
+      441 MB corpus would be ceremony.
+
+      **Two shape calls came out of building it** (D-077). The refresh is
+      applied unconditionally rather than only when `catalogVersion` moved —
+      1,662 rows is milliseconds, and the version is not the only thing that
+      goes stale: `cve_id` is resolved at load, so a sync that brought in the
+      records CISA listed last week turns unmatched entries into matched ones.
+      And **the table is created by the apply that fills it**, never empty on
+      open: its absence is the signal that no catalog is loaded, so a KEV
+      question against a copy that has none is refused by name instead of
+      answering that nothing is known to be exploited.
+- [x] **The query surface.** KEV membership and ransomware use are filter axes
+      with grouped counts and rows/series dimensions, `dateAdded` and `dueDate`
+      are date ranges, and every one of them rides the existing machinery —
+      `CODE_AXES` gives them checkboxes, chips and a permalink round trip
+      without a branch. Filters compile to `EXISTS`/`NOT EXISTS` rather than to
+      the dimensions' join, so a filter can never change how many times a
+      record appears even though this particular join is 1:1; the test asserts
+      the 1:1 against the record that affects two products rather than assuming
+      it. The complement is a categorical slot carrying its provenance, and the
+      *listed* band sorts first — D-073's argument for CRITICAL at the
+      baseline, applied to the band that is 0.4% of the corpus. Record exports
+      grow six KEV columns led by a computed `kev_listed`, with the catalog
+      version and date in the preamble; the SQL console reaches the table
+      through the existing authorizer with no new work.
+
+      **Two things are absent on purpose.** The KEV columns are absent from an
+      export made without a catalog rather than present and empty — a blank
+      `kev_date_added` cannot be told from a column nobody filled in, and which
+      of those it is *is* the claim (D-077 §1). And `k.cve` is what the
+      dimensions group on, never `k.cve_id`: `cve_id` is NULL for a record CISA
+      *has* listed that this copy does not hold, so grouping on it would file
+      those entries under "not in KEV" — the one place the two nulls mean
+      opposite things.
+- [x] **The detail view, freshness, and diagnostics.** The per-CVE detail gains
+      a KEV block above the references, because it is the strongest single
+      statement anything on that surface makes about a record: `dateAdded`,
+      `dueDate`, `requiredAction`, ransomware use in **three** states — Known,
+      Unknown *per CISA*, and "(not stated)" for a listed record whose value
+      this build cannot read — and the `notes` URLs. CISA writes `notes` as a
+      `;`-separated run of labelled URLs, so it is split and each part goes
+      through the reference list's own treatment: scheme allowlist, visible
+      host, `noreferrer`/`no-referrer`, never auto-fetched, and a refused one
+      rendered as text with the reason rather than disappearing. The
+      development catalog carries a `javascript:` token so that is asserted
+      rather than assumed.
+
+      Freshness is its own line, because the two datasets are on two cadences
+      and one number would be wrong about whichever moved last: `catalogVersion`,
+      the *release* age (not the fetch's — a browser that re-fetched an
+      unchanged catalog has not made it newer), the unmatched count, and when
+      this browser fetched it. Read out of the copy like the corpus's, so it is
+      honest offline and agrees across tabs. Diagnostics carries the same facts
+      in one line to paste into a bug report, plus the last refresh error.
 
 **Exit criteria:** KEV's terms are recorded (D-076) and provenance — source,
 `catalogVersion`, `dateReleased` — is visible wherever KEV is asserted, with
@@ -1145,6 +1307,27 @@ a KEV fetch failure or a malformed/hostile catalog leaves the corpus
 operation unaffected and the previous catalog answering with its age
 reported, verified by tests in both engines; and the detail view's KEV block
 renders a hostile fixture under the existing reference hardening.
+
+**Exit criteria — the client half is met, the origin half is not, and the
+milestone stays open on the second.** `tests/e2e/kev.spec.ts` passes on **both
+engines** — Chromium and Firefox, three tests each — against a data plane
+carrying a catalog: a download
+ends with one, membership filters and its grouped count agree, a KEV × severity
+report renders with **both** bands and reconciles with its table, the detail
+block's note links are all `http(s)` with `noreferrer`, a second tab reports the
+same catalog, and a cold reopen with the network killed still shows it. Both
+failure shapes hold: a 503 and a malformed-but-parseable catalog each leave the
+previous one serving with the failure reported beside it, and a sync still
+succeeds afterwards; a copy with no catalog refuses a KEV question by name while
+every other query still works.
+
+**What is not met is the origin half**, and it is the item the whole milestone
+was ordered around: `location = /data/kev.json` is owner-applied and has not
+been applied, so nothing has published a catalog and no response header has been
+verified through Cloudflare. Until then the exit criterion's first clause — the
+live origin serving `kev.json` under its own location — is unmet by
+construction, and publishing before it would be the failure the ordering
+exists to prevent.
 
 ## M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `pending`
 

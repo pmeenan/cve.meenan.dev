@@ -22,6 +22,111 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-028: The bundler drops a literal segment when a template carrying `${…}` is concatenated with `+`, so the browser runs SQL the source never had  (2026-08-08, status: worked-around)
+
+**Environment.** Next.js 16.2.12 / Turbopack production build (`next build`,
+`output: 'export'`), TypeScript 6.0.3, Node 24.16. Found in M6.
+
+**Repro / measurement.** In `lib/filters.ts`:
+
+```ts
+const KEV_RANSOMWARE_ORDER =
+  `CASE WHEN k.cve IS NULL THEN 2 WHEN k.ransomware = ${RANSOMWARE_KNOWN} THEN 0 ` +
+  `WHEN k.ransomware = ${RANSOMWARE_UNKNOWN} THEN 1 ELSE 99 END`
+```
+
+Built, and read out of `dist/_next/static/chunks/*.js`:
+
+```
+CASE WHEN k.cve IS NULL THEN 2 WHEN k.ransomware = 1WHEN k.ransomware = 0 THEN 1 ELSE 99 END
+```
+
+` THEN 0 ` is **gone** — not the space alone, the whole segment between the
+interpolation and the next literal. Reproduced twice on clean rebuilds, in two
+separate constants, and confirmed fixed by rewriting each as a single template
+literal. Removing the `+` and re-splitting it reproduces it on demand, which is
+what `scripts/check-bundle.mjs` is checked against.
+
+**Observed.** SQLite refused the statement: `SQLITE_ERROR: sqlite3 result code
+1: unrecognized token: "1WHEN"`.
+
+**Expected.** `'a ' + 'b'` folds to `'a b'`. It does — the defect needs the
+`${…}`; plain string concatenation across lines (`CVSS_VERSION_ORDER`, which has
+shipped since M4) is unaffected.
+
+**Impact.** This is the shape of defect the project's whole test strategy is
+blind to: **unit tests import the source, and only the browser runs the
+bundle.** `pnpm check` was green, `tests/unit/filters.test.ts` executed the
+affected SQL against real SQLite and passed, and the failure surfaced only in a
+full Playwright run — several steps away from the cause, as a download event
+that never fired. So: every interpolated SQL fragment in `lib/` is **one
+template literal**, and `scripts/check-bundle.mjs` runs on every build and
+refuses a bundle containing a SQL keyword glued to a digit. The check is
+deliberately narrow — a digit is the one neighbour that cannot be innocent; an
+earlier version also matched a quote and produced 53 lines of noise, since
+`"SELECT …` is just a string literal beginning.
+
+## RE-027: Playwright reuses a still-running local server by default, so `dist/` is not rebuilt and a fix appears not to work  (2026-08-08, status: worked-around)
+
+**Environment.** `@playwright/test` 1.62.1, `playwright.config.ts`'s
+`webServer: { command: 'pnpm build && node scripts/serve.mjs' }`. Found while
+iterating on the M6 KEV spec.
+
+**Repro / measurement.** Interrupt a run (`Ctrl-C`, or `pkill -f "playwright
+test"`). The `webServer` child — `sh -c pnpm build && node scripts/serve.mjs`
+and its `node` — is **not** killed with it and keeps listening on 4747. The next
+run sees the port answering and, because `reuseExistingServer` defaults to
+`!process.env.CI`, attaches to it and **skips the build**. Observed: a fix made
+at 14:05 tested against a `dist/` stamped 13:37, failing exactly as it had
+before the fix — twice, convincingly.
+
+**Observed.** The suite tests a build output, so "the code is fixed" and "the
+app under test is fixed" are different statements, and nothing in the run's
+output distinguishes them: there is no "reusing existing server" line at the
+default log level.
+
+**Expected.** That interrupting a run leaves nothing behind, or that reuse is
+announced.
+
+**Impact.** It is a trap specifically for the debugging loop, which is when it
+does the most damage: it makes a correct fix look wrong and invites a second,
+wrong fix on top of it. `pkill -f "playwright test"` alone is not enough —
+`pkill -f "scripts/serve.mjs"` (and the `sh -c` wrapper) has to follow, or the
+port has to be confirmed free before re-running. `ls -la dist/_next/static/chunks
+| head` against the clock is the cheap check when a result looks impossible.
+
+## RE-026: `urllib.request.urlopen(timeout=)` bounds each socket operation, not the transfer, so a dribbling peer holds the connection indefinitely  (2026-08-08, status: worked-around)
+
+**Environment.** Python 3.12.3 on Linux, `urllib.request`. Found while
+adversarially reviewing `pipeline/kev.py` (M6).
+
+**Repro / measurement.** A local HTTP server that declares a large
+`Content-Length` and then writes a few bytes at a time, just inside the
+timeout. With `urlopen(request, timeout=2.0)` and a plain `response.read(n)`,
+the connection was held **12.0 s on 12 bytes of traffic** — six times the
+timeout — and the duration scales linearly with how long the peer keeps
+dribbling. Nothing raised.
+
+**Observed.** `timeout` is passed to the socket, where it is a per-operation
+idle timeout: every read that returns *any* byte resets it. A peer that sends
+one byte per `timeout - ε` never trips it, and `read()` blocks until the
+declared length arrives.
+
+**Expected.** Reading the docs as "the request may not take longer than
+`timeout`" is the natural reading and is wrong. There is no total-deadline
+parameter.
+
+**Impact.** For this pipeline it was a permanent freeze rather than a slow run:
+`kev.py` holds its lock across the fetch, so a hung read means every later cron
+firing raises `Busy`, prints "skipped" and exits **0**. Combined with the fact
+that only `Refuse` was recorded as an outcome at the time, `kev.py status` would
+have gone on reporting a healthy job while the published catalog froze. The fix
+is to read in chunks against a `time.monotonic()` deadline
+(`MAX_FETCH_SECONDS`), keeping the socket timeout as the per-read bound. Any
+future server-side fetcher wants the same shape — the browser side already had
+it, because D-064's stall watch is written against bytes received rather than
+elapsed time.
+
 ## RE-025: `sites-enabled/meenan.dev` had been replaced by a regular file, so nginx edits landed in a file nobody was reading  (2026-08-08, status: fixed)
 
 **Environment.** nginx on `plex`, Ubuntu, 2026-08-08, during the M5 launch.

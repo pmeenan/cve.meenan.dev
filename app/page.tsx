@@ -6,8 +6,9 @@ import { gateMessage, SUPPORT_FLOOR, type CapabilityReport } from '@/lib/capabil
 import { newCancelFlag, requestCancel } from '@/lib/cancel'
 import { NO_SHELL, registerShell, shellVersion, type ShellState } from '@/lib/shell'
 import { draftToFilters, filtersToDraft } from '@/lib/draft'
-import { describeFreshness } from '@/lib/freshness'
+import { describeFreshness, KEV_STALE_AFTER_MS } from '@/lib/freshness'
 import type { ExportFormat } from '@/lib/export'
+import type { KevStatus } from '@/lib/kev'
 import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS, SCHEMA_VERSION } from '@/lib/protocol'
 import type {
   BenchResult,
@@ -178,6 +179,16 @@ export default function Home() {
    */
   const [now, setNow] = useState<number | null>(null)
   const [notice, setNotice] = useState('')
+  /**
+   * The CISA KEV catalog this copy holds (M6, D-076).
+   *
+   * From `status`, so it survives a reload and is available offline — the
+   * catalog's freshness is a property of the copy, not of this page's session.
+   * `kevError` is separate and *not* in `error`, because a KEV failure is not a
+   * failure of the corpus operation that triggered it.
+   */
+  const [kev, setKev] = useState<KevStatus | null>(null)
+  const [kevError, setKevError] = useState('')
   const [error, setError] = useState('')
   /**
    * Whether the run that is on screen imported successfully.
@@ -349,6 +360,20 @@ export default function Home() {
           setNotice(message.notice ?? '')
           setRevision(message.rev)
           setGenerated(message.generated)
+          // The KEV overlay's own freshness, read back out of the copy — which
+          // is what makes it honest offline and what makes two tabs agree
+          // (M6). Cleared with everything else when the copy is gone.
+          //
+          // A *newer* catalog clears this tab's stale failure notice too:
+          // another tab may have refreshed successfully since this one failed,
+          // and "here is catalog 2026.08.09" followed by "last refresh failed"
+          // describes the app rather than the data, which is exactly the
+          // disagreement multi-tab support exists to remove.
+          setKev((current) => {
+            const next = message.kev
+            if (next && (!current || next.fetched > current.fetched)) setKevError('')
+            return next
+          })
           if (!message.ready) {
             setTimings(null)
             setResult(null)
@@ -371,6 +396,13 @@ export default function Home() {
           importedThisRun.current = true
           setTimings(message.timings)
           setNotice(message.notice)
+          break
+        case 'kev':
+          // Not an error, even when it failed: the corpus operation that
+          // triggered this succeeded, and the previous catalog is still
+          // answering. So it is its own note beside a copy that works (M6).
+          setKev(message.kev)
+          setKevError(message.error ?? '')
           break
         case 'synced':
           setSync(message.outcome)
@@ -661,6 +693,15 @@ export default function Home() {
 
   const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
   const freshness = ready && now !== null ? describeFreshness(generated, now) : null
+  // The catalog's *release* age, not the fetch's: what matters is how old
+  // CISA's list is, and a browser that re-fetched an unchanged catalog this
+  // morning has not made it newer. Both numbers are on screen, so neither is
+  // standing in for the other (M6).
+  // …and against KEV's own threshold, not the corpus's: CISA is *business*-daily,
+  // so a Friday catalog would be flagged every weekend by a number justified by
+  // a pipeline that runs every day (M6).
+  const kevFreshness =
+    kev && now !== null ? describeFreshness(kev.releasedAt, now, KEV_STALE_AFTER_MS) : null
   // Read once on mount: the warning below has to be on screen *before* the
   // button is clicked, and D-061 accepts this path's destroy-then-download
   // behaviour only because it is diagnostic — an ordinary "Re-download data"
@@ -826,6 +867,40 @@ export default function Home() {
         </p>
       )}
 
+      {/* KEV's freshness is its own line, because it is a different dataset on
+          a different cadence: CISA publishes about business-daily and the
+          corpus daily, so one number for both would be wrong about whichever
+          moved last. Read from the local copy like the line above, so it is
+          honest offline and agrees across tabs (M6, D-076). The provenance is
+          in the sentence rather than in a footnote: "per CISA, as of …" is what
+          keeps this a statement about CISA's catalog rather than an endorsement
+          by it. */}
+      {ready && (kev !== null || kevError !== '') && (
+        <p
+          className={kevFreshness?.stale ? 'stale' : 'muted'}
+          data-kev={kev ? kev.version : 'none'}
+          data-kev-age-ms={kevFreshness ? Math.round(kevFreshness.ageMs) : undefined}
+        >
+          {kev ? (
+            <>
+              CISA KEV catalog {kev.version}, released{' '}
+              <time dateTime={kev.released}>{localTime(kev.released)}</time>
+              {kevFreshness && ` — ${kevFreshness.age}`}. {kev.entries.toLocaleString()} entries
+              {kev.unmatched > 0 &&
+                `, ${kev.unmatched.toLocaleString()} for CVEs this copy does not hold`}
+              . Fetched by this browser{' '}
+              <time dateTime={new Date(kev.fetched * 1000).toISOString()}>
+                {localTime(new Date(kev.fetched * 1000).toISOString())}
+              </time>
+              .
+            </>
+          ) : (
+            'No CISA KEV catalog in this copy yet.'
+          )}
+          {kevError !== '' && ` Last refresh failed: ${kevError}`}
+        </p>
+      )}
+
       <Tabs tabs={tabs} active={active} onSelect={(id) => setTab(id as TabId)} />
 
       <TabPanel id="data" active={active === 'data'}>
@@ -848,6 +923,15 @@ export default function Home() {
             disabled={!ready || busy || blocked}
           >
             Sync
+          </button>
+          <button
+            onClick={() => {
+              setKevError('')
+              send({ type: 'kev', options: importOptions(location.search) })
+            }}
+            disabled={!ready || busy || blocked}
+          >
+            Refresh KEV
           </button>
           <button
             onClick={() => send({ type: 'query', sql: DEMO_QUERY })}
@@ -916,6 +1000,15 @@ export default function Home() {
                 : ready
                   ? 'not counted this session'
                   : '—'}
+            </dd>
+            <dt>CISA KEV</dt>
+            <dd data-diag="kev">
+              {kev
+                ? `${kev.version}, released ${kev.released}, ${kev.entries.toLocaleString()} ` +
+                  `entries (${kev.unmatched.toLocaleString()} unmatched), fetched ` +
+                  new Date(kev.fetched * 1000).toISOString()
+                : 'no catalog'}
+              {kevError !== '' && ` — last refresh failed: ${kevError}`}
             </dd>
             <dt>Data built</dt>
             <dd data-diag="generated">

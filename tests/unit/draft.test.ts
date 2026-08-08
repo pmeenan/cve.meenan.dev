@@ -40,6 +40,11 @@ const FULL: Draft = {
   ssvcExpl: [2, NOT_ASSESSED],
   ssvcAuto: [1],
   ssvcImpact: [0, 1],
+  // KEV (M6). `kevRansomware` carries the sentinel for the same reason the SSVC
+  // axes do, plus its own "not listed" code — which is a *value*, not an
+  // absence, and would be the easiest of the three to quietly drop (D-076).
+  kev: [1],
+  kevRansomware: [1, 2, NOT_ASSESSED],
   scoreMin: '7',
   scoreMax: '10',
   publishedFrom: '2024-01-01',
@@ -48,6 +53,10 @@ const FULL: Draft = {
   updatedTo: '2025-06-30',
   yearFrom: '2020',
   yearTo: '2026',
+  kevAddedFrom: '2023-03-01',
+  kevAddedTo: '2026-08-01',
+  kevDueFrom: '2023-03-15',
+  kevDueTo: '2026-08-22',
   state: 'all',
 }
 

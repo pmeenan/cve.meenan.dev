@@ -689,6 +689,16 @@ button.link {
   font-size: 0.95rem;
 }
 
+/* The KEV block's two sub-headings (M6). A real heading level rather than a
+   styled paragraph, because "Required action" and "Notes" are sections of the
+   KEV entry and a screen reader's heading list is how someone finds them —
+   sized down from h4 so the nesting reads visually as well. */
+.detail h5 {
+  margin: 0.9rem 0 0.2rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
 .detail p.descr {
   white-space: pre-wrap;
   max-width: 46rem;

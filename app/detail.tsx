@@ -22,11 +22,14 @@
  * nothing downstream un-escapes it (rule 4).
  */
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 
 import { VERSION_STATUS } from '@/lib/detail'
+import { RANSOMWARE_KNOWN, RANSOMWARE_UNKNOWN, splitNotes } from '@/lib/kev'
+
 import {
   CVSS_VERSION_LABELS,
+  KEV_ABSENCE_LABEL,
   NOT_ASSESSED_LABEL,
   SEVERITY_LABELS,
   SSVC_AUTO_LABELS,
@@ -36,7 +39,7 @@ import {
   STATE_REJECTED,
 } from '@/lib/filters'
 import type { CveDetail, DetailVersion } from '@/lib/protocol'
-import { safeUrl } from '@/lib/sanitize'
+import { safeUrl, stripControls } from '@/lib/sanitize'
 
 export function Detail({
   cveId,
@@ -49,6 +52,15 @@ export function Detail({
   onClose: () => void
 }) {
   const headingRef = useRef<HTMLHeadingElement | null>(null)
+  // CISA writes `notes` as a `;`-separated run of labelled URLs, up to 724
+  // characters. Split so each link is its own item under the reference
+  // hardening; nothing here decides a URL is safe (M6).
+  // Memoized: `splitNotes` is a regex scan over a field bounded at 20,000
+  // characters, and the component re-renders on every progress tick and every
+  // keystroke elsewhere on the page. Unmemoized, one hostile entry made its
+  // detail view cost ~0.3 s of main thread per render.
+  const kevEntry = detail?.kev ?? null
+  const kevNotes = useMemo(() => (kevEntry ? splitNotes(kevEntry.notes) : []), [kevEntry])
   useEffect(() => {
     // Opening a detail view moves the reader somewhere new, and a keyboard or
     // screen-reader user has no way to know that unless focus goes there.
@@ -250,6 +262,83 @@ export function Detail({
             </>
           )}
 
+          {/* CISA KEV (M6, D-076). Rendered *above* the references because it
+              is the strongest single statement anything here makes about a
+              record: not "someone scored this highly" but "this is known to be
+              exploited". The provenance is in the prose rather than a footnote,
+              because CC0 waives every notice and the one rider it does not
+              waive is the endorsement one — naming the source and the date is
+              how "per CISA, as of …" stays a description of a relationship
+              rather than a claim of one. */}
+          {detail.kev !== null && (
+            <>
+              <h4>Known exploited (CISA KEV)</h4>
+              <dl className="facts" data-kev-entry="1">
+                <dt>Added to the catalog</dt>
+                <dd data-kev-added={detail.kev.added}>{detail.kev.added}</dd>
+                <dt>Remediation due</dt>
+                <dd data-kev-due={detail.kev.due}>{detail.kev.due}</dd>
+                <dt>Ransomware campaign use</dt>
+                {/* Three states, not two. Null is CISA having stated something
+                    this build does not read — which is not "Unknown", because
+                    "Unknown" is CISA having looked. */}
+                <dd data-kev-ransomware={String(detail.kev.ransomware)}>
+                  {detail.kev.ransomware === RANSOMWARE_KNOWN
+                    ? 'Known'
+                    : detail.kev.ransomware === RANSOMWARE_UNKNOWN
+                      ? 'Unknown, per CISA'
+                      : KEV_ABSENCE_LABEL}
+                </dd>
+                <dt>Listed as</dt>
+                <dd>
+                  {stripControls(detail.kev.vendor)} / {stripControls(detail.kev.product)}
+                </dd>
+              </dl>
+              {/* `stripControls` on the way to the DOM, which the CVE
+                  description deliberately does not get. The difference is what
+                  the text is *for*: a bidi override in a description makes a
+                  sentence read oddly, and one in `requiredAction` makes
+                  remediation instructions read backwards. This is the newer
+                  surface and the cost is nil, so it takes the stronger
+                  treatment; the asymmetry with the description above is
+                  deliberate rather than an oversight. */}
+              {detail.kev.name !== '' && <p className="descr">{stripControls(detail.kev.name)}</p>}
+              {detail.kev.description !== '' && (
+                <p className="descr" data-kev-description="1">
+                  {stripControls(detail.kev.description)}
+                </p>
+              )}
+              {detail.kev.action !== '' && (
+                <>
+                  <h5>Required action</h5>
+                  <p className="descr" data-kev-action="1">
+                    {stripControls(detail.kev.action)}
+                  </p>
+                </>
+              )}
+              {kevNotes.length > 0 && (
+                <>
+                  <h5>Notes</h5>
+                  {/* The same treatment the reference list gets, and for the
+                      same reason: these are URLs in a feed we did not write, so
+                      they go through the scheme allowlist, show their host,
+                      carry `noreferrer`/`no-referrer`, and are never fetched.
+                      A refused one renders as text with the reason rather than
+                      disappearing (rule 4). */}
+                  <ul className="plain refs" data-kev-notes="1">
+                    {kevNotes.map((note, at) =>
+                      note.url === null ? (
+                        <li key={at}>{note.text}</li>
+                      ) : (
+                        <Reference key={at} url={note.url} host="" label={note.text} />
+                      )
+                    )}
+                  </ul>
+                </>
+              )}
+            </>
+          )}
+
           {detail.references.length > 0 && (
             <>
               <h4>References</h4>
@@ -277,19 +366,34 @@ export function Detail({
   )
 }
 
-/** One reference, linked only if its scheme is allowed (`lib/sanitize.ts`). */
-function Reference({ url, host }: { url: string; host: string }) {
+/**
+ * One reference, linked only if its scheme is allowed (`lib/sanitize.ts`).
+ *
+ * `label` is for the KEV notes, whose parts carry a human prefix
+ * (`BOD 26-04: https://…`). It is rendered as the surrounding text, never as
+ * the anchor's own content — the anchor still shows the URL, so a label that
+ * says one thing while the link goes somewhere else cannot mislead.
+ */
+function Reference({ url, host, label }: { url: string; host: string; label?: string }) {
   const safe = safeUrl(url)
   if (safe.href === null) {
     return (
       <li data-ref-refused="1">
-        <span className="mono">{url}</span>{' '}
+        <span className="mono">{stripControls(label ?? url)}</span>{' '}
         <span className="muted">— not linked: {safe.refused}</span>
       </li>
     )
   }
   return (
     <li>
+      {/* The label goes *beside* the link, never inside it: the anchor still
+          shows the URL, so a note whose prose says one thing while the link
+          goes elsewhere cannot mislead. Dropping it silently — which an earlier
+          version did — loses CISA's own qualifying text on a remediation
+          pointer. */}
+      {label !== undefined && label !== url && (
+        <span className="muted">{stripControls(label)} </span>
+      )}
       <a
         href={safe.href}
         // Every one of these is load-bearing. `noreferrer` keeps the record the

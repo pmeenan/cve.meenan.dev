@@ -38,6 +38,9 @@ commit — it leaves the checkout dirty on purpose, and
     # last built (D-060) — no rebuild, no fetch, no new revision
     python3 pipeline/snapshot.py <pub-dir> --state <state-dir>
 
+    # the KEV catalog, on its own cron and its own failure domain (D-076)
+    python3 pipeline/kev.py run <pub-dir> --cache <cache-dir>
+
 | File | Role |
 | --- | --- |
 | `schema.sql` | The published schema. Single source of truth for both sides. |
@@ -49,8 +52,9 @@ commit — it leaves the checkout dirty on purpose, and
 | `ledger.py` | Append-only record of everything ever published, with the SHA-256 served at each URL, the ID space it belongs to, and the digest of the artifact each revision's content came from (D-060). Kept *outside* the published directory (`cve.pub/published.json`); it is pipeline state, not part of the contract. |
 | `ingest.py` | The daily cycle (D-042, D-058): fetch, hash, diff, tombstone guard, rebuild, one delta. The guard runs before the *build*, because seeding retires permanently. Subcommands `run`, `init`, `status`. |
 | `snapshot.py` | The monthly rotation (D-042, D-060): publish the artifact the ingest state points at, at the published head, then retain and retire. It does not rebuild — the daily already did. |
-| `state.py` | What the corpus looked like at the published head — a content hash per record, the revision each last changed at, the tombstone log, the seed pointer and the pending run. Plus the `flock` both crons take and one outcome record per cron. Lives in `cve.data/`, never served. |
-| `tests/` | unittest suite (CVSS priority, notice components, hostile shapes, the delta contract with a reference apply, the ID space's stability under rebuilds, and the ingest's guards and re-run semantics) — part of `pnpm check` via `pnpm test:pipeline`. |
+| `kev.py` | The CISA KEV catalog (D-010, D-076): fetch, validate fail-closed, publish the verbatim bytes to `kev.json`. Its own cron and its own failure domain — no pipeline lock, no ingest state, nothing the ingest writes. Subcommands `run`, `status`, `sample`. |
+| `state.py` | What the corpus looked like at the published head — a content hash per record, the revision each last changed at, the tombstone log, the seed pointer and the pending run. Plus the `flock` both corpus crons take and one outcome record per cron. Lives in `cve.data/`, never served. |
+| `tests/` | unittest suite (CVSS priority, notice components, hostile shapes, the delta contract with a reference apply, the ID space's stability under rebuilds, the ingest's guards and re-run semantics, and the KEV validator and its roll-backwards guard) — part of `pnpm check` via `pnpm test:pipeline`. |
 
 ## The daily ingest
 
@@ -343,3 +347,114 @@ revision is refused while it is there (`generations are immutable`) unless the
 bytes match. Finish the interrupted publish, or remove the directory once you
 have established nothing was served from it; it stops mattering as soon as head
 moves past that revision.
+
+## The KEV catalog
+
+`kev.py` is the third cron and the only one that is **not** part of the corpus
+pipeline. It fetches CISA's Known Exploited Vulnerabilities catalog, validates
+it fail-closed, and publishes the verbatim upstream bytes to
+`cve.pub/data/kev.json` (D-010, D-076).
+
+    mkdir -p /var/www/meenan.dev/cve.data/cache   # once: the redirect below cannot create it
+    41 */6 * * * cd /var/www/meenan.dev && python3 /home/pmeenan/src/meenan.dev/cve/pipeline/kev.py run cve.pub/data --cache cve.data/cache >> cve.data/cache/kev.log 2>&1
+
+One physical line, like the other two, for the same `crontab(5)` reason. Four
+times a day rather than hourly: CISA publishes about business-daily, an
+unchanged catalog costs 1.5 MB to confirm, and 00:41 / 06:41 / 12:41 / 18:41 is
+clear of both the daily's 4:17 and the monthly's 5:43 — which matters less here
+than it does between those two, because **this job shares nothing with them**.
+
+**Its own failure domain, deliberately.** It takes no pipeline lock, reads no
+ingest state, and writes no file the ingest writes; its own lock is
+`cve.data/cache/kev.lock` and its own state `cve.data/cache/kev-state.json`. A
+KEV fetch that fails leaves the corpus plane untouched and a corpus ingest that
+aborts leaves the catalog serving. The two jobs share a `flock` helper and
+nothing else — what makes two jobs mutually exclusive is naming the same file,
+and they deliberately do not.
+
+**Outside the manifest, and therefore needing its own nginx location** (D-076
+§2). `kev.json` is already self-describing (`catalogVersion`, `dateReleased`,
+`count`), its cadence is CISA's rather than the ingest's, and having two writers
+rewrite `manifest.json` is a race. It is the data plane's *second* mutable file,
+so it gets `location = /data/kev.json` at `no-cache` — the block is in
+[architecture.md](../docs/architecture.md), and it had to land **before** the
+first publish, because the first fetch through Cloudflare pins whatever policy
+is in place.
+
+**Every field this publishes is checked, and the bytes are published whole or
+not at all.** The catalog must parse as a UTF-8 JSON object; carry a bounded
+`title`, `catalogVersion` and `dateReleased`, the last of which must be a real
+timestamp because it is what the UI renders as provenance; agree with its own
+`count`; and hold at least one entry. Every entry must carry all eleven fields
+with the right types, a canonical `cveID` that appears exactly once, and dates
+that are real days rather than merely `YYYY-MM-DD`-shaped. Every string is
+bounded and must have a UTF-8 encoding, which is RE-015 applied to the second
+untrusted source — a lone surrogate is legal JSON and cannot be written to
+SQLite on either side. `Infinity` and `NaN` are refused because Python parses
+them and `JSON.parse` does not: these bytes ship verbatim, so one such value
+anywhere in the document — even in a key nothing here reads — would take the
+overlay down for every user while the cron reported success.
+
+What is deliberately **not** checked is anything beyond that: unknown keys ride
+along, because the bytes are CISA's. There is no partial publish either — half a
+known-exploited list read as a whole one is worse than yesterday's — so a
+refusal leaves the previous catalog serving unchanged. One entry per CVE is what
+makes the client's join 1:1 and every KEV count DISTINCT-safe, which is why a
+duplicate is a refusal rather than a dedup.
+
+**And a roll-backwards guard**, M5's data-plane review applied in advance: a
+catalog older than the published one is refused. Under a mutable URL that
+failure is silent — the file simply becomes an older list, with the freshness
+line still asserting whatever it says. Ordering comes from `catalogVersion` when
+it reads as a dated version (so `2026.08.07.1` sorts after `2026.08.07`) and
+from `dateReleased` otherwise.
+
+**The guard's own failure mode is the one worth understanding**, because it is
+sticky by construction: whatever is published defends itself against everything
+that follows. So a version is only an ordering basis when its leading component
+is a plausible year — `20260.08.09`, one fat-finger from real, would otherwise
+outrank every genuine catalog until the year 20260 — and a `dateReleased` more
+than two days ahead of the clock is refused outright, which is what stops a
+single hostile or hijacked response from freezing the catalog permanently while
+rendering as fresh. A version scheme this build does not read is *not* a
+refusal; it falls back to `dateReleased`, because wedging on a benign upstream
+change is the failure `knownRansomwareCampaignUse` is deliberately handled to
+avoid, and it applies here too. `--force` is for a rollback someone actually
+intends.
+
+**A failure of any kind is recorded**, not just a validation refusal: a run that
+died on a full disk or a permissions change is exactly the one where a `status`
+reading "healthy" would be worst, because the catalog freezes and every signal
+says it did not. The fetch is bounded in bytes *and* in wall-clock — a socket
+timeout bounds each read, not the transfer, and this job holds its lock across
+the fetch, so a peer dribbling one byte per timeout would be a permanent freeze
+that exits 0 four times a day.
+
+`knownRansomwareCampaignUse` is deliberately **not** held to an enum. A third
+value would wedge the cron on a benign upstream change, and folding one into
+`Unknown` would invent a finding — so the run reports the distribution
+(`"ransomware": {"Known": 338, "Unknown": 1324}`) and the client gives anything
+it does not recognise its own visible band.
+
+Exit codes: **0** published, unchanged, or the lock was held; **1** the run
+failed and nothing was published. `--dry-run` fetches, validates and guards
+without publishing or touching state. Like the other two jobs, a failure mails
+nobody — `kev.py status` is the alert, and reports what is being served
+(`catalogVersion`, `dateReleased`, entry count, bytes) beside when this job last
+ran and last succeeded.
+
+### The development catalog
+
+The real catalog is the wrong fixture for the development slice: the slice is
+2026 records and KEV is mostly older CVEs, so joining the two matches almost
+nothing and every count in a test is zero. `kev.py sample` writes a catalog in
+CISA's shape from the slice's own CVE ids — plus two the corpus does not hold,
+because "an entry whose CVE the corpus lacks is kept and counted" is a claim
+that needs one to be true — and `run --from-file` publishes it through *the same*
+validation and the same guard, so the local plane's catalog is provably one the
+real path would have accepted:
+
+    python3 pipeline/kev.py sample slice.sqlite /tmp/kev-sample.json
+    python3 pipeline/kev.py run pipeline/pub --cache pipeline/kev-cache --from-file /tmp/kev-sample.json
+
+`sample` publishes nothing and never touches a `pub_dir`.

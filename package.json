@@ -22,7 +22,7 @@
     "prebuild": "node scripts/copy-wasm.mjs",
     "predev": "node scripts/copy-wasm.mjs",
     "licenses:check": "node scripts/check-licenses.mjs",
-    "postbuild": "node scripts/build-sw.mjs"
+    "postbuild": "node scripts/build-sw.mjs && node scripts/check-bundle.mjs"
   },
   "dependencies": {
     "@sqlite.org/sqlite-wasm": "3.53.0-build1",

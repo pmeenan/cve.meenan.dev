@@ -144,6 +144,42 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
+**M6 in progress — the CISA KEV overlay.** The client half is built and passes
+end to end in a browser; the origin half is one owner-applied nginx block away
+and **nothing may publish a catalog until it lands**, because the first fetch
+through Cloudflare pins whatever cache policy is in place and correcting it
+needs a purge. KEV is CC0, so no notice travels (D-076) — provenance does:
+every place the app asserts membership says *per CISA*, with the catalog
+version and release date, which is what keeps it a statement about CISA's
+catalog rather than an endorsement by it. `pipeline/kev.py` is its own cron with
+its own lock and its own state, sharing a `flock` helper with the corpus crons
+and nothing else; it validates fail-closed, publishes CISA's verbatim bytes by
+atomic rename, and a refusal leaves the previous catalog serving. Client-side
+the catalog is a **rebuildable table** like the full-text indexes — no schema
+bump, so no re-download — created by the apply that fills it, which is what lets
+a copy with no catalog *refuse* a KEV question instead of answering that nothing
+is known to be exploited (D-077). "Not in KEV" is a labelled value, not an
+absence band: absence from the catalog is the finding.
+
+**Four defects came out of it that the unit tests could not see.** Two came
+from the adversarial pass over the server half and compounded into one story: a
+hostile or merely broken upstream could freeze the catalog **permanently** while
+`kev.py status`, the exit code and the cron log all reported success — because
+only a validation refusal recorded an outcome, and because the roll-backwards
+guard *defends whatever it is holding*, so one catalog claiming a far-future
+version was published once and then protected against every real one. The third
+came from writing the e2e: a KEV refresh reported its start and never its
+ending, and the page derives *busy* from the phase, so after a download every
+button in the app was disabled — permanently, with the catalog correctly loaded
+and the freshness line correctly rendered above them. The fourth is the one
+worth remembering: **the bundler dropped a literal segment** out of a template
+carrying `${…}` concatenated with `+`, so the browser ran SQL the source never
+had (RE-028) — unit tests import the source, only the browser runs the bundle,
+and `scripts/check-bundle.mjs` now refuses such a build. `pnpm check` was green
+through all four. Also fixed: `state.lock`'s new `name` argument was dead code, so the
+failure-domain claim rested on the directories differing rather than on the
+mechanism four documents described.
+
 **M5 complete — the site is launched.** The origin serves **schema 2, rev 11**
 in ID space `schema2-2026-08-08`, published 2026-08-08: 12 chunks, 65.7 MB
 compressed from 398.5 MB raw, which retired the old lineage and all eight of its

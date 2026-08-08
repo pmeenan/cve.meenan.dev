@@ -27,6 +27,89 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-077: An absent KEV catalog is refused, never answered as "not in KEV" — and the roll-backwards guard is bounded, because it defends whatever it is holding  (2026-08-08, status: accepted, implements D-076)
+
+**Decision.** Three things settled while building M6, each of which a later change
+could undo while looking like a simplification.
+
+1. **A copy with no catalog refuses a KEV question by name; it never answers
+   one.** The `kev` table is created by the apply that fills it, so its absence
+   is the signal that no catalog has been loaded, and `usesKev()` gates every
+   surface that would touch it — filters, both report axes, the export's KEV
+   columns, the detail block. The obvious simplification is to create the table
+   empty when the database is opened, which would make the SQL always valid.
+   That is the one thing this must not do: every record would then answer *not
+   known-exploited, per CISA*, which is a finding rather than a missing feature,
+   and it would be produced silently — through a permalink, and from M7 through
+   a model's tool call, where nobody is present to notice. It would also mean a
+   write on the read path, which M5's staged replacement spent a milestone
+   making sure does not happen. The refusal names the action that fixes it, and
+   says nothing else about the copy is affected. **Exports follow the same rule
+   from the other side:** the KEV columns are absent when there is no catalog
+   rather than present and empty, because a blank `kev_date_added` cannot be
+   told from a column nobody filled in, and which of those it is *is* the
+   overlay's claim.
+
+2. **A KEV failure never fails the corpus operation that triggered it.** A
+   download that fetched 372,322 records and then could not reach `kev.json`
+   has downloaded the corpus. So the refresh reports its own outcome on its own
+   message, the previous catalog stays and goes on reporting its own age, and
+   the corpus operation succeeds. The only dishonest option is silence, which
+   is why the outcome is posted on both paths and the freshness line says
+   *last refresh failed* beside a catalog that still works. The refresh is also
+   its own action, so a failure is retryable without re-running a download.
+
+3. **The roll-backwards guard is bounded in the future direction, and both
+   halves run on both sides.** The guard refuses a catalog older than the one
+   already held — which means it *defends whatever is held against everything
+   that follows*. Unbounded, one response claiming `catalogVersion:
+   99999999.1.1` (a hostile upstream, a hijacked fetch, or a CISA fat-finger)
+   freezes the catalog permanently, rendering as fresh because the same party
+   chose `dateReleased`. So `dateReleased` must parse and must not be more than
+   two days ahead of the clock, and a version is only an ordering basis when its
+   leading component is a plausible year. A version scheme this build does not
+   read is **not** a refusal — it falls back to `dateReleased` — because
+   wedging on a benign upstream change is the same failure the deliberate
+   non-enforcement of `knownRansomwareCampaignUse` avoids.
+
+   **The client needs this as much as the pipeline does, and that is the part
+   that was nearly missed.** The client already re-validates the catalog rather
+   than trusting the server, on the stated grounds that the server's check is
+   one it cannot see through a mutable URL with a cache in front of it — and it
+   re-implemented only the *shape* half. The ordering half is the half that
+   defends against exactly the thing that argument names. Without it one
+   poisoned response replaces a current catalog with an old one, and because
+   "Not in KEV" is a real value here rather than an absence (§1's framing), the
+   app then positively asserts *not known-exploited, per CISA* for everything
+   listed since — in the filter, on both report axes, in the detail view, and in
+   exports whose preamble names the forged version. It persists in OPFS,
+   survives a reload, reads correctly offline, and agrees across tabs. Nothing
+   on screen says anything is wrong. The client's guard is therefore not
+   redundancy; it is the guard, and the server's is the redundancy.
+
+**Context.** All three came out of the adversarial pass over the server half,
+which found that the guard converted a one-shot poisoning into a permanent one
+and that only `Refuse` was recorded as an outcome — so a run that died any other
+way left `kev.py status` reporting a healthy job while the catalog froze. Every
+guard named here has a regression test checked by removing it.
+
+**Consequences.** `usesKev()` is the single place that decides whether an
+answer needs the table, so a future filter or dimension that touches `kev` has
+to be added to it or it will fail with `no such table` rather than being gated.
+The two-day future bound is a wall-clock dependency on **both** sides: a server
+whose clock is wrong refuses real catalogs (visible in `kev.py status`), and a
+browser whose clock is wrong refuses to refresh (visible in the freshness line's
+own failure notice). Both are the safe direction. A local copy that somehow
+holds a future-dated catalog cannot be refreshed past it and is repaired by
+"Clear local copy" and a fresh download, which the refusal message says —
+there is deliberately no client-side `--force`, because a button that overrides
+this guard is a button an attacker's error message can ask a user to press.
+
+**Reopen if.** CISA starts publishing catalogs stamped meaningfully ahead of
+release (the two-day bound becomes wrong); or a future schema bump folds KEV
+into the artifact (D-076's own reopen), at which point §1 becomes moot because
+the table would always exist.
+
 ## D-076: KEV is CC0 — no notice travels; the catalog ships as a standalone mutable file outside the manifest, joined client-side as a rebuildable table  (2026-08-08, status: accepted; implements D-010, resolves D-008's second-source reopen)
 
 **Decision.** Four things, settled together at M6's decomposition because each

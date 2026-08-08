@@ -20,6 +20,14 @@
  * them says so, and the UI has to say so too.
  */
 
+import {
+  KEV_LISTED,
+  KEV_NOT_LISTED,
+  RANSOMWARE_KNOWN,
+  RANSOMWARE_NOT_LISTED,
+  RANSOMWARE_UNKNOWN,
+} from './kev'
+
 /** Bindable scalar. Everything a filter contributes is one of these. */
 export type SqlParam = string | number
 
@@ -119,6 +127,74 @@ export const STATE_LABELS: Record<number, string> = {
 }
 
 /**
+ * KEV membership (M6, D-076).
+ *
+ * **The complement is a real value, not an absence band.** Unlike an SSVC point
+ * nobody assessed, absence from CISA's catalog is the finding — *not
+ * known-exploited, per CISA* — so it is an ordinary bucket carrying its
+ * provenance, never the off-ramp neutral. The labels say "per CISA" because
+ * D-076's licence riders forbid presenting anything as a CISA endorsement, and
+ * stating the relationship is how that is satisfied: this is what CISA's
+ * catalog says, not a verdict of ours.
+ */
+export const KEV_LABELS: Record<number, string> = {
+  [KEV_LISTED]: 'In KEV (per CISA)',
+  [KEV_NOT_LISTED]: 'Not in KEV (per CISA)',
+}
+
+/**
+ * `knownRansomwareCampaignUse`, plus the bucket for records CISA has not listed
+ * at all.
+ *
+ * Four buckets rather than two, and the last two are the ones that matter:
+ * `Not in KEV` is the complement (a real value), and NULL is a listed record
+ * whose value this build does not recognise. Collapsing either into "Unknown"
+ * would assert CISA looked, which is a finding rather than a display choice.
+ *
+ * **The NULL band takes an ordinary categorical slot, not D-073's off-ramp
+ * neutral, and that is deliberate.** The neutral exists so an absence cannot be
+ * read as a *level* on a scale; this axis has no scale, so there is no
+ * misreading to prevent, and giving one of four categorical bands a grey would
+ * only make it look like the least important. What distinguishes it is its
+ * label — `KEV_ABSENCE_LABEL`, which every surface uses.
+ */
+export const KEV_RANSOMWARE_LABELS: Record<number, string> = {
+  [RANSOMWARE_KNOWN]: 'Known ransomware use',
+  [RANSOMWARE_UNKNOWN]: 'Unknown (per CISA)',
+  [RANSOMWARE_NOT_LISTED]: 'Not in KEV (per CISA)',
+}
+
+/**
+ * What the `kevRansomware` NULL band is called, everywhere.
+ *
+ * Not `NOT_ASSESSED_LABEL`: "(not assessed)" is right for an SSVC point nobody
+ * looked at, and wrong here — CISA *did* look and stated something this build
+ * does not read. The chart, the detail view, the filter checkbox and the chip
+ * all take this one string, because the same band under three names across four
+ * surfaces is how a reader concludes they are three different things.
+ */
+export const KEV_ABSENCE_LABEL = '(not stated by CISA)'
+
+/**
+ * What the NULL band on `axis` is called wherever one is named.
+ *
+ * One function rather than a constant, because the two absences mean different
+ * things: nobody assessed an SSVC point, while CISA *did* look at a KEV entry
+ * and stated something this build does not read. Every surface — chart bucket,
+ * detail view, filter checkbox, filter chip — goes through here.
+ */
+export function absenceLabel(axis: Dimension): string {
+  return axis === 'kevRansomware' ? KEV_ABSENCE_LABEL : NOT_ASSESSED_LABEL
+}
+
+export const KEV_CODES = [KEV_LISTED, KEV_NOT_LISTED] as const
+export const KEV_RANSOMWARE_CODES = [
+  RANSOMWARE_KNOWN,
+  RANSOMWARE_UNKNOWN,
+  RANSOMWARE_NOT_LISTED,
+] as const
+
+/**
  * The axes whose values are interned lookup rows, so a filter on one is a name
  * the user typed that has to become an id before it can be compared (D-055's
  * ID space is the server's, and the client holds only the ids it was sent).
@@ -163,6 +239,24 @@ export interface Filters {
   ssvcExpl?: number[]
   ssvcAuto?: number[]
   ssvcImpact?: number[]
+  /**
+   * CISA KEV (M6). `kev` is membership; `kevRansomware` adds `NOT_ASSESSED` for
+   * a listed record whose ransomware value this build does not recognise.
+   *
+   * Every one of these compiles to `EXISTS`/`NOT EXISTS` over the `kev` table
+   * rather than to a join, for the reason the link-table axes do: a record must
+   * not appear or count more than once. Here the join happens to be 1:1 — the
+   * catalog carries one entry per CVE, and both the validator and the table's
+   * primary key enforce it — but the filter surface does not depend on that,
+   * and `tests/unit/filters.test.ts` asserts the 1:1 rather than assuming it.
+   */
+  kev?: number[]
+  kevRansomware?: number[]
+  /** `dateAdded` / `dueDate` as unix seconds, inclusive. Each implies membership. */
+  kevAddedFrom?: number
+  kevAddedTo?: number
+  kevDueFrom?: number
+  kevDueTo?: number
   scoreMin?: number
   scoreMax?: number
   /** Unix seconds, inclusive on both ends. */
@@ -282,6 +376,11 @@ export function compile(filters: Filters, resolved: Resolved = {}): Compiled {
   pushNullable(clauses, params, 'c.ssvc_expl', filters.ssvcExpl)
   pushNullable(clauses, params, 'c.ssvc_auto', filters.ssvcAuto)
   pushNullable(clauses, params, 'c.ssvc_impact', filters.ssvcImpact)
+  pushKevMembership(clauses, filters.kev)
+  pushKevRansomware(clauses, params, filters.kevRansomware)
+  pushKevRange(clauses, params, 'added_at', filters.kevAddedFrom, filters.kevAddedTo)
+  pushKevRange(clauses, params, 'due_at', filters.kevDueFrom, filters.kevDueTo)
+
   pushRange(clauses, params, 'c.cvss_score', filters.scoreMin, filters.scoreMax)
   pushRange(clauses, params, 'c.published', filters.publishedFrom, filters.publishedTo)
   pushRange(clauses, params, 'c.updated', filters.updatedFrom, filters.updatedTo)
@@ -363,6 +462,158 @@ function pushNullable(
   // would bind looser than the join and widen every other filter.
   if (arms.length) clauses.push(arms.length > 1 ? `(${arms.join(' OR ')})` : arms[0]!)
 }
+
+/**
+ * The correlated existence probe every KEV *filter* is built on.
+ *
+ * `kf` rather than `k`: a KEV *dimension* joins the same table as `k`, and an
+ * inner alias shadowing an outer one is the kind of correct-but-unreadable SQL
+ * that stops being correct the first time someone edits it.
+ *
+ * `EXISTS` rather than the dimension's `LEFT JOIN` for the reason every
+ * link-table axis uses one — a filter must not be able to change how many times
+ * a record appears — even though this particular join is 1:1.
+ */
+const KEV_EXISTS = 'SELECT 1 FROM kev kf WHERE kf.cve_id = c.id'
+
+/**
+ * KEV membership: both codes, one code, or neither.
+ *
+ * Selecting **both** is not a filter — it is every record — so it contributes
+ * no clause. Selecting neither recognised code (a definition from a future
+ * build, or a hand-edited fragment) compiles to false rather than being dropped,
+ * which is the same rule `pushResolvedIn` follows: a filter nobody can satisfy
+ * must not silently return the whole corpus.
+ */
+function pushKevMembership(clauses: string[], values: number[] | undefined): void {
+  if (!values?.length) return
+  const listed = values.includes(KEV_LISTED)
+  const notListed = values.includes(KEV_NOT_LISTED)
+  if (listed && notListed) return
+  if (listed) clauses.push(`EXISTS (${KEV_EXISTS})`)
+  else if (notListed) clauses.push(`NOT EXISTS (${KEV_EXISTS})`)
+  else clauses.push('0')
+}
+
+/**
+ * Ransomware use, including the two buckets that are not stored values.
+ *
+ * `RANSOMWARE_NOT_LISTED` is the complement and compiles to `NOT EXISTS`;
+ * `NOT_ASSESSED` is a listed record whose value this build does not recognise
+ * and compiles to `IS NULL` *inside* the probe. Neither can be expressed by
+ * `IN (…)` over the stored column, which is the same gap `pushNullable` exists
+ * to close for the SSVC axes.
+ */
+function pushKevRansomware(
+  clauses: string[],
+  params: SqlParam[],
+  values: number[] | undefined
+): void {
+  if (!values?.length) return
+  const arms: string[] = []
+  const codes = values.filter((value) => value === RANSOMWARE_KNOWN || value === RANSOMWARE_UNKNOWN)
+  if (codes.length) {
+    arms.push(`EXISTS (${KEV_EXISTS} AND kf.ransomware IN (${placeholders(codes.length)}))`)
+    params.push(...codes)
+  }
+  if (values.includes(NOT_ASSESSED)) arms.push(`EXISTS (${KEV_EXISTS} AND kf.ransomware IS NULL)`)
+  if (values.includes(RANSOMWARE_NOT_LISTED)) arms.push(`NOT EXISTS (${KEV_EXISTS})`)
+  // No recognised bucket at all: false, not absent.
+  if (!arms.length) {
+    clauses.push('0')
+    return
+  }
+  // Parenthesised even at one arm for the reason `pushNullable` gives: this is
+  // joined with AND, and an unparenthesised OR would bind looser than the join
+  // and widen every other filter.
+  clauses.push(arms.length > 1 ? `(${arms.join(' OR ')})` : arms[0]!)
+}
+
+/**
+ * A date range over one of the catalog's own dates.
+ *
+ * Inside the probe rather than beside it, so "added between these dates" means
+ * *this record's* KEV entry was added then — not "this record is in KEV and
+ * some entry was added then". The column name is this file's own; only the
+ * bounds are bound.
+ */
+function pushKevRange(
+  clauses: string[],
+  params: SqlParam[],
+  column: 'added_at' | 'due_at',
+  from: number | undefined,
+  to: number | undefined
+): void {
+  const bounds: string[] = []
+  if (typeof from === 'number' && Number.isFinite(from)) {
+    bounds.push(`kf.${column} >= ?`)
+    params.push(from)
+  }
+  if (typeof to === 'number' && Number.isFinite(to)) {
+    bounds.push(`kf.${column} <= ?`)
+    params.push(to)
+  }
+  if (!bounds.length) return
+  clauses.push(`EXISTS (${KEV_EXISTS} AND ${bounds.join(' AND ')})`)
+}
+
+/**
+ * The KEV join, and the two expressions that turn it into buckets.
+ *
+ * Declared here rather than beside the other dimensions because the export path
+ * needs them too, and a `const` referenced above its own declaration is a
+ * temporal-dead-zone crash at import rather than a compile error.
+ *
+ * Not pinned with `CROSS JOIN` and not in `MULTIPLYING`: the catalog holds
+ * **one entry per CVE** — the pipeline refuses a duplicate and the table's
+ * primary key could not hold one anyway — so this join is 1:1 and cannot make a
+ * record count twice. `LEFT`, not inner, because the complement is the whole
+ * point: a record with no entry is *not known-exploited, per CISA*, which is a
+ * bucket rather than a row to drop. 1,662 rows against 372,322, reached through
+ * `i_kev_cve`.
+ */
+const JOIN_SQL_KEV = 'LEFT JOIN kev k ON k.cve_id = c.id'
+
+/**
+ * KEV membership as a bucket, from the LEFT JOIN's own null-ness.
+ *
+ * `k.cve` rather than `k.cve_id`, and the reason is narrower than it looks:
+ * **given this ON clause the two are equivalent**, because a catalog row whose
+ * `cve_id` is NULL can never satisfy `k.cve_id = c.id` and so never reaches the
+ * join output at all. What `k.cve` buys is that it stays correct if the join
+ * ever changes — it is the catalog's own key, NULL exactly when no entry
+ * matched, where `cve_id` is NULL for two different reasons and only one of
+ * them is "not listed". An earlier version of this comment claimed the two
+ * already differ here; they do not, and the unmatched entries are preserved by
+ * `KEV_INSERT`'s nullable `cve_id` and reported by the unmatched count, not by
+ * this expression.
+ */
+const KEV_MEMBER = `CASE WHEN k.cve IS NULL THEN ${KEV_NOT_LISTED} ELSE ${KEV_LISTED} END`
+
+/** Listed first: it is the small band, and the one a stack's baseline is for. */
+const KEV_MEMBER_ORDER = 'CASE WHEN k.cve IS NULL THEN 1 ELSE 0 END'
+
+/**
+ * Ransomware use, with the complement folded in as its own code.
+ *
+ * NULL survives this expression — a *listed* record whose value this build does
+ * not recognise — and lands in the axis's own "(not stated)" bucket rather than
+ * being read as `Unknown`, which would assert CISA looked.
+ */
+const KEV_RANSOMWARE = `CASE WHEN k.cve IS NULL THEN ${RANSOMWARE_NOT_LISTED} ELSE k.ransomware END`
+
+/**
+ * Known, Unknown, Not in KEV, then the unrecognised value last (D-070's rule).
+ *
+ * **One template literal, deliberately not two joined with `+`.** The bundler
+ * drops a literal segment when a template carrying `${…}` is concatenated
+ * across lines: this expression shipped to the browser as
+ * `… k.ransomware = 1WHEN k.ransomware = 0 …`, with ` THEN 0 ` simply gone, and
+ * SQLite refused it with `unrecognized token: "1WHEN"`. Unit tests cannot see
+ * it — they run the source — so the rule for every interpolated SQL fragment in
+ * this file is one literal (RE-028).
+ */
+const KEV_RANSOMWARE_ORDER = `CASE WHEN k.cve IS NULL THEN 2 WHEN k.ransomware = ${RANSOMWARE_KNOWN} THEN 0 WHEN k.ransomware = ${RANSOMWARE_UNKNOWN} THEN 1 ELSE 99 END`
 
 function pushExists(
   clauses: string[],
@@ -479,6 +730,36 @@ export function ftsQuery(text: string | undefined): string | null {
   return terms.length ? terms.join(' AND ') : null
 }
 
+/**
+ * Whether answering this needs the `kev` table.
+ *
+ * The table is created by the apply that fills it (lib/kev.ts), so on a copy
+ * that has never fetched a catalog it does not exist — and every KEV predicate
+ * and dimension would fail with `no such table: kev`. The caller checks this
+ * *before* compiling, because both alternatives are worse: an error the user
+ * cannot act on, or — if the table were created empty on open — a report
+ * quietly answering "nothing is known to be exploited".
+ *
+ * `filters` is checked field by field rather than by looking for a `kev` prefix,
+ * so a future filter that merely reads like one cannot become a silent
+ * requirement.
+ */
+export function usesKev(
+  filters: Filters,
+  ...dimensions: (Dimension | null | undefined)[]
+): boolean {
+  if (dimensions.some((dimension) => dimension != null && KEV_DIMENSIONS.has(dimension)))
+    return true
+  return (
+    Boolean(filters.kev?.length) ||
+    Boolean(filters.kevRansomware?.length) ||
+    typeof filters.kevAddedFrom === 'number' ||
+    typeof filters.kevAddedTo === 'number' ||
+    typeof filters.kevDueFrom === 'number' ||
+    typeof filters.kevDueTo === 'number'
+  )
+}
+
 /** How results are ordered. An allowlist, because this reaches SQL as text. */
 export type SortKey = 'published' | 'updated' | 'score' | 'cve'
 
@@ -524,6 +805,16 @@ export interface RowOptions {
    * with no text at all, which is precisely what D-070 exists to stop.
    */
   full?: boolean
+  /**
+   * Also carry the KEV columns. Only meaningful with `full`.
+   *
+   * A flag rather than always-on, because the `kev` table only exists once a
+   * catalog has been loaded (M6). The distinction is not cosmetic: **absent
+   * columns say this export does not cover KEV, and empty ones would say every
+   * record is not known-exploited.** Only the export path sets it, and only
+   * when the Worker has established a catalog is present.
+   */
+  kev?: boolean
 }
 
 /**
@@ -544,6 +835,37 @@ export const EXPORT_ONLY_SQL = [
   'c.ssvc_auto',
   'c.ssvc_impact',
 ] as const
+
+/**
+ * The KEV columns an export carries when this copy holds a catalog (M6).
+ *
+ * `kev_listed` is computed rather than left implicit: a consumer reading a file
+ * where `kev_date_added` is empty cannot tell "not in KEV" from "the column was
+ * not filled in", and this overlay's whole claim is about which of those it is.
+ * CC0 adds nothing to carry (D-076 §1); the file's provenance line names the
+ * catalog version, because "per CISA, as of …" is what keeps it a statement
+ * about CISA's catalog rather than an endorsement by it.
+ */
+export const EXPORT_KEV_SQL = [
+  KEV_MEMBER,
+  'k.added',
+  'k.due',
+  // **Words, not the stored code**, and this is the one column where it
+  // matters: `kev_listed`'s 0/1 is a boolean, but `ransomware`'s 0 means
+  // *Unknown, per CISA* — and every spreadsheet reader will read a 0 beside a
+  // 1 as "no". That is precisely the misreading `kev_listed` was computed to
+  // prevent, and the one this milestone's whole framing is about (D-070's
+  // "unknown is not none", applied to a second source). The CASE is this
+  // file's own SQL; nothing caller-supplied reaches it.
+  // One literal, for the reason `KEV_RANSOMWARE_ORDER` gives: split with `+`,
+  // the bundler drops a segment and the browser gets SQL the source never had.
+  `CASE WHEN k.cve IS NULL THEN '' WHEN k.ransomware = ${RANSOMWARE_KNOWN} THEN 'Known' WHEN k.ransomware = ${RANSOMWARE_UNKNOWN} THEN 'Unknown (per CISA)' ELSE 'not stated by CISA' END`,
+  'k.name',
+  'k.action',
+] as const
+
+/** The join an export needs for `EXPORT_KEV_SQL`. Shared with the dimensions. */
+export const EXPORT_KEV_JOIN = JOIN_SQL_KEV
 
 /**
  * The record list: one row per matching CVE, with enough to identify it.
@@ -568,11 +890,18 @@ export function rowsSql(
   const sort = SORT_SQL[options.sort as SortKey] ?? SORT_SQL.published
   const description = options.full ? 't.descr' : 'substr(t.descr, 1, 400)'
   const extra = options.full ? `, ${EXPORT_ONLY_SQL.join(', ')}` : ''
+  // Only when the caller has established the table exists (M6). `full` alone is
+  // not enough: an export from a copy that has never fetched a catalog carries
+  // no KEV columns rather than empty ones.
+  const withKev = Boolean(options.full && options.kev)
+  const kevColumns = withKev ? `, ${EXPORT_KEV_SQL.join(', ')}` : ''
+  const kevJoin = withKev ? ` ${EXPORT_KEV_JOIN}` : ''
   return {
     sql:
       `SELECT c.cve_id AS cve, c.state, c.published, c.updated, c.cvss_ver, c.cvss_score, ` +
-      `c.cvss_sev, n.name AS cna, ${description} AS description${extra} ` +
-      `FROM cve c LEFT JOIN cna n ON n.id = c.cna_id LEFT JOIN cve_text t ON t.cve_id = c.id ` +
+      `c.cvss_sev, n.name AS cna, ${description} AS description${extra}${kevColumns} ` +
+      `FROM cve c LEFT JOIN cna n ON n.id = c.cna_id LEFT JOIN cve_text t ON t.cve_id = c.id` +
+      `${kevJoin} ` +
       `WHERE ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`,
     params: [...params, limit + 1, offset],
     limit,
@@ -609,6 +938,8 @@ export const DIMENSIONS = [
   'ssvcExpl',
   'ssvcAuto',
   'ssvcImpact',
+  'kev',
+  'kevRansomware',
   'state',
   'cna',
   'vendor',
@@ -633,6 +964,8 @@ export const DIMENSION_LABELS: Record<Dimension, string> = {
   ssvcExpl: 'SSVC exploitation',
   ssvcAuto: 'SSVC automatable',
   ssvcImpact: 'SSVC technical impact',
+  kev: 'CISA KEV',
+  kevRansomware: 'KEV ransomware use',
   state: 'State',
   cna: 'CNA',
   vendor: 'Vendor',
@@ -652,8 +985,30 @@ const CODE_DIMENSIONS = new Set<Dimension>([
   'ssvcExpl',
   'ssvcAuto',
   'ssvcImpact',
+  'kev',
+  'kevRansomware',
   'state',
 ])
+
+/**
+ * The code dimensions whose axis reads in an order this file defines rather
+ * than by bucket size — `order` on their `DimensionSql`.
+ *
+ * A list rather than a chain of `||`, because it is consulted in two places and
+ * the two drifting apart would mean a chart's rows and its grouped counts
+ * disagreeing about what "first" means.
+ */
+const FIXED_ORDER_DIMENSIONS = new Set<Dimension>([
+  'cvssVersion',
+  'ssvcExpl',
+  'ssvcAuto',
+  'ssvcImpact',
+  'kev',
+  'kevRansomware',
+])
+
+/** The two KEV axes, which share a join, an encoding and a complement bucket. */
+export const KEV_DIMENSIONS = new Set<Dimension>(['kev', 'kevRansomware'])
 
 /**
  * The code dimensions whose NULL bucket is a **missing assessment** rather than
@@ -681,6 +1036,8 @@ export const CODE_LABELS: Partial<Record<Dimension, Record<number, string>>> = {
   ssvcExpl: SSVC_EXPL_LABELS,
   ssvcAuto: SSVC_AUTO_LABELS,
   ssvcImpact: SSVC_IMPACT_LABELS,
+  kev: KEV_LABELS,
+  kevRansomware: KEV_RANSOMWARE_LABELS,
 }
 
 /**
@@ -730,7 +1087,7 @@ function absentLast(column: string): string {
  * Independent groups are a different matter: vendor × CWE genuinely is every
  * pairing, and joining both chains is what expresses that.
  */
-type JoinGroup = 'prod' | 'cwe' | 'ref' | 'cna'
+type JoinGroup = 'prod' | 'cwe' | 'ref' | 'cna' | 'kev'
 
 /**
  * **`CROSS JOIN` is load-bearing, not a synonym.** In SQLite it is an inner
@@ -768,6 +1125,8 @@ const JOIN_SQL: Record<JoinGroup, string> = {
   // Not pinned, and not a link table: a scalar foreign key reached by a LEFT
   // JOIN, where there is no join order to get wrong.
   cna: 'LEFT JOIN cna n ON n.id = c.cna_id',
+  // Nor is this one — see `JOIN_SQL_KEV` above, which the export path shares.
+  kev: JOIN_SQL_KEV,
 }
 
 /**
@@ -824,6 +1183,20 @@ const DIMENSION_SQL: Record<Dimension, DimensionSql> = {
     group: 'c.ssvc_impact',
     order: absentLast('c.ssvc_impact'),
   },
+  kev: {
+    key: KEV_MEMBER,
+    label: KEV_MEMBER,
+    group: KEV_MEMBER,
+    order: KEV_MEMBER_ORDER,
+    join: 'kev',
+  },
+  kevRansomware: {
+    key: KEV_RANSOMWARE,
+    label: KEV_RANSOMWARE,
+    group: KEV_RANSOMWARE,
+    order: KEV_RANSOMWARE_ORDER,
+    join: 'kev',
+  },
   state: { key: 'c.state', label: 'c.state', group: 'c.state' },
   cna: { key: 'c.cna_id', label: 'n.name', group: 'c.cna_id', join: 'cna' },
   vendor: { key: 'v.id', label: 'v.name', group: 'v.id', join: 'prod' },
@@ -858,7 +1231,7 @@ export function groupSql(
   // `state` is the exception among the codes: PUBLISHED before REJECTED is the
   // reading order, and its stored codes run the other way.
   const ordered =
-    TIME_DIMENSIONS.has(dimension) || dimension === 'cvssVersion' || SSVC_DIMENSIONS.has(dimension)
+    TIME_DIMENSIONS.has(dimension) || FIXED_ORDER_DIMENSIONS.has(dimension)
       ? `${axisOrder(shape)} ASC`
       : dimension === 'state'
         ? `${shape.key} DESC`

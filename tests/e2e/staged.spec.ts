@@ -97,6 +97,7 @@ test('an interrupted download resumes and never destroys the live copy', async (
     // Asserted as an exact entry set rather than a byte ceiling: a ceiling says
     // only that some number stayed small, and the tightest leak it must catch —
     // one un-swept slot — clears it by under 10%.
+    await awaitIdle(page)
     await page.goto('/no-such-page')
     expect(await opfsEntries(page)).toEqual(['cve-b.sqlite'])
   })
@@ -131,6 +132,10 @@ test('clearing removes a half-finished download, not just the live copy', async 
   await page.goto('/')
   await page.getByRole('button', { name: 'Download data', exact: true }).click()
   await importedTimings(page)
+  // Before navigating away: the download continues into a catch-up and a KEV
+  // refresh, and killing the Worker mid-transaction leaves a journal beside the
+  // live file that the exact-set assertion below would count as an extra entry.
+  await awaitIdle(page)
 
   await page.goto('/?stop=1')
   await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
@@ -186,6 +191,7 @@ test('a copy under M1’s name is adopted, then retired by the first promotion',
   await page.goto('/')
   await page.getByRole('button', { name: 'Download data', exact: true }).click()
   await importedTimings(page)
+  await awaitIdle(page)
 
   // Rewrite the local copy into what M1 left behind: the legacy file name and
   // no promotion counter. Done from a page with no Worker, because the live
@@ -223,6 +229,7 @@ test('a copy under M1’s name is adopted, then retired by the first promotion',
     // One generation on disk, not two: the legacy copy is gone and the slot it
     // was staged beside is the only database left.
     expect(timings.opfsBytes!).toBeLessThan(timings.rawBytes * 2)
+    await awaitIdle(page)
     await page.goto('/no-such-page')
     expect(await opfsEntries(page)).toEqual(['cve-a.sqlite'])
   })
@@ -246,6 +253,7 @@ test('a discovery failure leaves the local copy alone', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: 'Download data', exact: true }).click()
   await importedTimings(page)
+  await awaitIdle(page)
 
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-a.sqlite'])
@@ -440,6 +448,7 @@ test('sidecars beside a staging slot are cleared before its bytes are reused', a
   expect(redone.records).toBe(first.records)
 
   // Gone, and the promoted database answers the same query.
+  await awaitIdle(page)
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-b.sqlite'])
   await page.goto('/')
@@ -598,6 +607,7 @@ test('a local copy that cannot be opened is reported unknown, not deleted', asyn
   await page.goto('/')
   await page.getByRole('button', { name: 'Download data', exact: true }).click()
   await importedTimings(page)
+  await awaitIdle(page)
 
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-a.sqlite'])
@@ -877,6 +887,7 @@ test('a snapshot rotation mid-download starts over rather than stranding the cli
   })
 
   await test.step('and the origin ends holding one generation, with no stale record', async () => {
+    await awaitIdle(page)
     await page.goto('/no-such-page')
     expect(await opfsEntries(page)).toEqual(['cve-b.sqlite'])
   })
@@ -1004,6 +1015,26 @@ async function queryFirstCell(page: Page): Promise<string> {
 }
 
 /** Everything the origin holds in OPFS, read from a page that runs no Worker. */
+/**
+ * Wait until the Worker has finished everything an import kicks off.
+ *
+ * `imported` is no longer the end of the operation: a download continues into a
+ * catch-up and then a KEV refresh (M6), and both write to the *live* database.
+ * Listing OPFS before they finish catches a rollback journal mid-transaction —
+ * which is not a leaked generation, but is enough to fail an exact-set
+ * assertion, and navigating away at that moment leaves the journal behind for
+ * real. So the entry-set assertions wait for the app to be idle first.
+ *
+ * Idle is read from a control the page disables while the Worker is busy,
+ * rather than from a progress string: `busy` is derived from the phase, so this
+ * is the same fact the UI uses.
+ */
+async function awaitIdle(page: Page): Promise<void> {
+  await expect(page.getByRole('button', { name: 'Sync', exact: true })).toBeEnabled({
+    timeout: 300_000,
+  })
+}
+
 async function opfsEntries(page: Page): Promise<string[]> {
   return await page.evaluate(async () => {
     const root = (await navigator.storage.getDirectory()) as unknown as {

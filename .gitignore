@@ -21,3 +21,6 @@ pipeline/pub-schema1/
 # for a local `pipeline/pub` means here (pipeline/ledger.py).
 pipeline/published.json
 pipeline/published-schema1.json
+# The KEV cron's own cache directory for local runs (pipeline/README.md).
+# Its production home is cve.data/cache, which is not in the tree either.
+pipeline/kev-cache/

@@ -6,7 +6,9 @@ import {
   exportFilename,
   exportWriter,
   jsonWriter,
+  KEV_COLUMNS,
   RECORD_COLUMNS,
+  recordColumns,
   type ExportHeader,
 } from '../../lib/export'
 
@@ -66,6 +68,47 @@ describe('the notice is a condition, not a footer (D-008)', () => {
     expect(csvWriter(header()).begin()).toContain('The MITRE Corporation')
     const json = JSON.parse(`${jsonWriter(header()).begin()}]}`) as { notice: string }
     expect(json.notice).toContain('The MITRE Corporation')
+  })
+})
+
+describe('KEV provenance travels with the columns (M6, D-076)', () => {
+  const kev = { version: '2026.08.07', released: '2026-08-07T16:45:47.0648Z' }
+
+  it('names the catalog and its date in both formats', () => {
+    // CC0 requires no notice, so this is not one — it is provenance. "Listed in
+    // CISA's KEV" is a statement about a *dated* catalog, and a file that made
+    // it without saying which one invites the reader to treat it as current
+    // forever.
+    const csv = csvWriter(header({ columns: [...recordColumns(true)], kev })).begin()
+    expect(csv).toContain('2026.08.07')
+    expect(csv).toContain('CC0')
+    const json = JSON.parse(`${jsonWriter(header({ kev })).begin()}]}`) as {
+      kev: { version: string } | null
+    }
+    expect(json.kev?.version).toBe('2026.08.07')
+  })
+
+  it('says nothing about KEV when the file carries no KEV columns', () => {
+    // Absent columns say "this export does not cover KEV". A provenance line
+    // beside no columns would be a claim the file cannot support.
+    expect(csvWriter(header()).begin()).not.toContain('Known Exploited')
+    const json = JSON.parse(`${jsonWriter(header()).begin()}]}`) as { kev: unknown }
+    expect(json.kev).toBeNull()
+  })
+
+  it('does not present the listing as a CISA endorsement', () => {
+    // The one rider CC0 does not waive (D-076 §1).
+    const csv = csvWriter(header({ columns: [...recordColumns(true)], kev })).begin()
+    expect(csv).toMatch(/not an endorsement/i)
+  })
+
+  it('adds its columns after the record ones, in the order the header claims', () => {
+    // A mismatch between `KEV_COLUMNS` and `EXPORT_KEV_SQL` would label every
+    // column after the first one wrongly — a file that reads as a copy and is
+    // not one.
+    expect(recordColumns(false)).toEqual([...RECORD_COLUMNS])
+    expect(recordColumns(true)).toEqual([...RECORD_COLUMNS, ...KEV_COLUMNS])
+    expect(KEV_COLUMNS[0]).toBe('kev_listed')
   })
 })
 

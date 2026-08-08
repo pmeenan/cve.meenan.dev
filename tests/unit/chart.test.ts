@@ -280,6 +280,37 @@ describe('buildChart', () => {
     expect(model.rows).toEqual([])
     expect(model.total).toBe(0)
   })
+
+  it('keeps the KEV bands in the query layer’s order, not by size (M6)', () => {
+    // "In KEV" is 0.4% of the corpus. Sorted by size it lands on top of a stack
+    // whose baseline is its own complement — and the baseline is the only
+    // position whose length a reader can compare across buckets, which is the
+    // whole of D-073's argument for CRITICAL. The SQL emits listed first; this
+    // is the check that nothing here re-sorts it away.
+    const rows: unknown[][] = [
+      ['2025-01', '2025-01', 1, 1, 4],
+      ['2025-01', '2025-01', 0, 0, 900],
+    ]
+    const model = buildChart(rows, 'month', 'kev', 12)
+    expect(model.series.map((entry) => entry.label)).toEqual([
+      'In KEV (per CISA)',
+      'Not in KEV (per CISA)',
+    ])
+  })
+
+  it('never drops a KEV band to the categorical cap', () => {
+    // The complement carries the denominator. A cap that trimmed it would turn
+    // every KEV chart into an assertion about the listed 0.4% alone.
+    const rows: unknown[][] = [
+      ['2025-01', '2025-01', 1, 1, 5],
+      ['2025-01', '2025-01', 0, 0, 5],
+      ['2025-01', '2025-01', 2, 2, 5],
+      ['2025-01', '2025-01', null, null, 5],
+    ]
+    const model = buildChart(rows, 'month', 'kevRansomware', 12)
+    expect(model.series).toHaveLength(4)
+    expect(model.droppedSeries).toBe(0)
+  })
 })
 
 describe('bucketLabel', () => {
@@ -301,6 +332,21 @@ describe('bucketLabel', () => {
 
   it('prefers a real label when SQL supplied one', () => {
     expect(bucketLabel('vendor', 7, 'Cisco')).toBe('Cisco')
+  })
+
+  it('keeps the KEV complement a value and its unread band an absence (M6)', () => {
+    // Three different facts that a two-way split would collapse: CISA lists it,
+    // CISA does not list it (a finding — *not known-exploited, per CISA*), and
+    // CISA listed it and stated something this build cannot read. Every label
+    // carries its provenance, which is how "per CISA" stays a statement about
+    // the catalog rather than an endorsement by it (D-076).
+    expect(bucketLabel('kev', 1, 1)).toBe('In KEV (per CISA)')
+    expect(bucketLabel('kev', 0, 0)).toBe('Not in KEV (per CISA)')
+    expect(bucketLabel('kevRansomware', 2, 2)).toBe('Not in KEV (per CISA)')
+    expect(bucketLabel('kevRansomware', 1, 1)).toBe('Known ransomware use')
+    expect(bucketLabel('kevRansomware', 0, 0)).toBe('Unknown (per CISA)')
+    // Not "Unknown", which is CISA having looked, and not the complement.
+    expect(bucketLabel('kevRansomware', null, null)).toBe('(not stated by CISA)')
   })
 })
 

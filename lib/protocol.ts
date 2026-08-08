@@ -9,6 +9,7 @@
 import type { CapabilityReport } from './capabilities'
 import type { Dimension, Filters, SortKey, StateFilter } from './filters'
 import type { ExportFormat } from './export'
+import type { KevStatus } from './kev'
 import type { Report } from './report'
 import type { StorageReport } from './storage'
 
@@ -486,12 +487,38 @@ export interface DetailReference {
   host: string
 }
 
+/**
+ * This record's CISA KEV entry (M6, D-076).
+ *
+ * Null when the catalog does not list it **or** when this copy holds no
+ * catalog, and the two are distinguished by `status.kev` rather than here: "not
+ * known-exploited, per CISA" is a finding, and asserting it from a copy that
+ * has never fetched a catalog would be inventing one.
+ */
+export interface DetailKev {
+  /** `YYYY-MM-DD`, verbatim as CISA published them. */
+  added: string
+  due: string
+  name: string
+  description: string
+  action: string
+  /** 1 Known, 0 Unknown, null when CISA stated something this build does not read. */
+  ransomware: number | null
+  /** CISA's `notes`, a `;`-separated run of labelled URLs. Hostile until proven otherwise. */
+  notes: string
+  cwes: string[]
+  vendor: string
+  product: string
+}
+
 export interface CveDetail {
   record: DetailRecord
   cwes: DetailCwe[]
   products: DetailProduct[]
   versions: DetailVersion[]
   references: DetailReference[]
+  /** Null when CISA does not list this record, or this copy has no catalog. */
+  kev: DetailKev | null
   /** Sections whose per-section cap was reached, so the omission is reported (D-052). */
   truncated: string[]
   ms: number
@@ -534,6 +561,14 @@ export type Request =
    * — probed once, and re-read on demand when the diagnostics panel is open.
    */
   | { type: 'probe' }
+  /**
+   * Fetch the KEV catalog and rebuild the local overlay (M6).
+   *
+   * Its own request as well as a step at the end of Download and Sync, because
+   * a refresh that failed has to be retryable without re-running either — and
+   * because a copy imported before this build existed has no catalog at all.
+   */
+  | { type: 'kev'; options?: ImportOptions }
   | { type: 'reset' }
 
 /**
@@ -624,6 +659,15 @@ export type Response =
       localSchema: number | null
       /** The schema version this build speaks — `SCHEMA_VERSION`, or the override. */
       schema: number
+      /**
+       * The KEV catalog this copy holds, or null when it holds none (M6).
+       *
+       * Rides on `status` for the same reason `notice` does: it is a property
+       * of the copy on disk, read back out of `meta`, and a returning visitor's
+       * page never saw the fetch that wrote it. Which is also what makes the
+       * freshness line honest offline — nothing here is a network request.
+       */
+      kev: KevStatus | null
     }
   /**
    * The capability gate's verdict and the storage picture behind it (M5,
@@ -633,6 +677,28 @@ export type Response =
   | { type: 'environment'; capabilities: CapabilityReport; storage: StorageReport }
   | { type: 'imported'; timings: Timings; notice: string }
   | { type: 'synced'; outcome: SyncOutcome }
+  /**
+   * What a KEV refresh did (M6).
+   *
+   * Its own message rather than an error, because a KEV failure is **not** a
+   * failure of the operation that triggered it: a download that fetched 372,322
+   * records and then could not reach `kev.json` has downloaded the corpus. So
+   * the corpus operation reports success, this reports what happened to the
+   * overlay, and the page shows it as a warning beside a copy that still works.
+   *
+   * `kev` is the catalog now in the local copy — the *previous* one when this
+   * refresh failed, which is what "the old catalog stays and its age is
+   * reported" means.
+   */
+  | {
+      type: 'kev'
+      kev: KevStatus | null
+      /** Null on success. A sentence, not a stack trace. */
+      error: string | null
+      /** How many entries were applied, when one was. */
+      applied: number | null
+      ms: number
+    }
   | {
       type: 'result'
       /** Which surface asked, so the page renders it in the right place. */

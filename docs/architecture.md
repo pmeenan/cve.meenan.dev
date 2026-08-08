@@ -192,7 +192,7 @@ and are never under the served root (D-018, D-034):
 | --- | --- |
 | `cve.data/git/cvelistV5` | The shallow clone (D-021). |
 | `cve.data/db/` | Working databases, including `snapshot.sqlite` — the artifact rev 1 was published from. |
-| `cve.data/cache/` | The KEV cache (D-010), empty until M6. |
+| `cve.data/cache/` | The KEV cron's own directory (D-010, D-076): `kev-state.json` — last run, last success, last error, and what was published — plus `kev.lock`. Its own failure domain: `kev.py` takes no ingest lock and touches no ingest state. The last-good catalog is the **published file itself**; there is deliberately no second copy here, because two authorities that can disagree about what is being served is the shape M5's review found in the manifest/ledger split. |
 | `cve.data/state/ingest.sqlite` | The ingest's hash state, seed pointer and pending run (D-058). |
 | `cve.data/state/pipeline.lock` | The `flock` both crons take (D-042). |
 | `cve.data/state/artifacts/rev-N.sqlite` | Daily builds, ~377 MB each; the newest three are kept. |
@@ -214,16 +214,44 @@ document root and of `cve.data/`, so nothing under `cve.data/` is web-reachable
 | `manifest.json` | `no-cache` | The only mutable file. Lists everything else with byte length and SHA-256. |
 | `snapshot-<rev>/NNN.br` | immutable | 12 chunks, ~5.2 MB each, **62.7 MB** total, each expanding to a 32 MB slice of the 376.7 MB database (D-041). Measured on the first published generation, 2026-08-01. |
 | `deltas/<from>-<to>.json.br` | immutable | One per day; consecutive revisions tile the space by construction (D-042). Retained back to the previous generation, so most of them start below `snapshot.rev` (D-060). |
-| `kev.json` | short — **not yet true** | CISA KEV, its own freshness (D-010). |
+| `kev.json` | `no-cache` — **applied 2026-08-08; the 200 is unverified until a catalog exists** | CISA KEV, its own freshness and its own cadence — deliberately *outside* the manifest (D-076). The plane's second mutable file, so it has its own location, exactly as the manifest does. |
 
-`kev.json`'s row is a statement of intent, not of the deployed configuration,
-and M6 has to close the gap before it publishes one. The block below has exactly
-two locations: an exact match for `/data/manifest.json` at `no-cache`, and
-`^~ /data/` stamping `immutable` on everything else. So the first KEV catalog
-published would be pinned for a year at the edge and in every browser that
-fetched it, under an unversioned URL — a frozen known-exploited set shown beside
-a freshness claim. It needs its own `location = /data/kev.json`, exactly as the
-manifest has one (found by M5's data-plane review).
+**The KEV location is owner-applied. It landed 2026-08-08, before any catalog
+was published** (M6, D-076), and what could be verified from outside was:
+`/data/kev.json` 404s with `cf-cache-status: BYPASS`, **no** `Cache-Control` at
+all, and COOP/COEP/CORP intact — while the manifest, `/sw.js` and the chunks
+kept their own policies, no `Access-Control-Allow-Origin` appears under a
+hostile `Origin`, and `.php` under `/data/` is still not executed.
+
+**A 404 cannot tell the two candidate locations apart, which is why the config
+itself was read.** Since the M5 fix dropped `always` from both `Cache-Control`
+lines, an exact-match `= /data/kev.json` and the general `^~ /data/` emit
+*identical* headers on an error — so a typo in the path would look exactly like
+success and would only surface on the first 200, with the edge already holding
+`immutable` for a year at an unversioned URL. `nginx -T` was used instead: one
+exact-match block, in the `cve.meenan.dev` server, with the three isolation
+headers carrying `always` and `Cache-Control "no-cache"` deliberately without
+it. The **200** remains unverified until a catalog exists;
+`tests/e2e/headers.spec.ts` run with `BASE_URL=https://cve.meenan.dev` is what
+closes that, and the plan item stays unticked until it does.
+
+The reason for the ordering is the whole finding. This block used to have two
+locations: an exact match for `/data/manifest.json` at `no-cache`, and
+`^~ /data/` stamping `immutable` on everything else. A `kev.json` published
+under the general rule would be pinned for a year at the edge and in every
+browser that fetched it, under an unversioned URL — a frozen known-exploited set
+shown beside a freshness claim — and the first fetch through Cloudflare is what
+pins the policy, so correcting it afterwards needs a purge (found by M5's
+data-plane review, which is also where the 404-poisoning fix below comes from).
+
+`no-cache` rather than a small `max-age`, which is the other reading of "short":
+the file is the one place the app says *what is currently known to be
+exploited*, the client already fetches it `no-store` (RE-023) so no `max-age`
+would buy a browser anything, and what is left is the edge — where `no-cache`
+means Cloudflare revalidates and the 1.5 MB crosses the origin link only when
+CISA has actually published. It is also the policy the manifest already proves
+behaves correctly through the proxy (`REVALIDATED`), which a hand-picked TTL
+would not be.
 
 ### Assets the export ships but never loads
 
@@ -263,6 +291,14 @@ location = /data/manifest.json {
     add_header Cache-Control "no-cache";
 }
 
+location = /data/kev.json {
+    root /var/www/meenan.dev/cve.pub;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Embedder-Policy "require-corp" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+    add_header Cache-Control "no-cache";
+}
+
 location ^~ /data/ {
     root /var/www/meenan.dev/cve.pub;
     autoindex off;
@@ -273,8 +309,16 @@ location ^~ /data/ {
 }
 ```
 
-Five things about it are load-bearing rather than stylistic:
+Six things about it are load-bearing rather than stylistic:
 
+- **`= /data/kev.json` is an exact match, so it outranks `^~ /data/`**, which is
+  what keeps the catalog off the `immutable` rule. It repeats every header
+  rather than sharing one — nginx's `add_header` does not merge across levels
+  (D-053), and the whole reason this location exists is that the general rule is
+  wrong for it. Its `Cache-Control` carries no `always` from birth, so a 404 for
+  a not-yet-published catalog is a `BYPASS` at the edge rather than a year-long
+  negative cache: this file's URL is as predictable as a delta's, and the M5
+  poisoning finding applies to it unchanged.
 - **`root`, not `alias`** — and the directory is named `data` so the URL maps
   straight through. This server block defines `try_files` at server level, which
   every location inherits, and `alias` + `try_files` is a long-standing nginx

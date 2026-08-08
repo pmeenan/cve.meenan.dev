@@ -26,6 +26,21 @@ const PORT = Number(process.env.PORT ?? 4747)
 const ROOT = resolve(process.env.SERVE_ROOT ?? 'dist')
 const DATA_ROOT = resolve(process.env.SERVE_DATA_ROOT ?? 'pipeline/pub')
 
+/**
+ * The data plane's two mutable files. Production gives each one a
+ * `location = …` block that outranks `^~ /data/`.
+ *
+ * Matched against the **resolved file path**, not the request path, because
+ * that is what nginx does: it decodes percent-escapes and merges duplicate
+ * slashes before selecting a location, so `/data/%6Bev.json` and
+ * `/data//kev.json` both match `= /data/kev.json` and both get `no-cache`.
+ * Comparing raw pathnames here would serve those two as `immutable` — looser
+ * than production, which is the exact direction RE-012 says never to be.
+ */
+const MUTABLE_DATA_FILES = new Set(
+  ['manifest.json', 'kev.json'].map((name) => join(DATA_ROOT, name))
+)
+
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -85,8 +100,13 @@ const server = createServer(async (req, res) => {
   const headers = { 'content-type': TYPES[ext] ?? 'application/octet-stream' }
 
   if (isData) {
-    // manifest.json is the only mutable file; everything else is immutable.
-    headers['cache-control'] = file.endsWith('manifest.json')
+    // Two mutable files, each with its own exact-match location in production
+    // (D-076): the manifest, and the KEV catalog whose cadence is CISA's rather
+    // than the ingest's. Everything else is immutable. A `kev.json` answered
+    // under the general rule would be pinned for a year at the edge under an
+    // unversioned URL — a frozen known-exploited set shown beside a freshness
+    // claim — so getting this wrong *here* is how it would ship.
+    headers['cache-control'] = MUTABLE_DATA_FILES.has(file)
       ? 'no-cache'
       : 'public, max-age=31536000, immutable'
   } else if (url.pathname.startsWith('/sqlite/')) {

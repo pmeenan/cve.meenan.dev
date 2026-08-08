@@ -27,6 +27,8 @@
 import {
   CVSS_VERSIONS,
   DIMENSIONS,
+  KEV_CODES,
+  KEV_RANSOMWARE_CODES,
   LOOKUP_AXES,
   NOT_ASSESSED,
   SEVERITIES,
@@ -226,6 +228,17 @@ function parseFilters(value: unknown): FiltersResult {
       allowed: [...SSVC_IMPACT, NOT_ASSESSED],
       name: 'SSVC technical-impact codes',
     },
+    // KEV membership has no absence: a record CISA has not listed is *not
+    // known-exploited, per CISA*, which is `KEV_NOT_LISTED` rather than a
+    // missing assessment (D-076). Ransomware use does have one — a listed
+    // record whose value this build does not recognise — so it takes the
+    // sentinel as well as its own "not listed" code.
+    { key: 'kev', allowed: KEV_CODES, name: 'KEV membership codes' },
+    {
+      key: 'kevRansomware',
+      allowed: [...KEV_RANSOMWARE_CODES, NOT_ASSESSED],
+      name: 'KEV ransomware codes',
+    },
   ] as const
   for (const { key, allowed, name } of codeFilters) {
     const codes = parseCodes(raw[key], allowed)
@@ -242,6 +255,10 @@ function parseFilters(value: unknown): FiltersResult {
     'updatedTo',
     'yearFrom',
     'yearTo',
+    'kevAddedFrom',
+    'kevAddedTo',
+    'kevDueFrom',
+    'kevDueTo',
   ] as const) {
     const at = raw[key]
     if (at === undefined) continue

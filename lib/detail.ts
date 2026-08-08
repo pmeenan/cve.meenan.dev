@@ -170,6 +170,30 @@ export function referencesSql(cveId: string): DetailQuery {
 }
 
 /**
+ * This record's KEV entry, if CISA lists it (M6, D-076).
+ *
+ * A sixth query rather than a join onto the record's own: the `kev` table only
+ * exists once a catalog has been loaded, so folding it into `recordSql` would
+ * make the whole detail view fail on a copy that has none — and this is a
+ * lookup by primary key against 1,662 rows.
+ *
+ * Joined on `k.cve_id = c.id` rather than on the two id *strings*, so it is an
+ * integer comparison against the primary key this table was indexed for
+ * (`i_kev_cve`) instead of a text comparison whose result would depend on
+ * collation. `cve.cve_id` is UNIQUE and the catalog holds one entry per CVE, so
+ * at most one row comes back either way.
+ */
+export function kevSql(cveId: string): DetailQuery {
+  return {
+    sql:
+      `SELECT k.added, k.due, k.name, k.descr, k.action, k.ransomware, k.notes, k.cwes, ` +
+      `k.vendor, k.product FROM cve c JOIN kev k ON k.cve_id = c.id WHERE ${BY_ID} LIMIT 1`,
+    params: [key(cveId)],
+    limit: 1,
+  }
+}
+
+/**
  * A CVE identifier the detail view will accept.
  *
  * Bounded and shaped before it becomes a query, because it arrives from a URL

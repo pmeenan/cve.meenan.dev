@@ -45,6 +45,46 @@ test.describe('served cache and isolation policy', () => {
     expect(chunk.headers()['content-encoding']).toBeUndefined()
   })
 
+  test('the KEV catalog revalidates and is never immutable (D-076)', async ({ request }) => {
+    // The plane's *second* mutable file, and the one whose cache policy is the
+    // easiest to get catastrophically wrong: under the general `^~ /data/` rule
+    // it would be pinned for a year at the edge and in every browser that
+    // fetched it, at an unversioned URL — a frozen known-exploited set shown
+    // beside a freshness claim. The first fetch through Cloudflare pins
+    // whatever policy is in place, so this has to be true before the first
+    // catalog is published, not after.
+    const response = await request.get('/data/kev.json')
+    expect(response.status()).toBe(200)
+    expect(response.headers()['cache-control']).toBe('no-cache')
+    // Self-describing, which is why it is outside the manifest (D-076 §2). This
+    // does **not** check verbatimness — nothing here has upstream's bytes to
+    // compare against; `pipeline/tests/test_kev.py` asserts that where it can.
+    const catalog = (await response.json()) as { catalogVersion: string; count: number }
+    expect(typeof catalog.catalogVersion).toBe('string')
+    expect(catalog.count).toBeGreaterThan(0)
+    // The notice CC0 does not require, checked as absent so a later change that
+    // "helpfully" adds one is caught (D-076 §1).
+    expect(Object.keys(catalog)).not.toContain('notice')
+  })
+
+  test('a 404 under /data/ is not cacheable for a year (M5)', async ({ request }) => {
+    // Delta and catalog URLs are predictable, so an `immutable` 404 is a cheap
+    // remote sync-DoS: request tomorrow's URL today and poison it at the edge
+    // for a year.
+    //
+    // **This only means something against the real origin.** The failure is
+    // nginx's `always` flag on the `Cache-Control` line, and `scripts/serve.mjs`
+    // has no equivalent — its 404 branch sends `content-type` and nothing else,
+    // so run locally this test cannot fail. It earns its place under
+    // `BASE_URL=https://cve.meenan.dev pnpm e2e headers`, which is how the M5
+    // finding was found and how this one has to be confirmed. Saying so here
+    // rather than letting a green local run imply coverage is the RE-024
+    // lesson.
+    const response = await request.get('/data/no-such-file-6f1a.json')
+    expect(response.status()).toBe(404)
+    expect(response.headers()['cache-control'] ?? '').not.toContain('immutable')
+  })
+
   test('same-origin is enforced by the absence of CORS headers (D-034)', async ({ request }) => {
     const response = await request.get('/data/manifest.json', {
       headers: { Origin: 'https://not-this-origin.example' },

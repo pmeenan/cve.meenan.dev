@@ -22,8 +22,9 @@
 
 import {
   ABSENCE_DIMENSIONS,
+  absenceLabel,
   CODE_LABELS,
-  NOT_ASSESSED_LABEL,
+  KEV_DIMENSIONS,
   SSVC_DIMENSIONS,
   TIME_DIMENSIONS,
   type Dimension,
@@ -141,12 +142,17 @@ function orderSeries(dimension: Dimension, keys: Map<string, { label: string; to
     dimension === 'cvssVersion' ||
     dimension === 'state' ||
     SSVC_DIMENSIONS.has(dimension) ||
+    KEV_DIMENSIONS.has(dimension) ||
     TIME_DIMENSIONS.has(dimension)
   ) {
     // The SQL emitted these in semantic order — for the SSVC axes, codes
-    // ascending with the unassessed band last (D-070) — and the insertion order
-    // of the map preserves it, so re-sorting here would be second-guessing the
-    // query layer.
+    // ascending with the unassessed band last (D-070); for the KEV axes,
+    // *listed* first, because it is the small band (1,662 of 372,322) and the
+    // baseline is the only position a reader can compare across buckets
+    // (D-073's argument for CRITICAL, applied to the band that matters here) —
+    // and the map's insertion order preserves it. Re-sorting by size would put
+    // "Not in KEV" at the baseline and make the interesting series a sliver
+    // floating on top of it.
     return entries
   }
   return entries.sort(([, a], [, b]) => b.total - a.total)
@@ -163,6 +169,13 @@ function orderSeries(dimension: Dimension, keys: Map<string, { label: string; to
 function seriesCap(dimension: Dimension): number {
   if (dimension === 'severity') return SEVERITY_SERIES_MAX
   if (SSVC_DIMENSIONS.has(dimension)) return SSVC_SERIES_MAX
+  // The KEV axes are two and four buckets, all of them meaningful — including
+  // the complement, which carries the denominator. Under the categorical cap
+  // they would never be trimmed anyway; naming them here is what stops a future
+  // change to that cap from silently deleting the "Not in KEV" band and
+  // turning every KEV chart into an assertion about the 0.4% of the corpus
+  // CISA lists (M6, D-076).
+  if (KEV_DIMENSIONS.has(dimension)) return 4
   return CHART_SERIES_MAX
 }
 
@@ -206,7 +219,12 @@ export function bucketLabel(dimension: Dimension, bucket: unknown, label: unknow
     // "not assessed" rather than "none recorded": nobody recorded an SSVC
     // assessment *and* `none` is one of the answers it could have recorded, so
     // the two have to read differently (D-070).
-    if (SSVC_DIMENSIONS.has(dimension)) return NOT_ASSESSED_LABEL
+    // The absence axes, each named by the one function every surface uses: a
+    // band with a different name on the chart than on its own filter checkbox
+    // reads as a different band (M6).
+    if (SSVC_DIMENSIONS.has(dimension) || dimension === 'kevRansomware') {
+      return absenceLabel(dimension)
+    }
     return '(none recorded)'
   }
   const code = Number(bucket)
