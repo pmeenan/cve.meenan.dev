@@ -22,6 +22,60 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-029: M5's `always` fix was recorded as deployed and was not on the running server, so `/data/` 404s were cached for a year  (2026-08-08, status: fixed)
+
+**Environment.** nginx on `plex`, behind Cloudflare. Found in M6 the first time
+`tests/e2e/headers.spec.ts` was pointed at the live origin
+(`BASE_URL=https://cve.meenan.dev pnpm e2e headers`).
+
+**Repro / measurement.**
+
+```
+$ curl -sSI https://cve.meenan.dev/data/no-such-file-6f1a.json
+HTTP/2 404
+cache-control: public, max-age=31536000, immutable
+cf-cache-status: HIT
+
+$ curl -sSI https://cve.meenan.dev/data/deltas/9998-9999.json.br
+HTTP/2 404
+cache-control: public, max-age=31536000, immutable
+cf-cache-status: MISS
+```
+
+`sites-available/meenan.dev:142` reads
+`add_header Cache-Control "public, max-age=31536000, immutable" always;`.
+
+**Observed.** The M5 data-plane review found exactly this and both
+`docs/architecture.md` and `docs/plan.md` record the `always` as dropped and the
+result as verified. It is not dropped. The `HIT` above means the edge is already
+holding a 404 under a year-long TTL.
+
+**Expected.** No `Cache-Control` on a 4xx under `/data/`, so Cloudflare's
+negative cache holds it for minutes.
+
+**Impact.** Delta URLs are predictable, so this is a cheap remote sync-DoS:
+request `deltas/<from>-<to>.json.br` before the pipeline publishes it, and every
+client is served a cached 404 for that revision for a year and can never sync
+past it. The fix is one word on one line, plus a Cloudflare purge — the purge is
+not optional, because a cached 404 outlives the header change that stopped
+producing it.
+
+**Fixed the same hour.** The owner removed `always` from every `Cache-Control`
+line and purged the edge. Re-measured: `/data/no-such-file-6f1a.json`,
+`/data/deltas/9998-9999.json.br` and `/data/snapshot-11/999.br` all return 404
+with **no `Cache-Control`** and `cf-cache-status: BYPASS`, while every 200 keeps
+its own policy and COEP survives throughout. `headers.spec.ts` is 12/12 on both
+engines against the live origin.
+
+**What this says about the process, which is the more useful half.** M5 verified
+this by hand from response headers, and the verification is quoted in the plan.
+The regression — or the fix never landing — went unnoticed for a day because
+nothing re-checked it. `headers.spec.ts` now covers it, and the lesson is that
+**the spec has to be run against the origin, not only locally**: `serve.mjs`
+has no `always` flag to model, so the local run passes vacuously and says so in
+a comment. RE-025 is the same family (a config edit that nginx was not reading);
+this one is a config edit that was recorded but is absent from the file.
+
 ## RE-028: The bundler drops a literal segment when a template carrying `${…}` is concatenated with `+`, so the browser runs SQL the source never had  (2026-08-08, status: worked-around)
 
 **Environment.** Next.js 16.2.12 / Turbopack production build (`next build`,

@@ -1028,7 +1028,7 @@ band rather than a silent zero — **and the bump ships before launch, not
 after**, with D-068's announcement path exercised end to end across the real
 bump; public launch.
 
-## M6 — CISA KEV overlay  `in progress`
+## M6 — CISA KEV overlay  `done`
 
 Scope: server-side KEV fetch and cache (D-010), joined to the corpus
 client-side. Small and self-contained. The gate the original scope set —
@@ -1073,7 +1073,7 @@ place — the M5 finding this milestone would otherwise inherit.
       stating the relationship instead of implying one. D-008's second-source
       reopen is exercised and closed; MITRE's notice still governs the CVE rows
       KEV columns appear beside.
-- [ ] **The nginx location** (owner-applied, **outstanding**). The block is
+- [x] **The nginx location** (owner-applied, landed 2026-08-08). The block is
       written and in [architecture.md](architecture.md): `location =
       /data/kev.json` at `no-cache` — an exact match, so it outranks
       `^~ /data/`; the security headers repeated (`add_header` does not merge,
@@ -1096,8 +1096,33 @@ place — the M5 finding this milestone would otherwise inherit.
 
       **Nothing may publish a catalog until this is applied and verified**: the
       first fetch through Cloudflare pins whatever policy is in place, and
-      correcting it afterwards needs a purge. architecture.md's contract table
-      keeps an "owner-applied, unverified" caveat until then.
+      correcting it afterwards needs a purge.
+
+      **Applied and verified 2026-08-08, in that order.** A 404 could not settle
+      it — since M5 dropped `always`, an exact-match block and the general
+      `^~ /data/` emit identical headers on an error — so `nginx -T` was read
+      first (one exact-match block, right server, isolation headers with
+      `always`, `Cache-Control` without), then the catalog was published, then
+      the **origin's own headers were read with Cloudflare bypassed**
+      (`--resolve cve.meenan.dev:443:127.0.0.1`) before the edge ever saw the
+      URL: `cache-control: no-cache` on the 200, so nothing could be pinned.
+      Through the edge afterwards: `MISS` → `REVALIDATED`, no
+      `Access-Control-Allow-Origin` under a hostile `Origin`, and the 404 for
+      the pre-publish state carried no `Cache-Control` at all.
+
+      **And running the spec against the live origin found an M5 regression**
+      (RE-029), which is the whole reason the exit criteria asked for a check
+      against the origin rather than a local one. `/data/no-such-file-6f1a.json`
+      returned 404 with `cache-control: public, max-age=31536000, immutable` and
+      `cf-cache-status: HIT` — the `always` M5 recorded as dropped was still on
+      `^~ /data/` line 142, and the edge was already holding a 404 under a
+      year-long TTL: a cheap remote sync-DoS on predictable delta URLs. It was
+      **not** inherited by this block (`= /data/kev.json` was correct, which is
+      why its own 404 carried no policy). Fixed the same hour — `always` removed
+      from every `Cache-Control` line, edge purged — and re-measured: three 404
+      shapes all `BYPASS` with no `Cache-Control`, every 200 unchanged, COEP
+      intact, and `headers.spec.ts` **12/12 on both engines against the live
+      origin**.
 - [x] **The pipeline half.** `pipeline/kev.py` on its own cron (`41 */6 * * *`),
       its own failure domain: its own lock file and its own state directory, so
       the two jobs share a `flock` helper and nothing else. Fetch from cisa.gov
@@ -1308,8 +1333,7 @@ operation unaffected and the previous catalog answering with its age
 reported, verified by tests in both engines; and the detail view's KEV block
 renders a hostile fixture under the existing reference hardening.
 
-**Exit criteria — the client half is met, the origin half is not, and the
-milestone stays open on the second.** `tests/e2e/kev.spec.ts` passes on **both
+**Exit criteria — met 2026-08-08.** `tests/e2e/kev.spec.ts` passes on **both
 engines** — Chromium and Firefox, three tests each — against a data plane
 carrying a catalog: a download
 ends with one, membership filters and its grouped count agree, a KEV × severity
@@ -1321,13 +1345,15 @@ previous one serving with the failure reported beside it, and a sync still
 succeeds afterwards; a copy with no catalog refuses a KEV question by name while
 every other query still works.
 
-**What is not met is the origin half**, and it is the item the whole milestone
-was ordered around: `location = /data/kev.json` is owner-applied and has not
-been applied, so nothing has published a catalog and no response header has been
-verified through Cloudflare. Until then the exit criterion's first clause — the
-live origin serving `kev.json` under its own location — is unmet by
-construction, and publishing before it would be the failure the ordering
-exists to prevent.
+**The origin half is now met too.** `pipeline/kev.py` published the real
+catalog on `plex` — 1,662 entries, 1,577,762 bytes, sha256 `2a6c54ce…`,
+**byte-identical to what cisa.gov serves**, with no notice added (CC0 requires
+none) — under a `no-cache` location verified at the origin *and* through
+Cloudflare, and the cron is installed at `41 */6 * * *` with the previous
+crontab backed up. The app was deployed in the same window. `pnpm e2e headers`
+against the live origin is **12/12 on both engines**, after the run's first
+attempt surfaced RE-029 — the M5 `always` regression on the general `^~ /data/`
+block, which this milestone did not introduce but did find, fix and re-measure.
 
 ## M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `pending`
 

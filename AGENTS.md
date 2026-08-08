@@ -144,11 +144,14 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M6 in progress — the CISA KEV overlay.** The client half is built and passes
-end to end in a browser; the origin half is one owner-applied nginx block away
-and **nothing may publish a catalog until it lands**, because the first fetch
-through Cloudflare pins whatever cache policy is in place and correcting it
-needs a purge. KEV is CC0, so no notice travels (D-076) — provenance does:
+**M6 complete — the CISA KEV overlay is live.** The origin serves `kev.json`
+under its own `no-cache` location, published by its own cron (`41 */6 * * *`):
+1,662 entries, 1,577,762 bytes, **byte-identical to what cisa.gov serves**.
+Verified in the order the risk demanded — `nginx -T` first, because a 404 cannot
+tell an exact-match location from the general one; then publish; then the
+origin's own headers with Cloudflare bypassed, before the edge ever saw the URL;
+then through the edge (`MISS` → `REVALIDATED`). KEV is CC0, so no notice travels
+(D-076) — provenance does:
 every place the app asserts membership says *per CISA*, with the catalog
 version and release date, which is what keeps it a statement about CISA's
 catalog rather than an endorsement by it. `pipeline/kev.py` is its own cron with
@@ -160,6 +163,15 @@ bump, so no re-download — created by the apply that fills it, which is what le
 a copy with no catalog *refuse* a KEV question instead of answering that nothing
 is known to be exploited (D-077). "Not in KEV" is a labelled value, not an
 absence band: absence from the catalog is the finding.
+
+**Pointing the header spec at the live origin found an M5 regression** (RE-029),
+which is the argument for that exit criterion existing at all: `always` was
+still on `^~ /data/`'s `Cache-Control`, so a 404 went out `immutable` and the
+edge was already holding one on a `HIT` — a cheap remote sync-DoS, since delta
+URLs are predictable. M5 had recorded that fix as deployed *and verified*. Fixed
+and re-measured the same hour; the spec is 12/12 on both engines against the
+origin. `scripts/serve.mjs` has no `always` to model, so a local run passes
+vacuously — and says so in a comment.
 
 **Four defects came out of it that the unit tests could not see.** Two came
 from the adversarial pass over the server half and compounded into one story: a

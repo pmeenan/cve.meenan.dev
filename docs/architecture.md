@@ -332,11 +332,25 @@ Six things about it are load-bearing rather than stylistic:
 - **`Cache-Control` without `always`; the security headers with it.** Without
   `always`, nginx attaches the header only to 2xx/3xx responses — so a 404
   under `/data/` carries no cache policy and Cloudflare's negative cache holds
-  it for minutes, not a year. With `always` (how it was first deployed), a 404
-  went out marked `immutable`, and since delta URLs are predictable
-  (`deltas/<from>-<to>.json.br`), anyone could request tomorrow's delta today
-  and poison that URL at the edge until a manual purge — a cheap remote
-  sync-DoS, observed live 2026-08-08 the day the proxy was enabled.
+  it for minutes, not a year. With `always`, a 404 goes out marked `immutable`,
+  and since delta URLs are predictable (`deltas/<from>-<to>.json.br`), anyone
+  can request tomorrow's delta today and poison that URL at the edge until a
+  manual purge — a cheap remote sync-DoS, observed live 2026-08-08 the day the
+  proxy was enabled.
+
+  **It had drifted, and it is fixed** (RE-029, 2026-08-08). The first run of
+  `tests/e2e/headers.spec.ts` against the live origin found `always` still on
+  this line: `/data/no-such-file-6f1a.json` returned 404 with
+  `cache-control: public, max-age=31536000, immutable` and
+  `cf-cache-status: HIT`, so the edge was already holding a 404 under a
+  year-long TTL, and `deltas/9998-9999.json.br` — a URL the pipeline will
+  legitimately publish one day — returned the same policy. The owner removed
+  `always` from every `Cache-Control` line and purged the edge; re-measured, all
+  three 404 shapes now return **no `Cache-Control` at all** with
+  `cf-cache-status: BYPASS`, while every 200 keeps its policy (manifest, KEV,
+  `/sw.js` and `/sqlite/` at `no-cache`, chunks `immutable`, HTML
+  `no-cache, must-revalidate`) and COEP survives on all of them. The spec is
+  12/12 on both engines against the origin.
   COOP/COEP/CORP keep `always`: isolation on an error page is harmless, and a
   gap would be a hole.
 - **What is absent.** No `Access-Control-Allow-Origin` — its absence is the
