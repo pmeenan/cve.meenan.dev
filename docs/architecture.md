@@ -245,7 +245,7 @@ location = /data/manifest.json {
     add_header Cross-Origin-Opener-Policy "same-origin" always;
     add_header Cross-Origin-Embedder-Policy "require-corp" always;
     add_header Cross-Origin-Resource-Policy "same-origin" always;
-    add_header Cache-Control "no-cache" always;
+    add_header Cache-Control "no-cache";
 }
 
 location ^~ /data/ {
@@ -254,11 +254,11 @@ location ^~ /data/ {
     add_header Cross-Origin-Opener-Policy "same-origin" always;
     add_header Cross-Origin-Embedder-Policy "require-corp" always;
     add_header Cross-Origin-Resource-Policy "same-origin" always;
-    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    add_header Cache-Control "public, max-age=31536000, immutable";
 }
 ```
 
-Four things about it are load-bearing rather than stylistic:
+Five things about it are load-bearing rather than stylistic:
 
 - **`root`, not `alias`** — and the directory is named `data` so the URL maps
   straight through. This server block defines `try_files` at server level, which
@@ -270,6 +270,16 @@ Four things about it are load-bearing rather than stylistic:
   directives as soon as a location declares one of its own, so leaving
   COOP/COEP to the server level would strip cross-origin isolation from every
   artifact — and the `opfs` VFS needs it (D-030, D-051).
+- **`Cache-Control` without `always`; the security headers with it.** Without
+  `always`, nginx attaches the header only to 2xx/3xx responses — so a 404
+  under `/data/` carries no cache policy and Cloudflare's negative cache holds
+  it for minutes, not a year. With `always` (how it was first deployed), a 404
+  went out marked `immutable`, and since delta URLs are predictable
+  (`deltas/<from>-<to>.json.br`), anyone could request tomorrow's delta today
+  and poison that URL at the edge until a manual purge — a cheap remote
+  sync-DoS, observed live 2026-08-08 the day the proxy was enabled.
+  COOP/COEP/CORP keep `always`: isolation on an error page is harmless, and a
+  gap would be a hole.
 - **What is absent.** No `Access-Control-Allow-Origin` — its absence is the
   same-origin control (D-034). No `brotli_static`, because artifacts are opaque
   `.br` the client decodes itself and an added `Content-Encoding` would corrupt

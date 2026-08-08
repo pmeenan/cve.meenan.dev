@@ -15,8 +15,8 @@ it touched.
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
 Milestones are decomposed into task-sized checkboxes (the workflow's unit of
-work) no later than when they become the next milestone up — M0 – M3 are
-decomposed and closed, and **M4 is decomposed and in progress**. M5+ carry scope
+work) no later than when they become the next milestone up — M0 – M4 are
+decomposed and closed, and **M5 is decomposed and next**. M6+ carry scope
 prose and exit criteria until their turn.
 
 ## M0 — Plan the plan  `done`
@@ -552,8 +552,6 @@ after it is either a producer or a consumer of one.
       movement and the chart's table fallback. The dependency's license is
       verified from its own metadata before it lands (D-002).
 
-
-
 **Exit criteria:** the owner's motivating question — counts by vendor, product,
 and severity over the last two years (D-046 benchmark item #2) — is answerable
 entirely through the UI, charted and exportable, with REJECTED records excluded
@@ -662,6 +660,21 @@ caching the shell, Worker, WASM, and brotli decoder — scoped to never touch
 `/data/` or model weights — so vision criterion 5 covers reopening the app
 offline, not just an already-open tab.
 
+Four shape decisions were taken by the owner at decomposition (2026-08-08),
+following M4's precedent, because each changes what the tasks below are.
+**Cloudflare is a flip, not a migration**: `meenan.dev` is already a Cloudflare
+zone, just unproxied — the work is proxying the record and applying D-039's
+cache rules, then verifying from response headers; no nameserver move.
+**Launch is the flip**: when the exit criteria hold, the site is launched — no
+landing page, about copy, or announcement surface is M5 scope. **Multi-tab is
+full support, not honest degradation** — a raise over the "degrades honestly"
+wording this section carried: a second tab must keep querying while another
+tab syncs, and must follow a replacement rather than keep answering from a
+promoted-over copy. And **the data-plane review gets the heavyweight
+treatment** (workflow.md's "when to go heavy"), sanctioned in advance rather
+than decided at the moment — it gates launch, and it is exactly the class of
+change that section names.
+
 **The last schema additions, and they land here for a timing reason** (D-070).
 Five fields the corpus has been carrying that the projection drops: SSVC's three
 decision points from CISA's Vulnrichment ADP — the corpus's only structured
@@ -678,18 +691,134 @@ is the schema assertion, the `lib/filters.ts` axes for the SSVC enums, and the
 detail view. Absence stays visible throughout: a record with no SSVC assessment
 is its own band, never folded into `none`.
 
+Tasks in dependency order. The schema bump leads because it invalidates every
+local copy and changes the artifact every later task tests against — landing it
+first means nothing downstream is verified twice. Cloudflare is the exception:
+it is independent of everything else and should be flipped early for soak time,
+in parallel with whatever task is current.
+
+- [ ] **The schema bump, pipeline half** (D-070). `schema.sql` gains the five
+      fields and a new schema version; `normalize.py` mines them — SSVC's three
+      decision points from `metrics[].other` where `type == "ssvc"`,
+      `dateReserved` as unix seconds, `defaultStatus` with the conservative
+      tie-break D-070 requires made explicit (affected beats unknown beats
+      unaffected, on the deduped `(vendor, product)` collision), `cna.title`,
+      and the first English `rejectedReasons[]` value. Full rebuild on the
+      recorded ID space (D-056 seeding is undisturbed — columns change, ids do
+      not), with the real marginal cost measured against D-033's table — a
+      number to record, not a gate; the owner settled `title` on the 2.58 MB
+      proxy (D-070). One thing to settle rather than discover: how the bump
+      lands on the wire — a fresh generation at the new version, with no delta
+      crossing the schema boundary and the ingest state advanced accordingly.
+- [ ] **The schema bump, client half.** The schema assertion learns the new
+      version; `lib/filters.ts` grows the three SSVC axes as filters, grouped
+      counts and report dimensions — with NULL as its own "not assessed"
+      band throughout, never folded into `none` (D-070); the detail view
+      renders `title`, the rejection reason (D-022's 17,822 records stop
+      rendering blank), `reserved`, and version ranges disambiguated by
+      `default_status`. Whether `title` joins the client-built FTS index
+      (D-035) is decided here by measurement — index bytes and build seconds
+      against recall on vulnerability-class terms — because D-070 left it open
+      deliberately.
+- [ ] **The bump exercised end to end** — the claim M3 and M4 deliberately
+      could not make (D-068), now that both builds exist for real: the old
+      client against the new data plane refuses before a byte is fetched, with
+      the reload message; the new client against an old local copy announces
+      `obsolete` with both versions, withdraws the query surfaces, keeps the
+      copy, and replaces it by ordinary download. Deploy sequencing is part of
+      the task: the deployed client refuses a new-schema manifest, so the
+      artifact and the app ship in one window, artifact first.
+- [ ] **Multi-tab, full support** (owner decision 2026-08-08). One writer at a
+      time via Web Locks — download and sync are exclusive, and a second tab
+      asked to sync says who is already doing it — while every tab keeps
+      querying throughout (the `opfs` VFS's concurrent-reader behaviour is why
+      D-051 chose it). Promotion and applied deltas propagate: a tab that did
+      not perform the replacement learns of it and reopens the new generation
+      rather than answering from the promoted-over slot, and freshness lines
+      agree across tabs. What must not regress: D-061's crash-safety with a
+      reader present at the moment of promotion. Verified by a two-page e2e —
+      tab B queries while tab A syncs; tab A replaces the database and tab B
+      follows.
+- [ ] **Storage quota, persistence and eviction.** `navigator.storage.persist()`
+      requested and its answer surfaced, not assumed; a preflight estimate
+      before download against the real need — two slots plus staging (D-061) —
+      so a doomed download is refused up front rather than dying at 90%;
+      `QuotaExceededError` mid-download fails cleanly with the live copy intact
+      (D-061's guarantee, now tested under quota pressure specifically); an
+      evicted copy discovered at reopen reports as an honest empty origin, not
+      an error; and D-068's open question — whether a retained obsolete copy is
+      a quota problem — is decided here, where quota is owned.
+- [ ] **The capability gate** (D-016). Probes the *synchronous* forms of
+      `FileSystemSyncAccessHandle`'s methods specifically — the naive
+      interface check passes on Safari 15.2–16.3 and then fails deep inside the
+      import, which is the failure the gate exists to prevent — plus whatever
+      else the import path actually requires. Below the floor, the message
+      arrives before any download and is self-explanatory on first read,
+      because D-009 means no gate hit is ever observed remotely.
+- [ ] **Firefox and WebKit** (D-016, rule 3). Playwright projects for both
+      engines; the e2e suite green on both — or each trade recorded by name —
+      *before* the floor is claimed publicly; the full-corpus import measured
+      per engine and recorded in features.md beside the Chromium numbers,
+      because a support claim is a measurement claim.
+- [ ] **The offline app shell** (D-048, network-first per D-054). A hand-rolled
+      service worker, versioned per deploy, caching the exported shell, the
+      `/sqlite/` distribution and the brotli decoder — and structurally never
+      `/data/`, which passes through untouched so the manifest stays the
+      freshness signal. The e2e is a *reopen*: network killed, app reopened
+      cold, corpus queried (vision criterion 5), plus the stale-manifest check
+      that `/data/` is never answered from the SW cache.
+- [ ] **The diagnostics panel** (D-009). The one support channel: storage used
+      against quota and whether persistence was granted, last sync and the
+      copy's age, record counts, schema version, service-worker state
+      (registered, version, controlling), and the capability probe's results —
+      the things a bug report needs and telemetry will never provide.
+- [x] **Cloudflare in front** (D-039, carried from M1). **Flipped and verified
+      2026-08-08.** The flip surfaced two real defects, both fixed the same
+      hour. First, the zone's SSL mode was *Flexible*, so Cloudflare spoke
+      HTTP to an origin that redirects HTTP→HTTPS and every request looped —
+      the site was down until the owner set *Full (strict)*. Second, the
+      origin sent its `immutable` Cache-Control on **404s** (`add_header …
+      always`), and Cloudflare cached one for a year (observed: `HIT`,
+      `age: 26`) — with delta URLs predictable, anyone could have poisoned
+      tomorrow's `deltas/<from>-<to>.json.br` at the edge for a year, a cheap
+      remote sync-DoS. Dropping `always` from the Cache-Control lines (the
+      security headers keep theirs) makes error responses `BYPASS` entirely;
+      the block and the reasoning are in architecture.md. Verified from
+      responses, not the dashboard: `cf-ray` everywhere, chunks `MISS`→`HIT`,
+      manifest and `/sqlite/` `REVALIDATED`/`no-cache`, COOP/COEP/CORP intact
+      through the proxy, no `Access-Control-Allow-Origin` under a hostile
+      `Origin`, `.php` under `/data/` 404, traversal 400, NEL disabled so
+      Cloudflare injects no reporting channel (D-009). The verification also
+      caught that the docroot still held the **Aug 2 build** — three
+      milestones stale — which the first live-origin e2e failed against;
+      the M4 app was deployed (D-003 rsync) and the full-corpus import e2e
+      then passed against the proxied origin, 7.2 m end to end.
+- [ ] **The heavyweight data-plane review** (sanctioned 2026-08-08, per
+      workflow.md's "when to go heavy"). Multi-agent adversarial pass with
+      fix/verify rounds over the published data plane end to end: the pipeline
+      and its crons, retention and rotation, the wire contract, the nginx
+      configuration, and the now-Cloudflare fronting — the class of change that
+      can corrupt the artifact chain, reviewed as such before the public is
+      invited to depend on it.
+- [ ] **Launch.** The flip, and nothing else ships with it: every criterion
+      below verified, the status paragraph and this plan updated, and the site
+      is public.
+
 **Exit criteria:** the origin is behind Cloudflare with the D-039 cache rules
 applied and verified from a response header; the app degrades honestly on an
-unsupported browser, under quota pressure, and in a second tab — each verified by a test, with the
-capability gate exercised in real Firefox and WebKit runs; the diagnostics
-panel reports storage used, last sync, record counts, and schema version; the
-data plane survives an adversarial pass; an offline *reopen* e2e test passes —
-network killed, app reopened, corpus queried — and a stale-manifest check
-confirms the service worker never serves `/data/` from cache (D-048); D-070's
-five fields are in the built artifact with their real marginal cost measured
-against D-033's table, filterable where they are axes, and reported with
-"not assessed" as a visible band rather than a silent zero — **and the bump
-ships before launch, not after**; public launch.
+unsupported browser and under quota pressure, and a second tab is **fully
+functional** — it queries during another tab's sync and follows a replacement —
+each verified by a test, with the capability gate exercised in real Firefox and
+WebKit runs; the diagnostics panel reports storage used, last sync, record
+counts, and schema version; the data plane survives the heavyweight adversarial
+pass; an offline *reopen* e2e test passes — network killed, app reopened,
+corpus queried — and a stale-manifest check confirms the service worker never
+serves `/data/` from cache (D-048); D-070's five fields are in the built
+artifact with their real marginal cost measured against D-033's table,
+filterable where they are axes, and reported with "not assessed" as a visible
+band rather than a silent zero — **and the bump ships before launch, not
+after**, with D-068's announcement path exercised end to end across the real
+bump; public launch.
 
 ## M6 — CISA KEV overlay  `pending`
 
