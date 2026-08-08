@@ -125,7 +125,7 @@ definitions the fixed UI renders.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| CISA KEV overlay | `confirmed` | D-010. 1,656 entries / 1.5 MB, ~daily. Sends no CORS header (checked 2026-07-30), so it routes through the existing server. |
+| CISA KEV overlay | `confirmed` | D-010; terms and wire shape in D-076 — CC0 1.0, no notice owed. 1,662 entries / 1.5 MB, updated ~business-daily (re-checked 2026-08-08). Still sends no CORS header, so it routes through the existing server; CISA's own `cisagov/kev-data` mirror is the sanctioned server-side fallback. |
 | EPSS score overlay | `rejected (D-010)` | Daily-changing scores across the whole corpus — a recurring sync problem for a secondary signal. |
 | NVD enrichment overlay | `rejected (D-010)` | Would mean operating a second mirror; rate limits make client-side full-corpus enrichment impractical. |
 

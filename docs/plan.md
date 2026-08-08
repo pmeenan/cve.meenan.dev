@@ -16,8 +16,8 @@ it touched.
 
 Milestones are decomposed into task-sized checkboxes (the workflow's unit of
 work) no later than when they become the next milestone up — M0 – M5 are
-decomposed and closed, and **M6 is next**. M7+ carry scope
-prose and exit criteria until their turn.
+decomposed and closed, and **M6 is next, decomposed 2026-08-08**. M7 and M8
+carry scope prose and exit criteria until their turn.
 
 ## M0 — Plan the plan  `done`
 
@@ -1031,15 +1031,120 @@ bump; public launch.
 ## M6 — CISA KEV overlay  `pending`
 
 Scope: server-side KEV fetch and cache (D-010), joined to the corpus
-client-side. Small and self-contained, which is why it sits last without
-blocking anything. Before anything ships: record KEV's redistribution terms
-and required provenance/notice in the decision log — D-008's reopen-if names
-"a second data source" as exactly this trigger, and only size/CORS were
-researched in D-010.
+client-side. Small and self-contained. The gate the original scope set —
+record KEV's redistribution terms before anything ships — was discharged at
+decomposition: **CC0 1.0 Universal, no notice obligation** (D-076), verified
+2026-08-08 from CISA's own license text, so nothing has to travel with the
+data and the open question becomes pure engineering. The wire shape is also
+settled there: `kev.json` is a standalone mutable file *outside* the manifest,
+served verbatim, and client-side KEV is a **client-built, D-013-style
+rebuildable table** — never part of the artifact or its schema version, which
+is what lets the overlay ship without the post-launch re-download a schema
+bump now costs (D-068, D-070).
 
-**Exit criteria:** KEV's terms are recorded and its required notice (if any)
-travels with the data; KEV status is a queryable, filterable attribute; its
-staleness is surfaced separately from the corpus's.
+Three shape decisions were taken by the owner at decomposition (2026-08-08),
+following M4 and M5's precedent, because each changes what the tasks below
+are. **KEV is a report dimension, not just a filter** — In KEV / Not in KEV
+and ransomware use as rows/series axes, which is what makes "KEV share of
+criticals over time" a chartable report and gives M7's KEV tool (D-044) a
+dimension to emit rather than only a predicate. **The client fetches KEV on
+Download and Sync only** — a download ends by fetching the catalog, a sync
+refreshes it when `catalogVersion` moved, and no request happens outside the
+actions users already understand. **All eleven fields ship** — at 1,662 rows
+the storage cost is noise, the detail view gets CISA's remediation text, and
+the SQL console gets the whole catalog.
+
+One framing point so it is not re-litigated per surface: **"Not in KEV" is a
+real value, not an absence band.** Unlike an SSVC point nobody assessed,
+absence from the catalog is the finding — *not known-exploited, per CISA* —
+so the complement is an ordinary categorical slot, labeled with its
+provenance ("per CISA, as of \<dateReleased\>"), never the off-ramp neutral
+M5 gave the unassessed.
+
+Tasks in dependency order. The nginx location precedes the first publish
+because the first fetch through Cloudflare pins whatever cache policy is in
+place — the M5 finding this milestone would otherwise inherit.
+
+- [x] **KEV's redistribution terms, recorded** (D-076). Done at decomposition,
+      2026-08-08: CC0 1.0 Universal — a full waiver, no notice or attribution
+      owed on any copy or export. The only riders sit outside copyright: no
+      CISA logo or DHS seal, and nothing presented as CISA endorsement — which
+      the provenance line ("per CISA, as of \<dateReleased\>") satisfies by
+      stating the relationship instead of implying one. D-008's second-source
+      reopen is exercised and closed; MITRE's notice still governs the CVE rows
+      KEV columns appear beside.
+- [ ] **The nginx location** (owner-applied). `location = /data/kev.json`
+      with a short/revalidating cache policy — never `immutable` — with the
+      security headers repeated (`add_header` does not merge, D-053) and no
+      `always` on the Cache-Control line, so error responses stay uncached at
+      the edge (the M5 404-poisoning fix applies to this block from birth).
+      Verified from response headers through Cloudflare, including that a 404
+      for the not-yet-published file is `BYPASS`/uncached — *then* the first
+      catalog may publish. architecture.md's contract table drops its "not yet
+      true" caveat in the same change.
+- [ ] **The pipeline half.** `pipeline/kev.py` on its own cron, its own
+      failure domain: it takes no ingest lock, touches no ingest state, and a
+      failure of either cron leaves the other's outputs untouched. Fetch from
+      cisa.gov (the official `cisagov/kev-data` mirror is the sanctioned
+      fallback, D-076 §3); validate fail-closed before anything is published —
+      parse, required fields per CISA's published JSON schema,
+      `count == len(vulnerabilities)`, well-formed `cveID`s, and a
+      roll-backwards guard refusing a `catalogVersion` older than the one
+      already published (the M5 review's lesson applied in advance); publish
+      the verbatim bytes by atomic rename, keep-last-good on *any* failure. A
+      `status` subcommand reports the published version and last successful
+      fetch, beside `ingest.py status`. Validation refusals and the guard get
+      pipeline tests.
+- [ ] **The client fetch and the local `kev` table.** Fetched same-origin with
+      `no-store` (RE-023 — the freshness signal is a network request or
+      nothing), validated as stranger input with size and structure bounds
+      before a row is written. Applied in one transaction — rows plus the meta
+      that describes them (`catalogVersion`, `dateReleased`, fetched-at) — so
+      a failure leaves the previous catalog intact and answering. `cveID`
+      resolves to `cve.id` at load; an entry the corpus lacks is kept by
+      string and counted in diagnostics, not dropped. Runs as a writer under
+      the Web Lock, announced like promotions so other tabs' KEV freshness
+      agrees; a download ends by fetching KEV (after catch-up, D-063), a sync
+      refreshes it when `catalogVersion` moved, and a replacement rebuilds it
+      by refetch. The failure path is honest and non-fatal: the corpus
+      operation still succeeds, the old catalog stays, and its age is
+      reported — covered by a `page.route` test like M2's.
+- [ ] **The query surface.** KEV membership and ransomware use as filter axes
+      with grouped counts, and as rows/series dimensions in the report
+      builder — categorical slots per D-073, the complement labeled per the
+      framing note above. `dateAdded` and `dueDate` join the date-range axes.
+      Counts stay DISTINCT-safe (the join is 1:1 by record, but the test
+      asserts it rather than assumes it). D-022's default is untouched: a KEV
+      entry whose CVE is REJECTED surfaces the same way any REJECTED record
+      does. Record exports grow the KEV columns — an export is a copy (D-071),
+      and CC0 adds nothing to carry. The SQL console reaches the table
+      through the same read-only authorizer with no new work.
+- [ ] **The detail view, freshness, and diagnostics.** The per-CVE detail
+      gains a KEV block: `dateAdded`, `dueDate`, `requiredAction`, ransomware
+      use, and the `notes` URLs — attacker-adjacent text like everything else
+      (rule 4), so the same scheme allowlist, visible host,
+      `noreferrer`/`no-referrer`, and never auto-fetched treatment the
+      reference list already has, with sanitization asserted over a hostile
+      KEV fixture. Freshness is its own line, beside but distinct from the
+      corpus's: `catalogVersion`, `dateReleased` age, and when this browser
+      fetched it — honest offline (stored values with age) and agreeing
+      across tabs. The diagnostics panel adds the KEV rows: version, entry
+      count, unmatched count, fetched-at.
+
+**Exit criteria:** KEV's terms are recorded (D-076) and provenance — source,
+`catalogVersion`, `dateReleased` — is visible wherever KEV is asserted, with
+no notice invented and nothing presented as CISA endorsement; the live origin
+serves `kev.json` published by the cron under its own nginx location, verified
+from response headers through Cloudflare — short/revalidating cache, never
+`immutable`, error responses uncached — closing the M5 finding rather than
+inheriting it; KEV status is queryable, filterable, *and chartable*: a
+filtered count agrees with its grouped count (M3's pattern) and a
+KEV × severity report renders reconciled with its table (M4's); KEV staleness
+is surfaced separately from the corpus's, including offline and across tabs;
+a KEV fetch failure or a malformed/hostile catalog leaves the corpus
+operation unaffected and the previous catalog answering with its age
+reported, verified by tests in both engines; and the detail view's KEV block
+renders a hostile fixture under the existing reference hardening.
 
 ## M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `pending`
 

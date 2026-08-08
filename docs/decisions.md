@@ -27,6 +27,86 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-076: KEV is CC0 — no notice travels; the catalog ships as a standalone mutable file outside the manifest, joined client-side as a rebuildable table  (2026-08-08, status: accepted; implements D-010, resolves D-008's second-source reopen)
+
+**Decision.** Four things, settled together at M6's decomposition because each
+is either a licensing posture or a published wire shape — the two categories
+this log exists for.
+
+1. **KEV's redistribution terms are CC0 1.0 Universal, and nothing is required
+   to travel with the data.** Verified 2026-08-08 from CISA's own license text.
+   The operative preamble, verbatim:
+
+   > The KEV database is distributed under the Creative Commons 0 1.0 License.
+   > You may use this data in any legal manner but note that information
+   > provided at any 3rd party links included in the KEV database are bound by
+   > the policies and licenses of those 3rd party websites. Use of the
+   > information does not authorize you to use the CISA Logo or DHS Seal, nor
+   > should such use be interpreted as an endorsement by CISA or DHS.
+
+   CC0 is a full waiver — no attribution, no notice, no copyleft. The only
+   riders are outside copyright: no CISA logo or DHS seal, and no implied
+   endorsement. Consequences: kev.json is served verbatim with no added notice;
+   exports that include KEV columns owe nothing for them (the MITRE notice
+   D-008 requires still attaches to the CVE rows they sit beside); and the UI
+   surfaces provenance — *source, `catalogVersion`, `dateReleased`* — as an
+   honesty measure and to keep "listed in CISA's KEV" a statement about CISA's
+   catalog rather than an endorsement by it. This discharges D-008's "reopen if
+   we redistribute a second source" for KEV.
+
+2. **`kev.json` is a standalone file, deliberately outside the manifest.** It
+   is published to `cve.pub/data/kev.json` as the verbatim upstream bytes —
+   already self-describing (`catalogVersion`, `dateReleased`, `count`) — and
+   the manifest never names it. Three reasons: its cadence is CISA's, not the
+   ingest's, and listing it would couple the two; the manifest is the data
+   plane's one mutable file and having `kev.py` and `ingest.py` both rewrite it
+   is a race the M5 review would have flagged; and the manifest's hashes exist
+   to pin *immutable, edge-cached* chunks, while kev.json is short-cached,
+   revalidated, and structurally validated by the client on every read. It
+   becomes the plane's second mutable URL and therefore needs its own nginx
+   location, exactly as the manifest has one — the M5 finding — and that
+   location must land **before** the first publish, because the first fetch
+   through Cloudflare pins whatever policy is in place.
+
+3. **The server fetches from cisa.gov, with the official GitHub mirror as the
+   sanctioned fallback.** The feed
+   (`cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json`)
+   answers plain `curl` today, but the same host's Akamai config 403s
+   non-browser fetchers on sibling paths (the license file, the HTML pages), so
+   the cron's fetch path is one config change away from being refused.
+   `github.com/cisagov/kev-data` is CISA's own mirror, carries the identical
+   LICENSE, and updates the same day as the feed (commits checked 2026-08-08).
+   It is a *server-side* fallback only: the mirror serves CORS `*`, so the
+   browser could fetch it directly, and the answer is still no — a third-party
+   request in the network panel breaks the "only cve.meenan.dev" claim D-009
+   makes verifiable, and widens CSP for a convenience the origin already
+   provides.
+
+4. **Client-side, KEV is a client-built table in the local copy — rebuildable
+   state, never part of the artifact or its schema version.** Like the FTS
+   index: created and populated by the client, destroyed by a replacement and
+   rebuilt by refetching, absent from the promotion gate's artifact checks.
+   This is what lets KEV ship *without* a schema bump — D-068 makes a bump a
+   full re-download for every user, and D-070 spent that budget before launch
+   precisely so overlays like this one would not have to — and what keeps KEV
+   freshness (CISA's ~business-daily cadence) decoupled from corpus freshness.
+   Refresh rides Download and Sync under the Web Lock like every other writer
+   (owner shape decision, recorded in plan.md).
+
+**Context.** Measured 2026-08-08: 1,662 entries, 1,577,762 bytes, catalogVersion
+2026.08.07, `knownRansomwareCampaignUse` = Known on 338 / Unknown on 1,324,
+`cwes` present on 1,491. Still no `access-control-allow-origin` header,
+re-confirming D-010's routing. Eleven fields per entry; all ship (owner). The
+join key is CISA's `cveID` against `cve.cve_id TEXT UNIQUE`, resolved to
+internal ids at load; an entry whose CVE the corpus lacks is kept by string and
+counted in diagnostics rather than dropped silently.
+
+**Reopen if.** CISA changes the license or the feed's location or shape (the
+published JSON schema beside the feed is the watch point); or a future schema
+bump happens for other reasons, at which point folding KEV into the artifact
+could be re-costed against the coupling in §2; or the overlay's freshness needs
+outgrow fetch-on-user-action.
+
 ## D-075: Schema 2 lands as a bootstrapped generation, and the record's columns ride the schema version  (2026-08-08, status: accepted, implements D-070, refines D-055 and D-068)
 
 **Decision.** D-070's five fields ship as **schema 2**. Three things about *how*
@@ -5085,7 +5165,7 @@ contributor to whatever budget Q-003 establishes.
 budget unachievable — the fallback ladder is scoped FTS over short fields, then
 metadata-only search.
 
-## D-010: Enrichment is limited to CISA KEV  (2026-07-30, status: accepted)
+## D-010: Enrichment is limited to CISA KEV  (2026-07-30, status: accepted; terms and wire shape settled by D-076)
 
 **Decision.** CISA's Known Exploited Vulnerabilities catalog is the only
 enrichment overlay in scope. EPSS and NVD enrichment are rejected.
@@ -5139,7 +5219,7 @@ repurposed into one.
 explicitly user-initiated "copy diagnostics to clipboard" affordance is not
 telemetry and does not require reopening this.
 
-## D-008: CVE content is freely reusable, subject to a notice obligation  (2026-07-30, status: accepted; notice text canonicalized by D-047)
+## D-008: CVE content is freely reusable, subject to a notice obligation  (2026-07-30, status: accepted; notice text canonicalized by D-047; the second-source reopen was exercised for KEV by D-076 — CC0, no notice owed)
 
 **Decision.** We may reproduce, transform, and redistribute CVE List content —
 including as derived artifacts such as a prebuilt database — provided every copy
