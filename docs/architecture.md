@@ -313,9 +313,30 @@ more permissive than it (RE-012's rule):
 
 ```nginx
 location = /sw.js {
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Embedder-Policy "require-corp" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
     add_header Cache-Control "no-cache";
 }
 ```
+
+**The three isolation headers have to be repeated here, and leaving them out is
+the trap.** nginx inherits `add_header` from the enclosing level *only if the
+current level declares none of its own* — so a block containing nothing but
+`Cache-Control` silently drops the server-level COOP/COEP that every other
+location on this vhost re-declares for exactly this reason. A service worker
+controlling cross-origin-isolated clients must itself be served with COEP, so
+the shortened form would trade a caching bug for a registration failure: RE-008
+one level up. Verified against the live config 2026-08-08, where `= /data/…` and
+`^~ /sqlite/` both carry the full set.
+
+Until it is applied, `/sw.js` matches the general `~* \.(js|css|…)$` rule and is
+served `max-age=315360000`. Confirmed live 2026-08-08 after the launch deploy:
+`cache-control: max-age=315360000`, `cf-cache-status: HIT`. The browser-side
+consequence is bounded by the 24-hour revalidation above; the **Cloudflare-side
+one is not** — the edge now holds a fixed-name file under a ten-year TTL, so the
+next service-worker change is shadowed until the block lands or the cache is
+purged.
 
 The manifest carries `format`, `schema`, the head `rev`, the snapshot (with its
 own `rev`), and the list of delta files, each with its byte lengths and SHA-256.

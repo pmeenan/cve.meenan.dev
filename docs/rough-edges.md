@@ -22,6 +22,51 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-024: `createSyncAccessHandle` is not exposed on the main thread in any engine, so a capability check written there skipped the entire data-path suite  (2026-08-08, status: fixed)
+
+**Environment.** Chromium 151, Firefox 153 and WebKit 26.5 via Playwright 1.62
+on Ubuntu 24.04, 2026-08-08. Also confirmed against the deployed origin.
+
+**Repro.** From `page.evaluate` — which runs on the **main thread** — against
+either `http://127.0.0.1:4747/` or `https://cve.meenan.dev/`:
+
+```js
+{ getDirectory: typeof navigator.storage?.getDirectory,          // 'function'
+  sync: 'createSyncAccessHandle' in FileSystemFileHandle.prototype }  // false
+```
+
+The same expression evaluated inside a `Worker` created on that page returns
+`true`. Chromium exposes OPFS broadly but `FileSystemSyncAccessHandle` is
+`[Exposed=DedicatedWorker]`, and the method that returns one goes with it.
+
+**Observed.** `tests/e2e/support.ts`'s `skipWithoutLocalStorage` tested
+`'createSyncAccessHandle' in FileSystemFileHandle.prototype` on the main thread,
+concluded "this browser has no OPFS", and called `test.skip` — on **every**
+engine, not just the WebKit build it was written for. Nine spec files use that
+guard (`import`, `query`, `report`, `sync`, `staged`, `tabs`, `offline`, `bump`,
+`a11y`), so the entire data path stopped being exercised while `pnpm e2e` stayed
+green. A three-engine run reported zero failures and had tested nothing.
+
+**Expected.** A guard that skips only where the app genuinely cannot run. The
+misreading is easy because the check *looks* like a feature test and the engine
+it was written against (RE-022) really is missing OPFS — the false negative on
+Chromium was invisible behind a correct-looking skip on WebKit.
+
+**Impact and workaround.** This is the same class as RE-020 — a test that tested
+nothing — and it hid for the same reason: skips are not failures, and a summary
+line reporting "N passed" does not say how many of the N ran. Fixed by moving
+the probe into a Worker and having it **call** `getSize()` on a real handle
+rather than look for the method (which is the app's own gate design, D-016 —
+Safari 16.3 exposes it and throws). The probe uses a per-call filename and
+releases the handle in `finally` (RE-007), and resolves `false` on a 15 s
+timeout or `onerror` so an engine that cannot construct the Worker cannot hang
+the suite.
+
+**Lesson worth keeping:** a green run is only evidence if the count of tests
+that *ran* is part of what you read. Check skip counts after touching a guard.
+
+**Links.** `tests/e2e/support.ts`, RE-020, RE-022, RE-007, D-016.
+
 ## RE-023: Firefox serves a `no-cache` response from its HTTP cache when offline, so a sync reported "already current"  (2026-08-08, status: worked-around)
 
 **Environment.** Firefox 153 via Playwright 1.62 on Linux, 2026-08-08. Chromium

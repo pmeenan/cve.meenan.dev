@@ -149,7 +149,18 @@ from a moved tree it no longer matches the fingerprint the ledger recorded, so
 against the same tree is safe: a seeded rebuild is deterministic, same
 fingerprint and same marks.
 
-### Landing a schema bump (D-070, D-075) — not yet run
+### Landing a schema bump (D-070, D-075) — done 2026-08-08
+
+**Already run**, 2026-08-08, for schema 1 → 2. The origin serves snapshot rev 11
+in ID space `schema2-2026-08-08`; publishing it retired space
+`a46cc2797a9aa338` and all eight deltas cut against it in the same operation
+(`deltas_kept: 0`). Measured on the day, on the real corpus: build **32.6 s**
+(374,269 records, 0 skipped, 398,487,552 raw bytes), publish **99.6 s** to 12
+chunks and **65,708,012 compressed bytes** (ratio 6.06), `init --force`
+**24.0 s**, and a full-corpus import from the deployed origin in a real browser
+**1.8 min**. The daily cron was already commented out, so nothing raced it.
+This section is kept because it is the procedure, not a to-do: the next bump
+repeats it.
 
 A schema change is the *other* thing that takes a data plane to a new
 generation, and it takes a different route from the adoption above: seeding
