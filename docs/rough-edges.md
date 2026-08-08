@@ -46,7 +46,8 @@ cf-cache-status: MISS
 `add_header Cache-Control "public, max-age=31536000, immutable" always;`.
 
 **Observed.** The M5 data-plane review found exactly this and both
-`docs/architecture.md` and `docs/plan.md` record the `always` as dropped and the
+`docs/architecture.md` and the plan's M5 record (now in
+`docs/plan-archive.md`) record the `always` as dropped and the
 result as verified. It is not dropped. The `HIT` above means the edge is already
 holding a 404 under a year-long TTL.
 

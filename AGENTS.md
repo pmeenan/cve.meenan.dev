@@ -101,7 +101,7 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 | Doc | Read when the task needs |
 | --- | --- |
-| [docs/plan.md](docs/plan.md) | What to work on, milestone scope, exit criteria — what "done" means |
+| [docs/plan.md](docs/plan.md) | What to work on, milestone scope, exit criteria — what "done" means. Closed milestones are summaries; their full record is [docs/plan-archive.md](docs/plan-archive.md) |
 | [docs/vision.md](docs/vision.md) | Why the project exists, who it's for, success criteria, non-goals |
 | [docs/features.md](docs/features.md) | The feature matrix: confirmed scope, proposed additions, open questions |
 | [docs/architecture.md](docs/architecture.md) | System structure and technical constraints |
