@@ -34,11 +34,18 @@ test('a browser below the floor is stopped at the gate, not mid-download', async
 
   // Which sentence it leads with depends on the browser, and that is the point
   // rather than a wrinkle: the gate names the *first* required capability that
-  // is missing. On an engine with no OPFS at all — Playwright's Linux WebKit —
-  // the honest answer is "there is nowhere to put it", not a story about
-  // asynchronous handles, and the forced probe must not talk over it. So the
-  // Safari-16.3 wording is asserted only where the browser would otherwise
-  // pass, which is exactly where that message is the one a user would get.
+  // is missing. On an engine with no OPFS at all the honest answer is "there is
+  // nowhere to put it", not a story about asynchronous handles, and the forced
+  // probe must not talk over it. So the Safari-16.3 wording is asserted only
+  // where the browser would otherwise pass, which is exactly where that message
+  // is the one a user would get.
+  //
+  // Both configured engines have OPFS since WebKit left the project list
+  // (2026-08-08, RE-022), so today this always takes the first branch — it stays
+  // a *measurement* rather than a constant so that adding an engine without
+  // OPFS changes the assertion instead of breaking it. What is genuinely lost
+  // with WebKit is that no engine in the suite now fails for real: this test
+  // covers the gate only on browsers told to pretend.
   const hasOpfs = await page.evaluate(() => typeof navigator.storage?.getDirectory === 'function')
   await expect(gate).toContainText(hasOpfs ? 'asynchronous' : 'nowhere to put it')
   await expect(gate).toContainText(SUPPORT_FLOOR)

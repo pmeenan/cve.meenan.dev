@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 import type { Manifest, Timings } from '../../lib/protocol'
 
@@ -28,7 +28,7 @@ test('an interrupted download resumes and never destroys the live copy', async (
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await skipWithoutLocalStorage(page)
+  await requireLocalStorage(page)
   const first = await test.step('a first, complete download', async () => {
     await page.getByRole('button', { name: 'Download data', exact: true }).click()
     const timings = await importedTimings(page)

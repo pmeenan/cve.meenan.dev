@@ -15,8 +15,8 @@ it touched.
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
 Milestones are decomposed into task-sized checkboxes (the workflow's unit of
-work) no later than when they become the next milestone up — M0 – M4 are
-decomposed and closed, and **M5 is decomposed and next**. M6+ carry scope
+work) no later than when they become the next milestone up — M0 – M5 are
+decomposed and closed, and **M6 is next**. M7+ carry scope
 prose and exit criteria until their turn.
 
 ## M0 — Plan the plan  `done`
@@ -131,8 +131,9 @@ OPFS; one query rendered in the UI carrying the D-008 notice.
       faster and then freezes any second tab entirely, and its `importDb`
       cannot express M2's resumable staged replacement. Both paths stay in the
       Worker so the comparison can be re-run.
-- [ ] **Deploy.** *Partially done 2026-08-01 — two steps need credentials the
-      agent does not have.*
+- [x] **Deploy.** *Mostly done 2026-08-01; the owner-applied nginx steps landed
+      the same day, and the last sub-item — Cloudflare — closed in M5 on
+      2026-08-08, which is what completes this box.*
       - [x] First generation published by the real pipeline (now at
             `cve.pub/data/`, D-053):
             372,322 records, 12 chunks, 62.7 MB, built from clone `d300c5fcc0`.
@@ -160,23 +161,25 @@ OPFS; one query rendered in the UI carrying the D-008 notice.
             ~7.1 s — indistinguishable from loopback, because this client and
             the origin share a fast path, so it neither confirms nor disturbs
             the throttled numbers in D-049.
-      - [→] **Cloudflare cache rules** (D-039) — **moved to M5.** Measured
-            2026-08-01: `cve.meenan.dev` resolves straight to the origin and no
-            response carries a `cf-ray`, so the domain is not proxied through
-            Cloudflare at all and there is nothing to configure yet. Until it
-            is, D-039's premise that Cloudflare absorbs abuse does not hold and
-            D-034's origin rate limiting is already gone — so the origin is
-            currently unprotected. Tracked as an M5 scope item and exit
-            criterion.
+      - [x] **Cloudflare cache rules** (D-039) — **was moved to M5, and closed
+            there 2026-08-08.** Measured 2026-08-01: `cve.meenan.dev` resolved
+            straight to the origin and no response carried a `cf-ray`, so the
+            domain was not proxied at all and there was nothing to configure —
+            which left D-039's premise that Cloudflare absorbs abuse false, and
+            D-034's origin rate limiting already gone. Flipped and verified from
+            response headers in M5; `cf-ray` and `cf-cache-status` are present
+            on every response, with the manifest revalidating and chunks
+            `immutable`.
 
 **Exit criteria — met 2026-08-01.** The deployed site loads from
 `cve.meenan.dev`, fetches the published chunks, decompresses them itself,
 writes them into OPFS, and renders one real query result — verified by running
 `tests/e2e/import.spec.ts` against the live origin, not just locally. Q-003 and
 Q-004 are answered (D-049 – D-051), vision criteria 1 and 3 carry real numbers,
-and `pnpm check` / `pnpm e2e` are green. The one item deliberately left open is
-Cloudflare (below): it is not in the request path at all, which is M5's problem
-rather than a gap in this milestone.
+and `pnpm check` / `pnpm e2e` are green. The one item deliberately left open was
+Cloudflare (below) — not in the request path at all, which made it M5's problem
+rather than a gap in this milestone. **It closed there on 2026-08-08, so this
+milestone is now complete with nothing carried.**
 
 ## M2 — Full-corpus Download and Sync  `done`
 
@@ -644,7 +647,7 @@ One thing is deliberately **not** claimed: the runs are Chromium-only, as every
 milestone's have been. Firefox and WebKit are M5's, before the D-016 floor is
 claimed publicly.
 
-## M5 — Resilience and public launch  `pending`
+## M5 — Resilience and public launch  `done`
 
 Scope: **putting `cve.meenan.dev` behind Cloudflare and applying D-039's cache
 rules** — carried over from M1, where it turned out the hostname resolves
@@ -829,9 +832,28 @@ in parallel with whatever task is current.
       *stricter*, which is what makes them safe to leave reachable — unlike
       `?vfs=` (D-051).
 - [x] **Firefox and WebKit** (D-016, rule 3), **with the WebKit half recorded
-      as a trade rather than claimed.** `playwright.config.ts` carries all three
-      engines, Chromium first so `--project=chromium` stays the fast loop and a
-      bare `pnpm e2e` runs the claim.
+      as a trade rather than claimed, and WebKit ultimately dropped.**
+      `playwright.config.ts` carries two engines, Chromium first so
+      `--project=chromium` stays the fast loop and a bare `pnpm e2e` runs the
+      claim.
+
+      **This item was ticked once on evidence that did not exist.** The guard
+      added to let WebKit skip the specs it cannot run tested
+      `createSyncAccessHandle` on the **main thread**, where no engine exposes
+      it — so it skipped all nine data-path spec files on all three engines, and
+      a run reporting "zero failures" had executed none of them (RE-024). The
+      guard now probes inside a Worker and **asserts** instead of skipping,
+      because after WebKit's removal every configured engine is expected to have
+      OPFS and a failure there is a regression, not a reason to run less.
+
+      **The real two-engine run**, once that was fixed: 98 tests, **57 passed,
+      40 skipped, 1 failed**. All 40 skips are `measure.spec`, which is opt-in
+      behind `MEASURE=1`; nothing else skipped, and `bump.spec` genuinely ran, so
+      D-068's announcement path is exercised rather than assumed. The single
+      failure was a Firefox race in `openTab` — `ready` goes true, then briefly
+      false again while the Worker settles a fresh profile's copy, and a click
+      inside that second window is dropped by a genuinely-disabled button. Fixed
+      by retrying the click, which is also what a person would do.
 
       **Firefox runs the whole suite**, and found two things Chromium could not.
       One was ours: a tab clicked across the enabled/disabled transition landed
@@ -854,12 +876,14 @@ in parallel with whatever task is current.
       documented feature availability plus the gate, which is weaker than the
       other two claims and is written down rather than implied.
 
-      What that engine *does* verify is not nothing: the capability gate fires
-      there for real, naming the right missing capability — the first time it
-      has been exercised on a browser that genuinely fails rather than one told
-      to pretend. The suite states the limitation instead of failing twenty
-      times: `tests/e2e/support.ts` **measures** the browser rather than naming
-      it, so a later WebKit with OPFS starts running those specs by itself.
+      **The engine was removed from the project list** (owner decision,
+      2026-08-08) rather than kept and skipped, because a project whose entire
+      contribution is skips reads identically to a passing one in a summary
+      line — which is precisely how RE-024 stayed invisible. The cost is named
+      rather than buried: WebKit was the only engine where the capability gate
+      fired on a browser that genuinely fails, so `resilience.spec.ts` now
+      covers it only through the forced `?probe=` knob. Re-adding a project is
+      one line if a WebKit build with OPFS appears.
 - [x] **The offline app shell** (D-048, network-first per D-054). A hand-rolled
       service worker **generated from the finished export** by
       `scripts/build-sw.mjs`, so the precache list is derived rather than
@@ -969,9 +993,24 @@ in parallel with whatever task is current.
 
       Every fix has a regression test, and the two on the publisher were checked
       **by removing them** and watching the test fail.
-- [ ] **Launch.** The flip, and nothing else ships with it: every criterion
-      below verified, the status paragraph and this plan updated, and the site
-      is public.
+- [x] **Launch.** Done 2026-08-08. The artifact shipped first and the app
+      followed in the same window, per the runbook's sequencing: bootstrap build
+      at rev 11 (32.6 s), `publish --new-id-space` (99.6 s, 12 chunks, 65.7 MB),
+      `ingest init --force` (24.0 s), then `pnpm build` and the rsync. Verified
+      from outside rather than from the deploy's own exit code — the live
+      manifest reads `schema 2, rev 11` with the MITRE notice, a chunk's
+      `content-length` matches the manifest byte for byte with no
+      `Content-Encoding` (D-040), and a **full-corpus import from the live
+      origin in a real browser passes in 1.8 min**. The daily cron was
+      commented out for the window and restored after; the cycle was then
+      rehearsed by hand and would cut rev 12 from 11, so its first unattended
+      firing against the new lineage is a repeat rather than a first.
+
+      Two owner-applied pieces landed with it: the `location = /sw.js` block,
+      and the `sites-enabled` symlink it turned out to need (RE-025) — the
+      block had been edited into a file nginx was not reading, and `/sw.js` was
+      serving `max-age=315360000` behind Cloudflare until a response header
+      said otherwise.
 
 **Exit criteria:** the origin is behind Cloudflare with the D-039 cache rules
 applied and verified from a response header; the app degrades honestly on an

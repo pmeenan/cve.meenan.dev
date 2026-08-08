@@ -5,7 +5,7 @@ import { expect, test } from '@playwright/test'
 
 import { SCHEMA_VERSION } from '../../lib/protocol'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 /**
  * The half of a schema bump that needs **two real data planes** — the claim M3
@@ -65,7 +65,7 @@ test('an old client refuses the new data plane, before a byte of it', async ({ p
     // `?schema=` makes this build claim the old version, which is precisely the
     // position a deployed app is in the moment the new artifact lands.
     await page.goto(`/?schema=${previous}`)
-    await skipWithoutLocalStorage(page)
+    await requireLocalStorage(page)
     await page.getByRole('button', { name: /Download data/ }).click()
 
     const error = page.locator('[data-error]')

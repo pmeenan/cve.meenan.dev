@@ -300,9 +300,10 @@ Five things about it are load-bearing rather than stylistic:
   `.br` the client decodes itself and an added `Content-Encoding` would corrupt
   that path (D-040). No `limit_conn`/`limit_rate` (D-039).
 
-**One location is still owner-applied and outstanding (M5).** The offline app
-shell's worker (D-048) is served from the document root as `/sw.js`, where the
-site's general `expires max` static-file rule would apply to it. That worker
+**One location is owner-applied, and was applied at launch (2026-08-08).** The
+offline app shell's worker (D-048) is served from the document root as
+`/sw.js`, where the site's general `expires max` static-file rule would
+otherwise apply to it. That worker
 decides which *other* files may be answered from a cache, so a stale one is a
 stale shell that outlives its own fix — the failure D-054 exists to prevent,
 reintroduced one level up. Browsers already bypass the HTTP cache for this
@@ -330,13 +331,15 @@ the shortened form would trade a caching bug for a registration failure: RE-008
 one level up. Verified against the live config 2026-08-08, where `= /data/…` and
 `^~ /sqlite/` both carry the full set.
 
-Until it is applied, `/sw.js` matches the general `~* \.(js|css|…)$` rule and is
-served `max-age=315360000`. Confirmed live 2026-08-08 after the launch deploy:
-`cache-control: max-age=315360000`, `cf-cache-status: HIT`. The browser-side
-consequence is bounded by the 24-hour revalidation above; the **Cloudflare-side
-one is not** — the edge now holds a fixed-name file under a ten-year TTL, so the
-next service-worker change is shadowed until the block lands or the cache is
-purged.
+Verified live 2026-08-08 after the block landed: `cache-control: no-cache` with
+all three isolation headers, and `/`, `/data/manifest.json` and `/sqlite/`
+unchanged. Before it landed the URL matched the general `~* \.(js|css|…)$` rule
+and served `max-age=315360000`, observed at the edge as `cf-cache-status: HIT` —
+the browser-side consequence is bounded by the 24-hour revalidation above, but
+the **Cloudflare-side one is not**: a fixed-name file under a ten-year edge TTL
+shadows the next service-worker change until the cache is purged. That is the
+failure this block prevents, and it is why the block is worth re-checking from a
+response header after any nginx change (RE-025).
 
 The manifest carries `format`, `schema`, the head `rev`, the snapshot (with its
 own `rev`), and the list of delta files, each with its byte lengths and SHA-256.

@@ -1,48 +1,32 @@
-import { test, type Page } from '@playwright/test'
+import { expect, type Page } from '@playwright/test'
 
 /**
- * Shared guards for the browser matrix (M5, D-016).
+ * The precondition every data-path spec shares: this browser can actually hold
+ * the corpus (M5, D-016).
  *
- * Three engines run this suite since M5, and one of them cannot run the app at
- * all — not because of anything the app does, but because **Playwright's Linux
- * WebKit build ships no OPFS**. Measured 2026-08-08 against that build:
+ * **This asserts rather than skips, and that is the point.** It began as
+ * `skipWithoutLocalStorage`, written for Playwright's Linux WebKit, which ships
+ * no OPFS at all (RE-022). Two things went wrong with that shape:
  *
- * | | value |
- * | --- | --- |
- * | `crossOriginIsolated` | true |
- * | `SharedArrayBuffer` | present |
- * | `navigator.locks` | present |
- * | `navigator.serviceWorker` | present |
- * | **`navigator.storage.getDirectory`** | **undefined** |
+ * 1. The check itself was written against
+ *    `'createSyncAccessHandle' in FileSystemFileHandle.prototype` evaluated in
+ *    `page.evaluate` — the **main thread**, where no engine exposes that method,
+ *    Chromium included. So it reported "no OPFS" everywhere and skipped all nine
+ *    data-path spec files on every engine (RE-024). `pnpm e2e` stayed green
+ *    while testing nothing.
+ * 2. Nothing said so. Skips are not failures, and a summary line reporting
+ *    "N passed" does not say how many of the N ran.
  *
- * The first version of this guard also tested
- * `'createSyncAccessHandle' in FileSystemFileHandle.prototype` **from
- * `page.evaluate`**, which runs on the main thread — where that method is not
- * exposed in *any* engine, Chromium included (RE-024). So it reported "no OPFS"
- * everywhere and skipped all nine data-path spec files on all three engines,
- * turning a green run into a green *empty* run. The probe below therefore runs
- * inside a Worker, which is the context the app uses it from.
+ * WebKit left the project list on 2026-08-08 for that reason, and with it went
+ * the only engine a skip was ever correct for. Every remaining engine is
+ * expected to support OPFS, so a browser that fails this probe is a regression —
+ * in the browser, the harness, or the served isolation headers — and the suite
+ * should say so loudly instead of quietly running less.
  *
- * That is a fact about the *test* browser rather than about Safari: D-016's
- * floor is Safari 16.4, which has both. So the suite cannot exercise the data
- * path there, and pretending otherwise would leave `pnpm e2e` permanently red
- * with twenty failures that say nothing — the state in which a real regression
- * is indistinguishable from a known limitation.
- *
- * What that engine *does* verify, and it is not nothing: the capability gate
- * fires on a real browser below the floor, naming the right missing capability.
- * `resilience.spec.ts` deliberately does not use this guard.
- *
- * The check is a **measurement, not a browser name**. If a later Playwright
- * WebKit ships OPFS, these specs start running there by themselves.
- */
-/**
- * Ask a Worker to actually take a synchronous access handle, the way the app's
- * own gate does (D-016) — presence of the method proves nothing, because Safari
- * 16.3 exposes it and throws. The filename is per-probe and the handle is
- * released in `finally`: a fixed name plus an exclusive handle is what deadlocked
- * two tabs in RE-007, and a guard that hangs the suite is worse than one that
- * lies.
+ * The probe runs **inside a Worker**, which is where the app uses these APIs,
+ * and it *calls* `getSize()` on a real handle rather than looking the method up:
+ * Safari 16.3 exposes `createSyncAccessHandle` and throws, so presence proves
+ * nothing and only a call separates the floor from the version below it (D-016).
  */
 const PROBE = `
 self.onmessage = async () => {
@@ -56,28 +40,32 @@ self.onmessage = async () => {
   } catch (error) {
     postMessage({ usable: false, why: String((error && error.message) || error) })
   } finally {
+    // A per-probe filename and a release in \`finally\`: a fixed name plus an
+    // exclusive handle is what deadlocked two tabs in RE-007, and a precondition
+    // that hangs the suite is worse than one that lies.
     try { if (access) access.close() } catch {}
     try { if (dir) await dir.removeEntry(name) } catch {}
   }
 }
 `
 
-export async function skipWithoutLocalStorage(page: Page): Promise<void> {
-  const usable = await page.evaluate(async (source) => {
+export async function requireLocalStorage(page: Page): Promise<void> {
+  const result = await page.evaluate(async (source) => {
     const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }))
     const worker = new Worker(url)
     try {
-      return await new Promise<boolean>((resolve) => {
-        // A worker that never answers must not hang the run: an engine with no
-        // OPFS at all can fail to construct it, and `onerror` is the only signal.
-        const done = setTimeout(() => resolve(false), 15_000)
+      return await new Promise<{ usable: boolean; why?: string }>((resolve) => {
+        // An engine with no OPFS may fail to construct the Worker at all, and
+        // `onerror` is the only signal; the timeout covers a worker that neither
+        // answers nor errors, which must not hang the run.
+        const done = setTimeout(() => resolve({ usable: false, why: 'probe timed out' }), 15_000)
         worker.onmessage = (event) => {
           clearTimeout(done)
-          resolve(Boolean(event.data?.usable))
+          resolve(event.data)
         }
-        worker.onerror = () => {
+        worker.onerror = (event) => {
           clearTimeout(done)
-          resolve(false)
+          resolve({ usable: false, why: `worker failed: ${event.message}` })
         }
         worker.postMessage(1)
       })
@@ -86,9 +74,12 @@ export async function skipWithoutLocalStorage(page: Page): Promise<void> {
       URL.revokeObjectURL(url)
     }
   }, PROBE)
-  test.skip(
-    !usable,
-    'this browser has no OPFS, so it cannot hold the corpus — the capability ' +
-      'gate covers it in resilience.spec.ts, which is the honest thing to assert here'
-  )
+
+  expect(
+    result.usable,
+    `this browser could not take a synchronous access handle in a Worker, so it cannot hold ` +
+      `the corpus: ${result.why ?? 'unknown'}. Every configured engine is expected to support ` +
+      `OPFS (WebKit was removed from the project list, RE-022), so this is a regression rather ` +
+      `than a reason to skip — see RE-024 for what skipping here cost last time.`
+  ).toBe(true)
 }

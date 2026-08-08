@@ -144,7 +144,13 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M5 in progress.** The published schema is at **2** (D-070, D-075): SSVC's
+**M5 complete — the site is launched.** The origin serves **schema 2, rev 11**
+in ID space `schema2-2026-08-08`, published 2026-08-08: 12 chunks, 65.7 MB
+compressed from 398.5 MB raw, which retired the old lineage and all eight of its
+deltas in the same operation. Verified from outside rather than asserted — a
+full-corpus import from the live origin in a real browser (1.8 min), the header
+contracts, and a hand-rehearsed daily cycle that would cut rev 12 from 11. The
+published schema is at **2** (D-070, D-075): SSVC's
 three decision points, `dateReserved`, `defaultStatus`, `cna.title` and the
 rejection reason for the 17,842 REJECTED records that used to render blank.
 Measured against a schema-1 build of the *same* clone, it costs **+2.40 MB
@@ -154,9 +160,9 @@ compiles to `IS NULL` beside the `IN`, sits last on every axis, and takes the
 off-ramp neutral on a chart, because `Exploitation: none` is a finding and half
 the corpus has no assessment at all. `title` joins the client-built full-text
 index as a second column, on 83.3% of titles not being substrings of their own
-description. The bump lands as a **bootstrapped** generation above the head with
-`--new-id-space`, which is what retires every pre-bump delta in the same
-operation; the runbook is in pipeline/README.md and has not been run.
+description. The bump landed as a **bootstrapped** generation above the head
+with `--new-id-space`; the runbook it followed is in pipeline/README.md, now
+carrying the measured timings of the run that executed it.
 
 Around it: a capability gate that *calls* a synchronous access-handle method
 rather than looking for one — the only check that separates Safari 16.4 from
@@ -164,19 +170,32 @@ rather than looking for one — the only check that separates Safari 16.4 from
 one writer across tabs via Web Locks, with promotions announced so a tab that
 did not perform the replacement reopens rather than answering from a generation
 nobody else can see; an offline app shell generated from the finished export;
-and the diagnostics panel D-009 makes the only support channel. **Four defects
-came out of building it, none of which a passing test would have shown**: a
-fixed probe filename that deadlocked two tabs on an exclusive handle (RE-007), a
-cached `Response` whose URL became the worker's and dropped the fragment its
-bootstrap config lived in (RE-021), a Worker load failure with no `onerror`
-handler anywhere, and RE-015 sitting live on the launch path — now closed for
-`build.py`. Cloudflare is in front and verified from response headers
+and the diagnostics panel D-009 makes the only support channel. **Six defects
+came out of building it, and a passing test would have shown none of them —
+one of them *was* a passing test**: a fixed probe filename that deadlocked two
+tabs on an exclusive handle (RE-007), a cached `Response` whose URL became the
+worker's and dropped the fragment its bootstrap config lived in (RE-021), a
+Worker load failure with no `onerror` handler anywhere, RE-015 sitting live on
+the launch path — now closed for `build.py` — a capability guard that checked
+`createSyncAccessHandle` on the main thread, where **no** engine exposes it, and
+so skipped all nine data-path spec files on every engine while `pnpm e2e`
+reported green (RE-024), and an `/etc/nginx/sites-enabled` entry that had
+stopped being a symlink, so a config change was edited into a file nginx was not
+reading (RE-025). Cloudflare is in front and verified from response headers
 (2026-08-08), which itself surfaced two live defects the day it was flipped.
 
-**Left in M5**: Firefox and WebKit runs before the D-016 floor is claimed
-publicly, the full-corpus measurement, the heavyweight data-plane review's
-confirmed findings, and the launch — which needs a human commit first, because
-the crons run from the git checkout on `plex` (D-059).
+**The browser matrix is two engines, not three.** WebKit was dropped
+2026-08-08: Playwright's Linux build ships no OPFS (RE-022), so it could only
+ever skip, and a project contributing nothing but skips is what let RE-024 hide.
+**The Safari half of the D-016 floor is therefore unverified** and rests on
+documented feature availability plus the gate. Chromium and Firefox run
+everything: 98 tests, 57 passing, and 40 skips that are all the opt-in
+`MEASURE=1` suite.
+
+**Left after M5**: the full-corpus measurement, deliberately not taken (owner,
+2026-08-08); Safari coverage, which needs real hardware; and a deterministic
+Next.js `generateBuildId`, without which every deploy changes the service
+worker's precache URLs and re-downloads the offline shell.
 
 Behind it: M4 made the corpus analysable through one validated report definition
 carried only in the URL fragment (D-069 – D-074), M3 made the query surface safe

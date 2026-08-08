@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 import { SCHEMA_VERSION } from '../../lib/protocol'
 
@@ -52,7 +52,7 @@ async function openTab(page: Page, name: string): Promise<void> {
 /** Download the development slice and wait for the local copy to be queryable. */
 async function importCorpus(page: Page): Promise<void> {
   await page.goto('/')
-  await skipWithoutLocalStorage(page)
+  await requireLocalStorage(page)
   await page.getByRole('button', { name: /Download data/ }).click()
   await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
   await openTab(page, 'Explore')

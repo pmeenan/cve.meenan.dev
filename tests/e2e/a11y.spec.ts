@@ -1,7 +1,7 @@
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test, type Page } from '@playwright/test'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 /**
  * Accessibility as an acceptance criterion, not a polish pass (M4).
@@ -51,7 +51,7 @@ async function scan(page: Page, label: string): Promise<void> {
 
 async function importCorpus(page: Page): Promise<void> {
   await page.goto('/')
-  await skipWithoutLocalStorage(page)
+  await requireLocalStorage(page)
   await page.getByRole('button', { name: /Download data/ }).click()
   await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
 }

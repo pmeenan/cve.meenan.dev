@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 /**
  * Multi-tab, as full support rather than honest degradation (M5, owner
@@ -65,7 +65,7 @@ test('a second tab queries while the first writes, and follows the replacement',
   const a = await context.newPage()
   watch(a, 'tab A')
   await a.goto('/')
-  await skipWithoutLocalStorage(a)
+  await requireLocalStorage(a)
   await settled(a)
   await download(a)
 

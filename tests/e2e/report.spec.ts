@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 
 import { expect, test, type Browser, type Page } from '@playwright/test'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 import { RECORD_COLUMNS } from '../../lib/export'
 
@@ -25,18 +25,26 @@ async function openTab(page: Page, name: string): Promise<void> {
   // reports one, and clicking across that transition landed a click the
   // component had not wired up yet — reliably on Firefox, where the window is
   // wider, and invisibly on Chromium.
+  //
+  // Waiting for enabled is necessary but not sufficient, and the retry below is
+  // not superstition: `ready` can go true, then briefly false again while the
+  // Worker settles a fresh profile's copy, and a click delivered inside that
+  // second window is dropped by a genuinely-disabled button. Observed on
+  // Firefox in "a permalink reproduces its report on a fresh browser profile",
+  // where the assertion saw `title="Download the corpus first"` return for five
+  // polls *after* the click. Retrying the click is right rather than merely
+  // convenient: a person who clicked and saw nothing happen would click again.
   const tab = page.getByRole('tab', { name, exact: true })
   await expect(tab).toBeEnabled({ timeout: 120_000 })
-  await tab.click()
-  await expect(page.getByRole('tab', { name, exact: true })).toHaveAttribute(
-    'aria-selected',
-    'true'
-  )
+  await expect(async () => {
+    await tab.click()
+    await expect(tab).toHaveAttribute('aria-selected', 'true', { timeout: 2_000 })
+  }).toPass({ timeout: 120_000 })
 }
 
 async function importCorpus(page: Page): Promise<void> {
   await page.goto('/')
-  await skipWithoutLocalStorage(page)
+  await requireLocalStorage(page)
   await page.getByRole('button', { name: /Download data/ }).click()
   await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
 }

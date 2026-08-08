@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 /**
  * The offline app shell (D-048, D-054), and the boundary it must never cross.
@@ -28,7 +28,7 @@ test('the app reopens with no network, and never serves /data/ from its cache', 
 
   await test.step('the shell registers and takes over', async () => {
     await page.goto('/')
-    await skipWithoutLocalStorage(page)
+    await requireLocalStorage(page)
     // The worker takes over on the *next* load by design, so this is two loads.
     await page.waitForFunction(() => navigator.serviceWorker?.controller !== null, undefined, {
       timeout: 60_000,

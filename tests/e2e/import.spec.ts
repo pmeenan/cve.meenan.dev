@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-import { skipWithoutLocalStorage } from './support'
+import { requireLocalStorage } from './support'
 
 import { SEARCH_INDEXES } from '../../lib/search'
 
@@ -35,7 +35,7 @@ test('imports, queries, and survives a reload', async ({ page }) => {
   })
 
   await page.goto('/')
-  await skipWithoutLocalStorage(page)
+  await requireLocalStorage(page)
   await expect(page.getByRole('heading', { name: 'cve.meenan.dev' })).toBeVisible()
 
   await test.step('import', async () => {

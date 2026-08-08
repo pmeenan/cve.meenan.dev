@@ -22,6 +22,48 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-025: `sites-enabled/meenan.dev` had been replaced by a regular file, so nginx edits landed in a file nobody was reading  (2026-08-08, status: fixed)
+
+**Environment.** nginx on `plex`, Ubuntu, 2026-08-08, during the M5 launch.
+
+**Repro / measurement.** `nginx.conf` carries the stock
+`include /etc/nginx/sites-enabled/*;`. The owner edits
+`sites-available/meenan.dev`, which is normally symlinked from `sites-enabled/`
+— every file in that directory is, by the owner's convention. It was not:
+
+```
+$ ls -la /etc/nginx/sites-enabled/meenan.dev
+-rw-r--r-- 1 root root 6435 Aug  8 12:59 /etc/nginx/sites-enabled/meenan.dev
+$ diff /etc/nginx/sites-{enabled,available}/meenan.dev   # the new block, only in available
+```
+
+**Observed.** A `location = /sw.js` block added to `sites-available` had no
+effect: `curl -D-` still reported `cache-control: max-age=315360000` from the
+general static rule, on both a plain request and one with a cache-busting query
+(`cf-cache-status: MISS` both times, so the origin was answering — not a stale
+edge copy). The two files had silently diverged.
+
+**Expected.** A symlink, so that editing either path is the same act.
+
+**Impact and workaround.** Restored with
+`ln -sfn /etc/nginx/sites-available/meenan.dev /etc/nginx/sites-enabled/meenan.dev`
+plus `nginx -t` and a reload; the header flipped to `no-cache` immediately.
+Before overwriting, `diff` the two and confirm nothing lives **only** in the
+enabled copy — certbot writes `listen 443 ssl` / `ssl_certificate` lines into
+these files, and clobbering them takes TLS down. Here the only enabled-only
+lines were the same directives without `always`, so nothing was lost.
+
+**Likely cause, worth knowing because it recurs.** In-place editors replace a
+symlink with a regular file rather than writing through it: `sed -i` always
+does, and vim does under `backupcopy=no`. The enabled copy's mtime was 12:59
+that day, hours after the symlink convention was established.
+
+**Lesson.** A config change is not applied because it was written — it is
+applied when a response header says so. Verify from the outside, which is the
+same rule D-039's Cloudflare criterion already states.
+
+**Links.** `docs/architecture.md` (nginx section), D-039, D-048, D-054.
+
 ## RE-024: `createSyncAccessHandle` is not exposed on the main thread in any engine, so a capability check written there skipped the entire data-path suite  (2026-08-08, status: fixed)
 
 **Environment.** Chromium 151, Firefox 153 and WebKit 26.5 via Playwright 1.62
@@ -113,7 +155,12 @@ immutable at their URLs and the ordinary cache is right for them.
 | `navigator.locks` | `object` |
 | `navigator.serviceWorker` | `object` |
 | **`navigator.storage.getDirectory`** | **`undefined`** |
-| **`FileSystemFileHandle.prototype.createSyncAccessHandle`** | **absent** |
+
+(An earlier version of this table also listed
+`FileSystemFileHandle.prototype.createSyncAccessHandle` as absent. That row was
+worthless: it was measured on the main thread, where **no** engine exposes it —
+see RE-024. `getDirectory` is the row that actually separates this build from
+the others.)
 
 **Observed.** Everything cross-origin isolation buys is present and the storage
 layer is simply not there, so the app cannot run: the capability gate fires with
@@ -130,13 +177,21 @@ Playwright option that closes it.
 **Impact.** **The Safari half of the D-016 floor is not verified by this suite
 and cannot be.** It rests on the documented feature availability plus the gate,
 which is weaker than the Chromium and Firefox claims and is recorded here rather
-than left implied. The suite states it rather than failing: the specs that need a
-corpus call `skipWithoutLocalStorage` (`tests/e2e/support.ts`), which **measures
-the browser** instead of naming it — so a later Playwright WebKit with OPFS
-starts running them by itself. The gate's own spec deliberately does not skip,
-because that browser is precisely what it is for.
+than left implied.
 
-**Links.** `tests/e2e/support.ts`, `lib/capabilities.ts`, D-016.
+**Resolution (owner decision, 2026-08-08): WebKit was removed from
+`playwright.config.ts`.** The first response was to keep the project and skip
+the specs it could not run, which is how RE-024 hid — a project contributing
+nothing but skips looks identical in a summary line to one that passed. Removing
+it makes the coverage claim legible: two engines run everything, and the Safari
+gap is a documented hole rather than a green tick over an empty run. What is
+given up is real and worth naming: WebKit was the only engine where the
+capability gate fired on a browser that genuinely fails, so `resilience.spec.ts`
+now exercises it only through the `?probe=` knob (RE-020). Re-adding the project
+is a one-line change if a WebKit build with OPFS appears.
+
+**Links.** `playwright.config.ts`, `tests/e2e/support.ts`, `lib/capabilities.ts`,
+RE-024, D-016.
 
 ## RE-021: A `Response` served from a `Cache` becomes the worker's `location`, dropping the fragment its bootstrap config was in  (2026-08-08, status: worked-around)
 

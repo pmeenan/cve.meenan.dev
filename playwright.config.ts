@@ -32,14 +32,25 @@ export default defineConfig({
     baseURL: remote ?? 'http://127.0.0.1:4747',
     trace: 'on-first-retry',
   },
-  // Three engines since M5 (D-016, rule 3): a support claim is a measurement
+  // Two engines since M5 (D-016, rule 3): a support claim is a measurement
   // claim, and every milestone's numbers up to M4 were Chromium-only. The
   // Chromium project stays first so `--project=chromium` is the fast loop; a
-  // bare `pnpm e2e` runs all three, which is the point.
+  // bare `pnpm e2e` runs both, which is the point.
+  //
+  // **WebKit is deliberately absent** (owner decision 2026-08-08). Playwright's
+  // Linux WebKit ships no OPFS at all — `navigator.storage.getDirectory` is
+  // `undefined` (RE-022) — so it cannot run the data path, and every spec that
+  // touches it was being skipped there. Keeping a project whose entire
+  // contribution is skips is how RE-024 stayed invisible: a suite that reports
+  // "passed" for tests that never ran. The cost is recorded rather than
+  // implied — the Safari half of the D-016 floor is **not verified by this
+  // suite**, and `resilience.spec.ts` no longer exercises the capability gate
+  // on a browser that genuinely fails, only on ones the `?probe=` knob tells to
+  // pretend. Re-adding a project is a one-line change if a WebKit build with
+  // OPFS becomes available.
   projects: [
     { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
     { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
-    { name: 'webkit', use: { ...devices['Desktop Safari'] } },
   ],
   webServer: remote
     ? undefined
