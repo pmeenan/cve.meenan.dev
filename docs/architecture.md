@@ -647,7 +647,7 @@ hand its id to a different value (D-056).
   then reports how many of the records it brought are CVEs this copy did not
   hold, which is the number a user actually opens the app for.
 
-## The AI layer (planned — M7/M8, D-044 – D-046, D-057)
+## The AI layer (shipped in M7; M8's further tiers parked — D-044 – D-046, D-057)
 
 Sits entirely above the client described previously; the data plane below it is
 unchanged, and the two Fixed points it touches — one origin, upstream sources —
@@ -687,7 +687,8 @@ transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
   chat completion as the only exposed operation, POST-only, body-capped, nginx
   rate- and concurrency-limited, nothing stored, no body logging. On this tier
   the question and its tool results transit this server — disclosed at first
-  use. The M8 tiers follow: local WASM/WebGPU model (the intended default;
+  use, and it is the only tier today. The M8 tiers are parked (2026-08-09,
+  owner) rather than cancelled: local WASM/WebGPU model (the intended default;
   weights from Hugging Face into OPFS on explicit action), Chrome built-in
   Gemini Nano, and user-supplied keys for Gemini / OpenRouter / Anthropic /
   OpenAI, called browser-direct with keys client-side only. `cve.meenan.dev`

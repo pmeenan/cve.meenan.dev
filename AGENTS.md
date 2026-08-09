@@ -3,14 +3,16 @@
 A public web app for searching, analyzing, and reporting on the complete CVE
 List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, 372,092
 records and growing — with an AI chat layer that turns plain-language questions
-into local queries (D-044): built in M7 against a model we host, with the other
-tiers in M8. The entire data plane runs
+into local queries (D-044): built in M7 against a model we host, which is the
+only tier today — M8's other tiers are parked (2026-08-09) while the
+single-tier product is exercised. The entire data plane runs
 in the browser: the corpus is normalized server-side into a ~63 MB compressed
 SQLite database, downloaded on demand into OPFS, and queried locally — so no
 search or report ever leaves the client. Chat is the opt-in exception: the
-first model tier is an Ollama instance we host, reached through a restricted
-same-origin relay (D-057), with in-browser models and user-supplied hosted-model
-keys (chat traffic browser-direct to that provider, D-045) following. The
+only model tier is an Ollama instance we host, reached through a restricted
+same-origin relay (D-057); in-browser models and user-supplied hosted-model
+keys (chat traffic browser-direct to that provider, D-045) remain the plan, but
+are parked rather than next. The
 server serves the snapshot and its deltas as static files and performs no
 analysis — the D-057 chat relay is its one dynamic endpoint, and it forwards
 chat to our own model without storing anything. Almost all code is written by

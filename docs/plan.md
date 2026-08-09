@@ -19,8 +19,11 @@ work) no later than when they become the next milestone up. **M0 – M7 are
 closed**: they are summarized below, and their full task-level record — every
 checkbox, its evidence, and the defects each surfaced — lives in
 [plan-archive.md](plan-archive.md), moved there verbatim so this document stays
-small enough to load per task. **M8 is next** and carries scope prose and exit
-criteria until its turn.
+small enough to load per task. **M8 is parked** (2026-08-09, owner): the
+product is complete on the tier it has, and the next work is user experience
+and testing rather than more model tiers. It keeps its scope and exit criteria
+for whenever it resumes. **The next milestone is not yet decomposed** — see
+"What's next" below.
 
 ## Completed milestones — summaries
 
@@ -187,7 +190,58 @@ and our own prompt says `sql`, and measurement says tightening either way
 breaks the other; and two environment changes that live outside git —
 `OLLAMA_NUM_PARALLEL=2` on the llm box and the nginx rate limit.
 
-## M8 — Other model tiers: BYO keys and in-browser local  `pending`
+## What's next — user experience and testing  `not decomposed`
+
+The owner's direction, 2026-08-09: iterate on the experience and test the
+product as it stands before adding model tiers. Scope is the owner's to set;
+this section is only the material already on the books, collected so
+decomposition starts from what is known rather than from memory.
+
+**Carried open from closed milestones** (each is in a summary above, with the
+milestone that recorded it):
+
+- A deterministic Next.js `generateBuildId` (M5). Without it every deploy
+  changes the service worker's precache URLs and re-downloads the offline
+  shell — a user-visible cost on every deploy, and the most product-shaped
+  item on this list.
+- The Safari half of the D-016 capability floor is unverified (M5). It needs
+  real hardware; Playwright's Linux WebKit ships no OPFS (RE-022).
+- The full-corpus measurement, deliberately not taken (M5, owner).
+- The monthly rotation cron's first unattended firing, 1 September (M2) —
+  still ahead, and still the one part of the publish path never observed
+  running by itself.
+- The chat decline paragraph's lexical coverage, and the `cisco-criticals`
+  disagreement between the benchmark and our own prompt (M7). Both measured,
+  both written down where they will be found.
+
+**Not yet examined at all**: the experience for a first-time visitor who has
+not downloaded the corpus, on a slow connection or a phone; what the app does
+when chat's single GPU box is unavailable; and whether the tabs, the filter
+surface and the report builder read the way an analyst expects rather than the
+way they were built.
+
+## M8 — Other model tiers: BYO keys and in-browser local  `parked` (2026-08-09)
+
+**On hold, owner's call.** The product is complete and usable on the tier it
+has: everything but chat runs in the browser and depends on no server at all,
+and chat works end to end against the model we host (D-057). Adding tiers
+multiplies the surface — four provider adapters, a WASM/WebGPU runtime,
+multi-gigabyte weight storage — before the single-tier product has been
+exercised by real use. So the next work is the user experience and testing what
+exists; this milestone resumes when that is worth building on.
+
+**What being parked here costs, stated rather than assumed.** Chat is the one
+feature with a server dependency, and it is a *hard* one: a single GPU box with
+two inference slots. Everything else — search, filtering, reports, charts,
+export, KEV, the SQL console — is unaffected if that box is down, so the
+failure is bounded to one feature degrading rather than the site. But the
+concurrency ceiling is real, and it is lower than the rate limit in front of
+it: nginx allows 120 requests a minute, and two slots at ~4.7 s serve far
+fewer, so the queue is the true limit and the honest number for concurrent chat
+users is single digits. This is the argument for D-045's tiers, and it is a
+scale argument, not a correctness one — which is why it can wait.
+
+The scope below is unchanged and still current.
 
 The differentiator ships here — AI analysis that never leaves the machine —
 plus hosted models on the user's own key (both moved after the site-hosted
