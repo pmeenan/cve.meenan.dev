@@ -169,7 +169,11 @@ a regression is visible.
   exists. Hosted providers are the user's own key and account, called
   browser-direct (D-045) — and consumer-subscription OAuth passthrough is out
   permanently where providers forbid it.
-- **Nothing is collected from users.** No telemetry, no analytics, no error
-  reporting, not even opt-in (D-009). The tradeoff is accepted knowingly: we are
-  blind to production failures, and the diagnostics panel exists so users can
-  tell us what we cannot see.
+- **The app collects nothing.** No telemetry, no analytics, no error reporting,
+  not even opt-in (D-009). The tradeoff is accepted knowingly: we are blind to
+  production failures, and the diagnostics panel exists so users can tell us
+  what we cannot see. What this buys is the claim worth making — **your queries
+  never reach us**, because the corpus is downloaded once and every search,
+  filter and report runs against your own copy. It is deliberately *not* a
+  claim that the server records nothing at all: it keeps an ordinary access log
+  with real visitor addresses, like every other web server (D-079).

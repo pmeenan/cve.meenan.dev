@@ -19,7 +19,16 @@
 import initBrotli, { decompress as brotliDecompress } from 'brotli-dec-wasm/web'
 import type { Database, SAHPoolUtil, Sqlite3Static, SqlValue } from '@sqlite.org/sqlite-wasm'
 
-import { authorize, AUTH_DENY, AUTH_OK, CONSOLE_ROW_LIMIT } from '../lib/authorizer'
+import {
+  authorize,
+  AUTH_DENY,
+  AUTH_OK,
+  CONSOLE_ROW_LIMIT,
+  MAX_GUARDED_CELL_BYTES,
+  RESULT_CHAR_BUDGET,
+  rowCost,
+  TOOL_DEADLINE_MS,
+} from '../lib/authorizer'
 import {
   armCancel,
   cancelRequested,
@@ -48,6 +57,7 @@ import {
 } from '../lib/filters'
 import {
   cwesSql,
+  existsSql,
   isCveId,
   kevSql,
   productsSql,
@@ -154,6 +164,7 @@ import {
   // mostly fetch code, and shadowing the global in a file that reads response
   // bodies is a trap.
   type CveDetail,
+  type DetailKev,
   type DetailReference,
   type DetailVersion,
   type ExportRequest,
@@ -163,9 +174,12 @@ import {
   type SearchRequest,
   type SyncOutcome,
   type Timings,
+  type ToolCall,
+  type ToolOutcome,
   type Unmatched,
   type Vfs,
 } from '../lib/protocol'
+import { searchReport } from '../lib/tools'
 
 /**
  * The name the `opfs-sahpool` path imports to, inside the pool's own opaque
@@ -2456,6 +2470,14 @@ interface RunOptions {
   guarded?: boolean
   /** Suppress the "still running" reports — the benchmark posts its own. */
   quiet?: boolean
+  /**
+   * Stop after this long, and report it as a refusal (D-044's "timed-out").
+   *
+   * Only for SQL this build did not write. The app's own statements have no
+   * deadline: an import's index build legitimately runs for a minute, and a
+   * deadline there would be a data-loss bug rather than a safety rail.
+   */
+  deadlineMs?: number
 }
 
 /**
@@ -2485,6 +2507,14 @@ function runSql(database: Database, sql: string, options: RunOptions): QueryResu
   // a bare SQLITE_AUTH. Keeping the reason here is what turns "not authorized"
   // into "this console is read-only: INSERT is refused".
   let denial: string | null = null
+  /** Set by the progress handler when the deadline passed, so the interrupt is nameable. */
+  let expired = false
+  /** Set by the row callback when the character budget stopped collection. */
+  let overflowed = false
+  /** Characters retained so far, against `RESULT_CHAR_BUDGET`. */
+  let budgetSpent = 0
+  /** The connection's own length limit, restored in the `finally`. -1 is "unset". */
+  let priorLength = -1
 
   if (progressOps > 0 && handle) {
     capi.sqlite3_progress_handler(
@@ -2492,8 +2522,15 @@ function runSql(database: Database, sql: string, options: RunOptions): QueryResu
       progressOps,
       () => {
         if (cancelRequested(cancelFlag)) return 1
-        if (options.quiet) return 0
         const now = performance.now()
+        if (options.deadlineMs !== undefined && now - started > options.deadlineMs) {
+          // Non-zero interrupts the statement, exactly as cancellation does.
+          // Distinguished by `expired` below, because "you stopped it" and "it
+          // ran too long" are different things to tell a user.
+          expired = true
+          return 1
+        }
+        if (options.quiet) return 0
         if (now - started < QUERY_QUIET_MS || now - lastReport < QUERY_REPORT_MS) return 0
         lastReport = now
         report('query', null, `running — ${elapsedLabel(now - started)} · Cancel to stop`)
@@ -2502,7 +2539,22 @@ function runSql(database: Database, sql: string, options: RunOptions): QueryResu
       0
     )
   }
+  // A guarded query with no connection handle would run *unguarded*: the only
+  // remaining defence would be `query_only`, which the same statement string can
+  // flip off. Refuse rather than proceed — this is unreachable on an open
+  // database, and the point of saying so is that it stays unreachable.
+  if (options.guarded && !handle) {
+    throw new Error('the database connection is not in a state where read-only can be enforced')
+  }
   if (options.guarded && handle) {
+    // Bound what SQLite will *build*, not just what we keep. The budget in the
+    // row callback runs after the value already exists as a JS string, so it
+    // stops a gigabyte from being retained and cloned but not from being
+    // materialized once; `SQLITE_LIMIT_LENGTH` stops it earlier, inside the
+    // engine, with `SQLITE_TOOBIG`. Restored below, because the app's own
+    // writes go through this same connection and a delta record is allowed to
+    // be larger than any cell a person reads.
+    priorLength = capi.sqlite3_limit(handle, capi.SQLITE_LIMIT_LENGTH, MAX_GUARDED_CELL_BYTES)
     capi.sqlite3_set_authorizer(
       handle,
       (_arg, code, arg1, arg2) => {
@@ -2529,12 +2581,30 @@ function runSql(database: Database, sql: string, options: RunOptions): QueryResu
           // afterwards.
           return false
         }
+        // …and the row cap is not the whole memory bound, because a row can be
+        // any size at all. Guarded queries carry a character budget as well,
+        // measured on what is actually retained. Checked *before* the row is
+        // kept, so the last row over the line is dropped rather than held.
+        if (options.guarded) {
+          budgetSpent += rowCost(row)
+          if (budgetSpent > RESULT_CHAR_BUDGET) {
+            truncated = true
+            overflowed = true
+            return false
+          }
+        }
         rows.push(row)
         return undefined
       },
     })
   } catch (error) {
     const ms = performance.now() - started
+    if (expired) {
+      throw new Error(
+        `this query ran for longer than ${Math.round((options.deadlineMs ?? 0) / 1000)} s and was ` +
+          'stopped. Narrow it — a filter on state, a date range, or a LIMIT — and try again.'
+      )
+    }
     if (isInterrupt(error)) throw new Cancelled(ms)
     if (denial) throw new Error(denial)
     throw error
@@ -2545,6 +2615,11 @@ function runSql(database: Database, sql: string, options: RunOptions): QueryResu
     if (handle) {
       if (progressOps > 0) capi.sqlite3_progress_handler(handle, 0, 0, 0)
       if (options.guarded) clearAuthorizer(handle)
+      // Unconditionally, and before anything else can use the connection: a
+      // 1 MB value limit left behind would make the *sync* path fail on any
+      // record longer than that, which is a data bug arriving hours later and
+      // nowhere near this line.
+      if (priorLength >= 0) capi.sqlite3_limit(handle, capi.SQLITE_LIMIT_LENGTH, priorLength)
     }
   }
 
@@ -2553,6 +2628,7 @@ function runSql(database: Database, sql: string, options: RunOptions): QueryResu
     rows,
     ms: Math.round(performance.now() - started),
     truncated,
+    ...(overflowed ? { overflowed: true } : {}),
     sql,
     params: [...(options.params ?? [])],
   }
@@ -2857,14 +2933,31 @@ function detail(cveId: string): void {
   report('query', null, 'Reading record')
 
   finishQuery('detail', () => {
-    const started = performance.now()
-    const found = section(database, recordSql(cveId))
-    const row = found.rows[0]
-    if (!row) {
+    const payload = readDetail(database, cveId)
+    if (!payload) {
       report('ready', 1, 'no such record')
       post({ type: 'detail', cveId, detail: null })
       return
     }
+    report('ready', 1, `${payload.record.cve} in ${payload.ms} ms`)
+    post({ type: 'detail', cveId, detail: payload })
+  })
+}
+
+/**
+ * Read one record in full, or null when nothing carries that id.
+ *
+ * Separated from the message handling above because the chat layer's
+ * `cve_detail` tool reads the *same* record through the same five bounded
+ * queries (M7). Two readers assembling a `CveDetail` from their own joins is
+ * how the panel and the chat answer end up disagreeing about a record.
+ */
+function readDetail(database: Database, cveId: string): CveDetail | null {
+  {
+    const started = performance.now()
+    const found = section(database, recordSql(cveId))
+    const row = found.rows[0]
+    if (!row) return null
 
     const cwes = section(database, cwesSql(cveId))
     const products = section(database, productsSql(cveId))
@@ -2929,30 +3022,229 @@ function detail(cveId: string): void {
         url: text(entry[0]),
         host: text(entry[1]),
       })),
-      kev: kevRow
-        ? {
-            added: text(kevRow[0]),
-            due: text(kevRow[1]),
-            name: text(kevRow[2]),
-            description: text(kevRow[3]),
-            action: text(kevRow[4]),
-            // Null stays null: it means CISA stated something this build does
-            // not read, which is not the same as `Unknown` — that is CISA
-            // having looked (D-076).
-            ransomware: num(kevRow[5]),
-            notes: text(kevRow[6]),
-            cwes: parseCwes(kevRow[7]),
-            vendor: text(kevRow[8]),
-            product: text(kevRow[9]),
-          }
-        : null,
+      kev: kevFrom(kevRow),
       truncated,
       ms: Math.round(performance.now() - started),
     }
 
-    report('ready', 1, `${payload.record.cve} in ${payload.ms} ms`)
-    post({ type: 'detail', cveId, detail: payload })
-  })
+    return payload
+  }
+}
+
+/**
+ * One `kevSql` row as a `DetailKev`, or null when there is no row.
+ *
+ * One reader, because the detail view and the chat layer's `kev_lookup` ask the
+ * same question of the same table and a second assembly here is how they would
+ * come to disagree about a record — the same reason `readDetail` exists rather
+ * than two copies of the five section queries.
+ */
+function kevFrom(row: unknown[] | undefined): DetailKev | null {
+  if (!row) return null
+  return {
+    added: text(row[0]),
+    due: text(row[1]),
+    name: text(row[2]),
+    description: text(row[3]),
+    action: text(row[4]),
+    // Null stays null: it means CISA stated something this build does not read,
+    // which is not the same as `Unknown` — that is CISA having looked (D-076).
+    ransomware: num(row[5]),
+    notes: text(row[6]),
+    cwes: parseCwes(row[7]),
+    vendor: text(row[8]),
+    product: text(row[9]),
+  }
+}
+
+/**
+ * Execute one chat tool call (M7, D-044).
+ *
+ * Every arm is a read that already exists for a deterministic surface —
+ * `crossSql`, `rowsSql`, `readDetail`, `kevSql`, and the console's guarded
+ * `runSql`. That is the containment story, and it is structural: there is no
+ * arm that fetches, writes or takes a path, so no argument can produce one.
+ * A model cannot reach a code path the UI could not.
+ *
+ * Failures become a **refusal outcome** rather than an error message. A tool
+ * call is one step inside a conversation the page is orchestrating: an error
+ * with no call id attached leaves the loop waiting for an answer that will
+ * never come, and a refusal is something the model can be told and can act on
+ * ("this copy has no KEV catalog" is an answer).
+ *
+ * **A cancelled call answers too.** `cancelled` carries a kind and no id, so a
+ * loop waiting on this call's id would wait forever — a spinner and a Stop
+ * button that has already been pressed. So the cancellation path posts a
+ * `toolResult` as well: the `cancelled` message is still what the UI reports,
+ * and this is what settles the promise. Every path out of here posts exactly
+ * one `toolResult` for the id it was given.
+ */
+function runTool(id: string, call: ToolCall): void {
+  const started = performance.now()
+  const elapsed = () => Math.round(performance.now() - started)
+  report('query', null, `Running ${call.name}`)
+
+  finishQuery(
+    'tool',
+    () => {
+      let outcome: ToolOutcome
+      try {
+        // `requireDb` inside the guard, not above it: "there is no local copy"
+        // is as much a refusal the model should hear as a KEV question asked of
+        // a copy with no catalog, and thrown from out here it would reach the
+        // page with no call id on it.
+        outcome = executeTool(requireDb(), call)
+      } catch (error) {
+        if (error instanceof Cancelled) throw error
+        outcome = {
+          kind: 'refused',
+          tool: call.name,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      }
+      const ms = elapsed()
+      // A refusal is not a success, and the progress line is the only place the
+      // difference shows for a user who is not reading the panel.
+      report(
+        'ready',
+        1,
+        outcome.kind === 'refused' ? `${call.name} refused` : `${call.name} in ${ms} ms`
+      )
+      post({ type: 'toolResult', id, outcome, ms })
+    },
+    () => {
+      post({
+        type: 'toolResult',
+        id,
+        outcome: { kind: 'refused', tool: call.name, error: 'stopped before it finished' },
+        ms: elapsed(),
+      })
+    }
+  )
+}
+
+function executeTool(database: Database, call: ToolCall): ToolOutcome {
+  switch (call.name) {
+    case 'aggregate': {
+      // Re-validated here, not trusted because the page validated it. The page
+      // is not the last gate before SQL; this is — and this definition came out
+      // of a model, which is the sharpest case `parseReport` exists for (D-069).
+      const parsed = parseReport(call.report)
+      if (!parsed.ok) throw new Error(parsed.error)
+      const definition = parsed.report
+      const filters: Filters = definition.filters ?? {}
+      if (usesKev(filters, definition.rows, definition.series)) assertKevLoaded(database)
+      const { resolved, unmatched } = resolveFilters(database, filters)
+      const rowCap = definition.limit ?? (definition.chart === 'table' ? TABLE_ROWS : CHART_ROWS)
+      const built = crossSql(filters, resolved, definition.rows, definition.series, {
+        rows: rowCap,
+      })
+      const result = runSql(database, built.sql, { params: built.params, limit: built.limit })
+      // Always counted, unlike `search`, where the count is opt-in because over
+      // the whole corpus with no filters it is a scan. Here it is usually the
+      // answer — "how many CRITICAL CVEs" is a count, not a chart — and a model
+      // told only "12 buckets" would have to guess the total or fetch it in a
+      // second round trip against an 8B model on one GPU.
+      const counted = countSql(filters, resolved)
+      const rows = runSql(database, counted.sql, { params: counted.params, limit: 1, quiet: true })
+      const value = rows.rows[0]?.[0]
+      return {
+        kind: 'aggregate',
+        report: definition,
+        result,
+        matches: typeof value === 'number' ? value : null,
+        unmatched,
+      }
+    }
+    case 'search_records': {
+      const definition = parseReport(searchReport(call))
+      if (!definition.ok) throw new Error(definition.error)
+      const filters = definition.report.filters
+      if (usesKev(filters, null)) assertKevLoaded(database)
+      const { resolved, unmatched } = resolveFilters(database, filters)
+      const built = rowsSql(filters, resolved, {
+        limit: call.limit,
+        sort: definition.report.sort,
+      })
+      const result = runSql(database, built.sql, { params: built.params, limit: built.limit })
+      const counted = countSql(filters, resolved)
+      const rows = runSql(database, counted.sql, { params: counted.params, limit: 1, quiet: true })
+      const value = rows.rows[0]?.[0]
+      return {
+        kind: 'records',
+        report: definition.report,
+        result,
+        matches: typeof value === 'number' ? value : null,
+        unmatched,
+      }
+    }
+    case 'cve_detail': {
+      if (!isCveId(call.cveId))
+        throw new Error(`not a CVE identifier: ${String(call.cveId).slice(0, 40)}`)
+      return { kind: 'detail', cveId: call.cveId, detail: readDetail(database, call.cveId) }
+    }
+    case 'kev_lookup': {
+      if (!isCveId(call.cveId))
+        throw new Error(`not a CVE identifier: ${String(call.cveId).slice(0, 40)}`)
+      // Refused, not answered. A copy with no catalog cannot say "not
+      // known-exploited" — that would be inventing CISA's silence out of our
+      // own (D-077), and it is the one wrong answer this tool could give that
+      // a reader would have no way to notice.
+      const catalog = localKev(database)
+      if (!catalog) {
+        throw new Error(
+          'this browser holds no CISA KEV catalog, so nothing can be said about whether ' +
+            'the record is known-exploited — refresh the catalog from the Data tab first'
+        )
+      }
+      // `lower(cve_id) = ?`, the form every other id lookup uses
+      // (lib/detail.ts) — not `= upper(id)`. The two agree only for as long as
+      // every stored id happens to be uppercase, and this call runs both: a
+      // divergence would report "this copy has no such record" beside a KEV
+      // entry read from the same row.
+      const probe = existsSql(call.cveId)
+      const exists = runSql(database, probe.sql, {
+        params: probe.params,
+        limit: 1,
+        quiet: true,
+      })
+      return {
+        kind: 'kev',
+        cveId: call.cveId,
+        kev: kevFrom(section(database, kevSql(call.cveId)).rows[0]),
+        catalog,
+        known: exists.rows.length > 0,
+      }
+    }
+    case 'sql': {
+      // The same guarded path the SQL console uses: the authorizer refuses
+      // every action but reading, from inside SQLite's parser (D-065), and the
+      // caps are memory bounds on this Worker. Nothing inspects the text.
+      //
+      // Note what this arm *cannot* do that the others can: `usesKev` has no
+      // opinion about arbitrary SQL, so a KEV question asked this way of a copy
+      // with no catalog is not gated by `assertKevLoaded`. It is safe only
+      // because such a copy has no `kev` table at all, so the statement errors
+      // into a refusal rather than answering that nothing is known to be
+      // exploited (D-077). If that table is ever created empty on open, this
+      // arm becomes the hole.
+      const result = runSql(database, call.sql, {
+        limit: CONSOLE_ROW_LIMIT,
+        guarded: true,
+        // D-044 asks for "row-capped, timed-out", and the console has a human
+        // watching a Cancel button where this has a model in a loop.
+        deadlineMs: TOOL_DEADLINE_MS,
+      })
+      return { kind: 'sql', result }
+    }
+    default:
+      // Unreachable through `parseToolCall`, and reachable if anything ever
+      // posts a `tool` request without going through it. Falling off the end of
+      // the switch returns `undefined`, which TypeScript accepts as exhaustive
+      // and which the page then dereferences — so the last gate before SQL
+      // refuses by name rather than by omission.
+      throw new Error(`no tool called ${String((call as { name?: unknown }).name).slice(0, 40)}`)
+  }
 }
 
 /** MITRE's notice, out of the copy's own `meta` — never a constant in this build (D-008). */
@@ -3351,6 +3643,9 @@ async function handle(request: Request): Promise<void> {
       case 'export':
         exportData(request.request)
         break
+      case 'tool':
+        runTool(request.id, request.call)
+        break
       case 'bench':
         bench()
         break
@@ -3368,6 +3663,21 @@ async function handle(request: Request): Promise<void> {
     }
   } catch (error) {
     report('error', null, '')
+    const message = error instanceof Error ? error.message : String(error)
+    // A tool call that failed before `runTool`'s own guard still has to come
+    // back *as that call*: the chat loop is waiting on this id, and a bare
+    // `error` message would leave the conversation stopped with a spinner and
+    // no way to retry — the silence D-052 forbids, in a new long-running thing.
+    if (request.type === 'tool') {
+      post({
+        type: 'toolResult',
+        id: request.id,
+        outcome: { kind: 'refused', tool: request.call?.name ?? 'unknown', error: message },
+        ms: 0,
+      })
+      await status().catch(() => undefined)
+      return
+    }
     const kind: QueryKind | undefined =
       request.type === 'console'
         ? 'console'
@@ -3382,11 +3692,7 @@ async function handle(request: Request): Promise<void> {
                 : request.type === 'query' || request.type === 'bench'
                   ? 'demo'
                   : undefined
-    post({
-      type: 'error',
-      message: error instanceof Error ? error.message : String(error),
-      ...(kind ? { kind } : {}),
-    })
+    post({ type: 'error', message, ...(kind ? { kind } : {}) })
     // Resync, and on the staged path this is where the good news arrives: a
     // failed download leaves the previous database untouched, so `status` says
     // "still ready" and the page keeps its query surface instead of offering a

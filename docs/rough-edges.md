@@ -22,6 +22,188 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-033: fts5 issues `PRAGMA data_version` itself, so a SQLite authorizer that denies PRAGMA denies all full-text search  (2026-08-08, status: fixed)
+
+**Environment.** SQLite 3.53.0 (`@sqlite.org/sqlite-wasm` in the browser,
+`node:sqlite` in tests), fts5 external-content index, the M3 console authorizer
+(`lib/authorizer.ts`) allowing only `SELECT`, `READ`, `FUNCTION` and
+`RECURSIVE`.
+
+**Repro / measurement.**
+
+```
+SELECT count(*) FROM fts JOIN cve c ON c.id = fts.rowid
+WHERE fts MATCH 'deserialization' AND c.state = 1
+→ authorization denied
+denied actions: [ [ 19, 'data_version', null ] ]     # 19 = SQLITE_PRAGMA
+```
+
+One denial, and it is the only one: fts5 reads `data_version` at the start of a
+query to decide whether its cached configuration is still valid.
+
+**Observed.** Denying `PRAGMA` wholesale denies **every fts5 query**. In this
+app that meant the SQL console could not run full-text search at all —
+including its own built-in example button, "Critical CVEs mentioning
+deserialization" — with the misleading message *"this console is read-only:
+PRAGMA (data_version) is refused by the database itself"*.
+
+**Expected.** That a read-only authorizer permits a read-only search.
+
+**Impact.** **Broken since M3 and unnoticed for two milestones**, because the
+app's own searches (Explore, Report, the chat layer's `search_records`) run
+*unguarded* — the authorizer is installed only for SQL the user or a model
+wrote. It surfaced when the D-046 benchmark ran an FTS query through the
+console to compute a ground truth, which is the first time anything drove that
+path automatically.
+
+Fixed with an allowlist that is narrow in two dimensions at once: by **name**
+(`data_version` only) and by **shape** (the no-argument read form only, since a
+pragma with an argument is a setting). `PRAGMA query_only=OFF` — the flip the
+wholesale denial existed to stop — is still refused, and so is
+`PRAGMA data_version = anything`; `tests/unit/authorizer.test.ts` asserts both
+against real SQLite alongside a real fts5 query that now returns rows.
+
+## RE-032: A Playwright locator that matches nothing does not time out inside `expect.poll` — it hangs the run  (2026-08-08, status: worked-around)
+
+**Environment.** `@playwright/test` 1.62.1, no `actionTimeout` configured (the
+default is 0 — bounded only by the test timeout). Found twice while building the
+D-046 benchmark harness, which sets `test.setTimeout(3_600_000)`.
+
+**Repro / measurement.**
+
+```ts
+// Hangs for the whole hour when no element matches, writing nothing:
+await expect
+  .poll(async () => page.locator('[data-chat-turn]').last().getAttribute('data-chat-turn'))
+  .not.toBe('running')
+```
+
+**Observed.** Two compounding behaviours. `locator.getAttribute()` on a locator
+matching zero elements *waits* for the element rather than returning null, and
+with no `actionTimeout` it waits until the test's own deadline. And
+`expect.poll` waits for its callback to **settle** — its `timeout` bounds how
+long it keeps *retrying*, not how long one in-flight call may take, so it never
+interrupts the hang. The two together turn "the element is not there yet" into
+a run that produces no output at all and then fails an hour later with a bare
+test-timeout message.
+
+**Expected.** That a poll with a 600 s timeout gives up after 600 s.
+
+**Impact.** Cost two benchmark runs — one against a locator for a console
+result that does not exist until the first query, one against a chat turn that
+had not been created. Both looked identical from outside: the process alive,
+the scorecard file empty, nothing in the log. The fix is to make every arm of a
+poll callback *return* — check `count()` first — and to assert the element is
+visible before polling its attribute. The harness now also wraps each question
+so one that cannot be scored is recorded as a zero with its reason rather than
+discarding the questions after it, which is the difference between a benchmark
+and a coin flip.
+
+## RE-031: Behind Cloudflare, `$binary_remote_addr` is an edge IP — a rate limit keyed on it is wrong in both directions  (2026-08-08, status: fixed)
+
+**Environment.** nginx 1.30.2 on `plex`, `cve.meenan.dev` proxied through
+Cloudflare. No `set_real_ip_from` configured (the `http_realip_module` is
+compiled in but unused).
+
+**Repro / measurement.** `limit_req_zone $binary_remote_addr … rate=12r/m` with
+`burst=4` on the chat relay, then the same requests by two routes:
+
+```
+# through Cloudflare
+$ for i in $(seq 1 15); do curl -s -o /dev/null -w "%{http_code} " -X POST … & done
+200 200 200 200 200 200 200 200 200 200 200 200 200 200 200
+
+# straight to the origin address
+$ for i in $(seq 1 8); do curl -sk --resolve cve.meenan.dev:443:<origin> … ; done
+200 200 200 200 200 429 429 429
+```
+
+The access log says why: `104.22.101.105`, `172.68.245.224` — Cloudflare, not
+the visitor.
+
+**Observed.** The limit is keyed on the Cloudflare edge IP, which makes it wrong
+in both directions at once. An attacker arrives over many edge IPs and is barely
+limited; two ordinary visitors who share one edge IP contend for the same
+allowance, and with `limit_conn 2` a third simultaneous user is a 429 for no
+reason at all.
+
+**Expected.** That a per-client limit is per client.
+
+**Impact.** Fixed with `set_real_ip_from` for Cloudflare's published ranges
+plus `real_ip_header CF-Connecting-IP`, so `$binary_remote_addr` *is* the
+visitor and the limits key on it directly. Trusting the header only from
+Cloudflare's own addresses is what makes it non-forgeable: a caller who finds
+the origin address and sends their own `CF-Connecting-IP` is not in the list,
+so their peer address is used.
+
+**This was first fixed a different way, and the detour is the interesting
+part.** Because `real_ip` also makes `$remote_addr` the visitor in the *access
+log*, and this origin had been logging Cloudflare's addresses, the first fix
+avoided it: a `map` over `CF-Connecting-IP` keyed the limits, with a second,
+looser limit on the real peer to cover header spoofing. That preserved a
+privacy property nobody had asked for at the cost of two zones, a map and a
+backstop. The owner's call (D-079) was that the property was not worth buying —
+real IPs in an access log are what every web server does, and the claim worth
+making is the structural one, that the corpus and every query run in the
+browser. The config is now simpler than either version.
+
+**Two things about how this was found are the point.** It is invisible in the
+config — every directive reads correctly — and it is invisible from the browser,
+because a real user never trips a limit. Only firing requests *by both routes*
+and comparing showed it. And the first attempt to apply the config had failed
+`nginx -t` outright (`"fastcgi_read_timeout" directive is duplicate`, because
+`fastcgi.conf` already sets it), which left the config files on disk while the
+**old** config kept serving — so a filesystem check for "is it applied?"
+answered yes and the endpoint's behaviour said nothing.
+
+## RE-030: Streaming through php-fpm needs three separate buffers turned off, and each one costs a different amount  (2026-08-08, status: worked-around)
+
+**Environment.** PHP 8.4.8 behind php-fpm, nginx 1.30.2 on `plex`, Cloudflare in
+front. Measured against `http://llm:11434/api/chat` with `gemma4:e4b`, observed
+from Chromium 143 and Firefox 145 via `fetch` + a `ReadableStream` reader
+(the D-057 experiment).
+
+**Repro / measurement.** A PHP script relaying Ollama's NDJSON with
+`CURLOPT_WRITEFUNCTION`, stamping each line with the server-side offset, read
+from a real browser. Time to first byte at the client, by knob:
+
+| configuration | client TTFB | distinct arrivals (112 lines) |
+| --- | --- | --- |
+| `X-Accel-Buffering: no`, `output_buffering` unwrapped, `application/x-ndjson` | **0.47 s** | 90 |
+| same but PHP's `output_buffering = 4096` left in place | 0.67 s | 62 |
+| same but no `X-Accel-Buffering` header | 0.63 s | 63 |
+| `text/plain` and no `X-Accel-Buffering` | **1.35 s** | 61 |
+
+Server-side first write was 0.33–0.37 s in every case, so the differences are
+entirely buffering below PHP. Ollama's own warm TTFT is ~0.37 s.
+
+**Observed.** Three independent buffers, none of which is off by default, and
+each of which alone is enough to make a token stream arrive in lumps:
+
+1. **PHP's `output_buffering = 4096`** (the stock php.ini value). Costs ~200 ms
+   — the first 4 KB sits in PHP. Cleared with an `ob_end_flush()` loop plus
+   `ob_implicit_flush(true)`; a single `ob_end_flush()` is not enough when
+   something else has already opened a level.
+2. **nginx's `fastcgi_buffering`**, on by default. Costs ~160 ms. Turned off
+   *per response* by sending `X-Accel-Buffering: no`, which nginx consumes and
+   does not forward — so an app can fix this with no config change, which is
+   what made the relay deployable by an unprivileged rsync.
+3. **nginx's gzip filter.** `text/plain` is in this server's `gzip_types` and
+   `application/x-ndjson` is not, and that alone is the difference between
+   1.35 s and 0.47 s. Choosing a content type outside `gzip_types` is a
+   streaming decision, not a formatting one.
+
+Cloudflare buffered nothing and cached nothing: `cf-cache-status: DYNAMIC`
+throughout, and the 40–95 ms it adds over talking to the box directly is
+network, not buffering.
+
+**Expected.** That `flush()` flushes.
+
+**Impact.** All three are applied in `public/api/chat.php`, and two of them are
+also asserted in `scripts/nginx-chat.conf` so a future PHP change cannot quietly
+reintroduce buffering. The measurement is what settled D-057's open
+implementation question — PHP streams, so no decision entry was owed.
+
 ## RE-029: M5's `always` fix was recorded as deployed and was not on the running server, so `/data/` 404s were cached for a year  (2026-08-08, status: fixed)
 
 **Environment.** nginx on `plex`, behind Cloudflare. Found in M6 the first time

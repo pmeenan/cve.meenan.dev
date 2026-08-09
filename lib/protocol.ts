@@ -524,6 +524,71 @@ export interface CveDetail {
   ms: number
 }
 
+/**
+ * One validated tool call from the chat layer (M7, D-044).
+ *
+ * The *output* of `lib/tools.ts`'s validation, never a model's raw arguments —
+ * by the time a value has this type it has been through a fixed vocabulary and,
+ * for `aggregate`, through `parseReport`. The Worker validates again on arrival
+ * for the same reason it re-validates a report: the page is not the last gate
+ * before SQL, the Worker is.
+ */
+export type ToolCall =
+  | { name: 'aggregate'; report: Report }
+  | { name: 'search_records'; filters: Filters; sort?: SortKey; limit?: number }
+  | { name: 'cve_detail'; cveId: string }
+  | { name: 'kev_lookup'; cveId: string }
+  | { name: 'sql'; sql: string }
+
+/**
+ * What a tool did, as the Worker reports it.
+ *
+ * One shape carrying both audiences: the page renders `result`/`detail` through
+ * the *same* components the Report and Explore tabs use, and
+ * `describeToolResult` reduces this to the bounded structured text the model
+ * sees. Splitting them into two messages would let the two drift, which is how
+ * a model ends up describing something other than what is on screen.
+ *
+ * `refused` is a first-class outcome rather than an error: a KEV question asked
+ * of a copy with no catalog, or a `SELECT` the authorizer stopped, is something
+ * the model should be told so it can say so — not a failure of the chat turn
+ * (D-077's rule, applied to the tool surface).
+ */
+export type ToolOutcome =
+  | {
+      kind: 'aggregate'
+      report: Report
+      result: QueryResult
+      matches: number | null
+      unmatched: Unmatched[]
+    }
+  | {
+      kind: 'records'
+      report: Report
+      result: QueryResult
+      matches: number | null
+      unmatched: Unmatched[]
+    }
+  | { kind: 'detail'; cveId: string; detail: CveDetail | null }
+  | {
+      kind: 'kev'
+      cveId: string
+      kev: DetailKev | null
+      catalog: KevStatus
+      /**
+       * Whether this copy holds the record at all.
+       *
+       * Separate from `kev`, because "CISA does not list it" and "this copy has
+       * never heard of it" are different answers and only the first is a
+       * finding — the same distinction D-077 draws one level up for a copy with
+       * no catalog, and the same one `resolveAxis` draws for a vendor nobody
+       * is called.
+       */
+      known: boolean
+    }
+  | { kind: 'sql'; result: QueryResult }
+  | { kind: 'refused'; tool: string; error: string }
+
 export type Request =
   | { type: 'status'; options?: ImportOptions }
   /**
@@ -551,6 +616,14 @@ export type Request =
   | { type: 'detail'; cveId: string }
   /** Stream an export, in batches, up to the disclosed cap (M4). */
   | { type: 'export'; request: ExportRequest }
+  /**
+   * Execute one validated tool call for the chat layer (M7).
+   *
+   * `id` is the model's own call id, echoed on the way back: a turn can issue
+   * several calls and the loop has to pair each answer with the call it
+   * answers, which a queue position cannot do once one of them is cancelled.
+   */
+  | { type: 'tool'; id: string; call: ToolCall }
   | { type: 'bench' }
   /**
    * What this browser can do and what its storage looks like (M5).
@@ -611,6 +684,16 @@ export interface QueryResult {
    * predicate (D-022).
    */
   truncated: boolean
+  /**
+   * Truncation was by *size*, not by row count (M7).
+   *
+   * A distinct signal because the two call for different sentences. "Capped at
+   * 1,000 rows" is an ordinary answer to a broad query; "this result was too
+   * large to hold" means the query produced values a page cannot render — one
+   * row of `group_concat` over the whole corpus — and the fix is to narrow the
+   * columns rather than to add a `LIMIT`. Absent when the row cap did it.
+   */
+  overflowed?: boolean
   /**
    * The SQL that ran and the values bound into it, so a number on screen can
    * always be traced to a query. This is the deterministic half of the
@@ -724,6 +807,8 @@ export type Response =
     }
   /** One record in full (M4). `detail` is null when no record carries that id. */
   | { type: 'detail'; cveId: string; detail: CveDetail | null }
+  /** What one chat tool call produced (M7), paired with the call by `id`. */
+  | { type: 'toolResult'; id: string; outcome: ToolOutcome; ms: number }
   /**
    * One serialized batch of an export, in order (M4).
    *
@@ -764,7 +849,7 @@ export type Response =
  * routes every one of these messages by this field — a kind that exists in one
  * union and not another is a message rendered in the wrong panel or nowhere.
  */
-export type QueryKind = 'demo' | 'console' | 'search' | 'report' | 'detail' | 'export'
+export type QueryKind = 'demo' | 'console' | 'search' | 'report' | 'detail' | 'export' | 'tool'
 
 /** One benchmark query's outcome. `ms` is wall-clock inside the Worker. */
 export interface BenchResult {

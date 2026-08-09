@@ -60,6 +60,35 @@ export function stripControls(value: string): string {
 }
 
 /**
+ * Everything `stripControls` removes, **plus every other invisible carrier**.
+ *
+ * For text on its way into a model's prompt (M7), where the threat is different
+ * from a spreadsheet's. `stripControls` covers C0/C1 and the bidi overrides,
+ * which is what a CSV cell and a rendered description need. A prompt has one
+ * more class: characters that carry meaning to a tokenizer and nothing to a
+ * reader — zero-width spaces and joiners, the directional marks, word joiner,
+ * BOM, the line/paragraph separators, and the **Unicode Tags block**
+ * (U+E0000–E007F), which is the standard way to smuggle a whole ASCII sentence
+ * into text that renders as nothing at all.
+ *
+ * A separate function rather than widening `stripControls`, because the two
+ * boundaries want different answers. U+200D is a legitimate joiner in emoji and
+ * in several scripts, so stripping it from an *export* would corrupt real
+ * values to defend against a threat exports do not have. The model path has no
+ * such use and every reason to be strict.
+ *
+ * This is not a defence against injection — D-044 assumes injection succeeds and
+ * bounds the blast radius structurally. It is about the prompt saying what it
+ * appears to say.
+ */
+export function stripInvisible(value: string): string {
+  return stripControls(value).replace(
+    /[\u061C\u200B-\u200F\u2028\u2029\u202F\u2060-\u2064\uFEFF]|[\u{E0000}-\u{E007F}]/gu,
+    ' '
+  )
+}
+
+/**
  * One CSV field, always quoted, never executable.
  *
  * Always quoting is deliberate: it makes commas, quotes and stray whitespace a

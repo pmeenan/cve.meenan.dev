@@ -4,8 +4,11 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 
 import { gateMessage, SUPPORT_FLOOR, type CapabilityReport } from '@/lib/capabilities'
 import { newCancelFlag, requestCancel } from '@/lib/cancel'
+import { hasConsent, setConsent, streamChat, systemPrompt, type ChatMessage } from '@/lib/chat'
+import { runChatTurn, type ChatTurn } from '@/lib/chat-loop'
 import { NO_SHELL, registerShell, shellVersion, type ShellState } from '@/lib/shell'
-import { draftToFilters, filtersToDraft } from '@/lib/draft'
+import { draftToFilters, EMPTY_DRAFT, filtersToDraft, type Draft } from '@/lib/draft'
+import type { SortKey } from '@/lib/filters'
 import { describeFreshness, KEV_STALE_AFTER_MS } from '@/lib/freshness'
 import type { ExportFormat } from '@/lib/export'
 import type { KevStatus } from '@/lib/kev'
@@ -21,6 +24,8 @@ import type {
   SearchRequest,
   SyncOutcome,
   Timings,
+  ToolCall,
+  ToolOutcome,
 } from '@/lib/protocol'
 import { emptyReport, fromFragment, REPORT_VERSION, type Report } from '@/lib/report'
 import {
@@ -40,6 +45,7 @@ import {
   type ReportStore,
 } from '@/lib/saved'
 
+import { ChatPanel } from './chat'
 import { Console } from './console'
 import { Explore, type SearchOutcome } from './explore'
 import { ReportTab, type ReportOutcome } from './report-tab'
@@ -300,6 +306,34 @@ export default function Home() {
    */
   const [linkPending, setLinkPending] = useState(false)
 
+  // --- M7 ---------------------------------------------------------------
+  /**
+   * The chat side panel (M7). Everything about it is session-only except the
+   * consent flag: a reload clears the conversation, which is what makes the
+   * tier's "nothing is stored" disclosure true on the client too (D-057).
+   */
+  const [chatOpen, setChatOpen] = useState(false)
+  const [chatTurns, setChatTurns] = useState<ChatTurn[]>([])
+  const [chatRunning, setChatRunning] = useState(false)
+  const [consented, setConsented] = useState(false)
+  /** The model's own view of the conversation. A ref: nothing renders from it. */
+  const chatHistory = useRef<ChatMessage[]>([])
+  const chatAbort = useRef<AbortController | null>(null)
+  /**
+   * Tool calls awaiting the Worker, by call id.
+   *
+   * The Worker answers asynchronously and the loop awaits a promise, so
+   * something has to hold the resolver between the two. Keyed by the model's
+   * call id, which the Worker echoes on every path out — including the
+   * cancelled one, which is what stops a stopped turn from hanging on a promise
+   * that never settles.
+   */
+  const toolWaiters = useRef(new Map<string, (outcome: ToolOutcome) => void>())
+
+  /** Explore's filter state, lifted so chat can hand it a record search. */
+  const [exploreDraft, setExploreDraft] = useState<Draft>(EMPTY_DRAFT)
+  const [exploreSort, setExploreSort] = useState<SortKey>('published')
+
   /**
    * The shared cancellation flag (lib/cancel.ts). Created once here, because
    * the page owns the button; null on a browser with no `SharedArrayBuffer`,
@@ -444,6 +478,14 @@ export default function Home() {
           setDetailId(message.cveId)
           setDetail(message.detail)
           break
+        case 'toolResult': {
+          // Resolved by id rather than by arrival order: a turn can issue
+          // several calls, and the loop has to pair each answer with the call
+          // it answers.
+          toolWaiters.current.get(message.id)?.(message.outcome)
+          setRunSeq((seq) => seq + 1)
+          break
+        }
         case 'exportChunk':
           exportParts.current.push(new Blob([message.text]))
           break
@@ -466,6 +508,12 @@ export default function Home() {
           setRunSeq((seq) => seq + 1)
           setStopping(false)
           setCancelled({ kind: message.kind, ms: message.ms })
+          // One cancellation flag means one running query (lib/cancel.ts), so
+          // the page-level Cancel button and the chat panel's Stop are the same
+          // request. The Worker still posts a `toolResult` for the call, which
+          // is what settles the loop's promise; this is what stops it issuing
+          // the next one.
+          if (message.kind === 'tool') chatAbort.current?.abort()
           if (message.kind === 'export') exportParts.current = []
           if (message.kind === 'detail') {
             detailRequest.current = null
@@ -516,6 +564,10 @@ export default function Home() {
           'reconnect once so the app can fetch the part it is missing.'
       )
       setStorage('unknown')
+      // A dead Worker answers no tool call, so a chat turn waiting on one would
+      // wait forever. Ending the conversation is the honest outcome — the
+      // failure is on screen, and the turn stops rather than spinning.
+      chatAbort.current?.abort()
     }
     // And a module the worker itself fails to import rejects here rather than
     // firing `onerror` in some browsers, which is the same silence.
@@ -572,6 +624,9 @@ export default function Home() {
     storeRef.current = loaded
     setStore(loaded)
     setStorable(local !== null)
+    // The chat tier's disclosure (D-057). Remembered across reloads — the
+    // *conversation* is what is session-only, not the decision to allow one.
+    setConsented(hasConsent(local))
     if (!location.hash || location.hash === '#') return
     const parsed = fromFragment(location.hash)
     if (parsed.ok) {
@@ -690,6 +745,116 @@ export default function Home() {
     setStopping(true)
     requestCancel(cancelFlag)
   }, [cancelFlag])
+
+  /**
+   * Run one validated tool call in the Worker and wait for its outcome.
+   *
+   * The bridge between the loop (which awaits) and the Worker (which posts).
+   * Never rejects: the Worker turns every failure into a `refused` outcome and
+   * answers even a cancelled call, so the only way this hangs is a Worker that
+   * has died — which `worker.onerror` reports separately.
+   */
+  const runToolCall = useCallback(
+    (id: string, call: ToolCall, signal: AbortSignal) =>
+      new Promise<ToolOutcome>((resolve, reject) => {
+        // The Worker answers every tool call, including a cancelled one — but
+        // a Worker that has *died* answers nothing, and the loop is sitting on
+        // this promise with its own abort check on the far side of the await.
+        // Without this, Stop would not stop it: the button is pressed, the
+        // signal fires, and nothing is listening.
+        const settle = () => {
+          toolWaiters.current.delete(id)
+          signal.removeEventListener('abort', onAbort)
+        }
+        const onAbort = () => {
+          settle()
+          reject(new Error('stopped'))
+        }
+        if (signal.aborted) return onAbort()
+        signal.addEventListener('abort', onAbort, { once: true })
+        toolWaiters.current.set(id, (outcome) => {
+          settle()
+          resolve(outcome)
+        })
+        send({ type: 'tool', id, call })
+      }),
+    [send]
+  )
+
+  const askChat = useCallback(
+    (question: string) => {
+      const controller = new AbortController()
+      chatAbort.current = controller
+      setChatRunning(true)
+      const id = `turn-${Date.now()}-${chatHistory.current.length}`
+      void runChatTurn(
+        question,
+        {
+          stream: (messages, onEvent) =>
+            streamChat({ messages, signal: controller.signal, onEvent }),
+          runTool: (toolId, call) => runToolCall(toolId, call, controller.signal),
+          onUpdate: (turn) =>
+            setChatTurns((current) => {
+              const at = current.findIndex((entry) => entry.id === turn.id)
+              if (at === -1) return [...current, turn]
+              const next = [...current]
+              next[at] = turn
+              return next
+            }),
+          signal: controller.signal,
+          history: chatHistory.current,
+          system: systemPrompt(),
+        },
+        id
+      ).then((result) => {
+        chatHistory.current = result.messages
+        finish()
+      }, finish)
+
+      // Both arms, because a rejection here would leave `chatRunning` true for
+      // the rest of the session: a Stop button that stops nothing and an Ask
+      // button that never re-enables. `runChatTurn` is written not to reject,
+      // and this is what makes that a property rather than a hope.
+      function finish() {
+        setChatRunning(false)
+        chatAbort.current = null
+        // Anything still waiting belongs to a call the loop has stopped caring
+        // about. Left in the map they would keep a closure alive for the rest
+        // of the session.
+        toolWaiters.current.clear()
+      }
+    },
+    [runToolCall]
+  )
+
+  const stopChat = useCallback(() => {
+    chatAbort.current?.abort()
+    // The fetch and the query are two different things to stop: the model may
+    // be streaming, or a tool may be inside SQLite, and only shared memory
+    // reaches the second (lib/cancel.ts).
+    requestCancel(cancelFlag)
+  }, [cancelFlag])
+
+  /**
+   * Hand a chat record search to Explore, which is the surface that renders
+   * records.
+   *
+   * Not the report builder: the same predicates opened there render as a
+   * year-by-year count, which is a different view of the thing the reader was
+   * looking at (lib/tools.ts's `searchReport`).
+   */
+  const openSearch = useCallback(
+    (definition: Report) => {
+      setExploreDraft(filtersToDraft(definition.filters))
+      if (definition.sort) setExploreSort(definition.sort)
+      setTab('explore')
+      send({
+        type: 'search',
+        request: { filters: definition.filters, sort: definition.sort, limit: 100, count: true },
+      })
+    },
+    [send]
+  )
 
   const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
   const freshness = ready && now !== null ? describeFreshness(generated, now) : null
@@ -901,7 +1066,21 @@ export default function Home() {
         </p>
       )}
 
-      <Tabs tabs={tabs} active={active} onSelect={(id) => setTab(id as TabId)} />
+      <div className="tabs-row">
+        <Tabs tabs={tabs} active={active} onSelect={(id) => setTab(id as TabId)} />
+        {/* A side panel, not a sixth tab: a question is usually *about* the tab
+            the reader is on, and making chat a tab would mean leaving that
+            view to ask about it. */}
+        <button
+          type="button"
+          className="quiet"
+          data-chat-toggle={chatOpen ? 'open' : 'closed'}
+          aria-expanded={chatOpen}
+          onClick={() => setChatOpen((open) => !open)}
+        >
+          {chatOpen ? 'Hide Ask' : 'Ask'}
+        </button>
+      </div>
 
       <TabPanel id="data" active={active === 'data'}>
         <section className="controls">
@@ -1186,6 +1365,10 @@ export default function Home() {
       <TabPanel id="explore" active={active === 'explore'}>
         {ready && (
           <Explore
+            draft={exploreDraft}
+            setDraft={setExploreDraft}
+            sort={exploreSort}
+            setSort={setExploreSort}
             disabled={busy}
             onRun={(request: SearchRequest) => send({ type: 'search', request })}
             onOpenRecord={(cveId) => {
@@ -1271,6 +1454,38 @@ export default function Home() {
           />
         )}
       </TabPanel>
+
+      <ChatPanel
+        open={chatOpen}
+        turns={chatTurns}
+        running={chatRunning}
+        ready={ready}
+        consented={consented}
+        consentStorable={storable}
+        onConsent={(accepted) => {
+          setConsented(accepted)
+          setConsent(safeStorage(), accepted)
+          // Turning it back off also drops the conversation, because leaving it
+          // on screen after the tier is off would suggest it is still live.
+          if (!accepted) {
+            chatAbort.current?.abort()
+            setChatTurns([])
+            chatHistory.current = []
+          }
+        }}
+        onAsk={askChat}
+        onStop={stopChat}
+        onClose={() => setChatOpen(false)}
+        onOpenReport={openReport}
+        onOpenSearch={openSearch}
+        onOpenRecord={(cveId) => {
+          // To the surface that owns the record view, rather than a second copy
+          // of it inside the panel.
+          setTab('explore')
+          setDetailId(cveId)
+          send({ type: 'detail', cveId })
+        }}
+      />
 
       {notice && <footer className="notice">{notice}</footer>}
     </main>

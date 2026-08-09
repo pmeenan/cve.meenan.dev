@@ -170,6 +170,21 @@ export function referencesSql(cveId: string): DetailQuery {
 }
 
 /**
+ * Whether this copy holds the record at all (M7).
+ *
+ * Its own query rather than a field on another, because it answers a question
+ * none of the others can: `kevSql` returning nothing means either "CISA does not
+ * list it" or "this copy has never heard of it", and the chat layer's
+ * `kev_lookup` must not report the second as the first — absence from CISA's
+ * catalog is a finding, and a record the corpus lacks is not (D-077's rule,
+ * one level down). Through `BY_ID` like every other lookup here, so a lowercase
+ * identifier finds the record.
+ */
+export function existsSql(cveId: string): DetailQuery {
+  return { sql: `SELECT 1 FROM cve c WHERE ${BY_ID} LIMIT 1`, params: [key(cveId)], limit: 1 }
+}
+
+/**
  * This record's KEV entry, if CISA lists it (M6, D-076).
  *
  * A sixth query rather than a join onto the record's own: the `kev` table only

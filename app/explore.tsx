@@ -47,6 +47,10 @@ export interface SearchOutcome {
 }
 
 export function Explore({
+  draft,
+  setDraft,
+  sort,
+  setSort,
   disabled,
   onRun,
   onOpenRecord,
@@ -59,6 +63,19 @@ export function Explore({
   onCloseDetail,
   exportNote,
 }: {
+  /**
+   * The filter draft, owned by the page (M7).
+   *
+   * Lifted out of this component so the chat panel can hand a `search_records`
+   * result to *this* surface — the one that renders records — instead of the
+   * report builder, which would show the same predicates as a year-by-year
+   * count. The alternative was a second record renderer in the chat panel,
+   * which is the parallel presentation path D-044 rules out.
+   */
+  draft: Draft
+  setDraft: (draft: Draft) => void
+  sort: SortKey
+  setSort: (sort: SortKey) => void
   disabled: boolean
   onRun: (request: SearchRequest) => void
   onOpenRecord: (cveId: string) => void
@@ -72,9 +89,7 @@ export function Explore({
   onCloseDetail: () => void
   exportNote: string
 }) {
-  const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT)
   const [groupBy, setGroupBy] = useState<'' | Dimension>('')
-  const [sort, setSort] = useState<SortKey>('published')
   const [format, setFormat] = useState<ExportFormat>('csv')
   const request = (): SearchRequest => ({
     filters: draftToFilters(draft),
@@ -294,7 +309,16 @@ function bucketLabel(row: unknown[], dimension: Dimension): string {
   return chartBucketLabel(dimension, row[0], row[1])
 }
 
-function RecordTable({
+/**
+ * The record list.
+ *
+ * Exported because the chat panel renders `search_records` results through
+ * *this* component rather than a compact copy of it (M7's shape decision): two
+ * renderers of one row set is how the two surfaces end up disagreeing about
+ * what a column means, and it is the parallel presentation path D-044 rules
+ * out. The chat panel's version is narrower by CSS, not by markup.
+ */
+export function RecordTable({
   result,
   onOpenRecord,
 }: {

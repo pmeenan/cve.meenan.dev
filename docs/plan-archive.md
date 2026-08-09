@@ -1347,3 +1347,459 @@ crontab backed up. The app was deployed in the same window. `pnpm e2e headers`
 against the live origin is **12/12 on both engines**, after the run's first
 attempt surfaced RE-029 — the M5 `always` regression on the general `^~ /data/`
 block, which this milestone did not introduce but did find, fix and re-measure.
+
+## M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `done` (2026-08-08)
+
+The chat loop proven against one consistent, always-available tier first — the
+Ollama instance we host (D-057) — so the tool surface can be developed and
+benchmarked with minimal client requirements: no key, no WebGPU, no weight
+download. Depends on M4's report definitions and, for the KEV tool, on M6. The
+risk this ordering accepts — an 8B model's failures being mistaken for
+tool-surface bugs — is recorded in D-057; the D-046 benchmark and a dev-only
+frontier-key spot check are the mitigations.
+
+Scope: the chat surface; the read-only tool surface over report definitions —
+curated high-level tools plus the `SELECT`-only SQL tool (D-044); the
+**same-origin chat endpoint** relaying to Ollama at `http://llm:11434/` —
+server-pinned model (`gemma4:e4b` today), chat completion as the only exposed
+operation, streamed, POST-only with a capped body, nginx rate and concurrency
+limits, no chat storage and no request-body logging (D-057), with the
+php-fpm streaming question settled by experiment before the implementation is
+committed; the consent surface: a first-use disclosure that on this tier the
+question and its tool results transit `cve.meenan.dev` and our model host, and
+that nothing is stored; CSP `connect-src` pinned — for this tier, to the
+origin itself; the D-046 benchmark harness with ground-truth questions, the
+owner's severity-over-time question first, scored against the pinned model.
+
+Four shape decisions were taken by the owner at decomposition (2026-08-08),
+following M4 – M6's precedent, because each changes what the tasks below are.
+**Chat is a side panel, not a sixth tab**: it opens beside whatever tab is
+active, so a user can ask about what they are looking at. The consequence
+follows from D-044 rather than from preference — the panel renders compact
+results inline through the *same* components the Report tab uses, never a
+parallel renderer, and every rendered definition carries an "Open in Report"
+action that loads it into the builder, which is what keeps chat's output
+hand-editable and re-runnable rather than a picture of an answer. **Chat
+history is session-only**: a reload clears the conversation and nothing about
+it is stored anywhere, which makes the tier's "nothing is stored" disclosure
+true on the client as well as the server; the durable artifact is the report
+definition, and Saved already owns that (D-072). **The first benchmark set is
+~10 questions**: D-046's two canonical items plus roughly one per tool, each
+with hand-written SQL ground truth — enough to score tool selection and
+argument accuracy per tool without ground-truth authoring dominating the
+milestone; the set grows in M8 when local-model selection needs it. **The
+heavyweight treatment is pre-sanctioned for both gating surfaces**
+(workflow.md's "when to go heavy" names them by name): the relay endpoint with
+its limits, and the injection-containment story — hostile records through the
+chat path — each get the multi-agent adversarial pass before the milestone
+closes, sanctioned now rather than decided at the moment.
+
+Tasks in dependency order. The streaming experiment leads because its outcome
+decides the relay's implementation — and possibly forces a decision entry —
+so nothing server-side is committed before it runs. The tool surface is
+deliberately second rather than after the relay: it is pure client code,
+testable without any model in the loop, so it can proceed while the server
+half settles.
+
+- [x] **The php-fpm streaming experiment** (D-057). **Verdict: PHP streams
+      cleanly through the whole stack, so D-057's implementation shape holds and
+      no decision entry is owed.** Measured 2026-08-08 against the live origin
+      with a temporary probe (deployed, measured, deleted the same hour; the
+      docroot holds no `.php` again). A real `gemma4:e4b` round trip, read from
+      a real browser through `fetch` + a `ReadableStream` reader rather than
+      from curl alone, because the browser is the buffering layer that matters:
+      **Chromium 105 separate `read()` resolutions for 112 lines, first at
+      431 ms; Firefox 111 for 112, first at 405 ms** — incremental, not one
+      flush. Server-side first write was 336–368 ms and Ollama's own warm TTFT
+      is ~366 ms, so the PHP + nginx + Cloudflare path costs **40–95 ms** over
+      talking to the box directly. `cf-cache-status: DYNAMIC`: the edge neither
+      caches nor buffers it.
+      Three things are load-bearing and all three are the app's to set, so none
+      needs an nginx change: **unwrap PHP's own `output_buffering`** (4096 in
+      `php.ini`; leaving it costs ~200 ms of TTFB), **send
+      `X-Accel-Buffering: no`** (nginx consumes the header, turns
+      `fastcgi_buffering` off for that response, and does not forward it —
+      without it TTFB is 0.62 s), and **keep the content type out of
+      `gzip_types`** — `application/x-ndjson` is, `text/plain` is not, and the
+      compressing path measured 1.35 s to first byte.
+- [x] **The tool surface** (D-044). `lib/tools.ts`, the Worker's `runTool`, and
+      45 unit tests with no model in the loop. The curated tools — search over the
+      client-built FTS, filter + aggregate emitting report definitions, CVE
+      detail, KEV lookup — with tight schemas sized for small models, plus the
+      `SELECT`-only SQL tool riding D-065's authorizer with its row cap and
+      D-066's cancellation. Read-only and render-only structurally: no tool
+      fetches a URL, writes, or reaches the network, enforced by what the
+      tools *can* do, never by inspecting arguments. Aggregates may enter
+      model context; row sets return as handles rendered by the fixed UI
+      (D-044: the model orchestrates, it never transcribes). Everything a
+      model emits is a stranger's input: emitted report definitions go through
+      `parseReport` exactly as a hostile fragment would, tool arguments are
+      validated by name with unknown tools and malformed arguments refused,
+      and a tool result carries structured data, never markup. Unit-tested
+      against hostile records with no model in the loop — the surface is
+      deterministic code, and its tests must not depend on an LLM.
+      Two shape calls worth naming: the model's vocabulary is **words and
+      dates, not stored codes and unix seconds**, because `severity: [4]` is
+      what a small model emits plausibly and wrongly (D-047's confusion, in a
+      tool call); and an **unknown argument is refused rather than ignored**,
+      the opposite of `parseReport`'s rule for unknown fields — a fragment from
+      a newer build should still open, while a model inventing `vendor_name`
+      has misunderstood the schema and running the unfiltered query would
+      answer a different question confidently.
+      **The heavyweight review found seven defects here and two of them were
+      exploitable** (skeptic + adversarial pass, both against real SQLite).
+      `kev_lookup` reported "not in CISA's catalog" for an identifier the copy
+      has never held — D-077's own rule, one level down, and the one wrong
+      answer a reader cannot notice. `cve_detail` reported
+      `knownRansomwareUse: false` where CISA had stated something this build
+      cannot read, disagreeing with `kev_lookup` about the same row. And **the
+      row cap was never a memory bound**: `SELECT hex(zeroblob(50000000))` is
+      one row and 100 MB, `group_concat(descr)` over `cve_text` is one row and
+      the whole table, and a recursive CTE lands exactly on the 1,000-row cap
+      with a gigabyte behind it — every one a plain read the authorizer allows,
+      because it is one. Fixed with `SQLITE_LIMIT_LENGTH` on the connection, a
+      retained-character budget, and the wall-clock deadline D-044 asked for
+      and nothing had (D-078). The console inherits all three.
+- [x] **The chat relay** (D-057, under D-006's rules). `public/api/chat.php`,
+      deployed and verified against the live origin 2026-08-08, limits
+      included. The same-origin
+      endpoint relaying to `http://llm:11434/`: chat completion as the only
+      exposed operation, server-pinned model (`gemma4:e4b` today), streamed,
+      POST-only with a capped body. No caller-supplied model, URL, host, or
+      path reaches anything; same-origin is the D-034 style — the *absence* of
+      CORS headers; nothing is stored and request bodies are never logged —
+      the access log records that the endpoint was hit, not what was asked,
+      and that claim is checked against the server's actual log configuration
+      rather than asserted. nginx `limit_req`/`limit_conn` on the location are
+      a ship requirement, not a nicety — absence-of-CORS stops cross-site
+      browsers, not `curl` — and the limits are verified against the live
+      origin by exceeding them. Cloudflare must pass the stream through
+      unbuffered and never cache the endpoint, verified from response headers
+      like every other edge claim (M5's lesson: the dashboard is not
+      evidence). Heavyweight review before this ships (pre-sanctioned above).
+      Verified against `https://cve.meenan.dev/api/chat.php`: `GET` → 405; a
+      POST carrying `Origin: https://evil.example` → 403; a 300 KB body → 413
+      *before it is read past the cap*; `{}` → 400; a caller-supplied
+      `"model":"llama3:70b"` ignored, with the pinned `gemma4:e4b` answering;
+      no `access-control-allow-origin` on any response; `cache-control:
+      no-store` and `cf-cache-status: DYNAMIC`. **The limits are verified by
+      exceeding them, through Cloudflare, which is the path a visitor takes:
+      15 concurrent requests → 4 × 429 and 11 × 200.** Straight to the origin,
+      8 sequential → `200 200 200 200 200 429 429 429`, which is `burst=4`
+      plus one. The no-body-logging claim is
+      checked against the running configuration rather than asserted:
+      `/etc/nginx/nginx.conf`'s `log_format time` carries `$request` — method,
+      URI and protocol — and no `$request_body`, and the relay itself writes
+      nothing anywhere.
+      The payload is **rebuilt, never forwarded**: `model`, `keep_alive`,
+      `format` and `stream` are constants in the file, so nothing a caller
+      sends can reach Ollama's other endpoints — there is one URL in the
+      script and nothing is concatenated into it.
+      A **full tool round trip** was exercised against the live relay with the
+      real model, 2026-08-08: an assistant turn carrying `tool_calls`, a `tool`
+      turn carrying `aggregate`'s bounded JSON result, and `gemma4:e4b`
+      answering *"a clear upward trend … 3,011 in 2023 to 4,102 in 2024, and
+      further to 5,233 in 2025"* — every number from the tool result and none
+      from its weights, which is D-046 item #1's shape end to end.
+- [x] **The chat loop and the panel.** `lib/chat.ts` (transport, prompt,
+      consent), `lib/chat-loop.ts` (orchestration), `app/chat.tsx` (the panel),
+      with 32 unit tests and 10 browser specs against a scripted model. The
+      client-side orchestration —
+      question → model → tool calls → grounded answer, streamed into the side
+      panel (shape decision above). Chat prose renders as plain text, never
+      markup or minted URLs (D-044); inline results render through the shared
+      report components with Open in Report; the backing query of every
+      number a user sees is inspectable from the panel, which is what vision
+      criterion 7 means in a chat. History is session-only (shape decision
+      above). Progress per D-052: a waiting model and a running tool each name
+      themselves past a second, a query is cancellable mid-tool-call (D-066),
+      and a stream that stops producing bytes is a stall reported as one
+      (D-064's rule applied to the new long-running thing). The consent
+      surface is here too: the first-use disclosure that on this tier the
+      question and its tool results transit `cve.meenan.dev` and our model
+      host and nothing is stored, shown before the first request leaves and
+      recorded client-side; CSP `connect-src` stays pinned to the origin
+      itself, asserted by a test so a later tier widening it is a deliberate
+      diff rather than drift.
+      Three things the shape decided. The relay **forwards upstream's NDJSON
+      unchanged** and the parsing lives in TypeScript, because the endpoint is
+      the one part of this project `pnpm check` cannot execute — the less it
+      decides, the better. Tool calls run **one at a time**, because there is
+      one cancellation flag (lib/cancel.ts) and a turn issuing three at once
+      would have one cancellable query and two that still ran after Stop. And a
+      stopped turn is **dropped from the conversation** rather than carried
+      forward: half of it exists, and a truncated assistant turn re-sent as
+      context reads as something the model said and meant.
+      Two obligations are met by things that are easy to miss. `connect-src
+      'self'` is a **meta tag** in `app/layout.tsx`, because the deploy is an
+      unprivileged rsync — which binds the document, where chat runs, and
+      **not** the Worker, which is served without a policy; the response-header
+      version that would cover both is in `scripts/nginx-chat.conf` for
+      whenever the server config is next touched. And an answer with **no tool
+      call behind it** is flagged on screen as ungrounded: a confident CVE
+      answer from the model's own weights is indistinguishable from a queried
+      one, which is the failure D-046 exists to measure.
+- [x] **The benchmark harness** (D-046). `lib/benchmark.ts` and
+      `tests/e2e/benchmark.spec.ts`, run as
+      `BENCH=1 BASE_URL=https://cve.meenan.dev pnpm e2e benchmark` against the
+      deployed site, the live relay and the pinned model. **Scorecard below.**
+      10 questions with hand-written SQL
+      ground truth: canonical items #1 and #2, plus at least one exercising
+      each tool — search, aggregate, CVE detail, KEV, and the SQL tool —
+      driven through the *actual* chat integration (our schemas, our system
+      prompt) in Playwright and scored by comparing the emitted report
+      definition or its result data against ground truth; no LLM judge.
+      Scorecard per question: tool-call accuracy, turns needed, latency.
+      Opt-in like `MEASURE=1`, because it needs the private `llm` host and an
+      inference round trip is not a unit test. The `gemma4:e4b` scorecard is
+      the milestone's honest-expectations artifact; a dev-only frontier-key
+      spot check disambiguates tool-surface bugs from model weakness before
+      either is "fixed" (D-057's accepted risk, mitigated as recorded).
+      Two scoring calls: **"over time" has three right answers**, so a question
+      accepts a set of row axes and the truth SQL is hand-written per grain —
+      demanding `month` would score prompt-guessing rather than tool use. And
+      **a wrong tool is scored separately from wrong data**, because they fail
+      differently and D-057's accepted risk is only separable if the scorecard
+      keeps them apart. The ground truth runs in the browser under test,
+      moments after the model's answer, so it is about the same generation
+      rather than about whichever one was current when the number was written
+      down (D-058: the corpus grows daily).
+
+      **The `gemma4:e4b` scorecard, 2026-08-08** — the milestone's
+      honest-expectations artifact, written to `measurements/benchmark.jsonl`
+      by a run against the deployed site, the live relay and the pinned model:
+
+      | question | tool | axes | data | turns | ms |
+      | --- | --- | --- | --- | --- | --- |
+      | severity-over-time (#1) | ✓ | ✓ | ✓ | 1 | 15,071 |
+      | vendor-product-severity-2y (#2) | ✓ | ✗ | ✗ | 1 | 20,016 |
+      | critical-by-cna | ✓ | ✓ | ✓ | 2 | 16,949 |
+      | top-cwes | ✓ | ✓ | ✓ | 1 | 12,952 |
+      | kev-by-year | ✓ | ✓ | ✓ | 1 | 12,918 |
+      | search-deserialization | ✓ | – | ✓ | 1 | 6,971 |
+      | cisco-criticals | ✓ | – | ✓ | 1 | 15,944 |
+      | log4shell-detail | ✓ | – | ✓ | 1 | 19,234 |
+      | kev-listed | ✓ | – | ✓ | 1 | 5,904 |
+      | sql-highest-score | ✓ | – | ✗ | 2 | 14,917 |
+
+      **10/10 tool selection, 8/10 data exactly right, median 15.0 s**, eight of
+      ten in a single model turn. **D-046 item #1 — the founding question — is
+      ✓✓✓ in one turn, and was in all seven runs it was measured over.**
+
+      **The `qwen3:8b` scorecard, 2026-08-09** — the same harness against the
+      switched model, after the date and ground-truth fixes below:
+
+      | question | tool | axes | data | turns | ms |
+      | --- | --- | --- | --- | --- | --- |
+      | severity-over-time (#1) | ✓ | ✓ | ✓ | 1 | 23,061 |
+      | vendor-product-severity-2y (#2) | ✓ | ✓ | ✓ | 1 | 28,025 |
+      | critical-by-cna | ✓ | ✓ | ✓ | 1 | 16,961 |
+      | top-cwes | ✓ | ✓ | ✓ | 1 | 16,996 |
+      | kev-by-year | ✓ | ✓ | ✓ | 1 | 13,981 |
+      | search-deserialization | ✓ | – | ✓ | 1 | 8,886 |
+      | cisco-criticals | ✗ | – | ✗ | 1 | 22,989 |
+      | log4shell-detail | ✓ | – | ✓ | 1 | 22,008 |
+      | kev-listed | ✓ | – | ✓ | 1 | 7,932 |
+      | sql-highest-score | ✓ | – | ✗ | 1 | 9,905 |
+
+      **9/10 tool selection, 8/10 data exactly right, median 17.0 s**, and
+      **ten of ten in a single model turn** — the first run where nothing
+      needed a second round trip. Item #2 scores fully for the first time.
+
+      **The run before it scored 7/10, and three of the four failures were the
+      harness rather than the model.** Both KEV questions failed inside the
+      *ground truth* — "no such table: kev" — because the spec never waited for
+      the catalog the download rebuilds after the import heading appears, and
+      the per-question `page.reload()` tore the Worker down mid-refresh with
+      nothing retrying it. **Nothing had ever told the model what day it is**,
+      so "the last two years" became `yearFrom: 2021, yearTo: 2023` in 2 of 3
+      probes: its training era, and on the wrong field — the identifier year,
+      not publication. The prompt now carries a `{{TODAY}}` placeholder the
+      relay fills per request (a build-time literal would go stale the next day
+      while still reading as authoritative), and both year parameters say which
+      year they mean; after that, 3/3 probes used `publishedFrom`/`publishedTo`
+      and 2/3 picked the exact rolling window. The third failure was the truth
+      itself — a hard-coded 2024-08-01 that a perfect answer could not match
+      and that drifted further from the question every day it went unedited.
+
+      The two that remain are the model's. `sql-highest-score` answered 186,280
+      against a truth of 1,562: it counted every scored record rather than
+      those holding the maximum. `cisco-criticals` called `sql` where this
+      benchmark wants `aggregate` — and **that is a tension in our own
+      prompt**, not a clear miss. The sentence that sends "a single value
+      rather than a tally" to `sql` is what moved `sql-highest-score` from 0/8
+      to 5/6, and "how many CRITICAL CVEs affect Cisco products?" is exactly a
+      single value. The benchmark prefers `aggregate` because its `vendor`
+      dimension resolves the name variants hand-written SQL has to guess at.
+      Tightening either way is measured to break the other, so it stands.
+
+      **Two rounds of push-back moved tool selection from 8/10 to 10/10, and
+      the scorecard is what attributed each one.** The failure mode of
+      `sql-highest-score` moved twice, each time to the next real obstacle:
+
+      | | `sql-highest-score` |
+      | --- | --- |
+      | baseline | `called aggregate, aggregate, aggregate` — three round trips, same rows |
+      | + repeated-call refusal | `called sql, and it refused: no such table: cve_records` |
+      | + schema in the prompt | the SQL ran; returned the count but not the max |
+
+      The first fix is that **an identical call is refused before it runs** —
+      the corpus cannot change mid-turn, so a repeat returns identical rows, and
+      the model is told so and named the tools it has not tried. The second is
+      that **the system prompt now carries the schema**, which D-044 specified
+      and it did not have: the model had no way to know the table is `cve`,
+      guessed `cve_records`, and failed. A test reads `pipeline/schema.sql` and
+      refuses a brief that names anything the corpus lacks, because a wrong
+      schema is worse than none — the model writes confident SQL against it.
+      Refusals also now name the valid values (`rows must be one of: year,
+      quarter, …`) rather than only what was wrong, because a refusal costs a
+      whole inference round trip and "not a dimension this build knows" is
+      useful to a person reading a broken permalink and useless to a model.
+
+      **Run-to-run variance is large, and one scorecard is a sample rather than
+      a constant.** Across seven runs `cisco-criticals` went exact → 0 against a
+      ground truth of 204 → exact again with no code change between them, and
+      item #2 produced a different wrong axis pair every single time —
+      `severity × vendor`, `vendor × product`, `vendor × severity`,
+      `year × severity`, and a refusal. Item #1 never varied. Anything read off
+      one run at ±1 question is noise.
+
+      **Both remaining failures were then traced to the tool surface, not to the
+      model — which is the conflation D-057's accepted risk names, and the
+      scorecard walked straight into it before a probe caught it.** Three
+      causes, all ours:
+
+      1. The `rows`/`series` schemas advertised **a bare enum of sixteen
+         dimension names with no descriptions**. Nothing said that `product`
+         buckets are labelled `vendor / product` and therefore carries both
+         dimensions a three-way question needs.
+      2. The system prompt said *"prefer `aggregate` for anything countable"*,
+         which steered both models away from the SQL tool for a question
+         `aggregate` cannot express. Naming what `aggregate` *cannot* do
+         (a maximum, an average, a single value rather than a tally) moved
+         first-call selection of `sql` from **0/8 to 2/6** on `gemma4:e4b` and
+         **0/8 to 5/6** on `qwen3:8b`.
+      3. No schema in the prompt at all, already fixed above.
+
+      **A model comparison then settled what was left** (`SAMPLES=6`, the real
+      prompt and the real schemas, straight to Ollama with no browser — the
+      Playwright run is the honest end-to-end measure but too slow to tell a
+      fix from noise at ~25 minutes for ten questions):
+
+      | model | size | item #2 | item #1 | picks `sql` | warm latency |
+      | --- | --- | --- | --- | --- | --- |
+      | `gemma4:e4b` (pinned) | 9.6 GB | 0/6 | 6/6 | 3/6 | 1.24 s |
+      | `qwen3:8b` | 5.2 GB | **6/6** | 6/6 | **6/6** | 1.27 s |
+      | `qwen3:14b` | 9.3 GB | 0/6 | 6/6 | 6/6 | 4.07 s |
+      | `mistral-nemo:12b` | 7.1 GB | 4/6 | 5/6 | 6/6 | — |
+
+      Two things in that table are worth more than the ranking. **It takes both
+      the documentation and a model able to use it**: `qwen3:8b` scores 0/8 on
+      item #2 *without* the dimension guide, consistently answering
+      `vendor × product`, and 8/8 with it — while `gemma4:e4b` has the same
+      guide and stays at 0/8, scattered across five different wrong pairs. And
+      **bigger is not better**: `qwen3:14b` is worse than `qwen3:8b` on item #2
+      and three times slower.
+
+      The pinned model is **unchanged** pending the owner's call; D-057 makes
+      swapping it configuration rather than a decision, and this table is the
+      D-046 evidence for whenever that is made.
+
+      **The harness cost four runs to get right, and one of those found a real
+      defect in a shipped surface.** Three of its own bugs were the same shape —
+      an unbounded wait (RE-032) — and one was a ground truth ordered so the
+      console's row cap kept the *oldest* months while the chart showed the
+      newest, which would have scored every correct answer as wrong. The fourth
+      was not the harness: computing an FTS ground truth through the SQL console
+      failed with *"PRAGMA (data_version) is refused"*, because **fts5 reads
+      that pragma itself and the M3 authorizer denied PRAGMA wholesale** — so
+      the console had never been able to run a full-text query, including its
+      own example button, and nothing noticed for two milestones because the
+      app's own searches run unguarded (RE-033).
+
+- [x] **The adversarial containment pass, heavyweight** (pre-sanctioned
+      above). Two independent reviewers over the tool surface — one skeptical
+      of the claims, one attacking under "assume injection has already
+      succeeded" — plus `tests/e2e/containment.spec.ts`, which drives the tool
+      surface with the attacker's own calls rather than with a model.
+      Hostile records through the chat path — markup, injection
+      payloads, and hostile URLs in the descriptions and titles the model
+      reads — and the containment claim verified rather than argued: nothing
+      beyond the read-only tool surface is reachable from a compromised
+      conversation, no record-supplied markup or URL renders outside the
+      fixed UI's existing treatment, and a successful injection yields
+      wrong-but-inspectable presentation and nothing more (D-044). The
+      relay's abuse surface is in scope too: oversized bodies, cross-origin
+      callers, concurrency exhaustion against the one small GPU box.
+      **What could not be broken is worth recording too.** Every write shape
+      was run against real SQLite under the real authorizer policy and denied,
+      with the data checked unchanged afterwards: `PRAGMA query_only=OFF;
+      DELETE FROM cve` as one string, `CREATE TEMP TABLE … AS SELECT`, `ATTACH`
+      to a file URI and to `:memory:`, `pragma_table_info` (a pragma wearing a
+      SELECT's clothes), `CREATE VIRTUAL TABLE … USING fts5vocab`, fts5's
+      `'integrity-check'` write, `UPDATE … RETURNING`, `writable_schema=ON`,
+      `SAVEPOINT`, `load_extension`. Framing escape fails because
+      `describeToolResult` is one `JSON.stringify`; prototype pollution fails
+      because `firstUnknown` refuses `__proto__` by name; the confused-deputy
+      attacks fail because `self.onmessage` serializes every request through
+      one promise chain, so a tool call cannot interleave with a delta apply,
+      clear another operation's cancel flag, or take a Web Lock it never asks
+      for.
+      What *was* found is above, in the tool-surface task, plus four smaller
+      ones: `executeTool` had no `default:` arm, so a name outside the five
+      returned `undefined` and the page dereferenced it; a cancelled tool call
+      posted no `toolResult`, leaving the loop waiting on a promise that would
+      never settle — a spinner and a Stop button already pressed; a guarded
+      query with no connection handle would have run *unguarded*; and the
+      aggregate's own bucket labels went through the description-sized cap
+      rather than the cell-sized one, which made a 1.9 MB prompt reachable
+      from "which products have the most CVEs" with no injection at all.
+
+**Applying the limits found two defects, and the second one is the reason this
+exit criterion says "verified by exceeding them" rather than "configured".**
+
+The first was cheap: `nginx -t` refused the config with
+`"fastcgi_read_timeout" directive is duplicate`, because `fastcgi.conf` already
+sets it (3600 s). Redundant as well as duplicate — PHP caps the upstream call
+at 180 s itself — so it is gone. Worth recording for what it nearly cost: the
+config files were already on disk, so a filesystem check for "is it applied?"
+answered yes, while the reload had never happened and the *old* config was
+still serving. Nothing about the endpoint's behaviour says so.
+
+The second was not cheap and no amount of reading would have found it. With the
+limits live, ten rapid requests **through Cloudflare** all returned 200, while
+the same requests **straight to the origin** returned `200 200 200 200 200 429
+429 429` — exactly `burst=4` plus one. The origin is behind Cloudflare, so
+`$binary_remote_addr` is a *Cloudflare edge IP*, and a limit keyed on it is
+wrong in both directions at once: an attacker arriving over many edge IPs is
+barely limited, and two ordinary visitors sharing one edge IP contend for the
+same allowance — with `limit_conn 2`, a third simultaneous user is a 429 for no
+reason. Fixed with `set_real_ip_from` over Cloudflare's published ranges plus
+`real_ip_header CF-Connecting-IP`, so `$binary_remote_addr` *is* the visitor
+and the limits key on it directly; trusting the header only from Cloudflare's
+own addresses is what makes it non-forgeable.
+
+That was not the first fix, and the detour is worth recording. Because
+`real_ip` also puts real visitor addresses in the *access log*, the first
+version avoided it — a `map` over `CF-Connecting-IP` for the key, plus a
+second, looser limit on the real peer to cover spoofing — buying a privacy
+property at the cost of two zones, a map and a backstop. The owner's call
+(D-079) was that the property was not worth buying: real addresses in an access
+log are what every web server does, and the claim worth making is the
+structural one — the corpus and every query over it run in the browser, and the
+server never receives a query. The config came out simpler than either
+version, and the docs now say the narrower thing.
+
+**Exit criteria:** the founding question — stacked CVE counts by severity over
+time, all products and per-product (D-046 benchmark item #1) — is answered
+end-to-end through chat on the site-hosted tier, rendering via the fixed UI
+with the backing queries inspectable; the benchmark runs against the pinned
+model and produces a scorecard; a network-panel check confirms chat traffic
+goes only browser → `cve.meenan.dev` → `llm`, and nothing else leaves the
+browser; the endpoint refuses cross-origin browser callers, oversized bodies,
+and any operation but its one, with its rate and concurrency limits verified
+against the live origin; and an adversarial pass feeds hostile records —
+markup, injection payloads, hostile URLs — through the chat path and shows
+containment: nothing beyond the read-only tool surface is reachable, and no
+record-supplied markup or URL renders outside the fixed UI's existing
+treatment.

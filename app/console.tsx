@@ -126,8 +126,15 @@ export function Console({
         <>
           <p className="muted" data-console-rows={result.rows.length} data-run={run}>
             {result.rows.length.toLocaleString()} rows in {result.ms} ms
-            {result.truncated &&
-              ` — capped at ${CONSOLE_ROW_LIMIT.toLocaleString()}; there may be more.`}
+            {/* Two different truncations, said differently (D-078). "Capped at
+                1,000 rows" is an ordinary answer to a broad query; stopping on
+                size means the query produced values a page cannot hold, and
+                the fix is narrower columns rather than a LIMIT. */}
+            {result.overflowed
+              ? ' — stopped early: this query produced more data than the browser will hold. ' +
+                'Select fewer or shorter columns.'
+              : result.truncated &&
+                ` — capped at ${CONSOLE_ROW_LIMIT.toLocaleString()}; there may be more.`}
           </p>
           <div className="scroll" tabIndex={0}>
             <table className="results console">

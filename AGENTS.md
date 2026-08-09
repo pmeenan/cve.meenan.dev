@@ -2,8 +2,9 @@
 
 A public web app for searching, analyzing, and reporting on the complete CVE
 List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, 372,092
-records and growing — with a planned AI chat layer (M7/M8) that turns
-plain-language questions into local queries (D-044). The entire data plane runs
+records and growing — with an AI chat layer that turns plain-language questions
+into local queries (D-044): built in M7 against a model we host, with the other
+tiers in M8. The entire data plane runs
 in the browser: the corpus is normalized server-side into a ~63 MB compressed
 SQLite database, downloaded on demand into OPFS, and queried locally — so no
 search or report ever leaves the client. Chat is the opt-in exception: the
@@ -40,15 +41,19 @@ affected docs. Until then, these govern.
   flows into LLM prompts, so injection is assumed: no tool may fetch a URL,
   write data, or reach the network. The first model tier is site-hosted: our
   own Ollama on the private `llm` box, relayed through a restricted
-  same-origin endpoint that pins the model, stores nothing, and logs no bodies
-  (D-057). Third-party hosted models are the user's own key — stored
+  same-origin endpoint that pins the model — `qwen3:8b` since 2026-08-09,
+  chosen by the D-046 benchmark — stores nothing, and logs no bodies (D-057). Third-party hosted models are the user's own key — stored
   client-side, called browser-direct, never proxied; no bundled key, and no
   consumer-subscription OAuth where providers forbid it (none is sanctioned
   today). (D-044, D-045, D-057)
-- **Nothing is collected from users — no telemetry, ever.** Not analytics, not
-  error reporting, not opt-in. This makes the privacy claim verifiable in a
-  network panel rather than a promise. Do not add a reporting channel; improve
-  the diagnostics panel instead. (D-009)
+- **The app collects nothing — no telemetry, ever.** Not analytics, not error
+  reporting, not opt-in. Do not add a reporting channel; improve the
+  diagnostics panel instead. **The claim this supports is the structural one**
+  (D-079): the corpus and every query over it run in the browser, and the
+  server never receives a search, a filter or a report — checkable in a network
+  panel rather than promised. It is *not* "nothing about you is recorded
+  anywhere": the origin keeps an ordinary web-server access log, with real
+  visitor addresses. (D-009, D-079)
 - **The data plane is static files, and no request handler stands in it.** The
   snapshot, manifest, deltas, and KEV catalog are pre-built files served by
   nginx from `cve.pub/data/`, a peer of the document root — nothing under
@@ -89,7 +94,7 @@ affected docs. Until then, these govern.
 | `pipeline/`  | Python ingest and publish (D-043). **Never in the docroot** — the crons run it from a git checkout at `~/src/meenan.dev/cve/` on `plex`, updated with `git pull` (D-059) |
 | `scripts/`   | Build, serve, deploy, license audit |
 | `tests/`     | `unit/` (Vitest) and `e2e/` (Playwright) |
-| `public/`    | Static passthrough into the export root |
+| `public/`    | Static passthrough into the export root — including `api/chat.php`, the one dynamic endpoint (D-057), which lives here so the ordinary `dist/` rsync deploys it |
 
 `pnpm check` runs typecheck, lint, format, unit tests and the license audit.
 `pnpm e2e` runs the browser path end to end.
@@ -144,53 +149,159 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M6 complete — the CISA KEV overlay is live.** The origin serves `kev.json`
-under its own `no-cache` location, published by its own cron (`41 */6 * * *`):
-1,662 entries, 1,577,762 bytes, **byte-identical to what cisa.gov serves**.
-Verified in the order the risk demanded — `nginx -T` first, because a 404 cannot
-tell an exact-match location from the general one; then publish; then the
-origin's own headers with Cloudflare bypassed, before the edge ever saw the URL;
-then through the edge (`MISS` → `REVALIDATED`). KEV is CC0, so no notice travels
-(D-076) — provenance does:
-every place the app asserts membership says *per CISA*, with the catalog
-version and release date, which is what keeps it a statement about CISA's
-catalog rather than an endorsement by it. `pipeline/kev.py` is its own cron with
-its own lock and its own state, sharing a `flock` helper with the corpus crons
-and nothing else; it validates fail-closed, publishes CISA's verbatim bytes by
-atomic rename, and a refusal leaves the previous catalog serving. Client-side
-the catalog is a **rebuildable table** like the full-text indexes — no schema
-bump, so no re-download — created by the apply that fills it, which is what lets
-a copy with no catalog *refuse* a KEV question instead of answering that nothing
+**M7 complete — the AI chat layer is live.**
+Five read-only tools over the local corpus (`lib/tools.ts`), a same-origin PHP
+relay to our own Ollama (`public/api/chat.php`, D-057), and a side panel that
+renders every answer through the *same* components the Report and Explore tabs
+use — no parallel renderer, and an aggregate leaves the conversation through
+"Open in Report" while a record search goes to Explore, because those are the
+surfaces that render each. Chat prose is a text node, always: no markdown, no
+linkification, and the one thing a compromised model must not be able to do is
+mint a URL. The conversation is session-only, which is what makes the tier's
+"nothing is stored" disclosure true on the client as well as the server.
+
+**A conversation that outgrows the window is fitted by dropping old tool
+results, never by summarising (D-080).** A conversation is ~99% tool output by
+volume — the floor is 3,717 tokens, one 50-row result is 3,215, an answer is
+~30 — so six or seven ordinary questions reach the window, and overrunning it
+is silent: 30 exchanges were accepted with `prompt_eval_count` pinned at 29,743
+and no error. The model then reconstructs the topic from whatever survived,
+which is how "which vendor am I investigating?" answered *Cisco* to a
+conversation that opened with Fortinet, 0/5. Evicting the bulk and keeping
+every word either party said: 5/5. **Summarising is the thing not to reach
+for** — it would mint counts indistinguishable from tool output in a
+conversation whose first rule is that only a tool may state one.
+
+**The php-fpm streaming question D-057 left open is settled by measurement: PHP
+streams.** Chromium saw 105 separate `read()` resolutions for 112 lines, first
+at 431 ms; Firefox 111 for 112, at 405 ms — through nginx and Cloudflare, which
+neither buffers nor caches it. Three buffers had to be turned off and each
+costs a different amount (RE-030); all three are the app's to set, which is why
+the relay deploys by unprivileged rsync.
+
+**The heavyweight review found nine defects, two of them exploitable, and the
+worst was a bound everyone assumed existed.** The SQL row cap counts *rows*, and
+one row can be any size: `SELECT hex(zeroblob(50000000))` is 100 MB,
+`group_concat(descr)` over `cve_text` is the whole table, and a recursive CTE
+lands exactly on the 1,000-row cap with a gigabyte behind it — held in the
+Worker, then structured-cloned to the page. Every one is a plain read the
+authorizer allows, *correctly*. Fixed at three layers and recorded in D-078:
+`SQLITE_LIMIT_LENGTH` inside the engine, a retained-character budget in the row
+callback, and the wall-clock deadline D-044 asked for and nothing had. **The SQL
+console had all of this exposure since M3**; the chat layer is only what made it
+reachable by something other than the person typing. The other two that would
+have shipped wrong answers: `kev_lookup` said "not in CISA's catalog" about an
+identifier the copy has never held — D-077's rule, one level down — and
+`cve_detail` reported `knownRansomwareUse: false` where CISA had stated
+something this build cannot read, disagreeing with `kev_lookup` about the same
+row.
+
+**The scorecard is the honest-expectations artifact: 9/10 tool selection, 8/10
+data exactly right, median 17.0 s** against the deployed site, the live relay
+and `qwen3:8b` (2026-08-09), **ten of ten in a single turn**. **D-046 item #1 —
+the founding question — is tool ✓ axes ✓ data ✓ in one turn, in every run.**
+Item #2, the three-way breakdown, now scores fully for the first time.
+
+**The run before it scored 7/10, and three of those four failures were mine,
+not the model's.** Both KEV questions failed inside the *ground truth* with "no
+such table: kev" — the harness never waited for the catalog the download
+rebuilds after the import heading appears, and `page.reload()` tore down the
+Worker mid-refresh with nothing retrying it. **And nothing had ever told the
+model what day it is**, so "the last two years" was filtered as 2021–2023 —
+its training era — in 2 of 3 probes. The date is now a `{{TODAY}}` placeholder
+the relay substitutes per request, not a baked literal that would be stale the
+day after a deploy while still reading as authoritative; `yearFrom`/`yearTo`
+now say they are the *identifier* year rather than publication. The third was
+the truth itself: a hard-coded 2024-08-01 that no correct answer could match
+and that drifted further every day.
+
+The two that remain are real. `sql-highest-score` answered 186,280 where the
+truth is 1,562 — it counted every scored record instead of those holding the
+maximum, which is a SQL reasoning error and not a surface gap.
+`cisco-criticals` called `sql` where the benchmark wants `aggregate`, and
+**that one is a tension in our own prompt**: the line that says to use `sql`
+for "a single value rather than a tally" is what took `sql-highest-score` from
+0/8 to 5/6, and a count of Cisco criticals is exactly a single value. The
+benchmark prefers `aggregate` because its vendor dimension resolves names that
+hand-written SQL guesses at. Tightening either way is measured to break the
+other; it is left as it stands, and noted.
+
+**Two rounds of push-back took tool selection from 8/10 to 10/10, and the
+scorecard attributed each.** `sql-highest-score` moved from *"called aggregate,
+aggregate, aggregate"* to *"called sql, and it refused: no such table:
+cve_records"* to running SQL — because (a) an identical tool call is now
+refused before it runs, the corpus cannot change mid-turn so a repeat returns
+identical rows, and (b) **the system prompt now carries the schema**, which
+D-044 specified and it did not have. A test reads `pipeline/schema.sql` and
+refuses a brief naming anything the corpus lacks: a wrong schema is worse than
+none, because the model writes confident SQL against it.
+
+**Run-to-run variance is large; one scorecard is a sample, not a constant.**
+`cisco-criticals` went exact → 0-against-204 → exact with no code change, and
+item #2 produced a different wrong axis pair in every run. Item #1 never varied.
+
+**Every remaining failure then turned out to be the tool surface, not the
+model** — D-057's accepted risk, walked into and then caught by a fast probe
+(the real prompt and schemas straight to Ollama, no browser). The dimensions
+were a bare enum of sixteen names with no descriptions, so nothing said
+`product` is labelled `vendor / product` and carries both; and the prompt's
+"prefer `aggregate` for anything countable" steered models off the SQL tool for
+a question `aggregate` cannot express (first-call `sql` selection 0/8 → 2/6 on
+`gemma4:e4b`, 0/8 → 5/6 on `qwen3:8b`). **A model comparison settled the rest:
+`qwen3:8b` scores 6/6 on item #2 where the pinned `gemma4:e4b` scores 0/6, at
+half the size and the same latency — and `qwen3:14b` is *worse* than the 8b.**
+It takes both halves: `qwen3:8b` is 0/8 on item #2 without the dimension guide
+and 8/8 with it. The pinned model is unchanged pending the owner's call
+(D-057 makes that configuration); the table is in plan.md.
+
+**Building the harness found a two-milestone-old defect in a shipped surface.**
+Computing a full-text ground truth through the SQL console failed with *"PRAGMA
+(data_version) is refused"*: **fts5 reads that pragma itself**, and the M3
+authorizer denied PRAGMA wholesale — so the console had never been able to run
+a full-text query, including its own "Critical CVEs mentioning deserialization"
+example button. Invisible for two milestones because Explore, Report and the
+chat tools all run *unguarded*; the authorizer is installed only for SQL a
+person or a model wrote, and nothing had ever driven that path automatically
+(RE-033).
+
+**Verifying against the live origin found three things reading the config could
+not.** `nginx -t` refused the first config as a duplicate directive, so the
+reload never happened while the files sat on disk saying "applied". The limits
+were then keyed on `$binary_remote_addr`, which behind Cloudflare is *an edge
+IP* — barely limiting an attacker while `limit_conn 2` would 429 a third
+simultaneous visitor sharing an edge (RE-031); now keyed on `CF-Connecting-IP`
+with a looser per-peer backstop, and deliberately not via `set_real_ip_from`,
+which would start writing visitor IPs into the access log of a site that
+collects nothing. And the benchmark harness itself hung twice on Playwright
+locators that match nothing — which do not time out inside `expect.poll`, they
+never settle (RE-032). Verified by exceeding: **15 concurrent through
+Cloudflare → 4 × 429**; the access log carries `$request` and no
+`$request_body`.
+
+711 unit tests and 100 browser specs passing across two engines (42 skips, all
+the opt-in `MEASURE=1` and `BENCH` suites), with the relay verified against the
+live origin (405 on GET, 403 cross-origin, 413 over 256 KB, caller-supplied
+`model` ignored, caller-supplied `system` or `tools` refused with 400, no CORS
+headers, `cf-cache-status: DYNAMIC`).
+
+**M6 complete — the CISA KEV overlay is live.** `kev.json` is served under its
+own `no-cache` location by its own cron (`41 */6 * * *`): 1,662 entries,
+byte-identical to what cisa.gov serves. KEV is CC0 so no notice travels (D-076)
+— provenance does: every assertion of membership says *per CISA*, with the
+catalog version and release date. Client-side the catalog is a **rebuildable
+table** like the full-text indexes, so no schema bump and no re-download, and a
+copy with no catalog *refuses* a KEV question rather than answering that nothing
 is known to be exploited (D-077). "Not in KEV" is a labelled value, not an
-absence band: absence from the catalog is the finding.
+absence band. Four defects came out of building it, `pnpm check` green through
+all four; the one worth remembering is that **the bundler dropped a literal
+segment** out of a template carrying `${…}` concatenated with `+`, so the
+browser ran SQL the source never had (RE-028) — unit tests import the source,
+only the browser runs the bundle, and `scripts/check-bundle.mjs` now refuses
+such a build. Pointing the header spec at the live origin also found an M5
+regression that had been recorded as verified (RE-029): `always` on
+`^~ /data/`'s `Cache-Control` meant a 404 went out `immutable` and the edge was
+already holding one, a cheap remote sync-DoS since delta URLs are predictable.
 
-**Pointing the header spec at the live origin found an M5 regression** (RE-029),
-which is the argument for that exit criterion existing at all: `always` was
-still on `^~ /data/`'s `Cache-Control`, so a 404 went out `immutable` and the
-edge was already holding one on a `HIT` — a cheap remote sync-DoS, since delta
-URLs are predictable. M5 had recorded that fix as deployed *and verified*. Fixed
-and re-measured the same hour; the spec is 12/12 on both engines against the
-origin. `scripts/serve.mjs` has no `always` to model, so a local run passes
-vacuously — and says so in a comment.
-
-**Four defects came out of it that the unit tests could not see.** Two came
-from the adversarial pass over the server half and compounded into one story: a
-hostile or merely broken upstream could freeze the catalog **permanently** while
-`kev.py status`, the exit code and the cron log all reported success — because
-only a validation refusal recorded an outcome, and because the roll-backwards
-guard *defends whatever it is holding*, so one catalog claiming a far-future
-version was published once and then protected against every real one. The third
-came from writing the e2e: a KEV refresh reported its start and never its
-ending, and the page derives *busy* from the phase, so after a download every
-button in the app was disabled — permanently, with the catalog correctly loaded
-and the freshness line correctly rendered above them. The fourth is the one
-worth remembering: **the bundler dropped a literal segment** out of a template
-carrying `${…}` concatenated with `+`, so the browser ran SQL the source never
-had (RE-028) — unit tests import the source, only the browser runs the bundle,
-and `scripts/check-bundle.mjs` now refuses such a build. `pnpm check` was green
-through all four. Also fixed: `state.lock`'s new `name` argument was dead code, so the
-failure-domain claim rested on the directories differing rather than on the
-mechanism four documents described.
 
 **M5 complete — the site is launched.** The origin serves **schema 2, rev 11**
 in ID space `schema2-2026-08-08`, published 2026-08-08: 12 chunks, 65.7 MB

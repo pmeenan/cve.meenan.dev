@@ -48,9 +48,11 @@ Each is backed by a decision entry and is not up for casual revision.
   data source without a decision entry. (D-010) The AI layer's browser-side
   fetches — model weights from Hugging Face, optional hosted-model calls — are
   not data sources and are bounded separately by D-045.
-- **Nothing is collected from users.** No telemetry, no analytics, no error
-  reporting. Server request logs are an operational fact, not a channel to
-  repurpose. (D-009)
+- **The app collects nothing.** No telemetry, no analytics, no error reporting.
+  The origin's access log is an ordinary operational one and now records real
+  visitor addresses via `real_ip` from Cloudflare's ranges — an explicit
+  narrowing of the claim to the part that is structural: the server never
+  receives a query, because the client sends no parameters (D-009, D-079).
 - **The browser's store is SQLite/WASM on OPFS**, owned by a Worker, because
   OPFS synchronous access handles are unavailable on the main thread. (D-004)
 - **One origin for the data plane.** Everything ships to
@@ -649,21 +651,29 @@ hand its id to a different value (D-056).
 
 Sits entirely above the client described previously; the data plane below it is
 unchanged, and the two Fixed points it touches — one origin, upstream sources —
-carry their D-045/D-057 annotations above. Detail lands here when the layer is
-built — these are the structural commitments:
+carry their D-045/D-057 annotations above. **Built in M7** for the site-hosted
+tier: `lib/tools.ts` (five tools), `lib/chat.ts` and `lib/chat-loop.ts` (the
+transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
+`public/api/chat.php` (the relay). These are the structural commitments:
 
 - **Chat drives the fixed UI through report definitions.** The model's
   presentation tools emit the same serializable object the deterministic UI
   builds, renders, and shares. Charts, clickable CVE lists, and drill-downs are
   the existing UI components fed by the model rather than duplicated for it.
 - **The model orchestrates; it never transcribes.** Small aggregate results may
-  enter model context for trend interpretation; row-level result sets are
-  returned as handles and rendered straight from SQLite. A number the user sees
-  is a query result by construction.
+  enter model context for trend interpretation; row-level result sets from the
+  curated tools are returned as handles and rendered straight from SQLite. A
+  number the user sees is a query result by construction. One narrowing, taken
+  deliberately in D-078: the `SELECT`-only tool gets a bounded window of its own
+  result, because a model that writes the query and is told only "1 row
+  returned" cannot answer the question it just asked.
 - **Tool surface: read-only, render-only, forever.** Curated high-level tools
-  with tight schemas, plus a `SELECT`-only, row-capped, timed-out SQL tool —
-  enforced structurally (read-only connection or SQLite authorizer), never by
-  inspecting query text. No tool fetches URLs, writes data, or reaches the
+  with tight schemas, plus a `SELECT`-only SQL tool that is row-capped,
+  **byte-capped** and timed out — enforced structurally (SQLite authorizer,
+  `SQLITE_LIMIT_LENGTH`, a retained-character budget and a progress-handler
+  deadline), never by inspecting query text. The byte cap and the deadline are
+  D-078, added when the adversarial pass showed the row cap bounds nothing: one
+  row can be the whole text table. No tool fetches URLs, writes data, or reaches the
   network — record text in the prompt is assumed hostile (rule 5), and
   containment is structural. Report definitions carry structured data only: no
   model-authored HTML, markdown, or URLs; chat prose renders as plain text,
@@ -672,7 +682,8 @@ built — these are the structural commitments:
 - **Provider ladder (D-045, re-ordered by D-057):** first to ship is the
   **site-hosted tier** — Ollama on the private `llm` box (`http://llm:11434/`,
   hostname in hosts on dev and prod, not publicly routable), relayed through a
-  restricted same-origin endpoint: server-pinned model (`gemma4:e4b` today),
+  restricted same-origin endpoint: server-pinned model (`qwen3:8b` since
+  2026-08-09, chosen on the D-046 scorecard),
   chat completion as the only exposed operation, POST-only, body-capped, nginx
   rate- and concurrency-limited, nothing stored, no body logging. On this tier
   the question and its tool results transit this server — disclosed at first
@@ -962,8 +973,12 @@ one generation behind applies instead of re-downloading (D-060).
   reintroduce isomorphic-git or a CORS proxy without reopening it.
 - **No server-side query execution.** Rejected in D-007, reaffirmed in D-014:
   the server ships data, it does not filter, rank, or aggregate.
-- **No dynamic endpoint at all**, as built (D-032). Adding one is a constraint
-  change and restores every question D-034 declined to answer.
+- **No dynamic endpoint in the data plane** (D-032). The corpus, manifest,
+  deltas and KEV catalog are static files and the client sends no parameters;
+  adding a handler there is a constraint change that restores every question
+  D-034 declined to answer. There is exactly **one** dynamic endpoint on the
+  origin and it is outside the data plane: D-057's chat relay, live since
+  2026-08-08 under D-006's rules.
 - **No custom SQLite VFS.** The range-request VFS was rejected in D-015 on
   simplicity grounds; do not reintroduce `sql.js-httpvfs`, `sqlite-wasm-http`,
   or a hand-written page-fetching VFS without reopening it.

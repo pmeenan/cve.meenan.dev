@@ -27,6 +27,210 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-080: A full context is fitted by evicting old tool results, never by summarising them  (2026-08-09, status: accepted; extends D-044's grounding rule to the context window)
+
+**Decision.** When the conversation exceeds `CONTEXT_BUDGET_TOKENS` (18,000
+estimated tokens, `lib/chat-loop.ts`), the loop empties the payload of the
+oldest `role: 'tool'` messages, oldest first, until it fits. User messages and
+assistant answers are never evicted. The emptied message is kept, not removed,
+and its content is replaced by a stub that says the result is gone and must not
+be answered from. The count is shown in the panel. **We do not summarise the
+conversation to compact it, and this is the part not to silently undo.**
+
+**Why there is a problem at all.** Measured 2026-08-09 against the deployed
+relay and `qwen3:8b`: the fixed floor is 3,717 tokens (system prompt and five
+tool schemas), one realistic 50-row tool result is 3,215, and the model's own
+answer is about 30. A conversation is ~99% tool output by volume, and six or
+seven ordinary questions reach the window. Overrunning is not a loud failure —
+a 30-exchange conversation was accepted with `prompt_eval_count` pinned at
+29,743 however much more was posted, with no error and no field reporting a
+loss. The system prompt itself survives; a sentinel planted in it was still
+recalled at 30 exchanges. What goes is the oldest conversation.
+
+**What the failure actually looks like**, which is what shaped the design: the
+model does not notice a gap, it reconstructs the topic from whatever content is
+still in the window. Asked "which vendor am I investigating?" after a
+conversation that opened with Fortinet, with the tool results carrying Cisco
+rows, it answered *Cisco* at eight refinements and *Cisco, 2025* at fourteen.
+With on-topic results in the same positions it stayed correct at both. The
+first of those failures is at 26k tokens — below the truncation point — so this
+is attention as well as truncation, and both are fixed by removing the bulk
+while keeping what was said.
+
+**Why not summarise.** Three reasons, and the first two are this project's own
+rules rather than preferences:
+
+- **It launders unverified numbers into grounded ones.** The system prompt's
+  first rule is that no count, date, score or CVE identifier may be stated
+  unless a tool returned it in this conversation (D-044, D-046). A summary is
+  model-written prose full of exactly those, no longer distinguishable from
+  tool output — and each later compaction summarises the summary.
+- **It gives corpus text a way to persist.** CVE records are attacker-influenced
+  (rule 4) and today their text dies with the round it arrived in. Summarising
+  means running the model over hostile text and keeping its output as durable
+  context.
+- It costs a second inference on a two-slot box.
+
+**Why eviction is enough.** The bulk and the meaning are in different messages.
+Dropping only tool results recovers ~3,215 tokens each against ~30 tokens of
+answer kept, so the question that opens a conversation — the thing the user is
+actually investigating — is structurally not a candidate for eviction rather
+than merely unlikely to be chosen. The results are still rendered on screen;
+it is the model's copy that goes, which is why the panel says so.
+
+**What would reopen it.** A model tier with a context large enough that the
+budget never binds (D-045's hosted keys, plausibly) can skip the eviction, not
+the rule against summarising. If a conversation is measured losing a *fact* it
+needed — as opposed to bulk it did not — the answer is a larger budget or a
+re-run of the tool, still not a summary.
+
+---
+
+## D-079: The privacy claim is narrowed to what is structurally true — the data plane is client-side — and the origin logs real visitor IPs like an ordinary web server  (2026-08-08, status: accepted, owner decision; narrows D-009 and amends D-034's consequences)
+
+**Decision.** Two changes, taken together because the first is what makes the
+second unremarkable.
+
+**1. The claim narrows to the thing that is structurally true.** What this
+project promises is: *the corpus and every query over it run in your browser;
+the server hands over static files and never sees a search, a filter or a
+report.* That is enforced by construction — the client sends no parameters
+(D-014, D-032) — and is checkable in a network panel. What it no longer claims
+is a blanket "nothing about you is recorded anywhere", which was never quite
+what an origin serving files could offer.
+
+**2. `set_real_ip_from` + `real_ip_header CF-Connecting-IP` go on, so the
+access log records the visitor rather than a Cloudflare edge address.** The
+rate limits key on `$binary_remote_addr` again, which is now the visitor, and
+the `map` over `CF-Connecting-IP` and its second per-peer zone are deleted.
+
+**D-009 is narrowed, not reversed.** No telemetry is still absolute *in the
+app*: no analytics, no error reporting, no beacon, nothing collected from the
+page even opt-in, and the diagnostics panel remains the only support channel.
+What changes is the scope of the sentence — it is about the application, not
+about the web server's own access log, which has existed since the first deploy
+and already recorded every request.
+
+**Context.** Owner decision (2026-08-08), prompted by M7's rate limiting. The
+limits had to be keyed on the visitor to work at all — behind Cloudflare,
+`$binary_remote_addr` is an edge IP, so a limit on it barely restrains an
+attacker while `limit_conn 2` would refuse a third ordinary visitor sharing an
+edge (RE-031). The privacy-preserving workaround keyed on `CF-Connecting-IP`
+through a `map`, with a looser per-peer backstop because that header is
+forgeable by anyone who finds the origin address. The owner's call is that the
+complexity is not worth buying a claim we do not need: real IPs in an access
+log are what every web server on the internet does, and the differentiating
+claim was never about that.
+
+The claim also has a scheduled expiry on its one real exception. The
+site-hosted chat tier is the only feature where analysis-related content
+reaches our infrastructure (D-057); once M8's BYO-key adapters ship, that
+traffic goes browser-direct to the user's own provider (D-045) and the backend
+is out of the chat path entirely for anyone who chooses it.
+
+**Consequences.**
+
+- **Say less, and mean it.** Every surface that described the privacy posture
+  is reworded to the structural claim: the corpus is downloaded once and
+  queried locally, the server never receives a query. Vision criterion 4's
+  network-panel check is unchanged and is still the evidence.
+- **The nginx config gets simpler, not more complex.** One zone keyed on
+  `$binary_remote_addr`, no `map`, no second backstop — because the header
+  spoofing problem the backstop existed for disappears once `real_ip` only
+  trusts `CF-Connecting-IP` from Cloudflare's own ranges.
+- **The Cloudflare ranges become a maintained list.** 20 CIDRs as of
+  2026-08-08, from `cloudflare.com/ips-v4` and `ips-v6`. Stale entries fail
+  *closed* in the harmless direction — an address outside the list is simply
+  not trusted, so the peer address is used and the limit falls back to
+  per-edge behaviour rather than becoming spoofable.
+- **What is still refused:** any in-app collection channel (D-009's core), and
+  request-body logging on the chat relay (D-057) — the access log records that
+  the endpoint was hit and by whom, never what was asked.
+
+**Reopen if.** The project ever wants the stronger claim back — at which point
+the cost is the rate limiting, not the logging, and RE-031 records what that
+workaround looked like.
+
+## D-078: The SQL tool's results enter model context, bounded by characters rather than by rows — and the row cap was never a memory bound  (2026-08-08, status: accepted, narrows D-044's transcription rule and hardens D-065)
+
+**Decision.** Two things, taken together because the second is what makes the
+first safe.
+
+**1. `describeToolResult` gives the model up to 50 rows of a `sql` tool result,
+within a 12,000-character budget.** This is a *narrowing* of D-044's "row-level
+result sets never do [enter the model's context] — they are returned as handles
+and rendered directly from SQLite by the fixed UI components", and it applies to
+the `sql` tool only. The four curated tools obey the rule as written:
+`search_records` returns a match count and nothing else, and the rows travel to
+`RecordTable`. `aggregate` is a pivot and was always allowed in — now also under
+the character budget, with labels bounded like cells rather than like
+descriptions.
+
+**2. A caller-supplied query is bounded in bytes and in time, not only in
+rows.** `SQLITE_LIMIT_LENGTH` is set on the connection for the duration of a
+guarded query (1 MB per value, restored afterwards); retained characters are
+summed against an 8 MB budget in the row callback; and the progress handler
+enforces a 60-second deadline. All three live in `lib/authorizer.ts` beside
+`CONSOLE_ROW_LIMIT`, so the SQL console gets them too.
+
+**Context.** The adversarial pass over the M7 tool surface (2026-08-08) ran
+these against real SQLite under the real authorizer policy and confirmed each:
+
+- `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+  SELECT hex(zeroblob(500000)) FROM n` — **1,000 rows, 1 GB of cells, 1.4 s**,
+  landing exactly on `CONSOLE_ROW_LIMIT`.
+- `SELECT group_concat(descr) FROM cve_text` — the whole text table in **one**
+  row.
+- `SELECT hex(zeroblob(50000000))` — 100 MB in one cell, 480 ms.
+
+Every one is a plain read, so the authorizer allows all three — correctly. The
+row cap was doing the job of a memory bound and could not do it, and
+`CONSOLE_CELL_CHARS` was applied by the *renderer*, downstream of the Worker
+having already held the value and structured-cloned it to the page. This has
+been true of the SQL console since M3; the chat layer is what made it reachable
+by something other than the person typing.
+
+D-044 also asks for a "row-capped, **timed-out** SQL tool" and there was no
+timeout anywhere — the only stop was the user pressing Cancel. Requests are
+serialized in the Worker, so a long query freezes every other operation.
+
+On the narrowing itself: two independent reviewers flagged the same thing, that
+`MAX_MODEL_ROWS` contradicted the module's own header and D-044's text, and that
+arguing for it in a code comment is not how a load-bearing constraint changes
+(rule 1). The alternative considered was withholding `sql` rows entirely, so
+that only the fixed UI ever renders them. It was rejected because it breaks the
+tool for its actual purpose — a model that asks `SELECT max(cvss_score) …` and
+is told only "1 row returned" cannot answer the question it just asked, and
+`aggregate` cannot express it. D-044's purpose clause is "every number a user
+sees came from a query, not from token sampling", and a bounded window preserves
+that: the number came from a query, the full result is rendered beside the prose
+with its SQL, and the panel discloses both.
+
+**Consequences.**
+
+- **The rule now has two halves and they are stated separately.** Curated
+  tools: row sets are handles. The `sql` tool: a bounded window, with the
+  omitted count reported. A future agent widening `MAX_MODEL_ROWS` or dropping
+  the budget is changing this entry, not tuning a constant.
+- **`QueryResult` gains `overflowed`.** "Capped at 1,000 rows" and "this result
+  was too large to hold" are different answers calling for different fixes, and
+  collapsing them would leave a `group_concat` over the corpus looking like an
+  ordinary broad query.
+- **The console inherits all three bounds**, which is the right place for them
+  — it has the same exposure and had it first.
+- **`SQLITE_LIMIT_LENGTH` must be restored on every path out**, including the
+  exception and cancellation ones. Left set, the *sync* path fails on any delta
+  record over 1 MB, hours later and nowhere near the cause.
+- **The deadline inherits the progress handler's limitation** (lib/cancel.ts): a
+  single long-running opcode is not interruptible, so it is checked between
+  opcodes. That is the same limitation cancellation has had since M3.
+
+**Reopen if.** A legitimate console query is refused by the value limit or the
+deadline (both are generous against a 372k-record corpus, and neither has been
+hit by a real question yet); or a model tier arrives whose context window makes
+the 12,000-character budget the thing limiting answer quality — at which point
+the number moves and the shape does not.
+
 ## D-077: An absent KEV catalog is refused, never answered as "not in KEV" — and the roll-backwards guard is bounded, because it defends whatever it is holding  (2026-08-08, status: accepted, implements D-076)
 
 **Decision.** Three things settled while building M6, each of which a later change

@@ -722,3 +722,132 @@ button.link {
 .refs a {
   color: var(--accent);
 }
+
+/* --- The chat side panel (M7) ------------------------------------------
+   A panel docked to the right of the page, not a tab, so a question can be
+   asked about whatever the reader is looking at without leaving it. It
+   collapses to a full-width sheet on narrow screens, where "beside" is not a
+   thing a phone has.
+
+   Everything inside it renders through the components the Report and Explore
+   tabs use, so this file adds *layout* and nothing about how a chart, a table
+   or a record row looks. A second set of visual rules here is how the same
+   number would come to look like two different things (D-044). */
+.tabs-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.chat {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(38rem, 46vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border-left: 1px solid var(--line);
+  box-shadow: -8px 0 24px rgb(0 0 0 / 8%);
+  padding: 0 1rem 1rem;
+  overflow: hidden;
+  z-index: 10;
+}
+
+@media (max-width: 60rem) {
+  .chat {
+    width: 100%;
+    border-left: none;
+  }
+}
+
+.chat-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+/* The scroller. `min-height: 0` is load-bearing in a flex column: without it
+   the log grows to its content and pushes the composer off the bottom of the
+   viewport, which on a long answer means no way to ask the next question. */
+.chat-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.5rem 0;
+}
+
+.chat-turn {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.chat-question {
+  font-weight: 600;
+  margin: 0.5rem 0;
+}
+
+/* Model prose. `pre-wrap` because the model writes newlines and nothing here
+   parses markdown — the text is rendered exactly as it arrived (D-044). */
+.chat-answer {
+  white-space: pre-wrap;
+  margin: 0.5rem 0;
+}
+
+.chat-thinking p {
+  white-space: pre-wrap;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.chat-step {
+  margin: 0.5rem 0;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--line);
+}
+
+.chat-step[data-chat-status='refused'] {
+  border-left-color: var(--sev-2);
+}
+
+.chat-consent p {
+  max-width: 34rem;
+}
+
+.chat-ask {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  padding-top: 0.6rem;
+}
+
+.chat-ask textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.small {
+  font-size: 0.85rem;
+}
+
+/* A label that a screen reader announces and nothing else shows. The clip-path
+   form rather than `display: none`, which removes it from the accessibility
+   tree as well and would leave the composer unlabelled. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

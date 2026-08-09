@@ -3,7 +3,17 @@ import { DatabaseSync, constants } from 'node:sqlite'
 
 import { describe, expect, it } from 'vitest'
 
-import { ACTION, authorize, AUTH_DENY, AUTH_OK, CONSOLE_ROW_LIMIT } from '../../lib/authorizer'
+import {
+  ACTION,
+  authorize,
+  AUTH_DENY,
+  AUTH_OK,
+  CONSOLE_ROW_LIMIT,
+  MAX_GUARDED_CELL_BYTES,
+  RESULT_CHAR_BUDGET,
+  rowCost,
+  TOOL_DEADLINE_MS,
+} from '../../lib/authorizer'
 
 /**
  * The console's read-only guarantee, checked against SQLite rather than against
@@ -99,6 +109,40 @@ describe('what the console can do', () => {
     expect(
       db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all().length
     ).toBeGreaterThan(5)
+  })
+})
+
+describe('full-text search, which needs one pragma of its own', () => {
+  it('runs an fts5 MATCH under the authorizer', () => {
+    // **Broken since M3 and invisible until M7.** Every fts5 query begins by
+    // reading `PRAGMA data_version`, and `PRAGMA` was denied wholesale — so
+    // every full-text query through the console failed with
+    // "PRAGMA (data_version) is refused", *including the console's own
+    // "Critical CVEs mentioning deserialization" example button*. The app's
+    // own searches were never affected because Explore and Report run
+    // unguarded, which is why nothing noticed for two milestones.
+    const db = guarded()
+    const { denials } = arm(db)
+    const rows = db
+      .prepare(
+        `SELECT c.cve_id FROM fts JOIN cve c ON c.id = fts.rowid ` +
+          `WHERE fts MATCH 'remote' AND c.state = 1`
+      )
+      .all()
+    expect(denials, denials.join('; ')).toEqual([])
+    expect(rows).toHaveLength(1)
+  })
+
+  it('allows only the read form, so the pragma that matters is still refused', () => {
+    // The whole reason PRAGMA was denied in the first place. An allowlist that
+    // let a *setting* through would hand back the flip D-065 exists to stop.
+    expect(authorize(ACTION.PRAGMA, 'data_version', null).ok).toBe(true)
+    expect(authorize(ACTION.PRAGMA, 'DATA_VERSION', null).ok).toBe(true)
+    expect(authorize(ACTION.PRAGMA, 'data_version', 'OFF').ok).toBe(false)
+    expect(authorize(ACTION.PRAGMA, 'query_only', 'OFF').ok).toBe(false)
+    expect(authorize(ACTION.PRAGMA, 'query_only', null).ok).toBe(false)
+    expect(authorize(ACTION.PRAGMA, 'writable_schema', 'ON').ok).toBe(false)
+    expect(authorize(ACTION.PRAGMA, 'journal_mode', 'DELETE').ok).toBe(false)
   })
 })
 
@@ -204,5 +248,60 @@ describe('the row cap', () => {
     // it is *finite* is not.
     expect(CONSOLE_ROW_LIMIT).toBeGreaterThan(100)
     expect(CONSOLE_ROW_LIMIT).toBeLessThanOrEqual(10_000)
+  })
+})
+
+/**
+ * The bounds that are *not* the authorizer (M7).
+ *
+ * Every statement below is a plain read, so the authorizer allows all of them —
+ * correctly. What stops them is arithmetic, and the adversarial pass over the
+ * chat tool surface confirmed each one against real SQLite before these bounds
+ * existed: a gigabyte retained in the Worker and structured-cloned to the page,
+ * from a query that lands exactly on the row cap.
+ *
+ * The bounds themselves are applied in the Worker, which `pnpm check` cannot
+ * execute. So what is tested here is the part that decides the outcome — the
+ * cost function, and the fact that the authorizer really does permit the shapes
+ * it has to be paired with.
+ */
+describe('the memory bounds behind the row cap', () => {
+  it('permits the queries that make the row cap meaningless', () => {
+    // Not a defect in the authorizer: these are reads. It is the reason a row
+    // cap is not a memory bound, and the reason the two bounds below exist.
+    const db = guarded()
+    const { denials } = arm(db)
+    const wide = db
+      .prepare(
+        'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) ' +
+          'SELECT hex(zeroblob(4096)) AS v FROM n'
+      )
+      .all() as { v: string }[]
+    expect(denials).toEqual([])
+    expect(wide).toHaveLength(20)
+    // Twenty rows — two percent of `CONSOLE_ROW_LIMIT` — and already 160 KB.
+    // Scaled to the cap it is a gigabyte, at 1.4 s, measured.
+    const cost = wide.reduce((sum, row) => sum + rowCost([row.v]), 0)
+    expect(cost).toBeGreaterThan(150_000)
+    expect(cost * (CONSOLE_ROW_LIMIT / 20)).toBeGreaterThan(RESULT_CHAR_BUDGET)
+  })
+
+  it('counts what is retained, not what is selected', () => {
+    // Numbers and nulls are fixed-size; counting them would make the budget a
+    // statement about column count rather than about bytes.
+    expect(rowCost([1, null, 2.5])).toBe(0)
+    expect(rowCost(['abcd', 7, null])).toBe(4)
+    expect(rowCost([new Uint8Array(32)])).toBe(32)
+    expect(rowCost([])).toBe(0)
+  })
+
+  it('bounds one value below the sum, and both below what a tab survives', () => {
+    // The per-value limit alone lets a thousand values just under it through;
+    // the sum alone lets one enormous value be built before it is measured.
+    expect(MAX_GUARDED_CELL_BYTES).toBeLessThan(RESULT_CHAR_BUDGET)
+    expect(RESULT_CHAR_BUDGET).toBeLessThan(64_000_000)
+    // A deadline at all is what D-044 asks for; a short one would refuse
+    // legitimate cross-tabs over 372k records.
+    expect(TOOL_DEADLINE_MS).toBeGreaterThan(10_000)
   })
 })

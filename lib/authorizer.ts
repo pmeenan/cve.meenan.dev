@@ -92,9 +92,33 @@ const ACTION_NAMES = new Map<number, string>(
  * only to wrap writes and a console that can open a transaction can hold a
  * lock the sync path then fails on. `PRAGMA` is the one that matters most:
  * denying it is what makes `PRAGMA query_only=OFF` — the flip that would undo
- * the older defence — a refusal rather than a re-arming.
+ * the older defence — a refusal rather than a re-arming. It is denied here and
+ * re-admitted for exactly one read-only name in `ALLOWED_PRAGMAS`, which fts5
+ * cannot work without.
  */
 const ALLOWED = new Set<number>([ACTION.SELECT, ACTION.READ, ACTION.FUNCTION, ACTION.RECURSIVE])
+
+/**
+ * Pragmas the console may run, in their **query** form only.
+ *
+ * `PRAGMA` is denied wholesale above, and that is deliberate: it is what makes
+ * `PRAGMA query_only=OFF` — the flip that would undo the older defence — a
+ * refusal rather than a re-arming. But "wholesale" turned out to include a
+ * pragma **fts5 issues by itself**: every fts5 query begins by reading
+ * `data_version` to decide whether its cached configuration is still valid, so
+ * denying it made *every* full-text query through the console fail with
+ * "PRAGMA (data_version) is refused" — including the console's own
+ * "Critical CVEs mentioning deserialization" example. Broken since M3 and
+ * invisible until the D-046 benchmark ran an FTS query through this path,
+ * because the app's own searches (Explore, Report) run unguarded and were
+ * never affected.
+ *
+ * The allowlist is by name **and** by shape: a pragma with an argument is a
+ * *setting*, so only the no-argument form is permitted. `data_version` is a
+ * counter SQLite bumps when another connection commits; reading it discloses
+ * nothing and changes nothing.
+ */
+const ALLOWED_PRAGMAS = new Set(['data_version'])
 
 /**
  * Functions refused by name even though `FUNCTION` is allowed.
@@ -136,6 +160,14 @@ export function authorize(code: number, arg1: string | null, arg2: string | null
     }
     return { ok: true }
   }
+  if (code === ACTION.PRAGMA) {
+    const name = (arg1 ?? '').toLowerCase()
+    // `arg2` is the pragma's argument. Absent means the read form; present
+    // means someone is setting something, and nothing on the allowlist has a
+    // setting worth permitting.
+    if (ALLOWED_PRAGMAS.has(name) && (arg2 === null || arg2 === '')) return { ok: true }
+    return { ok: false, reason: refusal(code, arg1) }
+  }
   if (ALLOWED.has(code)) return { ok: true }
   return { ok: false, reason: refusal(code, arg1) }
 }
@@ -169,5 +201,75 @@ export const CONSOLE_ROW_LIMIT = 1_000
  * 4): a `SELECT descr FROM cve_text` should not be able to lock the main thread
  * up laying out 400 MB of text. React escapes the content, so this is about
  * volume rather than markup.
+ *
+ * **This is a display cap and never was a memory bound.** It is applied by the
+ * renderer, which is downstream of the Worker having already held the value and
+ * structured-cloned it to the page. The bounds below are the memory ones.
  */
 export const CONSOLE_CELL_CHARS = 2_000
+
+/**
+ * The largest single value a caller-supplied query may produce, in bytes.
+ *
+ * Applied as SQLite's own `SQLITE_LIMIT_LENGTH` on the connection, for the
+ * duration of a guarded query only. That placement is the whole point: it is
+ * the only bound that acts *before* the value exists, so
+ * `SELECT group_concat(descr) FROM cve_text` — one row holding the entire text
+ * table, and a plain read the authorizer allows because it is one — fails with
+ * `SQLITE_TOOBIG` instead of being built, held and copied.
+ *
+ * Restored after every guarded query, including on the exception and
+ * cancellation paths: left in place it would make the *sync* path fail on any
+ * delta record larger than this, hours later and nowhere near the cause.
+ */
+export const MAX_GUARDED_CELL_BYTES = 1_048_576
+
+/**
+ * How many characters of result a caller-supplied query may retain.
+ *
+ * The row cap is not a memory bound, because a row can be any size:
+ * `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+ * SELECT hex(zeroblob(500000)) FROM n` lands exactly on `CONSOLE_ROW_LIMIT`
+ * with a gigabyte behind it, and every byte of it is held in the Worker and
+ * then cloned to the page — UTF-16 on both sides, so four times the figure.
+ * Measured at 1.4 s to produce, against real SQLite under the real authorizer
+ * policy, which allows it because it is a read.
+ *
+ * `MAX_GUARDED_CELL_BYTES` bounds one value; this bounds their sum. Both are
+ * needed: a thousand values just under the per-value limit is a gigabyte.
+ */
+export const RESULT_CHAR_BUDGET = 8_000_000
+
+/**
+ * How long a caller-supplied query may run (D-044: "row-capped, timed-out").
+ *
+ * Enforced through SQLite's progress handler, which is the only code that runs
+ * while a statement is executing — and which therefore inherits that
+ * mechanism's documented limitation (lib/cancel.ts): a single long-running
+ * opcode is not interruptible, so the deadline is checked between opcodes
+ * rather than during one.
+ *
+ * Generous, because the corpus is 372k records and a legitimate cross-tab
+ * through the link tables takes seconds. It is not a latency budget — D-052
+ * removed those — it is the difference between a slow query and one that has
+ * frozen the Worker, which serializes every other request behind it.
+ */
+export const TOOL_DEADLINE_MS = 60_000
+
+/**
+ * What one result row costs against `RESULT_CHAR_BUDGET`.
+ *
+ * Only strings and blobs count: numbers and nulls are fixed-size and counting
+ * them would make the budget about column count rather than about bytes. Here
+ * rather than inline in the Worker so it can be tested — the Worker is the one
+ * module `pnpm check` cannot execute, and this is arithmetic that decides
+ * whether a tab survives.
+ */
+export function rowCost(row: readonly unknown[]): number {
+  let cost = 0
+  for (const cell of row) {
+    if (typeof cell === 'string') cost += cell.length
+    else if (cell instanceof Uint8Array) cost += cell.byteLength
+  }
+  return cost
+}

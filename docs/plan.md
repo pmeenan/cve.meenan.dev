@@ -15,12 +15,12 @@ it touched.
 **Status legend:** `pending` · `in progress` · `done` · `parked`
 
 Milestones are decomposed into task-sized checkboxes (the workflow's unit of
-work) no later than when they become the next milestone up. **M0 – M6 are
+work) no later than when they become the next milestone up. **M0 – M7 are
 closed**: they are summarized below, and their full task-level record — every
 checkbox, its evidence, and the defects each surfaced — lives in
 [plan-archive.md](plan-archive.md), moved there verbatim so this document stays
-small enough to load per task. **M7 is next, decomposed 2026-08-08**; M8
-carries scope prose and exit criteria until its turn.
+small enough to load per task. **M8 is next** and carries scope prose and exit
+criteria until its turn.
 
 ## Completed milestones — summaries
 
@@ -132,152 +132,60 @@ segment (RE-028) — now caught by `scripts/check-bundle.mjs` on every build.
 Running the header spec against the live origin also found and fixed RE-029,
 an M5 `always` regression that let the edge cache 404s `immutable` for a year.
 
-## M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `pending`
+### M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `done` (2026-08-08, hardened through 2026-08-09)
 
-The chat loop proven against one consistent, always-available tier first — the
-Ollama instance we host (D-057) — so the tool surface can be developed and
-benchmarked with minimal client requirements: no key, no WebGPU, no weight
-download. Depends on M4's report definitions and, for the KEV tool, on M6. The
-risk this ordering accepts — an 8B model's failures being mistaken for
-tool-surface bugs — is recorded in D-057; the D-046 benchmark and a dev-only
-frontier-key spot check are the mitigations.
+Five read-only tools over the local corpus (`lib/tools.ts`), a same-origin PHP
+relay to our own Ollama (`public/api/chat.php`, D-057), and a side panel that
+renders every answer through the *same* components Report and Explore use — an
+aggregate leaves the conversation through "Open in Report", a record search
+through Explore, because those are the surfaces that render each. Chat prose is
+a text node always: no markdown, no linkification, because the one thing a
+compromised model must not do is mint a URL. The conversation is session-only,
+which is what makes "nothing is stored" true on the client as well as the
+server. The relay pins the system prompt and the tool schemas from a build-time
+artifact and refuses a caller-supplied one with 400, so the endpoint cannot be
+used as a general-purpose LLM — which is what let its rate limit be raised
+tenfold. **D-057's php-fpm streaming question was settled by measurement: PHP
+streams**, 105 `read()` resolutions for 112 lines through nginx and Cloudflare,
+once three separate buffers were turned off (RE-030).
 
-Scope: the chat surface; the read-only tool surface over report definitions —
-curated high-level tools plus the `SELECT`-only SQL tool (D-044); the
-**same-origin chat endpoint** relaying to Ollama at `http://llm:11434/` —
-server-pinned model (`gemma4:e4b` today), chat completion as the only exposed
-operation, streamed, POST-only with a capped body, nginx rate and concurrency
-limits, no chat storage and no request-body logging (D-057), with the
-php-fpm streaming question settled by experiment before the implementation is
-committed; the consent surface: a first-use disclosure that on this tier the
-question and its tool results transit `cve.meenan.dev` and our model host, and
-that nothing is stored; CSP `connect-src` pinned — for this tier, to the
-origin itself; the D-046 benchmark harness with ground-truth questions, the
-owner's severity-over-time question first, scored against the pinned model.
+**The heavyweight review found nine defects, two exploitable, and the worst was
+a bound everyone assumed existed**: the SQL row cap counts *rows*, and one row
+can be any size — `hex(zeroblob(50000000))` is 100 MB, and every one is a plain
+read the authorizer allows, correctly. Fixed at three layers (D-078). **The SQL
+console had that exposure since M3**; chat only made it reachable by something
+other than the person typing. Building the harness also found a two-milestone-old
+defect in a shipped surface: fts5 reads `PRAGMA data_version` itself and M3's
+authorizer denied PRAGMA wholesale, so the console had never run a full-text
+query — invisible because Explore, Report and the chat tools all run unguarded
+(RE-033). Verifying the relay against the live origin found three more that
+reading the config could not, including limits keyed on a Cloudflare edge IP
+(RE-031).
 
-Four shape decisions were taken by the owner at decomposition (2026-08-08),
-following M4 – M6's precedent, because each changes what the tasks below are.
-**Chat is a side panel, not a sixth tab**: it opens beside whatever tab is
-active, so a user can ask about what they are looking at. The consequence
-follows from D-044 rather than from preference — the panel renders compact
-results inline through the *same* components the Report tab uses, never a
-parallel renderer, and every rendered definition carries an "Open in Report"
-action that loads it into the builder, which is what keeps chat's output
-hand-editable and re-runnable rather than a picture of an answer. **Chat
-history is session-only**: a reload clears the conversation and nothing about
-it is stored anywhere, which makes the tier's "nothing is stored" disclosure
-true on the client as well as the server; the durable artifact is the report
-definition, and Saved already owns that (D-072). **The first benchmark set is
-~10 questions**: D-046's two canonical items plus roughly one per tool, each
-with hand-written SQL ground truth — enough to score tool selection and
-argument accuracy per tool without ground-truth authoring dominating the
-milestone; the set grows in M8 when local-model selection needs it. **The
-heavyweight treatment is pre-sanctioned for both gating surfaces**
-(workflow.md's "when to go heavy" names them by name): the relay endpoint with
-its limits, and the injection-containment story — hostile records through the
-chat path — each get the multi-agent adversarial pass before the milestone
-closes, sanctioned now rather than decided at the moment.
+**Model selection was decided by measurement, and every failure that looked
+like model weakness turned out to be the tool surface** — D-057's accepted risk,
+walked into and then caught. A bare enum of sixteen dimension names became a
+guide (item #2: 0/8 → 8/8), and "prefer `aggregate` for anything countable"
+became a line naming what `aggregate` *cannot* do (first-call `sql`: 0/8 → 5/6).
+`qwen3:8b` replaced `gemma4:e4b` at half the size and the same latency, with
+`qwen3:14b` measurably worse than the 8b.
 
-Tasks in dependency order. The streaming experiment leads because its outcome
-decides the relay's implementation — and possibly forces a decision entry —
-so nothing server-side is committed before it runs. The tool surface is
-deliberately second rather than after the relay: it is pure client code,
-testable without any model in the loop, so it can proceed while the server
-half settles.
+Closed 2026-08-08; hardened 2026-08-09 with three further prompt defects found
+the same way. **Nothing had ever told the model what day it is**, so "the last
+two years" resolved to its training era — now a `{{TODAY}}` placeholder the
+relay substitutes per request. The KEV join was ambiguous (`kev.cve_id` is the
+integer, `cve.cve_id` the string) and produced a silent zero-row join in 5/5
+probes. The decline paragraph declines the nouns it names and no others, which
+is written down rather than overclaimed. Context is fitted by evicting old tool
+results, never by summarising (D-080). Two scorecards are recorded rather than
+one overwriting the other: `gemma4:e4b` at 10/10 tool and 8/10 data, `qwen3:8b`
+at 9/10 and 8/10 with ten of ten in a single turn.
 
-- [ ] **The php-fpm streaming experiment** (D-057). Before any implementation
-      is committed: can PHP 8.4 behind php-fpm and this nginx stream a chat
-      completion token by token — `output_buffering`, `fastcgi_buffering`,
-      response compression, and Cloudflare in the path, all measured with a
-      real Ollama round trip observed from a browser, not assumed from
-      documentation (rule 3: training knowledge is stale for exactly this).
-      The deliverable is a number and a verdict recorded in the task note: time
-      to first token through the full stack, and whether tokens arrive
-      incrementally or in one buffered flush. If PHP cannot stream cleanly,
-      the alternative is a decision entry, not drift (D-057).
-- [ ] **The tool surface** (D-044). The curated tools — search over the
-      client-built FTS, filter + aggregate emitting report definitions, CVE
-      detail, KEV lookup — with tight schemas sized for small models, plus the
-      `SELECT`-only SQL tool riding D-065's authorizer with its row cap and
-      D-066's cancellation. Read-only and render-only structurally: no tool
-      fetches a URL, writes, or reaches the network, enforced by what the
-      tools *can* do, never by inspecting arguments. Aggregates may enter
-      model context; row sets return as handles rendered by the fixed UI
-      (D-044: the model orchestrates, it never transcribes). Everything a
-      model emits is a stranger's input: emitted report definitions go through
-      `parseReport` exactly as a hostile fragment would, tool arguments are
-      validated by name with unknown tools and malformed arguments refused,
-      and a tool result carries structured data, never markup. Unit-tested
-      against hostile records with no model in the loop — the surface is
-      deterministic code, and its tests must not depend on an LLM.
-- [ ] **The chat relay** (D-057, under D-006's rules). The same-origin
-      endpoint relaying to `http://llm:11434/`: chat completion as the only
-      exposed operation, server-pinned model (`gemma4:e4b` today), streamed,
-      POST-only with a capped body. No caller-supplied model, URL, host, or
-      path reaches anything; same-origin is the D-034 style — the *absence* of
-      CORS headers; nothing is stored and request bodies are never logged —
-      the access log records that the endpoint was hit, not what was asked,
-      and that claim is checked against the server's actual log configuration
-      rather than asserted. nginx `limit_req`/`limit_conn` on the location are
-      a ship requirement, not a nicety — absence-of-CORS stops cross-site
-      browsers, not `curl` — and the limits are verified against the live
-      origin by exceeding them. Cloudflare must pass the stream through
-      unbuffered and never cache the endpoint, verified from response headers
-      like every other edge claim (M5's lesson: the dashboard is not
-      evidence). Heavyweight review before this ships (pre-sanctioned above).
-- [ ] **The chat loop and the panel.** The client-side orchestration —
-      question → model → tool calls → grounded answer, streamed into the side
-      panel (shape decision above). Chat prose renders as plain text, never
-      markup or minted URLs (D-044); inline results render through the shared
-      report components with Open in Report; the backing query of every
-      number a user sees is inspectable from the panel, which is what vision
-      criterion 7 means in a chat. History is session-only (shape decision
-      above). Progress per D-052: a waiting model and a running tool each name
-      themselves past a second, a query is cancellable mid-tool-call (D-066),
-      and a stream that stops producing bytes is a stall reported as one
-      (D-064's rule applied to the new long-running thing). The consent
-      surface is here too: the first-use disclosure that on this tier the
-      question and its tool results transit `cve.meenan.dev` and our model
-      host and nothing is stored, shown before the first request leaves and
-      recorded client-side; CSP `connect-src` stays pinned to the origin
-      itself, asserted by a test so a later tier widening it is a deliberate
-      diff rather than drift.
-- [ ] **The benchmark harness** (D-046). ~10 questions with hand-written SQL
-      ground truth: canonical items #1 and #2, plus at least one exercising
-      each tool — search, aggregate, CVE detail, KEV, and the SQL tool —
-      driven through the *actual* chat integration (our schemas, our system
-      prompt) in Playwright and scored by comparing the emitted report
-      definition or its result data against ground truth; no LLM judge.
-      Scorecard per question: tool-call accuracy, turns needed, latency.
-      Opt-in like `MEASURE=1`, because it needs the private `llm` host and an
-      inference round trip is not a unit test. The `gemma4:e4b` scorecard is
-      the milestone's honest-expectations artifact; a dev-only frontier-key
-      spot check disambiguates tool-surface bugs from model weakness before
-      either is "fixed" (D-057's accepted risk, mitigated as recorded).
-- [ ] **The adversarial containment pass, heavyweight** (pre-sanctioned
-      above). Hostile records through the chat path — markup, injection
-      payloads, and hostile URLs in the descriptions and titles the model
-      reads — and the containment claim verified rather than argued: nothing
-      beyond the read-only tool surface is reachable from a compromised
-      conversation, no record-supplied markup or URL renders outside the
-      fixed UI's existing treatment, and a successful injection yields
-      wrong-but-inspectable presentation and nothing more (D-044). The
-      relay's abuse surface is in scope too: oversized bodies, cross-origin
-      callers, concurrency exhaustion against the one small GPU box.
-
-**Exit criteria:** the founding question — stacked CVE counts by severity over
-time, all products and per-product (D-046 benchmark item #1) — is answered
-end-to-end through chat on the site-hosted tier, rendering via the fixed UI
-with the backing queries inspectable; the benchmark runs against the pinned
-model and produces a scorecard; a network-panel check confirms chat traffic
-goes only browser → `cve.meenan.dev` → `llm`, and nothing else leaves the
-browser; the endpoint refuses cross-origin browser callers, oversized bodies,
-and any operation but its one, with its rate and concurrency limits verified
-against the live origin; and an adversarial pass feeds hostile records —
-markup, injection payloads, hostile URLs — through the chat path and shows
-containment: nothing beyond the read-only tool surface is reachable, and no
-record-supplied markup or URL renders outside the fixed UI's existing
-treatment.
+**Left open at closure**: the decline paragraph's lexical coverage (~1/11 leak
+on an unlisted noun); `cisco-criticals`, where the benchmark wants `aggregate`
+and our own prompt says `sql`, and measurement says tightening either way
+breaks the other; and two environment changes that live outside git —
+`OLLAMA_NUM_PARALLEL=2` on the llm box and the nginx rate limit.
 
 ## M8 — Other model tiers: BYO keys and in-browser local  `pending`
 
