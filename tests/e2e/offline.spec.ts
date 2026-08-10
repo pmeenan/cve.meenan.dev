@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
 
+import { awaitIdle, downloadButton, openPanel } from './ui'
+
 /**
  * The offline app shell (D-048, D-054), and the boundary it must never cross.
  *
@@ -39,8 +41,13 @@ test('the app reopens with no network, and never serves /data/ from its cache', 
   })
 
   await test.step('with a local copy', async () => {
-    await page.getByRole('button', { name: /Download data/ }).click()
+    // The landing view's CTA; the Import heading is inside the Data panel,
+    // which opens itself on the import that filled it.
+    await downloadButton(page).click()
     await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+    // Quiet before the next step: the post-import catch-up and auto-run
+    // report otherwise flicker every button disabled under a later click.
+    await awaitIdle(page)
   })
 
   await test.step('the data plane is not in the shell cache', async () => {
@@ -90,8 +97,13 @@ test('the app reopens with no network, and never serves /data/ from its cache', 
           `page errors:\n${offlineFailures.join('\n')}\n${String(error)}`
       )
     }
+    // A reopened page starts with the Data panel closed; the demo query is in
+    // it, and opening it must work offline like everything else.
+    await openPanel(reopened, 'data')
     await reopened.getByRole('button', { name: 'Run query' }).click()
-    await expect(reopened.locator('.results tbody tr').first()).toBeVisible({ timeout: 300_000 })
+    await expect(reopened.locator('#data-panel table.results tbody tr').first()).toBeVisible({
+      timeout: 300_000,
+    })
     // The notice travels with the copy, offline included (D-008).
     await expect(reopened.locator('.notice')).toContainText('The MITRE Corporation')
     expect(offlineFailures.join('\n')).not.toMatch(/Failed to fetch|NetworkError/)

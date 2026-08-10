@@ -1,7 +1,5 @@
 'use client'
 
-import { useState } from 'react'
-
 import { CONSOLE_CELL_CHARS, CONSOLE_ROW_LIMIT } from '@/lib/authorizer'
 import type { QueryResult } from '@/lib/protocol'
 
@@ -22,7 +20,7 @@ import type { QueryResult } from '@/lib/protocol'
  * whole corpus, one that tries to write.
  */
 
-const EXAMPLES: { label: string; sql: string }[] = [
+export const EXAMPLES: { label: string; sql: string }[] = [
   {
     label: 'Top CWEs',
     sql: `SELECT w.cwe, w.descr, count(*) AS cves
@@ -57,6 +55,8 @@ export function Console({
   error,
   cancelledMs,
   run,
+  sql,
+  onSql,
 }: {
   disabled: boolean
   onRun: (sql: string) => void
@@ -65,12 +65,17 @@ export function Console({
   cancelledMs: number | null
   /** Answer counter — rendered as `data-run` so a test can wait for *this* one. */
   run: number
+  /**
+   * Controlled by the page (UI revamp): a report run or a chat answer writes
+   * the SQL it executed into this drawer, so "show me the query" and "let me
+   * edit the query" are the same surface.
+   */
+  sql: string
+  onSql: (sql: string) => void
 }) {
-  const [sql, setSql] = useState(EXAMPLES[0]!.sql)
-
   return (
-    <section>
-      <h2>SQL console</h2>
+    <section aria-labelledby="sql-heading">
+      <h2 id="sql-heading">SQL console</h2>
       <p className="muted">
         Read-only, and not by inspecting what you type: SQLite&rsquo;s own authorizer refuses every
         action but reading, for the duration of the statement. Results are capped at{' '}
@@ -89,7 +94,7 @@ export function Console({
             value={sql}
             spellCheck={false}
             rows={8}
-            onChange={(event) => setSql(event.target.value)}
+            onChange={(event) => onSql(event.target.value)}
           />
         </label>
         <div className="actions">
@@ -101,7 +106,7 @@ export function Console({
               key={example.label}
               type="button"
               className="quiet"
-              onClick={() => setSql(example.sql)}
+              onClick={() => onSql(example.sql)}
             >
               {example.label}
             </button>

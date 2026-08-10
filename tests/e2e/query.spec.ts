@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
+import { awaitIdle, downloadButton, importCorpus, openPanel } from './ui'
 
 import { SCHEMA_VERSION } from '../../lib/protocol'
 
@@ -35,47 +36,20 @@ function watchConsole(page: Page): string[] {
 }
 
 /**
- * Open one of M4's tabs.
+ * The filter drawer's form, as a scope for every field lookup.
  *
- * The app is a tabbed workspace on one route (M4), so a surface is only in the
- * accessibility tree — and only reachable by a role query — once its tab is
- * selected. Everything else about these tests is unchanged.
- */
-async function openTab(page: Page, name: string): Promise<void> {
-  await page.getByRole('tab', { name, exact: true }).click()
-  await expect(page.getByRole('tab', { name, exact: true })).toHaveAttribute(
-    'aria-selected',
-    'true'
-  )
-}
-
-/** Download the development slice and wait for the local copy to be queryable. */
-async function importCorpus(page: Page): Promise<void> {
-  await page.goto('/')
-  await requireLocalStorage(page)
-  await page.getByRole('button', { name: /Download data/ }).click()
-  await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
-  await openTab(page, 'Explore')
-  await expect(page.getByRole('heading', { name: 'Explore' })).toBeVisible()
-}
-
-/**
- * Explore's filter form, as a scope for every field lookup.
- *
- * Scoped twice over. Page-wide, the console's textarea would answer to
- * `getByLabel('Group by')`, because an accessible name includes the value of
- * the control a label wraps and the example query contains a `GROUP BY`. And
- * since M4 there are *two* copies of this form — Explore's and the report
- * builder's — so the panel has to be named as well: `getByRole` skips the four
- * hidden panels because they are out of the accessibility tree, but `getByLabel`
- * is a DOM query and sees both.
+ * Scoped twice over. Page-wide, the SQL drawer's textarea would answer to
+ * `getByLabel('Group by')` whenever it is open, because an accessible name
+ * includes the value of the control a label wraps and a report's SQL contains
+ * a `GROUP BY`. And the panel id pins the lookup to the one copy of the form
+ * the workspace has — the revamp's merge of the old Explore and Report forms.
  */
 function filterForm(page: Page) {
-  return page.locator('#panel-explore form.filters')
+  return page.locator('#filters-panel form.filters')
 }
 
 /**
- * Run the filter form and wait for *this* run's result.
+ * Run the filter form as a record search and wait for *this* run's result.
  *
  * Waiting on the progress bar is not enough and was actively misleading: a
  * query that finishes in milliseconds may never render one, so the assertion
@@ -84,7 +58,7 @@ function filterForm(page: Page) {
  */
 async function runFilters(page: Page): Promise<void> {
   const before = await answered(page, '[data-matches]')
-  await filterForm(page).getByRole('button', { name: 'Run', exact: true }).click()
+  await filterForm(page).getByRole('button', { name: 'List records' }).click()
   await waitForAnswer(page, '[data-matches]', before)
 }
 
@@ -140,7 +114,13 @@ async function groupBy(page: Page, label: string): Promise<void> {
 test('filters, the console, cancellation and a schema bump', async ({ page }) => {
   test.setTimeout(600_000)
   const failures = watchConsole(page)
-  await importCorpus(page)
+  await page.goto('/')
+  await requireLocalStorage(page)
+  await importCorpus(page, 300_000)
+  // The canvas auto-runs a default report the first time a copy is ready, and
+  // the drawer's buttons are disabled while it does — wait it out.
+  await awaitIdle(page, 120_000)
+  await openPanel(page, 'filters')
 
   /**
    * Each lookup axis is checked against itself: group by the dimension, take
@@ -259,7 +239,7 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
   })
 
   await test.step('the console reads', async () => {
-    await openTab(page, 'SQL')
+    await openPanel(page, 'sql')
     await page.getByRole('button', { name: 'What the schema looks like' }).click()
     await page.getByRole('button', { name: 'Run SQL' }).click()
     await expect(page.locator('[data-console-rows]')).toBeVisible({ timeout: 120_000 })
@@ -307,12 +287,11 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     // The authorizer is installed for the duration of one console query and
     // removed afterwards, on the connection that also applies deltas. If
     // removal failed, this is where it would show: sync would be refused by the
-    // guard the console left behind.
-    await openTab(page, 'Data')
-    await page.getByRole('button', { name: 'Sync' }).click()
+    // guard the console left behind. Sync is a header button now — no panel
+    // needed, and the SQL drawer stays open underneath.
+    await page.getByRole('button', { name: 'Sync', exact: true }).click()
     await expect(page.locator('.progress')).toBeHidden({ timeout: 300_000 })
     await expect(page.locator('[data-error]')).toHaveCount(0)
-    await openTab(page, 'SQL')
   })
 
   await test.step('the row cap is applied and reported', async () => {
@@ -382,12 +361,14 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     await expect(announcement).toContainText(`schema ${ahead}`)
     await expect(announcement).toContainText('Download the corpus again')
     // Not offered as a query surface: a copy this build cannot read must not be
-    // queried, so the tabs that need one are disabled rather than opening onto
-    // an empty panel.
-    await expect(page.getByRole('tab', { name: 'Explore' })).toBeDisabled()
-    await expect(page.getByRole('tab', { name: 'SQL' })).toBeDisabled()
-    await expect(page.getByRole('heading', { name: 'Explore' })).toHaveCount(0)
-    await expect(page.getByRole('button', { name: 'Download data', exact: true })).toBeVisible()
+    // queried, so the app shows the landing view rather than the workspace —
+    // the filter drawer and the SQL console are not in the DOM to reach.
+    await expect(page.locator('[data-landing]')).toBeVisible()
+    await expect(page.locator('[data-toggle="filters"]')).toHaveCount(0)
+    await expect(page.locator('[data-toggle="sql"]')).toHaveCount(0)
+    await expect(page.locator('#filters-panel')).toHaveCount(0)
+    await expect(page.locator('#sql-panel')).toHaveCount(0)
+    await expect(downloadButton(page)).toHaveText('Re-download CVE dataset')
   })
 
   await test.step('and the origin is refused too, naming the fix', async () => {
@@ -395,7 +376,7 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     // downloading again cannot help —
     // and the app says the thing that can (reload for the matching build),
     // rather than sending the user round a loop.
-    await page.getByRole('button', { name: 'Download data', exact: true }).click()
+    await downloadButton(page).click()
     await expect(page.locator('[data-error]')).toContainText(/reload the page/, {
       timeout: 120_000,
     })
@@ -407,8 +388,11 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
   await test.step('the copy the bump refused is still there', async () => {
     // D-013 licenses *replacing* the local database, not deleting it out from
     // under someone who has been told to download again. Without the override
-    // the same copy is live and queryable.
+    // the same copy is live and queryable — the workspace opens on it, and the
+    // data panel offers a replacement rather than a first download.
     await page.goto('/')
+    await awaitIdle(page, 120_000)
+    await openPanel(page, 'data')
     await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
       timeout: 120_000,
     })

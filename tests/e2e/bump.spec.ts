@@ -6,6 +6,7 @@ import { expect, test } from '@playwright/test'
 import { SCHEMA_VERSION } from '../../lib/protocol'
 
 import { requireLocalStorage } from './support'
+import { awaitIdle, downloadButton, importCorpus, openPanel } from './ui'
 
 /**
  * The half of a schema bump that needs **two real data planes** — the claim M3
@@ -66,7 +67,10 @@ test('an old client refuses the new data plane, before a byte of it', async ({ p
     // position a deployed app is in the moment the new artifact lands.
     await page.goto(`/?schema=${previous}`)
     await requireLocalStorage(page)
-    await page.getByRole('button', { name: /Download data/ }).click()
+    await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
+      timeout: 15_000,
+    })
+    await downloadButton(page).click()
 
     const error = page.locator('[data-error]')
     await expect(error).toBeVisible({ timeout: 120_000 })
@@ -96,12 +100,13 @@ test('an old client refuses the new data plane, before a byte of it', async ({ p
     // else being wrong. And the new columns arrive, which is the point of the
     // bump (D-070) — asserted through the SQL console, so the assertion is
     // against the database rather than against a rendering of it.
-    await page.goto('/')
-    await page.getByRole('button', { name: /Download data/ }).click()
-    await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+    await importCorpus(page, 300_000)
     expect(chunks.length).toBeGreaterThan(0)
 
-    await page.getByRole('tab', { name: 'SQL' }).click()
+    // The canvas auto-runs a report on the fresh copy; the console's Run
+    // button is disabled until it finishes.
+    await awaitIdle(page, 120_000)
+    await openPanel(page, 'sql')
     await page
       .locator('textarea.sql-input')
       .fill(
@@ -124,9 +129,9 @@ test('an old client refuses the new data plane, before a byte of it', async ({ p
   })
 
   await test.step('and a title is searchable, which is what put it in the index', async () => {
-    await page.getByRole('tab', { name: 'Explore' }).click()
-    await page.locator('#panel-explore').getByLabel('Search descriptions').fill('traversal')
-    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await openPanel(page, 'filters')
+    await page.locator('#filters-panel').getByLabel('Search descriptions').fill('traversal')
+    await page.getByRole('button', { name: 'List records' }).click()
     await expect(page.locator('[data-matches]')).toBeVisible({ timeout: 120_000 })
     // Not an assertion about *which* records match — the slice is whatever the
     // corpus holds — only that the two-column index answers at all.

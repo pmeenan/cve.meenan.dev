@@ -218,7 +218,38 @@ milestone that recorded it):
 not downloaded the corpus, on a slow connection or a phone; what the app does
 when chat's single GPU box is unavailable; and whether the tabs, the filter
 surface and the report builder read the way an analyst expects rather than the
-way they were built.
+way they were built. *The first and last of these are M9's subject.*
+
+## M9 — Workspace UI revamp  `in progress` (2026-08-09)
+
+The owner's decomposition of the experience work: reshape the app from five
+mechanism-named tabs into a data-exploration product (D-081), branded **CVE
+Explorer**.
+
+Scope, from the owner's direction:
+
+- **Landing view** for a visitor with no local copy: what the app is, what it
+  offers, one "Download CVE dataset" action. The capability gate and storage
+  preflight speak here, before the button.
+- **Single-pane workspace** once a copy exists: the report canvas front and
+  centre, chat beside it as the primary interaction, and collapsible panels
+  for filters, raw SQL, data management and saved reports.
+- **Chat populates the surfaces**: a model aggregate lands on the canvas and
+  fills the filter and SQL panels (hidden by default, editable) — the answer
+  is an editable report, not a terminal rendering.
+- **Never an empty canvas**: auto-run the most recent report, or CVEs by
+  severity over time on a first visit.
+- **Presentation control on the canvas**: chart-type switching suited to the
+  axes, legend show/hide per series, editable title and series display names.
+- **Copy paths for sharing**: chart to clipboard as PNG (title, subtitle and
+  legend drawn in), grid to clipboard as TSV + HTML for docs and Excel — every
+  cell formula-guarded (D-071), no attribution block (D-082).
+- **Test migration**: the e2e suite follows the UI it tests — a shared
+  selector map (`tests/e2e/ui.ts`) replaces per-spec locator duplication.
+
+Exit: `pnpm check` and `pnpm e2e` green on both engines against the new UI;
+the owner has used the deployed workspace and the remaining rough edges are
+recorded here rather than open-ended.
 
 ## M8 — Other model tiers: BYO keys and in-browser local  `parked` (2026-08-09)
 

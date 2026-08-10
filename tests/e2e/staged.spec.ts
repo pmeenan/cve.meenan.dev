@@ -2,6 +2,8 @@ import { expect, test, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
 
+import { awaitIdle, downloadButton, openPanel } from './ui'
+
 import type { Manifest, Timings } from '../../lib/protocol'
 
 /**
@@ -30,7 +32,7 @@ test('an interrupted download resumes and never destroys the live copy', async (
   await page.goto('/')
   await requireLocalStorage(page)
   const first = await test.step('a first, complete download', async () => {
-    await page.getByRole('button', { name: 'Download data', exact: true }).click()
+    await startDownload(page)
     const timings = await importedTimings(page)
     expect(timings.chunksFetched).toBe(timings.chunksTotal)
     expect(timings.chunksTotal).toBeGreaterThan(1)
@@ -39,19 +41,26 @@ test('an interrupted download resumes and never destroys the live copy', async (
 
   const rows = await test.step('and it answers a query', async () => {
     await page.getByRole('button', { name: 'Run query' }).click()
-    await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-    return await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
+    await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+      timeout: 120_000,
+    })
+    return await page
+      .locator('#data-panel table.results tbody tr')
+      .first()
+      .locator('td')
+      .nth(1)
+      .innerText()
   })
 
   await test.step('a download that dies partway leaves the live copy usable', async () => {
     // `?stop=1` aborts after one chunk has landed and been recorded — the same
     // state a closed laptop would leave behind.
     await page.goto('/?stop=1')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Re-download data' }).click()
-    await expect(page.locator('.error')).toContainText('stopAfterChunks', { timeout: 180_000 })
+    await expect(page.locator('[data-error]')).toContainText('stopAfterChunks', {
+      timeout: 180_000,
+    })
 
     // The button still offers a *re*-download, which is the UI saying a local
     // copy is still there. M1's import would have truncated it by now.
@@ -63,11 +72,15 @@ test('an interrupted download resumes and never destroys the live copy', async (
     await expect(page.locator('.notice')).toContainText('The MITRE Corporation')
 
     await page.getByRole('button', { name: 'Run query' }).click()
-    await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+    await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+      timeout: 120_000,
+    })
     // The same count as before the failed download. Only one generation is
     // reachable locally, so this cannot tell the old copy from a hypothetical
     // different correct one — it does catch a truncated or partial database.
-    await expect(page.locator('.results tbody tr').first().locator('td').nth(1)).toHaveText(rows)
+    await expect(
+      page.locator('#data-panel table.results tbody tr').first().locator('td').nth(1)
+    ).toHaveText(rows)
 
     // The Import panel from the earlier successful run must not survive: its
     // "OPFS footprint" row omits the staged file this failure just left behind,
@@ -82,9 +95,7 @@ test('an interrupted download resumes and never destroys the live copy', async (
 
   await test.step('resuming refetches only the chunks that are missing', async () => {
     await page.goto('/')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Re-download data' }).click()
     const resumed = await importedTimings(page)
 
@@ -97,22 +108,24 @@ test('an interrupted download resumes and never destroys the live copy', async (
     // Asserted as an exact entry set rather than a byte ceiling: a ceiling says
     // only that some number stayed small, and the tightest leak it must catch —
     // one un-swept slot — clears it by under 10%.
-    await awaitIdle(page)
+    await awaitIdle(page, 300_000)
     await page.goto('/no-such-page')
     expect(await opfsEntries(page)).toEqual(['cve-b.sqlite'])
   })
 
   await test.step('the promoted copy is the one being queried', async () => {
     await page.goto('/')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     // A fresh page, and therefore a fresh Worker, proves the promotion is on
     // disk rather than in the importing Worker's head: discovery has to find
     // the live slot by itself, from the file headers (D-061).
     await page.getByRole('button', { name: 'Run query' }).click()
-    await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-    await expect(page.locator('.results tbody tr').first().locator('td').nth(1)).toHaveText(rows)
+    await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+      timeout: 120_000,
+    })
+    await expect(
+      page.locator('#data-panel table.results tbody tr').first().locator('td').nth(1)
+    ).toHaveText(rows)
   })
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
@@ -130,35 +143,34 @@ test('clearing removes a half-finished download, not just the live copy', async 
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   await importedTimings(page)
   // Before navigating away: the download continues into a catch-up and a KEV
   // refresh, and killing the Worker mid-transaction leaves a journal beside the
   // live file that the exact-set assertion below would count as an extra entry.
-  await awaitIdle(page)
+  await awaitIdle(page, 300_000)
 
   await page.goto('/?stop=1')
-  await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-    timeout: 60_000,
-  })
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Re-download data' }).click()
-  await expect(page.locator('.error')).toContainText('stopAfterChunks', { timeout: 180_000 })
+  await expect(page.locator('[data-error]')).toContainText('stopAfterChunks', { timeout: 180_000 })
 
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-a.sqlite', 'cve-b.sqlite', 'staging.json'])
 
   await page.goto('/')
   // Wait for the page to *report* the local copy before clearing it. Clicking
-  // straight after the navigation is a trap: the button already reads "Download
-  // data" before the first status arrives, so an assertion on that label passes
-  // instantly and the next navigation kills the Worker mid-clear.
-  await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-    timeout: 60_000,
-  })
+  // straight after the navigation is a trap: navigating away too soon kills
+  // the Worker mid-clear. `openDataControls` waits for the workspace to come
+  // up idle — a status message arrived and a copy is live — before opening
+  // the panel that holds the Clear button.
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Clear local copy' }).click()
-  await expect(page.getByRole('button', { name: 'Download data', exact: true })).toBeVisible({
-    timeout: 60_000,
-  })
+  await expect(page.getByRole('button', { name: 'Download CVE dataset', exact: true })).toBeVisible(
+    {
+      timeout: 60_000,
+    }
+  )
 
   await page.goto('/no-such-page')
   // Nothing of ours survives — not the live slot, not the staged one, not the
@@ -169,7 +181,7 @@ test('clearing removes a half-finished download, not just the live copy', async 
   // And the record is gone in the sense that matters: the next download has
   // nothing to resume and fetches everything.
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   const restarted = await importedTimings(page)
   expect(restarted.chunksFetched).toBe(restarted.chunksTotal)
 
@@ -189,9 +201,9 @@ test('a copy under M1’s name is adopted, then retired by the first promotion',
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   await importedTimings(page)
-  await awaitIdle(page)
+  await awaitIdle(page, 300_000)
 
   // Rewrite the local copy into what M1 left behind: the legacy file name and
   // no promotion counter. Done from a page with no Worker, because the live
@@ -216,11 +228,11 @@ test('a copy under M1’s name is adopted, then retired by the first promotion',
 
   await test.step('it is adopted rather than swept', async () => {
     await page.goto('/')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Run query' }).click()
-    await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+    await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+      timeout: 120_000,
+    })
   })
 
   await test.step('and the first promotion retires it', async () => {
@@ -229,7 +241,7 @@ test('a copy under M1’s name is adopted, then retired by the first promotion',
     // One generation on disk, not two: the legacy copy is gone and the slot it
     // was staged beside is the only database left.
     expect(timings.opfsBytes!).toBeLessThan(timings.rawBytes * 2)
-    await awaitIdle(page)
+    await awaitIdle(page, 300_000)
     await page.goto('/no-such-page')
     expect(await opfsEntries(page)).toEqual(['cve-a.sqlite'])
   })
@@ -251,9 +263,9 @@ test('a discovery failure leaves the local copy alone', async ({ page }) => {
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   await importedTimings(page)
-  await awaitIdle(page)
+  await awaitIdle(page, 300_000)
 
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-a.sqlite'])
@@ -278,8 +290,11 @@ test('a discovery failure leaves the local copy alone', async ({ page }) => {
   // in the *other* slot is no reason to take the user's database away from
   // them. What it does cost is the sweep.
   await expect(page.locator('main')).toHaveAttribute('data-status', 'ready')
+  await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
 
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-a.sqlite', 'cve-b.sqlite'])
@@ -291,11 +306,11 @@ test('a discovery failure leaves the local copy alone', async ({ page }) => {
     await root.removeEntry('cve-b.sqlite')
   })
   await page.goto('/')
-  await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-    timeout: 60_000,
-  })
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
 })
@@ -315,11 +330,18 @@ test('a resume record that outlived its file is discarded, not believed', async 
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   const first = await importedTimings(page)
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  const rows = await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  const rows = await page
+    .locator('#data-panel table.results tbody tr')
+    .first()
+    .locator('td')
+    .nth(1)
+    .innerText()
 
   // A record claiming every chunk but the first has already been staged into a
   // file that does not exist at all.
@@ -352,9 +374,7 @@ test('a resume record that outlived its file is discarded, not believed', async 
   })
 
   await page.goto('/')
-  await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-    timeout: 60_000,
-  })
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Re-download data' }).click()
   const redone = await importedTimings(page)
 
@@ -365,8 +385,12 @@ test('a resume record that outlived its file is discarded, not believed', async 
   // Wait for the rows first: `toHaveText` carries Playwright's 5 s default, and
   // the first query after a full-corpus import spends ~9 s warming the page
   // cache — a ceiling D-052 says this project does not have.
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  await expect(page.locator('.results tbody tr').first().locator('td').nth(1)).toHaveText(rows)
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  await expect(
+    page.locator('#data-panel table.results tbody tr').first().locator('td').nth(1)
+  ).toHaveText(rows)
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
 })
@@ -392,11 +416,18 @@ test('sidecars beside a staging slot are cleared before its bytes are reused', a
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   const first = await importedTimings(page)
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  const rows = await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  const rows = await page
+    .locator('#data-panel table.results tbody tr')
+    .first()
+    .locator('td')
+    .nth(1)
+    .innerText()
 
   // The state an aborted index build leaves behind, followed by a rotation: a
   // sidecar beside the staging slot, and a resume record that keeps the slot
@@ -440,24 +471,24 @@ test('sidecars beside a staging slot are cleared before its bytes are reused', a
   expect(await opfsEntries(page)).toContain('cve-b.sqlite-mj0a1b2c3d')
 
   await page.goto('/')
-  await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-    timeout: 60_000,
-  })
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Re-download data' }).click()
   const redone = await importedTimings(page)
   expect(redone.records).toBe(first.records)
 
   // Gone, and the promoted database answers the same query.
-  await awaitIdle(page)
+  await awaitIdle(page, 300_000)
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-b.sqlite'])
   await page.goto('/')
-  await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-    timeout: 60_000,
-  })
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  await expect(page.locator('.results tbody tr').first().locator('td').nth(1)).toHaveText(rows)
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  await expect(
+    page.locator('#data-panel table.results tbody tr').first().locator('td').nth(1)
+  ).toHaveText(rows)
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
 })
@@ -483,11 +514,18 @@ test('a slot whose header claims a promotion SQLite cannot confirm is not live',
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   await importedTimings(page)
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  const rows = await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  const rows = await page
+    .locator('#data-panel table.results tbody tr')
+    .first()
+    .locator('td')
+    .nth(1)
+    .innerText()
 
   await page.goto('/no-such-page')
   await page.evaluate(async () => {
@@ -506,9 +544,14 @@ test('a slot whose header claims a promotion SQLite cannot confirm is not live',
   await page.goto('/')
   // The real copy is still what the page reports and queries.
   await expect(page.locator('main')).toHaveAttribute('data-status', 'ready', { timeout: 60_000 })
+  await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  await expect(page.locator('.results tbody tr').first().locator('td').nth(1)).toHaveText(rows)
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  await expect(
+    page.locator('#data-panel table.results tbody tr').first().locator('td').nth(1)
+  ).toHaveText(rows)
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
 })
@@ -529,7 +572,7 @@ test('a crash during index building resumes at the index build, not the download
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   const first = await importedTimings(page)
 
   // Reconstruct the state a kill during index building leaves: every chunk on
@@ -574,9 +617,7 @@ test('a crash during index building resumes at the index build, not the download
   })
 
   await page.goto('/')
-  await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-    timeout: 60_000,
-  })
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Re-download data' }).click()
   const resumed = await importedTimings(page)
 
@@ -586,7 +627,9 @@ test('a crash during index building resumes at the index build, not the download
   expect(resumed.records).toBe(first.records)
 
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
 })
@@ -605,9 +648,9 @@ test('a local copy that cannot be opened is reported unknown, not deleted', asyn
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   await importedTimings(page)
-  await awaitIdle(page)
+  await awaitIdle(page, 300_000)
 
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-a.sqlite'])
@@ -622,7 +665,7 @@ test('a local copy that cannot be opened is reported unknown, not deleted', asyn
 
   await page.goto('/')
   await expect(page.locator('main')).toHaveAttribute('data-status', 'unknown', { timeout: 60_000 })
-  await expect(page.locator('.error')).toContainText('unknown')
+  await expect(page.locator('[data-error]')).toContainText('unknown')
 
   // Still there. "I could not read it" is not a licence to delete it.
   await page.goto('/no-such-page')
@@ -657,11 +700,18 @@ test('a counter on a corpus with no client-built indexes does not win discovery'
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   await importedTimings(page)
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  const rows = await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  const rows = await page
+    .locator('#data-panel table.results tbody tr')
+    .first()
+    .locator('td')
+    .nth(1)
+    .innerText()
 
   await page.goto('/no-such-page')
   await page.evaluate(async (base64: string) => {
@@ -675,9 +725,14 @@ test('a counter on a corpus with no client-built indexes does not win discovery'
 
   await page.goto('/')
   await expect(page.locator('main')).toHaveAttribute('data-status', 'ready', { timeout: 60_000 })
+  await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  await expect(page.locator('.results tbody tr').first().locator('td').nth(1)).toHaveText(rows)
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  await expect(
+    page.locator('#data-panel table.results tbody tr').first().locator('td').nth(1)
+  ).toHaveText(rows)
 
   await page.goto('/no-such-page')
   expect(await opfsEntries(page)).toEqual(['cve-a.sqlite'])
@@ -708,11 +763,18 @@ test('a high counter on a database this build would not serve does not win disco
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   await importedTimings(page)
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  const rows = await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  const rows = await page
+    .locator('#data-panel table.results tbody tr')
+    .first()
+    .locator('td')
+    .nth(1)
+    .innerText()
 
   await page.goto('/no-such-page')
   await page.evaluate(async (base64: string) => {
@@ -727,9 +789,14 @@ test('a high counter on a database this build would not serve does not win disco
   await page.goto('/')
   // The real copy is still live and still answers.
   await expect(page.locator('main')).toHaveAttribute('data-status', 'ready', { timeout: 60_000 })
+  await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  await expect(page.locator('.results tbody tr').first().locator('td').nth(1)).toHaveText(rows)
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
+  })
+  await expect(
+    page.locator('#data-panel table.results tbody tr').first().locator('td').nth(1)
+  ).toHaveText(rows)
 
   // And the decoy is reclaimed rather than promoted: it opened, so discovery
   // saw the whole picture and the sweep was safe to run.
@@ -756,7 +823,7 @@ test('a chunk that fails its checksum refuses the download, and the retry refetc
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   const first = await importedTimings(page)
   const rows = await queryFirstCell(page)
 
@@ -778,7 +845,9 @@ test('a chunk that fails its checksum refuses the download, and the retry refetc
 
   await test.step('the download is refused and says why', async () => {
     await page.getByRole('button', { name: 'Re-download data' }).click()
-    await expect(page.locator('.error')).toContainText('checksum mismatch', { timeout: 180_000 })
+    await expect(page.locator('[data-error]')).toContainText('checksum mismatch', {
+      timeout: 180_000,
+    })
     expect(corruptions).toBeGreaterThan(0)
   })
 
@@ -791,9 +860,7 @@ test('a chunk that fails its checksum refuses the download, and the retry refetc
   await test.step('the retry refetches the chunk that failed', async () => {
     await page.unroute(`**/${doomed}`)
     await page.goto('/')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Re-download data' }).click()
     const retried = await importedTimings(page)
 
@@ -832,17 +899,17 @@ test('a snapshot rotation mid-download starts over rather than stranding the cli
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   const first = await importedTimings(page)
   const rows = await queryFirstCell(page)
 
   await test.step('a download dies partway, leaving a staged generation behind', async () => {
     await page.goto('/?stop=1')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Re-download data' }).click()
-    await expect(page.locator('.error')).toContainText('stopAfterChunks', { timeout: 180_000 })
+    await expect(page.locator('[data-error]')).toContainText('stopAfterChunks', {
+      timeout: 180_000,
+    })
     await page.goto('/no-such-page')
     expect(await opfsEntries(page)).toContain('staging.json')
   })
@@ -870,9 +937,7 @@ test('a snapshot rotation mid-download starts over rather than stranding the cli
 
   await test.step('the stale staged copy is discarded, not resumed into', async () => {
     await page.goto('/')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     // Still usable while the origin has moved on: a rotation is not an outage.
     expect(await queryFirstCell(page)).toBe(rows)
 
@@ -887,7 +952,7 @@ test('a snapshot rotation mid-download starts over rather than stranding the cli
   })
 
   await test.step('and the origin ends holding one generation, with no stale record', async () => {
-    await awaitIdle(page)
+    await awaitIdle(page, 300_000)
     await page.goto('/no-such-page')
     expect(await opfsEntries(page)).toEqual(['cve-b.sqlite'])
   })
@@ -912,7 +977,7 @@ test('a download that stops receiving data is reported as stalled, not left spin
   const failures = watchForErrors(page)
 
   await page.goto('/')
-  await page.getByRole('button', { name: 'Download data', exact: true }).click()
+  await startDownload(page)
   const first = await importedTimings(page)
   const rows = await queryFirstCell(page)
 
@@ -934,12 +999,10 @@ test('a download that stops receiving data is reported as stalled, not left spin
 
   await test.step('the stall is named as a stall', async () => {
     await page.goto('/?stall=2000')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Re-download data' }).click()
 
-    const error = page.locator('.error')
+    const error = page.locator('[data-error]')
     await expect(error).toContainText('stalled', { timeout: 120_000 })
     // The distinction D-052 exists for, in the message itself.
     await expect(error).toContainText('rather than a slow one')
@@ -954,9 +1017,7 @@ test('a download that stops receiving data is reported as stalled, not left spin
     await page.unroute(`**/${doomed}`)
 
     await page.goto('/')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Re-download data' }).click()
     const resumed = await importedTimings(page)
     // The chunks that did land are still staged: a stall is a failed transfer,
@@ -977,18 +1038,18 @@ test('a download that stops receiving data is reported as stalled, not left spin
       await route.continue()
     })
     await page.goto('/?stall=5000')
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
-      timeout: 60_000,
-    })
+    await openDataControls(page)
     await page.getByRole('button', { name: 'Clear local copy' }).click()
-    await expect(page.getByRole('button', { name: 'Download data', exact: true })).toBeVisible({
+    await expect(
+      page.getByRole('button', { name: 'Download CVE dataset', exact: true })
+    ).toBeVisible({
       timeout: 60_000,
     })
-    await page.getByRole('button', { name: 'Download data', exact: true }).click()
+    await startDownload(page)
     const slow = await importedTimings(page)
     expect(slow.chunksFetched).toBe(slow.chunksTotal)
     expect(slow.records).toBe(first.records)
-    await expect(page.locator('.error')).toHaveCount(0)
+    await expect(page.locator('[data-error]')).toHaveCount(0)
   })
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])
@@ -1005,36 +1066,64 @@ async function snapshotChunks(page: Page): Promise<string[]> {
 }
 
 /**
+ * Start the first download of this origin from the landing view's CTA — the
+ * workspace and its Data panel do not exist until a copy is usable. Waiting
+ * out `pending` first keeps the click from racing the Worker's first status.
+ */
+async function startDownload(page: Page): Promise<void> {
+  await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
+    timeout: 60_000,
+  })
+  await downloadButton(page).click()
+}
+
+/**
+ * Wait for the workspace to report the live copy, then open the Data panel —
+ * where the re-download, demo-query and clear controls live since the UI
+ * revamp. The idle wait asserts the same facts the old "Re-download data is
+ * enabled" wait did: a status message arrived, a copy is live, and the Worker
+ * is not busy (which also covers the report the canvas auto-runs when a copy
+ * first becomes ready in a page load).
+ */
+async function openDataControls(page: Page): Promise<void> {
+  await awaitIdle(page, 60_000)
+  await openPanel(page, 'data')
+}
+
+/**
  * Run the demo query and return one cell of it — the cheapest proof that the
  * database on disk is the corpus and not a truncated or half-written copy.
  */
 async function queryFirstCell(page: Page): Promise<string> {
+  // Idle first: right after an import the canvas's auto-run report is still
+  // in flight, and a click dispatched into the disabled→enabled re-render is
+  // a click the swapped-in button can miss.
+  await awaitIdle(page, 60_000)
+  await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
-  return await page.locator('.results tbody tr').first().locator('td').nth(1).innerText()
-}
-
-/** Everything the origin holds in OPFS, read from a page that runs no Worker. */
-/**
- * Wait until the Worker has finished everything an import kicks off.
- *
- * `imported` is no longer the end of the operation: a download continues into a
- * catch-up and then a KEV refresh (M6), and both write to the *live* database.
- * Listing OPFS before they finish catches a rollback journal mid-transaction —
- * which is not a leaked generation, but is enough to fail an exact-set
- * assertion, and navigating away at that moment leaves the journal behind for
- * real. So the entry-set assertions wait for the app to be idle first.
- *
- * Idle is read from a control the page disables while the Worker is busy,
- * rather than from a progress string: `busy` is derived from the phase, so this
- * is the same fact the UI uses.
- */
-async function awaitIdle(page: Page): Promise<void> {
-  await expect(page.getByRole('button', { name: 'Sync', exact: true })).toBeEnabled({
-    timeout: 300_000,
+  await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+    timeout: 120_000,
   })
+  return await page
+    .locator('#data-panel table.results tbody tr')
+    .first()
+    .locator('td')
+    .nth(1)
+    .innerText()
 }
 
+/**
+ * Everything the origin holds in OPFS, read from a page that runs no Worker.
+ *
+ * The entry-set assertions call `awaitIdle` (ui.ts) before listing: `imported`
+ * is not the end of the operation — a download continues into a catch-up and
+ * then a KEV refresh (M6), and both write to the *live* database. Listing OPFS
+ * before they finish catches a rollback journal mid-transaction — which is not
+ * a leaked generation, but is enough to fail an exact-set assertion, and
+ * navigating away at that moment leaves the journal behind for real. Idle is
+ * read from a control the page disables while the Worker is busy, so it is the
+ * same fact the UI uses.
+ */
 async function opfsEntries(page: Page): Promise<string[]> {
   return await page.evaluate(async () => {
     const root = (await navigator.storage.getDirectory()) as unknown as {
@@ -1063,6 +1152,10 @@ async function importedTimings(page: Page): Promise<Timings> {
       `OPFS ${timings.opfsBytes === null ? 'unmeasured' : `${(timings.opfsBytes / 1e6).toFixed(1)} MB`}, ` +
       `${(timings.totalMs / 1000).toFixed(1)} s total`,
   })
+  // Quiet before returning: the catch-up, KEV refresh and auto-run report all
+  // follow an import, and a click dispatched into one of their busy flickers
+  // lands on a disabled button and is swallowed — the run-2 failure mode.
+  await awaitIdle(page, 60_000)
   return timings
 }
 

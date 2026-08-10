@@ -5,6 +5,15 @@
   --muted: #5b6070;
   --line: #dfe2ea;
   --accent: #1f6feb;
+  /* Link text gets its own token: the accent measures 4.36:1 on --surface,
+     under the 4.5:1 text floor, and darkening the accent itself would change
+     the primary buttons. 5.50:1 on --surface, 5.85:1 on --bg (measured). */
+  --link: #1a5fd0;
+  /* Surfaces for the workspace's cards and drawers — one step off the page in
+     each scheme, so a panel reads as a place rather than a border. */
+  --surface: #f7f8fa;
+  --surface-2: #eef0f4;
+  --shadow: 0 1px 2px rgb(16 24 40 / 6%), 0 8px 24px rgb(16 24 40 / 6%);
 
   /* --- The severity ramp (M4) ------------------------------------------
      An *ordinal* encoding, not a categorical one: LOW → CRITICAL is an
@@ -51,6 +60,11 @@
     --muted: #9aa1b1;
     --line: #262a33;
     --accent: #6ea8ff;
+    /* 7.30:1 on the dark --surface — the accent itself passes there. */
+    --link: #6ea8ff;
+    --surface: #16191f;
+    --surface-2: #1c2027;
+    --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px rgb(0 0 0 / 35%);
 
     --sev-4: #faa080;
     --sev-3: #ed6f4c;
@@ -76,9 +90,9 @@
 
 body {
   margin: 0;
-  padding: 2rem 1.5rem 4rem;
+  padding: 0;
   font:
-    16px/1.55 ui-sans-serif,
+    15px/1.55 ui-sans-serif,
     system-ui,
     -apple-system,
     'Segoe UI',
@@ -88,30 +102,297 @@ body {
 }
 
 main {
-  max-width: 60rem;
+  max-width: 110rem;
   margin: 0 auto;
+  padding: 0 1.25rem 3rem;
 }
 
 h1 {
-  font-size: 1.6rem;
-  margin: 0 0 0.35rem;
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+  margin: 0;
 }
 
 h2 {
-  font-size: 1.05rem;
-  margin: 2rem 0 0.6rem;
+  font-size: 1.02rem;
+  margin: 0 0 0.6rem;
 }
 
-.lede {
-  color: var(--muted);
-  max-width: 46rem;
-  margin: 0 0 1.5rem;
+h3 {
+  font-size: 0.95rem;
+  margin: 1.4rem 0 0.4rem;
 }
 
 .muted {
   color: var(--muted);
   font-size: 0.9rem;
 }
+
+/* --- The top bar -------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.25rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 0.8rem;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.brand .domain {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.panel-toggles {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.panel-toggles button[aria-expanded='true'] {
+  background: var(--surface-2);
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+.status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 1.5rem;
+  margin-bottom: 0.6rem;
+}
+
+.status-strip p {
+  margin: 0.1rem 0;
+  font-size: 0.8rem;
+}
+
+/* --- The landing view --------------------------------------------------- */
+
+.landing {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 2.5rem 0 1rem;
+}
+
+.hero-kicker {
+  color: var(--muted);
+  font-size: 0.85rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin: 0 0 0.5rem;
+}
+
+.hero-title {
+  font-size: clamp(1.6rem, 3.4vw, 2.4rem);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.9rem;
+  max-width: 34ch;
+}
+
+.hero-lede {
+  color: var(--muted);
+  font-size: 1.05rem;
+  max-width: 46rem;
+  margin: 0 0 1.6rem;
+}
+
+.hero-cta {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.2rem;
+}
+
+.hero-cta button {
+  font-size: 1.02rem;
+  padding: 0.7rem 1.4rem;
+}
+
+.hero-cta .muted {
+  max-width: 22rem;
+  margin: 0;
+}
+
+.features {
+  display: grid;
+  /* Two by two, not auto-fit: four cards in an auto-fit three-column grid
+     leave the last one alone on its own row, which reads as a mistake. */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
+  margin: 2rem 0 1.5rem;
+}
+
+@media (max-width: 40rem) {
+  .features {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.feature {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+
+.feature h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.98rem;
+}
+
+.feature p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* --- The workspace grid -------------------------------------------------
+   Three columns where there is room: filter drawer, canvas, chat. The drawer
+   and the chat column drop out of the grid as their state and the viewport
+   dictate; the canvas always remains, because it is the app. */
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.workspace[data-chat-open='1'] {
+  grid-template-columns: minmax(0, 1fr) minmax(20rem, 26rem);
+}
+
+.workspace:has(#filters-panel) {
+  grid-template-columns: minmax(17rem, 21rem) minmax(0, 1fr);
+}
+
+.workspace[data-chat-open='1']:has(#filters-panel) {
+  grid-template-columns: minmax(17rem, 21rem) minmax(0, 1fr) minmax(20rem, 26rem);
+}
+
+.side-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+  position: sticky;
+  top: 0.8rem;
+  max-height: calc(100vh - 1.6rem);
+  overflow-y: auto;
+}
+
+.canvas-col {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.bottom-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+
+/* On narrow screens everything stacks, and the chat column becomes a sheet. */
+@media (max-width: 68rem) {
+  .workspace,
+  .workspace[data-chat-open='1'],
+  .workspace:has(#filters-panel),
+  .workspace[data-chat-open='1']:has(#filters-panel) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .side-panel {
+    position: static;
+    max-height: none;
+  }
+
+  .workspace .chat {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    z-index: 10;
+    box-shadow: -8px 0 24px rgb(0 0 0 / 20%);
+  }
+}
+
+/* --- The canvas ---------------------------------------------------------- */
+
+.canvas {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.25rem 1.25rem;
+  box-shadow: var(--shadow);
+  min-width: 0;
+}
+
+.canvas-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.25rem;
+  margin-bottom: 0.6rem;
+}
+
+/* The title is an input styled as a heading: editing it is the common path
+   for a chart headed somewhere public. The border appears on focus/hover so
+   at rest it reads as a title, not a form. */
+.canvas-title {
+  font: inherit;
+  font-size: 1.25rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0.15rem 0.4rem;
+  margin-left: -0.4rem;
+  flex: 1 1 16rem;
+  min-width: 12rem;
+}
+
+.canvas-title:hover {
+  border-color: var(--line);
+}
+
+.canvas-title:focus {
+  border-color: var(--accent);
+  outline: none;
+  background: var(--bg);
+}
+
+.canvas-tools {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.canvas-tools .field {
+  font-size: 0.78rem;
+}
+
+/* --- Controls ------------------------------------------------------------ */
 
 .controls {
   display: flex;
@@ -121,12 +402,16 @@ h2 {
 
 button {
   font: inherit;
-  padding: 0.5rem 0.95rem;
-  border-radius: 6px;
+  font-size: 0.92rem;
+  padding: 0.45rem 0.9rem;
+  border-radius: 7px;
   border: 1px solid var(--accent);
   background: var(--accent);
   color: #fff;
   cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
 }
 
 button.quiet {
@@ -135,29 +420,38 @@ button.quiet {
   color: var(--muted);
 }
 
+button.quiet:hover:not(:disabled) {
+  border-color: var(--muted);
+  color: var(--fg);
+}
+
 button:disabled {
   opacity: 0.45;
   cursor: default;
 }
 
 .progress {
-  margin-top: 1.25rem;
+  margin: 1rem 0;
 }
 
-.bar {
+/* Scoped to the progress widget on purpose: CSS geometry properties apply to
+   SVG in every current engine, so a bare `.bar { height: 6px }` also squashes
+   the chart's `rect.bar` marks to six pixels — the height *attribute* loses
+   to any CSS rule (RE-035). */
+.progress .bar {
   height: 6px;
   border-radius: 3px;
   background: var(--line);
   overflow: hidden;
 }
 
-.fill {
+.progress .fill {
   height: 100%;
   background: var(--accent);
   transition: width 0.2s ease;
 }
 
-.fill[data-indeterminate='true'] {
+.progress .fill[data-indeterminate='true'] {
   animation: pulse 1.2s ease-in-out infinite;
 }
 
@@ -252,7 +546,7 @@ td {
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-size: 0.82rem;
-  max-width: 46rem;
+  max-width: 60rem;
 }
 
 /* --- M3: the filter surface and the SQL console ------------------------- */
@@ -261,9 +555,6 @@ td {
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
-  padding: 0.9rem 1rem;
-  border: 1px solid var(--line);
-  border-radius: 8px;
 }
 
 .filters .row {
@@ -289,7 +580,7 @@ td {
   color: var(--fg);
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 6px;
   padding: 0.3rem 0.45rem;
 }
 
@@ -302,7 +593,7 @@ fieldset {
   flex-wrap: wrap;
   gap: 0.15rem 0.8rem;
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 6px;
   padding: 0.3rem 0.7rem 0.5rem;
   margin: 0;
 }
@@ -328,7 +619,7 @@ legend {
 }
 
 .outcome {
-  margin-top: 1rem;
+  margin-top: 0.5rem;
 }
 
 /* A result cell that is prose, not a value: the one place the table is allowed
@@ -366,6 +657,13 @@ details.sql {
   color: var(--muted);
 }
 
+details.sql summary,
+details.share summary,
+details.series-labels summary,
+details.filter-disclosure summary {
+  cursor: pointer;
+}
+
 /* The support channel (D-009). Closed by default and visually quiet, because
    it is for the day something is wrong — but a real disclosure widget, so it
    is keyboard-operable and announced without any code of ours. */
@@ -373,8 +671,9 @@ details.diagnostics {
   margin-top: 1.2rem;
   padding: 0.6rem 0.9rem;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 8px;
   font-size: 0.85rem;
+  background: var(--bg);
 }
 
 details.diagnostics > summary {
@@ -393,12 +692,13 @@ details.sql pre {
   border-radius: 6px;
   font-size: 0.82rem;
   color: var(--fg);
+  background: var(--bg);
 }
 
 .sql-input {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.85rem;
-  width: min(100%, 60rem);
+  width: 100%;
   resize: vertical;
 }
 
@@ -408,40 +708,13 @@ details.sql pre {
   text-overflow: ellipsis;
 }
 
-/* --- M4: the tabbed workspace, reports, charts and the detail view ------- */
-
-.tabs {
-  display: flex;
-  gap: 0.25rem;
-  flex-wrap: wrap;
-  margin: 1.5rem 0 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.tab {
-  background: transparent;
-  border: 1px solid transparent;
-  border-bottom: none;
-  border-radius: 6px 6px 0 0;
-  color: var(--muted);
-  padding: 0.45rem 0.9rem;
-  margin-bottom: -1px;
-}
-
-.tab.selected {
-  color: var(--fg);
-  border-color: var(--line);
-  background: var(--bg);
-  font-weight: 600;
-}
-
-/* Focus has to be visible on a tablist: the roving tabindex means the browser's
-   own outline is the only thing telling a keyboard user where they are. */
-.tab:focus-visible,
+/* Focus must be visible everywhere the keyboard can land. */
 button:focus-visible,
 a:focus-visible,
 summary:focus-visible,
-[role='tabpanel']:focus-visible {
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -449,11 +722,7 @@ summary:focus-visible,
 .tab-badge {
   margin-left: 0.4rem;
   font-size: 0.78rem;
-  color: var(--muted);
-}
-
-[role='tabpanel'] {
-  padding-top: 0.5rem;
+  opacity: 0.8;
 }
 
 /* --- Filter chips ------------------------------------------------------- */
@@ -463,7 +732,7 @@ summary:focus-visible,
   flex-wrap: wrap;
   gap: 0.35rem;
   list-style: none;
-  margin: 0;
+  margin: 0 0 0.6rem;
   padding: 0;
 }
 
@@ -473,6 +742,7 @@ summary:focus-visible,
   gap: 0.35rem;
   font-size: 0.82rem;
   border: 1px solid var(--line);
+  background: var(--bg);
   border-radius: 999px;
   padding: 0.15rem 0.3rem 0.15rem 0.65rem;
   max-width: 32rem;
@@ -490,6 +760,7 @@ summary:focus-visible,
   border-style: dashed;
   color: var(--muted);
   padding-right: 0.65rem;
+  background: transparent;
 }
 
 .chip-clear {
@@ -507,7 +778,6 @@ summary:focus-visible,
 }
 
 .filter-disclosure summary {
-  cursor: pointer;
   color: var(--muted);
 }
 
@@ -524,8 +794,27 @@ summary:focus-visible,
   gap: 0.4rem;
 }
 
-.export-actions {
-  margin-top: 0.9rem;
+details.share {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+details.share > .actions {
+  margin-top: 0.6rem;
+}
+
+details.series-labels {
+  margin: 0.5rem 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.series-labels-inner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.2rem;
+  padding: 0.5rem 0;
 }
 
 .permalink {
@@ -567,10 +856,10 @@ summary:focus-visible,
   font-family: inherit;
 }
 
-/* A hairline in the page background separates adjacent stacked bands even
+/* A hairline in the panel background separates adjacent stacked bands even
    where two ramp steps are closest, and lifts a bar off the gridlines. */
 .chart .bar {
-  stroke: var(--bg);
+  stroke: var(--surface);
   stroke-width: 0.75;
 }
 
@@ -584,7 +873,7 @@ summary:focus-visible,
 .legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.3rem 1rem;
+  gap: 0.3rem 0.8rem;
   list-style: none;
   padding: 0;
   margin: 0.5rem 0 0;
@@ -598,12 +887,39 @@ summary:focus-visible,
   gap: 0.35rem;
 }
 
+/* A legend entry that is a control: same reading, plus state. A hidden series
+   dims and strikes through — colour alone must not carry the state. */
+.legend-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0.1rem 0.4rem;
+  color: inherit;
+  font-size: inherit;
+}
+
+.legend-toggle:hover {
+  border-color: var(--line);
+}
+
+.legend li[data-series-hidden] .legend-toggle {
+  text-decoration: line-through;
+  opacity: 0.55;
+}
+
 .swatch {
   display: inline-block;
   width: 0.8rem;
   height: 0.8rem;
-  border-radius: 2px;
+  border-radius: 3px;
   border: 1px solid var(--line);
+}
+
+.swatch[data-swatch-hidden] {
+  background: transparent !important;
 }
 
 .chart-data caption {
@@ -656,7 +972,7 @@ ul.plain.columns {
 button.link {
   background: transparent;
   border: none;
-  color: var(--accent);
+  color: var(--link);
   padding: 0;
   font: inherit;
   text-align: left;
@@ -666,10 +982,11 @@ button.link {
 /* --- The per-CVE detail view -------------------------------------------- */
 
 .detail {
-  margin: 1rem 0;
+  margin: 0 0 1rem;
   padding: 1rem 1.1rem;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 10px;
+  background: var(--bg);
 }
 
 .detail-head {
@@ -720,47 +1037,29 @@ button.link {
 }
 
 .refs a {
-  color: var(--accent);
+  color: var(--link);
 }
 
-/* --- The chat side panel (M7) ------------------------------------------
-   A panel docked to the right of the page, not a tab, so a question can be
-   asked about whatever the reader is looking at without leaving it. It
-   collapses to a full-width sheet on narrow screens, where "beside" is not a
-   thing a phone has.
-
-   Everything inside it renders through the components the Report and Explore
-   tabs use, so this file adds *layout* and nothing about how a chart, a table
-   or a record row looks. A second set of visual rules here is how the same
-   number would come to look like two different things (D-044). */
-.tabs-row {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 1rem;
-}
+/* --- The chat column (M7, revamped) -------------------------------------
+   The workspace's third pane on a wide screen, a full-height sheet on a
+   narrow one (see the media query in the workspace section). Everything
+   inside it renders through the components the canvas uses, so this file adds
+   *layout* and nothing about how a chart, a table or a record row looks. A
+   second set of visual rules here is how the same number would come to look
+   like two different things (D-044). */
 
 .chat {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(38rem, 46vw);
   display: flex;
   flex-direction: column;
-  background: var(--bg);
-  border-left: 1px solid var(--line);
-  box-shadow: -8px 0 24px rgb(0 0 0 / 8%);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
   padding: 0 1rem 1rem;
   overflow: hidden;
-  z-index: 10;
-}
-
-@media (max-width: 60rem) {
-  .chat {
-    width: 100%;
-    border-left: none;
-  }
+  position: sticky;
+  top: 0.8rem;
+  max-height: calc(100vh - 1.6rem);
+  min-height: 24rem;
 }
 
 .chat-head {
@@ -774,7 +1073,7 @@ button.link {
 
 .chat-head h2 {
   margin: 0;
-  font-size: 1.05rem;
+  font-size: 1.02rem;
 }
 
 /* The scroller. `min-height: 0` is load-bearing in a flex column: without it
@@ -788,14 +1087,23 @@ button.link {
 }
 
 .chat-turn {
-  border-bottom: 1px solid var(--line);
   padding-bottom: 0.75rem;
   margin-bottom: 0.75rem;
 }
 
+/* The reader's own words as a bubble on the right — the conversational shape.
+   Model output stays flat and full-width: it carries charts and tables, and a
+   bubble would squeeze the one thing the reader came to see. */
 .chat-question {
-  font-weight: 600;
-  margin: 0.5rem 0;
+  font-weight: 500;
+  margin: 0.5rem 0 0.5rem auto;
+  max-width: 85%;
+  width: fit-content;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 12px 12px 3px 12px;
+  padding: 0.45rem 0.8rem;
+  white-space: pre-wrap;
 }
 
 /* Model prose. `pre-wrap` because the model writes newlines and nothing here
@@ -838,6 +1146,11 @@ button.link {
 
 .small {
   font-size: 0.85rem;
+}
+
+/* Copy affordances answer where they were clicked, quietly. */
+[data-copy-note] {
+  margin: 0.2rem 0;
 }
 
 /* A label that a screen reader announces and nothing else shows. The clip-path

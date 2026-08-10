@@ -2,6 +2,8 @@ import { expect, test, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
 
+import { awaitIdle, downloadButton, openPanel } from './ui'
+
 /**
  * Multi-tab, as full support rather than honest degradation (M5, owner
  * decision 2026-08-08).
@@ -26,27 +28,47 @@ async function settled(page: Page): Promise<void> {
 }
 
 /**
- * The button is labelled "Download data" the first time and "Re-download data"
- * afterwards, and an accessible-name regex is case-sensitive — so `/Download
- * data/` silently matches nothing on a tab that already has a copy, which is
- * the whole second half of this test.
+ * The first download starts from the landing view's CTA; every later one is
+ * the Data panel's "Re-download data" button inside the workspace — two
+ * different surfaces since the UI revamp, so two helpers rather than one
+ * label regex.
  */
-const DOWNLOAD = /^(Re-)?download data$/i
-
 async function download(page: Page): Promise<void> {
-  await page.getByRole('button', { name: DOWNLOAD }).click()
+  await downloadButton(page).click()
   await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+  // Quiet before returning: the catch-up and auto-run report follow an
+  // import, and their busy flickers can swallow a click on a disabled button.
+  await awaitIdle(page, 60_000)
+}
+
+/**
+ * A re-download from a ready workspace. The Import heading is already on
+ * screen from the previous import, so completion is waited on as a *change*
+ * to the recorded timings — capture, click, wait for a different payload —
+ * rather than on a heading that would match instantly.
+ */
+async function redownload(page: Page): Promise<void> {
+  await openPanel(page, 'data')
+  const before = await page.locator('.timings').getAttribute('data-json')
+  await page.getByRole('button', { name: 'Re-download data' }).click()
+  await expect(page.locator('.timings')).not.toHaveAttribute('data-json', before ?? '', {
+    timeout: 300_000,
+  })
+  await awaitIdle(page, 60_000)
 }
 
 /** Wait for a tab to finish whatever it is doing, so the next step is not a race. */
 async function idle(page: Page): Promise<void> {
-  await expect(page.getByRole('button', { name: DOWNLOAD })).toBeEnabled({ timeout: 300_000 })
+  await awaitIdle(page, 300_000)
 }
 
 /** The demo aggregate, which is the cheapest proof a tab can still answer. */
 async function query(page: Page): Promise<void> {
+  await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr').first()).toBeVisible({ timeout: 300_000 })
+  await expect(page.locator('#data-panel table.results tbody tr').first()).toBeVisible({
+    timeout: 300_000,
+  })
 }
 
 test('a second tab queries while the first writes, and follows the replacement', async ({
@@ -58,7 +80,16 @@ test('a second tab queries while the first writes, and follows the replacement',
   const watch = (page: Page, name: string) => {
     page.on('pageerror', (error) => failures.push(`${name}: ${error}`))
     page.on('console', (message) => {
-      if (message.type() === 'error') failures.push(`${name}: ${message.text()}`)
+      if (message.type() !== 'error') return
+      // sqlite3's OPFS async proxy logs its own console.error when an open
+      // hits a file the other tab just replaced — the exact window the
+      // promotion protocol exists to handle, and the reader tab recovers by
+      // reopening (M5). Since the canvas auto-runs a report the moment a tab
+      // is ready (D-081), the non-writing tab now queries *during* that
+      // window routinely. The app-level assertions below are what verify the
+      // recovery; the proxy's own logging of the transient is not a failure.
+      if (/opfs.*(async error|async-proxy)/i.test(message.text())) return
+      failures.push(`${name}: ${message.text()}`)
     })
   }
 
@@ -156,7 +187,7 @@ test('a second tab queries while the first writes, and follows the replacement',
       return names.filter((name) => name.startsWith('cve-')).sort()
     })
 
-    await download(a)
+    await redownload(a)
 
     // B re-reports without being touched: `data-run` is not enough here,
     // because the revision may be unchanged — what changed is which file it

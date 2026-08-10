@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
 
+import { awaitIdle, downloadButton, openPanel } from './ui'
+
 import { SEARCH_INDEXES } from '../../lib/search'
 
 /**
@@ -36,10 +38,15 @@ test('imports, queries, and survives a reload', async ({ page }) => {
 
   await page.goto('/')
   await requireLocalStorage(page)
-  await expect(page.getByRole('heading', { name: 'cve.meenan.dev' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'CVE Explorer' })).toBeVisible()
 
   await test.step('import', async () => {
-    await page.getByRole('button', { name: /Download data/ }).click()
+    // The landing view's CTA — the workspace and its Data panel do not exist
+    // until the import below produces a usable copy.
+    await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
+      timeout: 60_000,
+    })
+    await downloadButton(page).click()
 
     // Building the indexes is 90% of an import — 9 s on the development slice,
     // 65 s on the full corpus — so D-052 puts it above the line where silence
@@ -60,6 +67,9 @@ test('imports, queries, and survives a reload', async ({ page }) => {
     // placeholder an unmeasurable phase renders.
     await expect(page.locator('.progress .fill')).toHaveAttribute('data-indeterminate', 'false')
 
+    // The Import heading lives inside the Data panel, which opens itself on
+    // the import that filled it — so this asserts the import and the panel
+    // behaviour at once.
     await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
 
     const timings = await page.locator('.timings').innerText()
@@ -67,6 +77,9 @@ test('imports, queries, and survives a reload', async ({ page }) => {
   })
 
   await test.step('query', async () => {
+    // The catch-up, KEV refresh and auto-run report follow an import; a click
+    // dispatched into one of their busy flickers lands on a disabled button.
+    await awaitIdle(page)
     await page.getByRole('button', { name: 'Run query' }).click()
     // D-052: no latency ceiling, so this timeout is a stall detector and not a
     // budget. It has to be generous — against the full corpus the first query
@@ -76,12 +89,12 @@ test('imports, queries, and survives a reload', async ({ page }) => {
       timeout: 120_000,
     })
 
-    const rows = page.locator('.results tbody tr')
+    const rows = page.locator('#data-panel table.results tbody tr')
     await expect(rows).toHaveCount(15, { timeout: 120_000 })
 
     // A real aggregate over real records, not a fixture: three columns, and a
     // leading count that is a plausible number rather than zero.
-    const cells = page.locator('.results tbody tr').first().locator('td')
+    const cells = page.locator('#data-panel table.results tbody tr').first().locator('td')
     await expect(cells).toHaveCount(3)
     expect(Number(await cells.nth(1).innerText())).toBeGreaterThan(0)
   })
@@ -148,13 +161,23 @@ test('imports, queries, and survives a reload', async ({ page }) => {
 
   await test.step('persistence, notice included (D-008)', async () => {
     await page.reload()
-    // No download this time: the button reports an existing local copy, and the
-    // query runs against what OPFS kept.
-    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+    // No download this time: the page comes straight back up ready, and the
+    // query runs against what OPFS kept. The Data panel is closed after a
+    // reload — it opens itself only on an import — so open it, and check that
+    // its download button reports an existing local copy ("Re-download", not
+    // "Download"). The generous enabled-timeout covers the report the canvas
+    // auto-runs when a copy first becomes ready.
+    await expect(page.locator('main')).toHaveAttribute('data-status', 'ready', {
       timeout: 30_000,
     })
+    await openPanel(page, 'data')
+    await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
+      timeout: 120_000,
+    })
     await page.getByRole('button', { name: 'Run query' }).click()
-    await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+    await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+      timeout: 120_000,
+    })
 
     // The notice has to survive the reload, not just the import. A returning
     // visitor's page never receives an `imported` message, so if the notice
@@ -167,13 +190,15 @@ test('imports, queries, and survives a reload', async ({ page }) => {
 
   await test.step('clearing removes the copy and everything derived from it', async () => {
     await page.getByRole('button', { name: 'Clear local copy' }).click()
-    await expect(page.getByRole('button', { name: 'Download data', exact: true })).toBeVisible({
-      timeout: 60_000,
-    })
-    // Stale panels next to a "Download data" button are the UI asserting
-    // something false about what is on disk.
+    // With the copy gone the workspace gives way to the landing view, whose
+    // CTA says "Download", not "Re-download": the UI reporting no local copy.
+    await expect(
+      page.getByRole('button', { name: 'Download CVE dataset', exact: true })
+    ).toBeVisible({ timeout: 60_000 })
+    // Stale panels next to a download CTA are the UI asserting something
+    // false about what is on disk.
     await expect(page.locator('.timings')).toHaveCount(0)
-    await expect(page.locator('.results')).toHaveCount(0)
+    await expect(page.locator('#data-panel table.results')).toHaveCount(0)
     await expect(page.locator('.notice')).toHaveCount(0)
   })
 

@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
+import { awaitIdle, importCorpus, openPanel } from './ui'
 
 /**
  * The CISA KEV overlay, in a browser (M6, D-010, D-076).
@@ -45,8 +46,7 @@ test.describe('CISA KEV overlay', () => {
     test.skip(!(await catalogPresent(page)), 'this data plane serves no kev.json')
 
     await test.step('the corpus downloads and the catalog rides along', async () => {
-      await page.getByRole('button', { name: /Download data/ }).click()
-      await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+      await importCorpus(page, 300_000)
       // The line is its own, beside but distinct from the corpus's: two datasets
       // on two cadences, so one number for both would be wrong about whichever
       // moved last.
@@ -63,19 +63,18 @@ test.describe('CISA KEV overlay', () => {
       // presented as this spec waiting ten minutes for a Run button that was
       // never going to enable. Asserted here, with a short timeout, so that
       // failure is thirty seconds and a sentence rather than a test timeout
-      // with no obvious cause.
-      await expect(page.getByRole('button', { name: 'Sync', exact: true })).toBeEnabled({
-        timeout: 30_000,
-      })
+      // with no obvious cause. (The auto-run report holds Sync disabled for a
+      // moment after readiness, so this also waits that out.)
+      await awaitIdle(page, 30_000)
     })
 
     await test.step('membership is filterable and the counts agree (M3’s pattern)', async () => {
-      await page.getByRole('tab', { name: 'Explore' }).click()
+      await openPanel(page, 'filters')
       // Grouped count first, then the filter, then the two have to agree — the
       // check that would catch a filter and an aggregate disagreeing about what
       // "in KEV" means.
       await page.locator('#explore-group').selectOption('kev')
-      await page.getByRole('button', { name: 'Run', exact: true }).click()
+      await page.getByRole('button', { name: 'List records' }).click()
       const rows = page.locator('.results tbody tr')
       await expect(rows.first()).toBeVisible({ timeout: 180_000 })
       const grouped = await rows.first().innerText()
@@ -94,7 +93,7 @@ test.describe('CISA KEV overlay', () => {
         .getByLabel('In KEV (per CISA)', { exact: true })
         .check()
       await page.locator('#explore-group').selectOption('')
-      await page.getByRole('button', { name: 'Run', exact: true }).click()
+      await page.getByRole('button', { name: 'List records' }).click()
       await expect(page.locator('[data-matches]')).toHaveAttribute(
         'data-matches',
         String(listedCount),
@@ -103,10 +102,13 @@ test.describe('CISA KEV overlay', () => {
     })
 
     await test.step('a KEV × severity report renders reconciled with its table', async () => {
-      await page.getByRole('tab', { name: 'Report' }).click()
+      // One form now drives both shapes (UI revamp), so the KEV membership
+      // filter checked above would knock the "Not in KEV" band off this chart.
+      // Clear it first: the report must see the whole denominator.
+      await page.getByRole('button', { name: 'Reset filters' }).click()
       await page.locator('#report-rows').selectOption('kev')
       await page.locator('#report-series').selectOption('severity')
-      await page.getByRole('button', { name: /Run report/ }).click()
+      await page.getByRole('button', { name: 'Run report' }).click()
       const chart = page.locator('[data-chart]')
       await expect(chart).toBeVisible({ timeout: 180_000 })
       // Both membership bands on the chart. A KEV chart showing only the listed
@@ -119,9 +121,13 @@ test.describe('CISA KEV overlay', () => {
 
     await test.step('the detail view renders the KEV block under the reference hardening', async () => {
       // The listed record is found through the KEV filter rather than named, so
-      // this works against either data plane.
-      await page.getByRole('tab', { name: 'Explore' }).click()
-      await page.getByRole('button', { name: 'Run', exact: true }).click()
+      // this works against either data plane — re-checked here because the
+      // report step reset the shared form.
+      await page
+        .getByRole('group', { name: 'CISA KEV', exact: true })
+        .getByLabel('In KEV (per CISA)', { exact: true })
+        .check()
+      await page.getByRole('button', { name: 'List records' }).click()
       const first = page.locator('.results.records tbody button').first()
       await expect(first).toBeVisible({ timeout: 180_000 })
       await first.click()
@@ -182,6 +188,10 @@ test.describe('CISA KEV overlay', () => {
       // the copy — which is what makes it honest offline (D-048). The reopen is
       // the real claim, and it needs the shell's worker *controlling*, which
       // takes a second load by design — the trap offline.spec.ts documents.
+      // The reload *is* that second load: waiting for the first page to become
+      // controlled without one depends on the engine's claim timing, and
+      // Firefox sat past 60 s while busy with the post-import work.
+      await page.reload()
       await page.waitForFunction(() => navigator.serviceWorker?.controller !== null, undefined, {
         timeout: 60_000,
       })
@@ -207,12 +217,15 @@ test.describe('CISA KEV overlay', () => {
     await requireLocalStorage(page)
     test.skip(!(await catalogPresent(page)), 'this data plane serves no kev.json')
 
-    await page.getByRole('button', { name: /Download data/ }).click()
-    await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+    // The data panel opens itself on the import that filled it, which is where
+    // "Refresh KEV" and "Run query" live now.
+    await importCorpus(page, 300_000)
     const line = page.locator('[data-kev]')
     await expect(line).toBeVisible({ timeout: 300_000 })
     const before = await line.getAttribute('data-kev')
     expect(before).not.toBe('none')
+    // Wait out the auto-run report: its busy window holds every button disabled.
+    await awaitIdle(page, 60_000)
 
     await test.step('the origin starts refusing the catalog', async () => {
       // `page.route` sees the Worker's requests, which is what M2's failure
@@ -263,12 +276,12 @@ test.describe('CISA KEV overlay', () => {
     // the one where answering "nothing is known to be exploited" would be a
     // finding rather than a missing feature.
     await page.route('**/data/kev.json', (route) => route.abort())
-    await page.getByRole('button', { name: /Download data/ }).click()
-    await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+    await importCorpus(page, 300_000)
+    await awaitIdle(page, 60_000)
 
-    await page.getByRole('tab', { name: 'Explore' }).click()
+    await openPanel(page, 'filters')
     await page.locator('#explore-group').selectOption('kev')
-    await page.getByRole('button', { name: 'Run', exact: true }).click()
+    await page.getByRole('button', { name: 'List records' }).click()
     // By name, and actionable: the message says what to do and that nothing
     // else about the copy is affected.
     await expect(page.locator('[data-error="1"]')).toContainText('no CISA KEV catalog', {
@@ -277,22 +290,20 @@ test.describe('CISA KEV overlay', () => {
     await expect(page.locator('[data-error="1"]')).toContainText('Refresh KEV')
 
     await test.step('and every other KEV surface refuses the same way', async () => {
-      // The Explore path is not the only gate. A report, an export and the
+      // The record-list path is not the only gate. A report, an export and the
       // detail view each reach the table by a different route, and the detail
       // view is the sharpest: without its own check *every* record on a
       // catalog-less copy would die with `no such table` — which is the
       // "makes the overlay's absence look like a broken record" failure its
       // own comment names.
-      await page.getByRole('tab', { name: 'Report' }).click()
       await page.locator('#report-rows').selectOption('kev')
-      await page.getByRole('button', { name: /Run report/ }).click()
+      await page.getByRole('button', { name: 'Run report' }).click()
       await expect(page.locator('[data-error="1"]')).toContainText('no CISA KEV catalog', {
         timeout: 120_000,
       })
 
-      await page.getByRole('tab', { name: 'Explore' }).click()
       await page.locator('#explore-group').selectOption('')
-      await page.getByRole('button', { name: 'Run', exact: true }).click()
+      await page.getByRole('button', { name: 'List records' }).click()
       const first = page.locator('.results.records tbody button').first()
       await expect(first).toBeVisible({ timeout: 180_000 })
       await first.click()
@@ -303,7 +314,7 @@ test.describe('CISA KEV overlay', () => {
 
     await test.step('while every other query still works', async () => {
       await page.locator('#explore-group').selectOption('severity')
-      await page.getByRole('button', { name: 'Run', exact: true }).click()
+      await page.getByRole('button', { name: 'List records' }).click()
       await expect(page.locator('.results tbody tr').first()).toBeVisible({
         timeout: 180_000,
       })

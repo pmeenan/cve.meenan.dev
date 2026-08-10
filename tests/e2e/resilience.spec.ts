@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test'
 
 import { SUPPORT_FLOOR } from '../../lib/capabilities'
 
+import { downloadButton, importCorpus } from './ui'
+
 /**
  * The gate, the quota preflight and the diagnostics panel (M5).
  *
@@ -15,6 +17,10 @@ import { SUPPORT_FLOOR } from '../../lib/capabilities'
  * That is worth doing because there is no telemetry (D-009): whatever these
  * paths say on screen is the entire support channel, and a message nobody has
  * ever read is a message nobody can act on.
+ *
+ * All three run on the landing view (UI revamp): the gate and the preflight
+ * fire before there is a usable copy, and the diagnostics disclosure renders
+ * there as well as in the workspace's data panel.
  */
 
 test('a browser below the floor is stopped at the gate, not mid-download', async ({ page }) => {
@@ -52,9 +58,9 @@ test('a browser below the floor is stopped at the gate, not mid-download', async
   // The reassurance a dead end owes: nothing was fetched and nothing was
   // changed. Both are true because the gate runs before the manifest.
   await expect(gate).toContainText('nothing on this machine has been changed')
-  // And the button is not merely useless — it is disabled, so the message is
-  // the end of the interaction rather than the start of a failed download.
-  await expect(page.getByRole('button', { name: /Download data/ })).toBeDisabled()
+  // And the landing CTA is not merely useless — it is disabled, so the message
+  // is the end of the interaction rather than the start of a failed download.
+  await expect(downloadButton(page)).toBeDisabled()
 })
 
 test('a download that cannot fit is refused before a byte of it is fetched', async ({ page }) => {
@@ -76,7 +82,7 @@ test('a download that cannot fit is refused before a byte of it is fetched', asy
   await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
     timeout: 120_000,
   })
-  await page.getByRole('button', { name: /Download data/ }).click()
+  await downloadButton(page).click()
 
   const error = page.locator('[data-error]')
   await expect(error).toBeVisible({ timeout: 120_000 })
@@ -93,12 +99,9 @@ test('a download that cannot fit is refused before a byte of it is fetched', asy
 test('the diagnostics panel reports what a bug report needs', async ({ page }) => {
   test.setTimeout(300_000)
 
-  await page.goto('/')
-  await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
-    timeout: 120_000,
-  })
-  await page.getByRole('button', { name: /Download data/ }).click()
-  await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+  // After the import the workspace's data panel has opened itself, and the
+  // diagnostics disclosure renders inside it — same hooks as on the landing view.
+  await importCorpus(page, 300_000)
 
   const panel = page.locator('[data-diagnostics]')
   // Closed by default: it is for the day something is wrong.

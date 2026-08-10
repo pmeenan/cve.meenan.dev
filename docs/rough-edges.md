@@ -22,6 +22,61 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-035: CSS geometry properties beat SVG attributes, so a generic `.bar { height: 6px }` squashed every chart bar  (2026-08-09, status: fixed)
+
+**Environment.** Chromium and Firefox (SVG2 geometry properties as CSS,
+shipped in both for years). Present since M4 shipped the charts beside M1's
+progress bar.
+
+**Repro.** The progress widget styled `.bar { height: 6px }`; the chart's
+stacked/grouped marks are `<rect class="bar" height="82">`. CSS geometry
+properties apply to SVG elements, and a CSS rule outranks a *presentation
+attribute* — so every bar rendered six pixels tall at its correct `y`, reading
+as a floating strip at each segment's top edge.
+
+**Observed vs expected.** DOM inspection showed correct `height` attributes
+(22/76/82 units); the rendered picture showed ~6 px strips. Expected: the
+attribute to draw. Nothing failed programmatically — the e2e suite asserts
+`rect.bar` counts and the data table's numbers, never rendered geometry, so
+this survived M4→M9 invisibly and was caught only by looking at a screenshot
+(M9's visual pass).
+
+**Impact / fix.** Scoped the widget rules to `.progress .bar` / `.progress
+.fill` (app/globals.css). The general lesson: never share a bare class name
+between HTML layout CSS and SVG mark classes — geometry styling crosses that
+boundary silently, and no selector-based test will notice.
+
+## RE-034: A Playwright click dispatched into a busy-flicker window lands on a disabled button and is silently swallowed  (2026-08-09, status: worked-around)
+
+**Environment.** Playwright 1.x (Chromium project), any React UI that renders
+`disabled={busy}` where `busy` flips several times in quick succession — here,
+the post-import sequence (catch-up sync, KEV refresh, canvas auto-run report)
+after the M9 revamp.
+
+**Repro / measurement.** `staged.spec.ts` clicking "Run query" immediately
+after the Import timings appeared. Two full-suite runs failed on *different*
+tests with the identical signature — the click "succeeded", the handler never
+ran, and the expected result table polled at 0 elements for 120 s. Each failing
+test passed in isolation.
+
+**Observed.** Playwright's actionability check sees the button enabled during a
+gap between busy windows, then dispatches the events; by dispatch time React
+has re-rendered the button `disabled`, and the browser drops clicks on disabled
+buttons entirely. Playwright does not re-check after dispatch, so the test
+believes the click happened.
+
+**Expected.** Either the click errors, or it lands. A swallowed click that
+reports success is the worst of both.
+
+**Impact / workaround.** Any spec clicking a workspace control right after an
+import (or a reload, which re-fires the auto-run) is exposed. Worked around
+centrally: `ui.ts`'s `importCorpus` and the per-spec import helpers end with
+`awaitIdle`, and `awaitIdle` requires the idle state to *hold* across two
+samples 300 ms apart — a single "Sync enabled" sample can land in the
+effect-tick gap between two busy windows with more work still queued, which is
+how the race outlived the first workaround. If a new spec bypasses those
+helpers, it inherits the race — idle first, then click.
+
 ## RE-033: fts5 issues `PRAGMA data_version` itself, so a SQLite authorizer that denies PRAGMA denies all full-text search  (2026-08-08, status: fixed)
 
 **Environment.** SQLite 3.53.0 (`@sqlite.org/sqlite-wasm` in the browser,

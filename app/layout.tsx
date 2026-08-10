@@ -2,8 +2,9 @@ import type { Metadata } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'cve.meenan.dev',
-  description: 'Browser-based search and analysis over the complete CVE List.',
+  title: 'CVE Explorer',
+  description:
+    'CVE Explorer — browser-based search, analysis and AI chat over the complete CVE List.',
 }
 
 /**

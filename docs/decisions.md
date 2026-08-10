@@ -27,6 +27,69 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-082: MITRE attribution lives in the application UI, not in what a user copies out  (2026-08-10, status: accepted; scopes D-008's copy rule)
+
+**Decision (owner, 2026-08-10).** The D-008 notice obligation is discharged
+where *we* emit CVE data: the served artifacts (database, manifest, deltas —
+pipeline-enforced) and the application UI (the persistent footer). What a user
+copies out of the app — a chart PNG, a clipboard grid — carries **no**
+attribution block. It is their report from an investigation, a derivative work
+the CVE terms already license them to make; how they attribute it onward is
+theirs to decide, not something the app stamps on.
+
+**Context.** A review read D-008 as requiring the complete copyright and
+license text on every copied artifact, which would have put a paragraph of
+legal text into every pasted grid and a full-notice band into every chart
+image. The owner rejected that direction and the compact-attribution
+middle-ground alike: aggregated counts and a rendered chart are not a copy of
+the corpus, and the copy path is a sharing feature, not a distribution channel
+of ours.
+
+**What stays.** The M4 file exports (CSV/JSON) keep the canonical notice they
+have carried since they shipped — they can contain full record text, which is
+the case the notice is actually for, and the owner's rationale ("a report, not
+the underlying data") does not cover a record dump. The pipeline's
+refuse-to-publish-without-notice guards are untouched.
+
+**Reopen if** MITRE's terms are re-read to require notice on user-derived
+renderings, or the copy path starts emitting record *text* wholesale rather
+than derived numbers and drawings.
+
+## D-081: The UI is a landing gate and a single-pane workspace with chat primary  (2026-08-09, status: accepted; replaces M4's five-tab shape)
+
+**Decision.** The app has two top-level states. With no usable local copy it
+renders a **landing view**: a pitch for what the product does and one action,
+"Download CVE dataset". With a copy it renders a **workspace**: one report
+canvas at the centre, the chat column beside it as the primary way of asking
+questions, and everything else as collapsible panels off the header — Filters,
+SQL, Data, Saved. The canvas never opens empty: it auto-runs the reader's most
+recent report, or "CVEs by severity over time" on a first visit. A chat
+aggregate lands on the canvas and populates the filter and SQL panels
+automatically — the model's answer arrives as an *editable* report, not a
+terminal rendering. Presentation controls (chart type switching, legend
+show/hide, display renames, copy as PNG or TSV/HTML) are views of a result and
+never re-query; the complete numbers table and the backing SQL stay one step
+away on every result. The site is branded "CVE Explorer".
+
+**Context.** M4's tabs were organized by *mechanism* (Explore, Report, SQL) —
+the owner's 2026-08-09 direction is a data-exploration app organized around the
+question, with chat as the main interaction and shareable output (a copied
+chart, a pasted table) as a first-class product. The one-Worker constraint that
+motivated tabs (nothing may unmount the page, D-049) holds unchanged: panels
+collapse, the page never navigates.
+
+**Consequences.** Explore and Report stopped being separate surfaces — one
+filter form drives both an aggregate and a record list, which is the strongest
+form of M4's no-drift rule. The Data tab became a panel that opens itself after
+an import. Copied artifacts (PNG, TSV, HTML) are the user's own report and
+carry no attribution block (D-082). The e2e suite gained `tests/e2e/ui.ts` as
+the single selector map, which any future UI change should update first.
+
+**Reopen if** chat stops being the main way users reach answers (the panels are
+then the product and deserve the front seat back), or the auto-run default
+report turns out to cost more on a slow machine than the blank canvas it
+replaced.
+
 ## D-080: A full context is fitted by evicting old tool results, never by summarising them  (2026-08-09, status: accepted; extends D-044's grounding rule to the context window)
 
 **Decision.** When the conversation exceeds `CONTEXT_BUDGET_TOKENS` (18,000

@@ -78,11 +78,13 @@ affected docs. Until then, these govern.
 - **Apache-2.0, and dependencies must be license-compatible.** Every added
   dependency's license is verified from the package's own metadata before it
   lands, not assumed. (D-002)
-- **Every copy of CVE data carries MITRE's notice.** The CVE terms grant broad
-  reuse — derivative works included — on one condition: each copy reproduces
-  MITRE's copyright designation and the license. That covers served artifacts
-  and anything a user exports, so it is a functional requirement of those
-  features, not a footer. (D-008)
+- **Every copy of CVE data *we* emit carries MITRE's notice.** The CVE terms
+  grant broad reuse — derivative works included — on one condition: each copy
+  reproduces MITRE's copyright designation and the license. That covers the
+  served artifacts and the application UI, plus the file exports that carry
+  record text. What a user copies out (a chart PNG, a clipboard grid) is their
+  own derived report and carries no notice — that attribution is theirs to
+  manage. (D-008, scoped by D-082)
 - **Agents write, humans commit.** (D-001)
 
 ## Repository layout
@@ -150,6 +152,20 @@ build → commit loop, on-demand reviews, and the human commit gate.
    concluding.
 
 ## Current status
+
+**M9 in progress — the UI is now a landing gate plus a single-pane workspace
+(D-081), branded "CVE Explorer".** A visitor with no local copy gets a landing
+page with one "Download CVE dataset" action; with a copy, one report canvas
+sits at the centre with chat beside it as the primary interaction, and
+Filters / SQL / Data / Saved are collapsible panels off the header. The canvas
+never opens empty (most recent report, else severity-over-time), a chat
+aggregate lands on it as an *editable* report — populating the filter and SQL
+panels — and results copy out as PNG charts and TSV/HTML grids, formula-guarded
+per D-071 and attribution-free per D-082. Explore and Report merged into one filter
+form driving both an aggregate and a record list; the audit surfaces (full
+numbers table, backing SQL, provenance lines) are unchanged. The e2e suite's
+selector knowledge now lives in `tests/e2e/ui.ts` — update it first when the
+UI changes.
 
 **M7 complete — the AI chat layer is live.**
 Five read-only tools over the local corpus (`lib/tools.ts`), a same-origin PHP

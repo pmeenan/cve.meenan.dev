@@ -3,13 +3,16 @@ import { readFileSync } from 'node:fs'
 import { expect, test, type Browser, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
+import { awaitIdle, downloadButton, importCorpus, openPanel, openShare } from './ui'
 
 import { KEV_COLUMNS, RECORD_COLUMNS } from '../../lib/export'
 
 /**
  * M4's exit criteria in a browser: the owner's motivating question answered
  * entirely through the UI, charted and exportable, with REJECTED excluded by
- * default — plus each of the surfaces that question drags in.
+ * default — plus each of the surfaces that question drags in. Migrated to the
+ * single-pane workspace: the canvas replaces the Report tab, the filter drawer
+ * replaces both filter forms, and "List records" replaces Explore's Run.
  *
  * One import, then everything else. An import is the expensive part and OPFS is
  * scoped to the browser context, so a test per criterion would mean a download
@@ -19,35 +22,6 @@ import { KEV_COLUMNS, RECORD_COLUMNS } from '../../lib/export'
  */
 
 const FORMULA_LEAD = /^[=+\-@\t\r]/
-
-async function openTab(page: Page, name: string): Promise<void> {
-  // Enabled *first*. The tabs that need a corpus are disabled until the Worker
-  // reports one, and clicking across that transition landed a click the
-  // component had not wired up yet — reliably on Firefox, where the window is
-  // wider, and invisibly on Chromium.
-  //
-  // Waiting for enabled is necessary but not sufficient, and the retry below is
-  // not superstition: `ready` can go true, then briefly false again while the
-  // Worker settles a fresh profile's copy, and a click delivered inside that
-  // second window is dropped by a genuinely-disabled button. Observed on
-  // Firefox in "a permalink reproduces its report on a fresh browser profile",
-  // where the assertion saw `title="Download the corpus first"` return for five
-  // polls *after* the click. Retrying the click is right rather than merely
-  // convenient: a person who clicked and saw nothing happen would click again.
-  const tab = page.getByRole('tab', { name, exact: true })
-  await expect(tab).toBeEnabled({ timeout: 120_000 })
-  await expect(async () => {
-    await tab.click()
-    await expect(tab).toHaveAttribute('aria-selected', 'true', { timeout: 2_000 })
-  }).toPass({ timeout: 120_000 })
-}
-
-async function importCorpus(page: Page): Promise<void> {
-  await page.goto('/')
-  await requireLocalStorage(page)
-  await page.getByRole('button', { name: /Download data/ }).click()
-  await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
-}
 
 /** The answer counter currently on screen for a surface, or null if it is empty. */
 async function answered(page: Page, selector: string): Promise<string | null> {
@@ -61,7 +35,9 @@ async function answered(page: Page, selector: string): Promise<string | null> {
  *
  * The same reasoning as M3's `runFilters`: a report that finishes in
  * milliseconds may never render a progress bar, so waiting on one reads the
- * previous result and a dimension that never applied looks correct.
+ * previous result and a dimension that never applied looks correct. `data-run`
+ * is captured and waited on rather than assumed zero, because the canvas
+ * auto-runs a report of its own the first time a copy is ready.
  */
 async function runReport(page: Page): Promise<void> {
   const before = await answered(page, '[data-report-matches]')
@@ -70,6 +46,24 @@ async function runReport(page: Page): Promise<void> {
     .poll(
       async () => {
         const after = await answered(page, '[data-report-matches]')
+        return after !== null && after !== before
+      },
+      { timeout: 120_000 }
+    )
+    .toBe(true)
+}
+
+/**
+ * Run the current predicates as a record search — the filter drawer's
+ * "List records", which replaced Explore's Run — and wait for *this* answer.
+ */
+async function runRecords(page: Page): Promise<void> {
+  const before = await answered(page, '[data-matches]')
+  await page.locator('[data-list-records]').click()
+  await expect
+    .poll(
+      async () => {
+        const after = await answered(page, '[data-matches]')
         return after !== null && after !== before
       },
       { timeout: 120_000 }
@@ -102,11 +96,16 @@ async function seriesLabels(page: Page): Promise<string[]> {
   return out
 }
 
+/**
+ * Edit the report definition across its two homes: the title lives on the
+ * canvas (`#canvas-title`) and the chart type in the canvas toolbar, while the
+ * axes live in the filter drawer — which must be open (`openPanel`).
+ */
 async function setReport(
   page: Page,
   fields: { title?: string; rows?: string; series?: string; chart?: string }
 ): Promise<void> {
-  if (fields.title !== undefined) await page.locator('#report-title').fill(fields.title)
+  if (fields.title !== undefined) await page.locator('#canvas-title').fill(fields.title)
   if (fields.rows) await page.locator('#report-rows').selectOption({ label: fields.rows })
   if (fields.series !== undefined) {
     await page
@@ -175,8 +174,16 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
   browser,
 }) => {
   test.setTimeout(1_200_000)
-  await importCorpus(page)
-  await openTab(page, 'Report')
+  await page.goto('/')
+  await requireLocalStorage(page)
+  await importCorpus(page, 300_000)
+
+  // The canvas auto-runs a default report the first time a copy is ready, and
+  // the import is followed by a catch-up (M2). Wait both out, so the run
+  // counters below always compare against a settled workspace.
+  await expect(page.locator('[data-report-matches]')).toBeVisible({ timeout: 120_000 })
+  await awaitIdle(page, 120_000)
+  await openPanel(page, 'filters')
 
   /**
    * The founding question, in the shape D-046 benchmark item #1 asks it: CVE
@@ -225,8 +232,9 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
   })
 
   await test.step('the PUBLISHED-only default is shown, not implied (D-022)', async () => {
-    // The one filter that changes every number on screen. It is a chip in the
-    // same row as everything the user chose, and it is not removable.
+    // The one filter that changes every number on screen. It is a chip on the
+    // canvas in the same row as everything the user chose, and it is not
+    // removable.
     const chip = page.locator('[data-chip="state"]')
     await expect(chip).toContainText('PUBLISHED records only')
     await expect(chip.locator('button')).toHaveCount(0)
@@ -253,7 +261,8 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
   await test.step('vendor and product by severity, over the last two years', async () => {
     const from = new Date()
     from.setUTCFullYear(from.getUTCFullYear() - 2)
-    await page.locator('details.filter-disclosure summary').click()
+    // The date fields sit directly in the filter drawer now — the old
+    // disclosure is gone.
     await page.locator('#report-pub-from').fill(from.toISOString().slice(0, 10))
 
     for (const dimension of ['Vendor', 'Product']) {
@@ -296,6 +305,7 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
   await test.step('a CSV export carries the notice and is quoted throughout', async () => {
     await setReport(page, { title: 'Severity by month', rows: 'Month', chart: 'Stacked bars' })
     await runReport(page)
+    await openShare(page)
     const file = await exportFile(page, 'Export these numbers')
     expect(file.name).toBe('severity-by-month.csv')
 
@@ -334,6 +344,7 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
     // different, unrun definition. "Export these numbers" must stay attached
     // to the Worker-echoed report that produced the visible table.
     await page.locator('#report-rows').selectOption({ label: 'Year' })
+    await openShare(page)
     await page.locator('#export-format').selectOption('json')
     const file = await exportFile(page, 'Export these numbers')
     expect(file.name).toBe('severity-by-month.json')
@@ -353,22 +364,24 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
   })
 
   await test.step('a record export is the whole match set, not the page', async () => {
-    await openTab(page, 'Explore')
     // A filter that is certain to match in any generation of the corpus and
     // certain to be narrower than the on-screen cap of 100 — which is the
-    // difference this step exists to demonstrate.
-    //
-    // Scoped to the panel, not the page: `getByRole` skips the four hidden
-    // panels because they are out of the accessibility tree, but `getByLabel`
-    // is a DOM query and matches Explore's and Report's copies of the shared
-    // filter form alike.
-    await page.locator('#panel-explore').getByLabel('CRITICAL').check()
-    await page.getByRole('button', { name: 'Run', exact: true }).click()
-    await expect(page.locator('[data-matches]')).toBeVisible({ timeout: 120_000 })
+    // difference this step exists to demonstrate. Reset first, so the date
+    // filter from the vendor step does not narrow it further than intended.
+    await page.getByRole('button', { name: 'Reset filters' }).click()
+    // Scoped to the drawer, not the page: 'CRITICAL' also appears in the
+    // chart legend's 'Hide series: CRITICAL' toggles on the canvas, and
+    // `getByLabel` matches aria-labels too.
+    await page.locator('#filters-panel').getByLabel('CRITICAL').check()
+    await runRecords(page)
     const matches = Number(await page.locator('[data-matches]').getAttribute('data-matches'))
     expect(matches).toBeGreaterThan(100)
 
-    const file = await exportFile(page, 'Export records')
+    await openShare(page)
+    // One format select serves every export now, and the previous step left
+    // it on JSON — a CSV parse of a JSON export is what this guards against.
+    await page.locator('#export-format').selectOption('csv')
+    const file = await exportFile(page, 'Export matching records')
     const records = parseCsv(
       file.text
         .split('\r\n')
@@ -404,8 +417,7 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
 
   await test.step('a record opens in full, with its references held to an allowlist', async () => {
     await page.getByRole('button', { name: 'Reset filters' }).click()
-    await page.getByRole('button', { name: 'Run', exact: true }).click()
-    await expect(page.locator('[data-matches]')).toBeVisible({ timeout: 120_000 })
+    await runRecords(page)
 
     const first = page.locator('table.records tbody tr').first().locator('button.link')
     const cve = (await first.innerText()).trim()
@@ -437,23 +449,32 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
   await test.step('an identifier no record carries is answered, not failed', async () => {
     // "No record has that id" is an answer. Reporting it as an error sends the
     // reader looking for a broken app instead of a typo.
-    await page.locator('#explore-cve').fill('CVE-1999-0001')
-    await page.getByRole('button', { name: 'Run', exact: true }).click()
-    await expect(page.locator('[data-matches]')).toBeVisible({ timeout: 120_000 })
+    await page.locator('#report-cve').fill('CVE-1999-0001')
+    await runRecords(page)
+    await expect(page.locator('[data-matches]')).toBeVisible()
     await expect(page.locator('[data-error]')).toHaveCount(0)
   })
 
   // --- Saved reports, history, and permalinks -----------------------------
 
   await test.step('a saved report and the history survive a reload', async () => {
-    await openTab(page, 'Report')
+    // Clear the record-search predicates first, so the saved definition is the
+    // CWE spread and not the leftover CVE-id filter.
+    await page.getByRole('button', { name: 'Reset filters' }).click()
     await setReport(page, { title: 'CWE spread', rows: 'CWE', series: 'Severity' })
     await runReport(page)
+    await openShare(page)
     await page.locator('#report-save-name').fill('CWE spread')
     await page.getByRole('button', { name: 'Save report' }).click()
 
     await page.reload()
-    await openTab(page, 'Saved')
+    // The workspace header renders once the Worker reports the copy; the
+    // canvas then auto-runs the most recent report, which awaitIdle outlasts.
+    await expect(page.getByRole('button', { name: 'Sync', exact: true })).toBeVisible({
+      timeout: 120_000,
+    })
+    await awaitIdle(page, 120_000)
+    await openPanel(page, 'saved')
     // Not in the SQLite copy, which a re-download or a schema bump destroys
     // (D-013, D-068) — that is the whole reason these live in localStorage.
     await expect(page.locator('[data-saved]')).toBeVisible({ timeout: 120_000 })
@@ -461,19 +482,34 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
     await expect(page.locator('[data-recent]')).toBeVisible()
   })
 
-  await test.step('opening a saved report runs it', async () => {
+  await test.step('opening a saved report runs it on the canvas', async () => {
+    const before = await answered(page, '[data-report-matches]')
     await page.getByRole('button', { name: 'Open saved report: CWE spread' }).click()
-    await expect(page.getByRole('tab', { name: 'Report' })).toHaveAttribute('aria-selected', 'true')
-    await expect(page.locator('[data-report-matches]')).toBeVisible({ timeout: 120_000 })
-    await expect(page.locator('[data-report-title]')).toContainText('CWE spread')
+    await expect
+      .poll(
+        async () => {
+          const after = await answered(page, '[data-report-matches]')
+          return after !== null && after !== before
+        },
+        { timeout: 120_000 }
+      )
+      .toBe(true)
+    // The title heading became the canvas title input; it carries the saved
+    // definition's title, and flags it via data-report-title.
+    await expect(page.locator('#canvas-title')).toHaveValue('CWE spread')
+    await expect(page.locator('#canvas-title')).toHaveAttribute('data-report-title', '1')
   })
 
   await test.step('deleting a saved report removes it, and it stays gone', async () => {
-    await openTab(page, 'Saved')
+    await openPanel(page, 'saved')
     await page.getByRole('button', { name: 'Delete saved report: CWE spread' }).click()
     await expect(page.getByRole('button', { name: 'Open saved report: CWE spread' })).toHaveCount(0)
     await page.reload()
-    await openTab(page, 'Saved')
+    await expect(page.getByRole('button', { name: 'Sync', exact: true })).toBeVisible({
+      timeout: 120_000,
+    })
+    await awaitIdle(page, 120_000)
+    await openPanel(page, 'saved')
     await expect(page.getByRole('button', { name: 'Open saved report: CWE spread' })).toHaveCount(0)
   })
 
@@ -485,7 +521,7 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
    * its own `localStorage`, so nothing but the URL crosses.
    */
   await test.step('a permalink reproduces its report on a fresh browser profile', async () => {
-    await openTab(page, 'Report')
+    await openPanel(page, 'filters')
     await setReport(page, {
       title: 'Shared: CNA by severity',
       rows: 'CNA',
@@ -493,6 +529,7 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
       chart: 'Grouped bars',
     })
     await runReport(page)
+    await openShare(page)
     await page.getByRole('button', { name: 'Copy link' }).click()
     const link = await page.locator('input.permalink').inputValue()
 
@@ -510,18 +547,21 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
       await expect(fresh.locator('[data-link-pending]')).toBeVisible({ timeout: 120_000 })
       await expect(fresh.locator('[data-link-error]')).toHaveCount(0)
 
-      await fresh.getByRole('button', { name: /Download data/ }).click()
+      // The landing CTA, once the Worker has spoken — clicking across the
+      // pre-status render is the click ui.ts's importCorpus guards against.
+      await expect(fresh.locator('main')).not.toHaveAttribute('data-status', 'pending', {
+        timeout: 15_000,
+      })
+      await downloadButton(fresh).click()
 
-      // And then it runs itself, and takes the reader to it — which is what
-      // they asked for by following the link. Waiting on the Import panel would
-      // be waiting on something the app correctly hides at that moment.
+      // And then it runs itself on the canvas, and the pending fragment wins
+      // over the auto-run default report — which is what the reader asked for
+      // by following the link. Waiting on the Import heading would be waiting
+      // on a panel that opens beside the answer, not the answer.
       await expect(fresh.locator('[data-report-matches]')).toBeVisible({ timeout: 300_000 })
-      await expect(fresh.getByRole('tab', { name: 'Report' })).toHaveAttribute(
-        'aria-selected',
-        'true'
-      )
       await expect(fresh.locator('[data-revision]')).toBeVisible()
-      await expect(fresh.locator('#report-title')).toHaveValue('Shared: CNA by severity')
+      await expect(fresh.locator('#canvas-title')).toHaveValue('Shared: CNA by severity')
+      await openPanel(fresh, 'filters')
       await expect(fresh.locator('#report-rows')).toHaveValue('cna')
       await expect(fresh.locator('[data-link-pending]')).toHaveCount(0)
       // The same numbers, from a browser that shares nothing with this one but

@@ -12,6 +12,7 @@ import {
 import type { Dimension } from '../../lib/filters'
 
 import { requireLocalStorage } from './support'
+import { importCorpus, openChat, openPanel } from './ui'
 
 /**
  * The tool-calling benchmark (D-046), against the pinned model.
@@ -57,7 +58,10 @@ function record(entry: unknown): void {
  * what a person would read.
  */
 async function truth(page: Page, sql: string): Promise<(string | number | null)[][]> {
-  await page.getByRole('tab', { name: 'SQL' }).click()
+  await openPanel(page, 'sql')
+  // `fill` before every run, never trusting prior contents: the SQL panel
+  // auto-fills with the query of the last report or chat answer that ran
+  // while it was closed (UI revamp).
   await page.locator('textarea.sql-input').fill(sql)
   // `.count()` first, because on the first call of a page there is no result
   // yet — and `getAttribute` on a locator that matches nothing *waits* for it,
@@ -138,8 +142,8 @@ test.describe('D-046 tool-calling benchmark', () => {
 
     await page.goto('/')
     await requireLocalStorage(page)
-    await page.getByRole('button', { name: /Download data/ }).click()
-    await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 900_000 })
+    // `importCorpus` navigates again; the probe above only needs a loaded page.
+    await importCorpus(page, 900_000)
     // **And then wait for the catalog**, which the download rebuilds *after* the
     // import heading appears (`refreshKev`, workers/db.worker.ts). Without this
     // the first `page.reload()` below tore down the Worker mid-refresh, and
@@ -151,7 +155,8 @@ test.describe('D-046 tool-calling benchmark', () => {
     await expect(kevLine).toBeVisible({ timeout: 300_000 })
     await expect(kevLine).not.toHaveAttribute('data-kev', 'none', { timeout: 300_000 })
 
-    await page.getByRole('button', { name: 'Ask', exact: true }).click()
+    // The chat column auto-opens at this viewport; be explicit anyway.
+    await openChat(page)
     const consent = page.getByRole('button', { name: 'Turn chat on' })
     if (await consent.isVisible()) await consent.click()
 
@@ -171,11 +176,15 @@ test.describe('D-046 tool-calling benchmark', () => {
           // from the one a user asks first (D-046 scores the integration, not
           // the effect of context accumulating).
           await page.reload()
-          await page.getByRole('button', { name: 'Ask', exact: true }).click()
+          // The column reopens itself once the copy is ready; `openChat` waits
+          // for the workspace either way, and the consent flag survives the
+          // reload so the composer is what renders.
+          await openChat(page)
           await expect(page.getByLabel('Your question')).toBeEnabled({ timeout: 120_000 })
 
           await page.getByLabel('Your question').fill(question.ask)
-          await page.getByRole('button', { name: 'Ask', exact: true }).last().click()
+          // The submit button is unique now — the old header opener is gone.
+          await page.getByRole('button', { name: 'Ask', exact: true }).click()
           // The turn has to *exist* before its status can be polled. Without
           // this the poll below calls `.last().getAttribute()` on a locator
           // matching nothing, which does not time out inside `expect.poll` —

@@ -2,6 +2,8 @@ import { expect, test, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
 
+import { awaitIdle, downloadButton, openPanel } from './ui'
+
 import { DATA_ROOT } from '../../lib/protocol'
 
 /**
@@ -65,8 +67,16 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
   const revision = page.locator('[data-revision]')
 
   await test.step('download, which ends by catching up', async () => {
-    await page.getByRole('button', { name: /Download data/ }).click()
+    // The landing view's CTA; the Import heading is inside the Data panel,
+    // which opens itself on the import that filled it.
+    await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
+      timeout: 60_000,
+    })
+    await downloadButton(page).click()
     await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
+    // Quiet before anything is clicked: the catch-up and the canvas auto-run
+    // follow an import, and their busy flickers can swallow a click.
+    await awaitIdle(page)
 
     // The property: a download lands at `snapshot.rev`, and the head has moved
     // on daily since that generation was cut (D-058). Stopping there would
@@ -106,12 +116,15 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
     await page.getByRole('button', { name: 'Sync', exact: true }).click()
     await expect(revision).toContainText('already current', { timeout: 120_000 })
     await expect(revision).toHaveAttribute('data-revision', String(plane.head))
-    await expect(page.locator('.error')).toHaveCount(0)
+    await expect(page.locator('[data-error]')).toHaveCount(0)
   })
 
   await test.step('and the synced copy still answers a query', async () => {
+    await openPanel(page, 'data')
     await page.getByRole('button', { name: 'Run query' }).click()
-    await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 180_000 })
+    await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+      timeout: 180_000,
+    })
     await expect(page.locator('.notice')).toContainText('The MITRE Corporation')
   })
 
@@ -134,6 +147,13 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
  * about a corpus a delta has touched.
  */
 async function assertSearchable(page: Page): Promise<void> {
+  // After a reload the Data panel is closed; the demo query lives inside it.
+  // Idle first — a reload re-fires the canvas auto-run, whose busy window
+  // would otherwise swallow the click below.
+  await awaitIdle(page)
+  await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()
-  await expect(page.locator('.results tbody tr').first()).toBeVisible({ timeout: 180_000 })
+  await expect(page.locator('#data-panel table.results tbody tr').first()).toBeVisible({
+    timeout: 180_000,
+  })
 }

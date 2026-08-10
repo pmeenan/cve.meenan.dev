@@ -1,6 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
+import { importCorpus, openChat, openPanel } from './ui'
 
 /**
  * Containment: what a **fully compromised conversation** can reach (M7, D-044).
@@ -51,24 +52,36 @@ async function attacker(page: Page, rounds: string[][]): Promise<void> {
 async function ready(page: Page): Promise<void> {
   await page.goto('/')
   await requireLocalStorage(page)
-  await page.getByRole('button', { name: /Download data/ }).click()
-  await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
-  await page.getByRole('button', { name: 'Ask', exact: true }).click()
+  // `importCorpus` navigates again; the probe above only needs a loaded page.
+  await importCorpus(page, 300_000)
+  // The chat column auto-opens at this viewport, but that is state, not a given.
+  await openChat(page)
   const consent = page.getByRole('button', { name: 'Turn chat on' })
   if (await consent.isVisible()) await consent.click()
 }
 
 async function ask(page: Page, question: string): Promise<void> {
   await page.getByLabel('Your question').fill(question)
-  await page.getByRole('button', { name: 'Ask', exact: true }).last().click()
+  // The submit button is unique now — the old header 'Ask' opener is gone.
+  await page.getByRole('button', { name: 'Ask', exact: true }).click()
 }
 
 /** Count the records, through the console, so a write would be visible. */
 async function recordCount(page: Page): Promise<number> {
-  await page.getByRole('tab', { name: 'SQL' }).click()
+  await openPanel(page, 'sql')
+  // Always filled, never assumed: the SQL drawer auto-fills with the query of
+  // the last report, search or chat answer that ran while it was closed.
   await page.locator('textarea.sql-input').fill('SELECT count(*) AS n FROM cve')
+  const rows = page.locator('[data-console-rows]')
+  const before = (await rows.count()) ? await rows.getAttribute('data-run') : null
   await page.getByRole('button', { name: 'Run SQL' }).click()
-  await expect(page.locator('[data-console-rows]')).toBeVisible({ timeout: 120_000 })
+  // Wait for *this* run's answer, not whatever a previous call left on screen.
+  // Every poll arm returns rather than waiting on a locator (RE-032).
+  await expect
+    .poll(async () => ((await rows.count()) ? await rows.getAttribute('data-run') : null), {
+      timeout: 120_000,
+    })
+    .not.toBe(before)
   const text = (await page.locator('table.console tbody tr td').first().textContent()) ?? '0'
   return Number(text)
 }
@@ -108,8 +121,8 @@ test.describe('a compromised conversation', () => {
     const before = await recordCount(page)
     expect(before).toBeGreaterThan(0)
 
-    // No need to switch back from the SQL tab: the panel is docked beside the
-    // tabs rather than being one, which is the whole point of the shape.
+    // No need to close the SQL panel: chat is its own column beside the
+    // canvas, so both surfaces stay on screen at once — the point of the shape.
     await ask(page, 'delete everything')
 
     // Every one refused, and each refusal is *shown* — a reader has to be able
@@ -257,6 +270,9 @@ test.describe('a compromised conversation', () => {
     page,
     baseURL,
   }) => {
+    // Import + idle + consent + two stubbed exchanges: Firefox's slower
+    // import runs this right up against the 120 s default.
+    test.setTimeout(300_000)
     const external: string[] = []
     // `baseURL`, not `page.url()`: at the first request the page is still
     // `about:blank` and its origin is the string "null", which makes the

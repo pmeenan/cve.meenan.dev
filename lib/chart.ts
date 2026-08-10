@@ -306,6 +306,58 @@ function keyOf(value: unknown): string {
 }
 
 /**
+ * The model with some series hidden — the legend-toggle view (UI revamp).
+ *
+ * A *view* of the model, not a new query: the hidden series' counts leave the
+ * bars and the y-scale so the visible ones can be compared, but the full table
+ * below the chart still renders the complete model — the numbers are the audit
+ * channel and hiding a band must not hide its data. Rows are kept even when
+ * every visible value is zero, because a vanishing bucket would re-space the
+ * x-axis under the reader's toggle.
+ */
+export function visibleModel(model: ChartModel, hidden: ReadonlySet<string>): ChartModel {
+  if (hidden.size === 0) return model
+  const keptAt: number[] = []
+  const series = model.series.filter((entry, at) => {
+    const kept = !hidden.has(entry.key)
+    if (kept) keptAt.push(at)
+    return kept
+  })
+  let max = 0
+  let maxTotal = 0
+  let total = 0
+  const rows = model.rows.map((row) => {
+    const values = keptAt.map((at) => row.values[at] ?? 0)
+    const rowTotal = values.reduce((sum, value) => sum + value, 0)
+    for (const value of values) max = Math.max(max, value)
+    maxTotal = Math.max(maxTotal, rowTotal)
+    total += rowTotal
+    return { ...row, values, total: rowTotal }
+  })
+  return { ...model, rows, series, max, maxTotal, total }
+}
+
+/**
+ * The model with the reader's own series names.
+ *
+ * Display-only: the overrides never travel in a report definition or a
+ * permalink, and an override for a key the model does not hold is ignored
+ * rather than inventing a series. An empty or whitespace name falls back to
+ * the real label, because a blank legend entry is a swatch with no meaning.
+ */
+export function relabelModel(
+  model: ChartModel,
+  labels: Readonly<Record<string, string>>
+): ChartModel {
+  const overridden = model.series.map((entry) => {
+    const label = labels[entry.key]?.trim()
+    return label ? { ...entry, label } : entry
+  })
+  if (overridden.every((entry, at) => entry === model.series[at])) return model
+  return { ...model, series: overridden }
+}
+
+/**
  * Axis ticks at values a reader can hold in their head.
  *
  * 1, 2, 5 × a power of ten, chosen so there are about `count` of them. Without

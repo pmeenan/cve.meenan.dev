@@ -1,42 +1,21 @@
 'use client'
 
 /**
- * The filter surface: every confirmed filter axis, in one form (M3, refactored
- * for M4).
+ * The record tables (M3, refactored twice since).
  *
- * What M3 owed was that each axis is *queryable* and that a person can see it
- * answering, so this was a form and two tables. M4 kept the shape and moved two
- * things out: the form's fields are now the shared `FilterForm` that the Report
- * tab also uses, and the draft-to-`Filters` conversion is `lib/draft.ts`. Both
- * moved for the same reason — Explore and Report must not drift into
- * disagreeing about what an axis means, and a permalink has to be able to
- * populate a form as well as read one.
- *
- * What M4 added here is the drill-in: a CVE id in the record list is a button
- * that opens the per-CVE detail view, which is the only surface that reaches
- * the references and version ranges D-033 put in the schema.
+ * M4 made this file the Explore tab; the UI revamp dissolved that tab into the
+ * workspace — the filter form now lives in the filter drawer
+ * (`filters-panel.tsx`) and results render on the canvas. What remains here is
+ * what both the canvas and the chat panel share: the record list, the grouped
+ * table, and their copyable-grid forms. One renderer per shape, used
+ * everywhere a record row appears, so two surfaces cannot drift into
+ * disagreeing about what a column means (D-044).
  */
 
-import { useState } from 'react'
-
 import { bucketLabel as chartBucketLabel } from '@/lib/chart'
-import { draftToFilters, EMPTY_DRAFT, SORT_LABELS, type Draft } from '@/lib/draft'
-import {
-  DIMENSION_LABELS,
-  DIMENSIONS,
-  SEVERITY_LABELS,
-  type Dimension,
-  type SortKey,
-  type StateFilter,
-} from '@/lib/filters'
-import { EXPORT_LIMIT, type ExportFormat } from '@/lib/export'
-import type { CveDetail, QueryResult, SearchRequest, Unmatched } from '@/lib/protocol'
-
-import { Detail } from './detail'
-import { Field, FilterForm } from './filter-form'
-
-/** How many records a list asks for. Bounded again in the Worker (D-052 §4). */
-const PAGE_ROWS = 100
+import type { GridData } from '@/lib/clipboard'
+import { SEVERITY_LABELS, type Dimension, type StateFilter } from '@/lib/filters'
+import type { QueryResult, Unmatched } from '@/lib/protocol'
 
 export interface SearchOutcome {
   result: QueryResult
@@ -46,221 +25,7 @@ export interface SearchOutcome {
   state: StateFilter
 }
 
-export function Explore({
-  draft,
-  setDraft,
-  sort,
-  setSort,
-  disabled,
-  onRun,
-  onOpenRecord,
-  onExport,
-  outcome,
-  cancelledMs,
-  run,
-  detailId,
-  detail,
-  onCloseDetail,
-  exportNote,
-}: {
-  /**
-   * The filter draft, owned by the page (M7).
-   *
-   * Lifted out of this component so the chat panel can hand a `search_records`
-   * result to *this* surface — the one that renders records — instead of the
-   * report builder, which would show the same predicates as a year-by-year
-   * count. The alternative was a second record renderer in the chat panel,
-   * which is the parallel presentation path D-044 rules out.
-   */
-  draft: Draft
-  setDraft: (draft: Draft) => void
-  sort: SortKey
-  setSort: (sort: SortKey) => void
-  disabled: boolean
-  onRun: (request: SearchRequest) => void
-  onOpenRecord: (cveId: string) => void
-  onExport: (format: ExportFormat, request: SearchRequest) => void
-  outcome: SearchOutcome | null
-  cancelledMs: number | null
-  /** Answer counter — rendered as `data-run` so a test can wait for *this* one. */
-  run: number
-  detailId: string | null
-  detail: CveDetail | null | undefined
-  onCloseDetail: () => void
-  exportNote: string
-}) {
-  const [groupBy, setGroupBy] = useState<'' | Dimension>('')
-  const [format, setFormat] = useState<ExportFormat>('csv')
-  const request = (): SearchRequest => ({
-    filters: draftToFilters(draft),
-    groupBy: groupBy === '' ? null : groupBy,
-    sort,
-    limit: PAGE_ROWS,
-    // The count is a second query — over the whole corpus with no filters it is
-    // a scan — so it is asked for deliberately. It is worth it: "100 shown" of
-    // an unknown total is not an answer.
-    count: true,
-  })
-
-  return (
-    <section aria-labelledby="explore-heading">
-      <h2 id="explore-heading">Explore</h2>
-      <form
-        className="filters"
-        onSubmit={(event) => {
-          event.preventDefault()
-          onRun(request())
-        }}
-      >
-        <FilterForm draft={draft} onChange={setDraft} idPrefix="explore" />
-
-        <div className="row">
-          <Field label="Group by" id="explore-group">
-            <select
-              id="explore-group"
-              value={groupBy}
-              onChange={(event) => setGroupBy(event.target.value as '' | Dimension)}
-            >
-              <option value="">No grouping — list records</option>
-              {DIMENSIONS.map((dimension) => (
-                <option key={dimension} value={dimension}>
-                  {DIMENSION_LABELS[dimension]}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="Sort records by" id="explore-sort">
-            <select
-              id="explore-sort"
-              value={sort}
-              disabled={groupBy !== ''}
-              onChange={(event) => setSort(event.target.value as SortKey)}
-            >
-              {(Object.keys(SORT_LABELS) as SortKey[]).map((key) => (
-                <option key={key} value={key}>
-                  {SORT_LABELS[key]}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <div className="actions">
-            <button type="submit" disabled={disabled}>
-              Run
-            </button>
-            <button
-              type="button"
-              className="quiet"
-              disabled={disabled}
-              onClick={() => {
-                setDraft(EMPTY_DRAFT)
-                setGroupBy('')
-                setSort('published')
-              }}
-            >
-              Reset filters
-            </button>
-            <label className="field inline" htmlFor="explore-format">
-              <span>Export as</span>
-              <select
-                id="explore-format"
-                value={format}
-                onChange={(event) => setFormat(event.target.value as ExportFormat)}
-              >
-                <option value="csv">CSV</option>
-                <option value="json">JSON</option>
-              </select>
-            </label>
-            <button
-              type="button"
-              className="quiet"
-              disabled={disabled}
-              onClick={() => onExport(format, request())}
-            >
-              Export records
-            </button>
-          </div>
-        </div>
-      </form>
-
-      <p className="muted">
-        An export covers the whole match set up to {EXPORT_LIMIT.toLocaleString()} records — not
-        just what is on screen — and carries MITRE&rsquo;s notice (D-008).
-      </p>
-      {exportNote && (
-        <p className="muted" data-export-note="1">
-          {exportNote}
-        </p>
-      )}
-
-      {cancelledMs !== null && (
-        <p className="muted" data-search-cancelled="1">
-          Query cancelled after {(cancelledMs / 1000).toFixed(1)} s. Nothing was changed.
-        </p>
-      )}
-
-      {detailId && <Detail cveId={detailId} detail={detail} onClose={onCloseDetail} />}
-
-      {outcome && <Results outcome={outcome} run={run} onOpenRecord={onOpenRecord} />}
-    </section>
-  )
-}
-
-function Results({
-  outcome,
-  run,
-  onOpenRecord,
-}: {
-  outcome: SearchOutcome
-  run: number
-  onOpenRecord: (cveId: string) => void
-}) {
-  const { result, matches, unmatched, groupBy, state } = outcome
-  return (
-    <div className="outcome">
-      {/* A name that matched nothing is a typo, not an empty corpus. Saying so
-          is the same obligation as D-023's "this record has no indexed text"
-          rather than "no results". */}
-      {unmatched.map((entry) => (
-        <p key={entry.axis} className="error" data-unmatched={entry.axis}>
-          No {entry.axis} in this copy is called {entry.values.map((v) => `“${v}”`).join(', ')}.
-          Those values cannot contribute matches. Group by {entry.axis} with no filter to see the
-          names that exist.
-        </p>
-      ))}
-      {state !== 'published' && (
-        <p className="stale" data-state-warning={state}>
-          {state === 'all'
-            ? 'Including REJECTED records: about 4.8% of the corpus, which inflates every count below against the default (D-022).'
-            : 'REJECTED records only — these are withdrawn CVE IDs, not vulnerabilities.'}
-        </p>
-      )}
-      <p className="muted" data-matches={matches ?? ''} data-run={run}>
-        {matches === null
-          ? `${result.rows.length.toLocaleString()} rows`
-          : `${matches.toLocaleString()} records match`}
-        {groupBy ? ` — grouped by ${DIMENSION_LABELS[groupBy]},` : ' —'}{' '}
-        {result.rows.length.toLocaleString()} shown in {result.ms} ms
-        {result.truncated && ' (capped)'}
-      </p>
-      <div className="scroll" tabIndex={0}>
-        {groupBy ? (
-          <GroupTable result={result} dimension={groupBy} />
-        ) : (
-          <RecordTable result={result} onOpenRecord={onOpenRecord} />
-        )}
-      </div>
-      {/* The query behind the numbers, always available. Deterministic today;
-          the same property the chat layer's answers will have to carry (D-044). */}
-      <details className="sql">
-        <summary>The SQL that produced this</summary>
-        <pre>{result.sql}</pre>
-        <p className="muted">Bound values: {result.params.map((p) => String(p)).join(' · ')}</p>
-      </details>
-    </div>
-  )
-}
-
-function GroupTable({ result, dimension }: { result: QueryResult; dimension: Dimension }) {
+export function GroupTable({ result, dimension }: { result: QueryResult; dimension: Dimension }) {
   const total = result.rows.reduce((sum, row) => sum + Number(row[2] ?? 0), 0)
   return (
     <table className="results groups">
@@ -312,11 +77,10 @@ function bucketLabel(row: unknown[], dimension: Dimension): string {
 /**
  * The record list.
  *
- * Exported because the chat panel renders `search_records` results through
- * *this* component rather than a compact copy of it (M7's shape decision): two
- * renderers of one row set is how the two surfaces end up disagreeing about
- * what a column means, and it is the parallel presentation path D-044 rules
- * out. The chat panel's version is narrower by CSS, not by markup.
+ * Shared by the canvas and the chat panel (M7's shape decision): two renderers
+ * of one row set is how two surfaces end up disagreeing about what a column
+ * means, and it is the parallel presentation path D-044 rules out. The chat
+ * panel's version is narrower by CSS, not by markup.
  */
 export function RecordTable({
   result,
@@ -369,6 +133,34 @@ export function RecordTable({
       </tbody>
     </table>
   )
+}
+
+/**
+ * The record list as a copyable grid — the same columns, the same formatting,
+ * so what pastes into a spreadsheet is what the table showed.
+ */
+export function recordGrid(result: QueryResult, title: string): GridData {
+  return {
+    title,
+    columns: ['CVE', 'Published', 'Severity', 'Score', 'CNA', 'Description'],
+    rows: result.rows.map((row) => [
+      String(row[0] ?? ''),
+      day(row[2]),
+      severity(row[6]),
+      row[5] === null || row[5] === undefined ? null : String(row[5]),
+      String(row[7] ?? ''),
+      String(row[8] ?? ''),
+    ]),
+  }
+}
+
+/** The grouped count as a copyable grid. The share bar is presentation, not data. */
+export function groupGrid(result: QueryResult, dimension: Dimension, title: string): GridData {
+  return {
+    title,
+    columns: ['Value', 'CVEs'],
+    rows: result.rows.map((row) => [bucketLabel(row, dimension), Number(row[2] ?? 0)]),
+  }
 }
 
 function severity(value: unknown): string {

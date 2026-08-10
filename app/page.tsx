@@ -2,17 +2,18 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 
-import { gateMessage, SUPPORT_FLOOR, type CapabilityReport } from '@/lib/capabilities'
+import { gateMessage, type CapabilityReport } from '@/lib/capabilities'
 import { newCancelFlag, requestCancel } from '@/lib/cancel'
 import { hasConsent, setConsent, streamChat, systemPrompt, type ChatMessage } from '@/lib/chat'
 import { runChatTurn, type ChatTurn } from '@/lib/chat-loop'
 import { NO_SHELL, registerShell, shellVersion, type ShellState } from '@/lib/shell'
-import { draftToFilters, EMPTY_DRAFT, filtersToDraft, type Draft } from '@/lib/draft'
-import type { SortKey } from '@/lib/filters'
+import { draftToFilters, filtersToDraft } from '@/lib/draft'
+import type { Dimension, SortKey } from '@/lib/filters'
 import { describeFreshness, KEV_STALE_AFTER_MS } from '@/lib/freshness'
 import type { ExportFormat } from '@/lib/export'
+import { inlineSql } from '@/lib/inline-sql'
 import type { KevStatus } from '@/lib/kev'
-import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS, SCHEMA_VERSION } from '@/lib/protocol'
+import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
 import type {
   BenchResult,
   CveDetail,
@@ -27,13 +28,8 @@ import type {
   ToolCall,
   ToolOutcome,
 } from '@/lib/protocol'
-import { emptyReport, fromFragment, REPORT_VERSION, type Report } from '@/lib/report'
-import {
-  bytes as formatBytes,
-  persistenceMessage,
-  requestPersistence,
-  type StorageReport,
-} from '@/lib/storage'
+import { defaultReport, emptyReport, fromFragment, REPORT_VERSION, type Report } from '@/lib/report'
+import { persistenceMessage, requestPersistence, type StorageReport } from '@/lib/storage'
 import {
   clearRecent,
   emptyStore,
@@ -45,12 +41,16 @@ import {
   type ReportStore,
 } from '@/lib/saved'
 
+import { Canvas, type ReportOutcome } from './canvas'
 import { ChatPanel } from './chat'
-import { Console } from './console'
-import { Explore, type SearchOutcome } from './explore'
-import { ReportTab, type ReportOutcome } from './report-tab'
+import { Console, EXAMPLES } from './console'
+import { DataPanel } from './data-panel'
+import { Diagnostics } from './diagnostics'
+import type { SearchOutcome } from './explore'
+import { FiltersPanel } from './filters-panel'
+import { Landing } from './landing'
+import { ProgressBar } from './progress'
 import { SavedTab } from './saved'
-import { Tabs, TabPanel, type TabSpec } from './tabs'
 
 /**
  * M1's end-to-end path: download the published chunks, decompress them in
@@ -69,7 +69,18 @@ LIMIT 15`
 
 const IDLE: Progress = { phase: 'idle', fraction: null, detail: '' }
 
-type TabId = 'data' | 'explore' | 'report' | 'saved' | 'sql'
+/** How many records a list asks for. Bounded again in the Worker (D-052 §4). */
+const PAGE_ROWS = 100
+
+/** The workspace's collapsible panels. Chat is its own column, not one of these. */
+interface Panels {
+  filters: boolean
+  sql: boolean
+  data: boolean
+  saved: boolean
+}
+
+const CLOSED: Panels = { filters: false, sql: false, data: false, saved: false }
 
 /**
  * Import knobs from the query string, for the Q-003/Q-004 sweep and the
@@ -146,11 +157,11 @@ export default function Home() {
    * What the Worker has established about local storage.
    *
    * `ready` alone cannot express it: false covers "no status yet", "there is no
-   * local copy", and "I could not find out", and the button reads "Download
-   * data" in all three. The first is invisible to a user but silently breaks
-   * tests, which act on the pre-status render. The third is worse — clearing
-   * the panels and inviting a download implies the copy is gone when it may
-   * simply be unreadable this instant (D-061).
+   * local copy", and "I could not find out", and the landing CTA reads
+   * "Download CVE dataset" in all three. The first is invisible to a user but
+   * silently breaks tests, which act on the pre-status render. The third is
+   * worse — clearing the panels and inviting a download implies the copy is
+   * gone when it may simply be unreadable this instant (D-061).
    *
    * `pending` (no answer yet) is kept distinct from `unknown` (an answer of
    * "I could not tell") so that both the UI and a test can wait for the Worker
@@ -246,11 +257,30 @@ export default function Home() {
   /** The offline app shell's own account of itself (D-048, D-009). */
   const [shell, setShell] = useState<ShellState>(NO_SHELL)
 
-  // --- M4 ---------------------------------------------------------------
-  const [tab, setTab] = useState<TabId>('data')
-  /** The report definition the builder is editing. One object, three consumers (D-069). */
+  // --- The workspace (UI revamp) ---------------------------------------
+  /** What the canvas is showing: the last thing that ran. */
+  const [view, setView] = useState<'report' | 'records'>('report')
+  const [panels, setPanels] = useState<Panels>(CLOSED)
+  /**
+   * Mirror of `panels.sql` for the Worker message handler, which is created
+   * once and must not close over stale state: the SQL drawer is auto-populated
+   * only while it is hidden, so an open drawer never loses an edit underway.
+   */
+  const sqlOpen = useRef(false)
+  /** The report definition every surface edits. One object, many consumers (D-069). */
   const [report, setReport] = useState<Report>(() => emptyReport())
   const [reportOutcome, setReportOutcome] = useState<ReportOutcome | null>(null)
+  /** Record-list controls, drawer-owned but page-held so chat can set them. */
+  const [groupBy, setGroupBy] = useState<'' | Dimension>('')
+  const [sort, setSort] = useState<SortKey>('published')
+  /** Legend toggles and display renames — views of a result, reset per run. */
+  const [hiddenSeries, setHiddenSeries] = useState<ReadonlySet<string>>(new Set())
+  const [seriesLabels, setSeriesLabels] = useState<Record<string, string>>({})
+  /** The SQL drawer's text: the last query that ran, editable. */
+  const [sqlText, setSqlText] = useState(EXAMPLES[0]!.sql)
+  /** The workspace opened once with something on the canvas. */
+  const autoRan = useRef(false)
+
   const [store, setStore] = useState<ReportStore>(() => emptyStore())
   /**
    * The same value as `store`, readable synchronously.
@@ -278,18 +308,13 @@ export default function Home() {
    * what keeps a 25 MB export off the JS heap — the page's half of the bound
    * the Worker holds on its side (lib/export.ts).
    */
-  // Convert each transient message string to a Blob immediately. Keeping the
-  // strings themselves in this array would retain the entire export on the JS
-  // heap and then duplicate it when the final Blob is constructed; Blob parts
-  // can instead be backed or spilled by the browser and are composed without
-  // re-serializing their contents.
   const exportParts = useRef<Blob[]>([])
   /**
    * A report waiting for a database.
    *
    * Two things put one here: a URL fragment read on mount, and a saved report
    * opened before the Worker has finished reopening the copy — which is a real
-   * window, because the Saved tab is readable from `localStorage` immediately
+   * window, because the Saved panel is readable from `localStorage` immediately
    * and the corpus takes seconds (D-049). Both need the same answer: hold the
    * definition, run it the moment a copy exists, and forget it if none ever
    * does. Without this the click silently does nothing.
@@ -299,18 +324,18 @@ export default function Home() {
   /**
    * A report is waiting on a corpus.
    *
-   * Rendered rather than left silent: someone who followed a report link, or
-   * opened a saved report, onto a browser with no readable copy lands on the
-   * Data tab with the Report tab disabled — and without this the app looks like
-   * it ignored the click.
+   * Rendered rather than left silent: someone who followed a report link onto a
+   * browser with no readable copy lands on the landing view — and without this
+   * the app looks like it ignored the click.
    */
   const [linkPending, setLinkPending] = useState(false)
 
   // --- M7 ---------------------------------------------------------------
   /**
-   * The chat side panel (M7). Everything about it is session-only except the
-   * consent flag: a reload clears the conversation, which is what makes the
-   * tier's "nothing is stored" disclosure true on the client too (D-057).
+   * The chat column (M7, revamped into the workspace's third pane). Everything
+   * about it is session-only except the consent flag: a reload clears the
+   * conversation, which is what makes the tier's "nothing is stored"
+   * disclosure true on the client too (D-057).
    */
   const [chatOpen, setChatOpen] = useState(false)
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([])
@@ -330,10 +355,6 @@ export default function Home() {
    */
   const toolWaiters = useRef(new Map<string, (outcome: ToolOutcome) => void>())
 
-  /** Explore's filter state, lifted so chat can hand it a record search. */
-  const [exploreDraft, setExploreDraft] = useState<Draft>(EMPTY_DRAFT)
-  const [exploreSort, setExploreSort] = useState<SortKey>('published')
-
   /**
    * The shared cancellation flag (lib/cancel.ts). Created once here, because
    * the page owns the button; null on a browser with no `SharedArrayBuffer`,
@@ -343,6 +364,13 @@ export default function Home() {
    * decides whether to offer Cancel sees it.
    */
   const [cancelFlag] = useState<Int32Array | null>(() => newCancelFlag())
+
+  /** Fold a fresh query result into the SQL drawer, unless it is being edited. */
+  const populateSql = useCallback((queryResult: QueryResult) => {
+    if (sqlOpen.current) return
+    if (!queryResult.sql) return
+    setSqlText(inlineSql(queryResult.sql, queryResult.params))
+  }, [])
 
   useEffect(() => {
     // The offline shell (D-048). Its own effect, and deliberately not awaited by
@@ -419,6 +447,9 @@ export default function Home() {
             detailRequest.current = null
             setDetailId(null)
             setDetail(undefined)
+            // A workspace that lost its copy starts over: the landing view is
+            // about to render, and the next ready copy deserves a fresh canvas.
+            autoRan.current = false
           }
           break
         case 'environment':
@@ -430,6 +461,9 @@ export default function Home() {
           importedThisRun.current = true
           setTimings(message.timings)
           setNotice(message.notice)
+          // The run that just happened reports where the reader is looking:
+          // the data panel opens itself once, on the import that filled it.
+          setPanels((current) => ({ ...current, data: true }))
           break
         case 'kev':
           // Not an error, even when it failed: the corpus operation that
@@ -457,6 +491,10 @@ export default function Home() {
                 unmatched: message.unmatched ?? [],
                 report: message.report,
               })
+              setView('report')
+              setHiddenSeries(new Set())
+              setSeriesLabels({})
+              populateSql(message.result)
             }
           } else if (message.kind === 'search') {
             setSearch({
@@ -466,6 +504,8 @@ export default function Home() {
               groupBy: message.groupBy ?? null,
               state: message.state ?? 'published',
             })
+            setView('records')
+            populateSql(message.result)
           } else setResult(message.result)
           break
         case 'detail':
@@ -484,6 +524,39 @@ export default function Home() {
           // it answers.
           toolWaiters.current.get(message.id)?.(message.outcome)
           setRunSeq((seq) => seq + 1)
+          // A chat answer *is* a report: the model's aggregate lands on the
+          // canvas and in the filter drawer exactly as if the reader had built
+          // it, which is what makes it editable rather than final (UI revamp).
+          // The chat panel still renders its own inline copy of every step.
+          const outcome = message.outcome
+          if (outcome.kind === 'aggregate') {
+            setReport(outcome.report)
+            setReportOutcome({
+              result: outcome.result,
+              matches: outcome.matches,
+              unmatched: outcome.unmatched,
+              report: outcome.report,
+            })
+            setView('report')
+            setHiddenSeries(new Set())
+            setSeriesLabels({})
+            populateSql(outcome.result)
+          } else if (outcome.kind === 'records') {
+            setSearch({
+              result: outcome.result,
+              matches: outcome.matches,
+              unmatched: outcome.unmatched,
+              groupBy: null,
+              state: outcome.report.filters.state ?? 'published',
+            })
+            setReport((current) => ({ ...current, filters: outcome.report.filters }))
+            if (outcome.report.sort) setSort(outcome.report.sort)
+            setGroupBy('')
+            setView('records')
+            populateSql(outcome.result)
+          } else if (outcome.kind === 'sql') {
+            populateSql(outcome.result)
+          }
           break
         }
         case 'exportChunk':
@@ -589,7 +662,7 @@ export default function Home() {
       options: importOptions(location.search),
     } satisfies Request)
     return () => worker.terminate()
-  }, [cancelFlag])
+  }, [cancelFlag, populateSql])
 
   useEffect(() => {
     // A minute is far finer than the units this reports in (hours, then days),
@@ -603,22 +676,23 @@ export default function Home() {
   }, [])
 
   /**
-   * Saved reports and history, and the permalink in the fragment.
+   * Saved reports and history, the chat consent flag, the chat column's
+   * initial state, and the permalink in the fragment.
    *
-   * Both are read once, on mount, and both are stranger-supplied in the sense
-   * that matters: `localStorage` was written by some build of this app and the
-   * fragment was written by whoever sent the link. They go through the same
-   * validation (`lib/saved.ts`, `fromFragment`), which is what makes a hostile
-   * link and a stale entry fail the same way (D-069).
+   * All are read once, on mount, and the stored ones are stranger-supplied in
+   * the sense that matters: `localStorage` was written by some build of this
+   * app and the fragment was written by whoever sent the link. They go through
+   * the same validation (`lib/saved.ts`, `fromFragment`), which is what makes
+   * a hostile link and a stale entry fail the same way (D-069).
    */
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect --
-       Both reads are of things that do not exist during render. This page is a
-       static export, so it is prerendered at build time: reading `localStorage`
-       or `location.hash` in the render body would produce markup the server
-       could not have produced, which is a hydration mismatch rather than a
-       performance question. Once, on mount, is the only correct time — the same
-       reasoning as the `now` sample above. */
+       These reads are of things that do not exist during render. This page is a
+       static export, so it is prerendered at build time: reading `localStorage`,
+       `location.hash` or a media query in the render body would produce markup
+       the server could not have produced, which is a hydration mismatch rather
+       than a performance question. Once, on mount, is the only correct time —
+       the same reasoning as the `now` sample above. */
     const local = safeStorage()
     const loaded = loadStore(local)
     storeRef.current = loaded
@@ -627,16 +701,18 @@ export default function Home() {
     // The chat tier's disclosure (D-057). Remembered across reloads — the
     // *conversation* is what is session-only, not the decision to allow one.
     setConsented(hasConsent(local))
+    // Chat is the workspace's primary interaction, so it opens by itself where
+    // there is room for it; on a phone it would cover the canvas, so it waits
+    // to be asked for.
+    setChatOpen(window.matchMedia('(min-width: 68rem)').matches)
     if (!location.hash || location.hash === '#') return
     const parsed = fromFragment(location.hash)
     if (parsed.ok) {
       setReport(parsed.report)
       pendingReport.current = parsed.report
       setLinkPending(true)
-      setTab('report')
     } else {
       setLinkError(`That report link could not be opened: ${parsed.error}`)
-      setTab('report')
     }
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [])
@@ -692,6 +768,7 @@ export default function Home() {
   const runReport = useCallback(
     (definition: Report) => {
       setReport(definition)
+      setView('report')
       setLinkError('')
       send({ type: 'report', request: { report: definition, count: true } })
       const at = Date.now()
@@ -701,17 +778,17 @@ export default function Home() {
   )
 
   /**
-   * Open a report in the builder and run it — or queue it, if there is nothing
+   * Open a report on the canvas and run it — or queue it, if there is nothing
    * to run it against yet.
    *
-   * The queueing arm is not hypothetical: the Saved tab renders from
+   * The queueing arm is not hypothetical: the Saved panel renders from
    * `localStorage` the instant the page mounts, while the Worker is still
-   * reopening the database, so a fast click lands in that window.
+   * reopening the copy — a fast click lands in that window.
    */
   const openReport = useCallback(
     (definition: Report) => {
       setReport(definition)
-      setTab('report')
+      setView('report')
       setLinkError('')
       if (ready) {
         runReport(definition)
@@ -731,7 +808,23 @@ export default function Home() {
     const pending = pendingReport.current
     pendingReport.current = null
     setLinkPending(false)
+    autoRan.current = true
     runReport(pending)
+  }, [ready, runReport])
+
+  /**
+   * The default canvas (UI revamp): a workspace never opens empty. The most
+   * recent report is the reader's own context resumed; with no history at all
+   * it is CVE counts by severity over time — the founding question.
+   *
+   * Deliberately *after* the pending-report check: a permalink or a saved
+   * report the reader explicitly opened always wins over the default.
+   */
+  useEffect(() => {
+    if (!ready || autoRan.current || pendingReport.current) return
+    autoRan.current = true
+    const recent = storeRef.current.recent[0]?.report
+    runReport(recent ?? defaultReport())
   }, [ready, runReport])
 
   /**
@@ -836,22 +929,55 @@ export default function Home() {
   }, [cancelFlag])
 
   /**
-   * Hand a chat record search to Explore, which is the surface that renders
-   * records.
-   *
-   * Not the report builder: the same predicates opened there render as a
-   * year-by-year count, which is a different view of the thing the reader was
-   * looking at (lib/tools.ts's `searchReport`).
+   * Run the current predicates as a record search — the filter drawer's
+   * "List records", and the canvas's records view.
+   */
+  const runSearch = useCallback(() => {
+    setView('records')
+    send({
+      type: 'search',
+      request: {
+        filters: report.filters,
+        groupBy: groupBy === '' ? null : groupBy,
+        sort,
+        limit: PAGE_ROWS,
+        // The count is a second query — over the whole corpus with no filters
+        // it is a scan — so it is asked for deliberately. It is worth it: "100
+        // shown" of an unknown total is not an answer.
+        count: true,
+      },
+    })
+  }, [report.filters, groupBy, sort, send])
+
+  /**
+   * Hand a chat record search to the records view, which is the surface that
+   * renders records — not the report canvas, where the same predicates would
+   * render as a year-by-year count (lib/tools.ts's `searchReport`).
    */
   const openSearch = useCallback(
     (definition: Report) => {
-      setExploreDraft(filtersToDraft(definition.filters))
-      if (definition.sort) setExploreSort(definition.sort)
-      setTab('explore')
+      setReport((current) => ({ ...current, filters: definition.filters }))
+      if (definition.sort) setSort(definition.sort)
+      setGroupBy('')
+      setView('records')
       send({
         type: 'search',
-        request: { filters: definition.filters, sort: definition.sort, limit: 100, count: true },
+        request: {
+          filters: definition.filters,
+          sort: definition.sort,
+          limit: PAGE_ROWS,
+          count: true,
+        },
       })
+    },
+    [send]
+  )
+
+  const openRecord = useCallback(
+    (cveId: string) => {
+      setView('records')
+      setDetailId(cveId)
+      send({ type: 'detail', cveId })
     },
     [send]
   )
@@ -888,64 +1014,53 @@ export default function Home() {
    * on every first paint.
    */
   const blocked = environment !== null && !environment.capabilities.supported
-  const needsCorpus = ready ? undefined : 'Download the corpus first'
-  const tabs: TabSpec[] = [
-    { id: 'data', label: 'Data' },
-    { id: 'explore', label: 'Explore', disabled: !ready, disabledReason: needsCorpus },
-    { id: 'report', label: 'Report', disabled: !ready, disabledReason: needsCorpus },
-    {
-      id: 'saved',
-      label: 'Saved',
-      badge: store.saved.length ? String(store.saved.length) : undefined,
-    },
-    { id: 'sql', label: 'SQL', disabled: !ready, disabledReason: needsCorpus },
-  ]
-  // A tab can stop being usable underneath the reader — "Clear local copy" does
-  // exactly that. Falling back to Data is the only honest destination.
-  const active = tabs.find((entry) => entry.id === tab && !entry.disabled) ? tab : 'data'
 
-  return (
-    <main data-status={storage}>
-      <h1>cve.meenan.dev</h1>
-      <p className="lede">
-        Browser-based search and analysis over the CVE List. Everything below runs locally: the
-        server hands over static files and never sees a query.
-      </p>
+  const downloadNow = useCallback(() => {
+    // Asked from the click, because Firefox prompts and a prompt outside a
+    // user gesture is a prompt that is dismissed. The *answer* is what gets
+    // reported — a request that "succeeded" and was refused looks identical
+    // from the call site otherwise.
+    void requestPersistence(navigator.storage).then(setPersisted)
+    send({ type: 'import', options: importOptions(location.search) })
+  }, [send])
 
-      {busy && (
-        <section className="progress" aria-live="polite">
-          <div className="bar">
-            <div
-              className="fill"
-              style={{ width: progress.fraction === null ? '100%' : `${progress.fraction * 100}%` }}
-              data-indeterminate={progress.fraction === null}
-            />
-          </div>
-          <p className="muted">
-            {phaseLabel(progress.phase)}
-            {progress.detail && ` — ${progress.detail}`}
-          </p>
-          {/* Only queries can be stopped. An import or a sync has its own
-              answer to "this is taking too long" — the stall watch (D-064) —
-              and stopping one part way is what staged replacement already
-              makes safe without a button. */}
-          {(progress.phase === 'query' || progress.phase === 'export') && (
-            <p className="muted">
-              {cancelFlag === null ? (
-                <span data-cancel="unavailable">
-                  This browser is not cross-origin isolated, so a running query cannot be stopped
-                  from here. The tab stays responsive; the query finishes on its own.
-                </span>
-              ) : (
-                <button type="button" className="quiet" onClick={cancel} disabled={stopping}>
-                  {stopping ? 'Stopping…' : 'Cancel query'}
-                </button>
-              )}
-            </p>
-          )}
-        </section>
-      )}
+  const togglePanel = useCallback((panel: keyof Panels) => {
+    setPanels((current) => {
+      const next = { ...current, [panel]: !current[panel] }
+      if (panel === 'sql') sqlOpen.current = next.sql
+      return next
+    })
+  }, [])
 
+  const diagnostics = (
+    <Diagnostics
+      storage={storage}
+      revision={revision}
+      schemas={schemas}
+      timings={timings}
+      ready={ready}
+      kev={kev}
+      kevError={kevError}
+      generated={generated}
+      sync={sync}
+      environment={environment}
+      persisted={persisted}
+      shell={shell}
+      onOpen={() => {
+        // Re-probed on open rather than kept live: storage numbers move, and a
+        // panel showing what was true at page load sends someone chasing a
+        // number that already changed.
+        send({ type: 'probe' })
+        const controlling = Boolean(navigator.serviceWorker?.controller)
+        void shellVersion(navigator.serviceWorker).then((version) =>
+          setShell((current) => ({ ...current, version, controlling }))
+        )
+      }}
+    />
+  )
+
+  const banners = (
+    <>
       {/* The support gate (D-016, M5). Above every control, because the point
           is that it arrives *before* a download rather than tens of seconds
           into one — and there is no telemetry (D-009), so this sentence is the
@@ -987,9 +1102,9 @@ export default function Home() {
         </p>
       )}
 
-      {/* Both link banners are page-level rather than inside the Report panel.
-          A link that arrives before there is a local copy leaves that panel
-          disabled, so a message inside it would be a message nobody sees. */}
+      {/* Both link banners are page-level rather than inside any panel: a link
+          that arrives before there is a local copy renders the landing view,
+          so a message inside the workspace would be a message nobody sees. */}
       {linkError && (
         <p className="error" data-link-error="1">
           {linkError}
@@ -1002,490 +1117,354 @@ export default function Home() {
           to the server.
         </p>
       )}
+    </>
+  )
 
-      {/* Both of these stay outside the panels: the revision a number came from
-          and MITRE's notice attach to the *copy*, not to a view of it (D-008),
-          so switching tabs must not take either off the screen. */}
-      {ready && revision !== null && (
-        <p className="muted" data-revision={revision}>
-          Local copy at revision {revision}
-          {sync && syncSummary(sync)}
-        </p>
-      )}
-
-      {/* Staleness, from the data's own build stamp rather than from a
-          comparison with the origin: `status` makes no network request, which
-          is what lets a reopen work offline (D-048). So this says how old the
-          data is — a fact — and prompts a check rather than asserting there is
-          something newer to fetch. */}
-      {ready && freshness !== null && (
-        <p
-          className={freshness.stale ? 'stale' : 'muted'}
-          data-freshness={freshness.stale ? 'stale' : 'current'}
-          data-age-ms={Math.round(freshness.ageMs)}
-        >
-          Data as of <time dateTime={freshness.iso}>{localTime(freshness.iso)}</time> —{' '}
-          {freshness.age}.
-          {freshness.stale &&
-            ' The corpus is published daily, so this copy is behind unless the origin has ' +
-              'stopped publishing — Sync to find out.'}
-        </p>
-      )}
-
-      {/* KEV's freshness is its own line, because it is a different dataset on
-          a different cadence: CISA publishes about business-daily and the
-          corpus daily, so one number for both would be wrong about whichever
-          moved last. Read from the local copy like the line above, so it is
-          honest offline and agrees across tabs (M6, D-076). The provenance is
-          in the sentence rather than in a footnote: "per CISA, as of …" is what
-          keeps this a statement about CISA's catalog rather than an endorsement
-          by it. */}
-      {ready && (kev !== null || kevError !== '') && (
-        <p
-          className={kevFreshness?.stale ? 'stale' : 'muted'}
-          data-kev={kev ? kev.version : 'none'}
-          data-kev-age-ms={kevFreshness ? Math.round(kevFreshness.ageMs) : undefined}
-        >
-          {kev ? (
-            <>
-              CISA KEV catalog {kev.version}, released{' '}
-              <time dateTime={kev.released}>{localTime(kev.released)}</time>
-              {kevFreshness && ` — ${kevFreshness.age}`}. {kev.entries.toLocaleString()} entries
-              {kev.unmatched > 0 &&
-                `, ${kev.unmatched.toLocaleString()} for CVEs this copy does not hold`}
-              . Fetched by this browser{' '}
-              <time dateTime={new Date(kev.fetched * 1000).toISOString()}>
-                {localTime(new Date(kev.fetched * 1000).toISOString())}
-              </time>
-              .
-            </>
-          ) : (
-            'No CISA KEV catalog in this copy yet.'
-          )}
-          {kevError !== '' && ` Last refresh failed: ${kevError}`}
-        </p>
-      )}
-
-      <div className="tabs-row">
-        <Tabs tabs={tabs} active={active} onSelect={(id) => setTab(id as TabId)} />
-        {/* A side panel, not a sixth tab: a question is usually *about* the tab
-            the reader is on, and making chat a tab would mean leaving that
-            view to ask about it. */}
-        <button
-          type="button"
-          className="quiet"
-          data-chat-toggle={chatOpen ? 'open' : 'closed'}
-          aria-expanded={chatOpen}
-          onClick={() => setChatOpen((open) => !open)}
-        >
-          {chatOpen ? 'Hide Ask' : 'Ask'}
-        </button>
-      </div>
-
-      <TabPanel id="data" active={active === 'data'}>
-        <section className="controls">
-          <button
-            onClick={() => {
-              // Asked from the click, because Firefox prompts and a prompt
-              // outside a user gesture is a prompt that is dismissed. The
-              // *answer* is what gets reported — a request that "succeeded" and
-              // was refused looks identical from the call site otherwise.
-              void requestPersistence(navigator.storage).then(setPersisted)
-              send({ type: 'import', options: importOptions(location.search) })
-            }}
+  return (
+    <main data-status={storage}>
+      {!ready ? (
+        <>
+          <header className="topbar">
+            <div className="brand">
+              <h1>CVE Explorer</h1>
+              <span className="domain">cve.meenan.dev</span>
+            </div>
+          </header>
+          {banners}
+          <Landing
+            onDownload={downloadNow}
             disabled={busy || blocked}
+            busy={busy}
+            obsolete={storage === 'obsolete'}
+            progress={
+              busy ? (
+                <ProgressBar
+                  progress={progress}
+                  cancelFlag={cancelFlag}
+                  stopping={stopping}
+                  onCancel={cancel}
+                />
+              ) : null
+            }
           >
-            {ready ? 'Re-download data' : 'Download data'}
-          </button>
-          <button
-            onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
-            disabled={!ready || busy || blocked}
-          >
-            Sync
-          </button>
-          <button
-            onClick={() => {
-              setKevError('')
-              send({ type: 'kev', options: importOptions(location.search) })
-            }}
-            disabled={!ready || busy || blocked}
-          >
-            Refresh KEV
-          </button>
-          <button
-            onClick={() => send({ type: 'query', sql: DEMO_QUERY })}
-            disabled={!ready || busy}
-          >
-            Run query
-          </button>
-          <button
-            onClick={() => {
-              // Drop the previous table before re-running: the Worker reports no
-              // progress for this, so a stale result on screen is indistinguishable
-              // from a finished one — to a reader and to the sweep alike.
-              setBenchmark(null)
-              send({ type: 'bench' })
-            }}
-            disabled={!ready || busy}
-          >
-            Measure query latency
-          </button>
-          <button onClick={() => send({ type: 'reset' })} disabled={busy} className="quiet">
-            Clear local copy
-          </button>
-        </section>
-
-        {/* The one support channel (D-009). Nothing is collected from users —
-            not analytics, not error reporting — so a bug report is whatever a
-            person can read off this panel and paste. A `<details>` rather than
-            a tab: it is closed by default because it is for the day something
-            is wrong, and it is keyboard-operable and screen-reader-labelled
-            without any code of ours. */}
-        <details
-          className="diagnostics"
-          data-diagnostics="1"
-          onToggle={(event) => {
-            // Re-probed on open rather than kept live: storage numbers move,
-            // and a panel showing what was true at page load is a panel that
-            // sends someone chasing a number that already changed.
-            if (!(event.currentTarget as HTMLDetailsElement).open) return
-            send({ type: 'probe' })
-            const controlling = Boolean(navigator.serviceWorker?.controller)
-            void shellVersion(navigator.serviceWorker).then((version) =>
-              setShell((current) => ({ ...current, version, controlling }))
-            )
-          }}
-        >
-          <summary>Diagnostics</summary>
-          <p className="muted">
-            Everything below is read from this browser. Nothing is sent anywhere — there is no
-            telemetry in this app at all, so if something is wrong, this panel is what to copy into
-            a bug report.
-          </p>
-          <dl className="facts" data-diagnostics-body="1">
-            <dt>Local copy</dt>
-            <dd data-diag="storage">
-              {storage}
-              {revision !== null && ` at revision ${revision}`}
-            </dd>
-            <dt>Schema</dt>
-            <dd data-diag="schema">
-              copy {schemas.local ?? '—'}, this app reads {schemas.speaks || SCHEMA_VERSION}
-            </dd>
-            <dt>Records</dt>
-            <dd data-diag="records">
-              {timings
-                ? timings.records.toLocaleString()
-                : ready
-                  ? 'not counted this session'
-                  : '—'}
-            </dd>
-            <dt>CISA KEV</dt>
-            <dd data-diag="kev">
-              {kev
-                ? `${kev.version}, released ${kev.released}, ${kev.entries.toLocaleString()} ` +
-                  `entries (${kev.unmatched.toLocaleString()} unmatched), fetched ` +
-                  new Date(kev.fetched * 1000).toISOString()
-                : 'no catalog'}
-              {kevError !== '' && ` — last refresh failed: ${kevError}`}
-            </dd>
-            <dt>Data built</dt>
-            <dd data-diag="generated">
-              {generated === null ? '—' : new Date(generated * 1000).toISOString()}
-            </dd>
-            <dt>Last sync</dt>
-            <dd data-diag="sync">
-              {sync
-                ? `${sync.applied} delta${sync.applied === 1 ? '' : 's'} to revision ${sync.to}`
-                : 'not this session'}
-            </dd>
-            <dt>Storage used</dt>
-            <dd data-diag="usage">
-              {environment
-                ? `${formatBytes(environment.storage.usage)} of ${formatBytes(
-                    environment.storage.quota
-                  )}`
-                : '—'}
-            </dd>
-            <dt>Eviction</dt>
-            <dd data-diag="persisted">
-              {persistenceMessage(persisted ?? environment?.storage.persisted ?? null)}
-            </dd>
-            <dt>Offline shell</dt>
-            <dd data-diag="shell">
-              {!shell.supported
-                ? 'not supported by this browser'
-                : shell.error
-                  ? `registration failed: ${shell.error}`
-                  : `${shell.registered ? 'registered' : 'not registered'}, ${
-                      shell.controlling ? 'controlling this page' : 'not controlling this page yet'
-                    }${shell.version ? `, cache ${shell.version}` : ''}`}
-            </dd>
-            <dt>Browser support</dt>
-            <dd data-diag="capabilities">
-              {environment
-                ? environment.capabilities.capabilities
-                    .map((entry) => `${entry.label}: ${entry.ok ? 'yes' : 'no'}`)
-                    .join('; ')
-                : '—'}
-            </dd>
-            <dt>Support floor</dt>
-            <dd data-diag="floor">{SUPPORT_FLOOR}</dd>
-          </dl>
-        </details>
-
-        {vfs !== DEFAULT_VFS && (
-          <p className="error">
-            Diagnostic mode: <code>{vfs}</code>. This VFS cannot stage a download (D-051), so
-            “Re-download data” <strong>deletes the local copy before fetching anything</strong> — a
-            failure part-way leaves nothing. Remove <code>?vfs=</code> from the URL to use the
-            normal path.
-          </p>
-        )}
-
-        {timings && (
-          <section>
-            <h2>Import</h2>
-            {/* The rendered rows are rounded for reading; the sweep in
-                tests/e2e/measure.spec.ts reads this instead, so a recorded number
-                is the Worker's, not a re-parsed label. */}
-            <dl className="timings" data-json={JSON.stringify(timings)}>
-              <Timing label="Records" value={timings.records.toLocaleString()} />
-              <Timing
-                label="Chunks fetched"
-                value={
-                  // Fewer than the total means this run resumed a staged download
-                  // (D-061) — worth saying out loud, because it is also why the
-                  // elapsed time will not match a fresh import's.
-                  timings.chunksFetched === timings.chunksTotal
-                    ? `${timings.chunksTotal}`
-                    : `${timings.chunksFetched} of ${timings.chunksTotal} (resumed)`
-                }
-              />
-              {/* "Snapshot size", not "Downloaded": this is the whole published
-                  snapshot, and a resumed run may have fetched none of it. The
-                  row above says what this run actually did. */}
-              <Timing
-                label="Snapshot size"
-                value={`${(timings.compressedBytes / 1e6).toFixed(1)} MB`}
-              />
-              <Timing label="Expanded to" value={`${(timings.rawBytes / 1e6).toFixed(1)} MB`} />
-              <Timing label="Fetch" value={`${timings.fetchMs} ms`} />
-              <Timing label="Decompress" value={`${timings.decompressMs} ms`} />
-              <Timing label="Write to OPFS" value={`${timings.writeMs} ms`} />
-              <Timing label="Build indexes" value={`${timings.indexMs} ms`} />
-              <Timing label="Verify and promote" value={`${timings.verifyMs} ms`} />
-              <Timing label="Total" value={`${(timings.totalMs / 1000).toFixed(1)} s`} />
-              <Timing
-                label="OPFS footprint"
-                value={
-                  timings.opfsBytes === null
-                    ? 'could not be measured'
-                    : `${(timings.opfsBytes / 1e6).toFixed(1)} MB`
-                }
-              />
-              <Timing
-                label="SQLite WASM heap"
-                value={`${(timings.wasmHeapBytes / 1e6).toFixed(1)} MB`}
-              />
-              <Timing
-                label="VFS"
-                value={`${timings.vfs} × ${timings.concurrency}, ${timings.cacheMib} MiB cache`}
-              />
-            </dl>
-          </section>
-        )}
-
-        {benchmark && (
-          <section>
-            <h2>Query latency</h2>
-            <p className="muted">
-              SQLite WASM heap after these queries: {(benchmark.wasmHeapBytes / 1e6).toFixed(1)} MB
-            </p>
-            <div className="scroll" tabIndex={0}>
-              <table className="bench" data-json={JSON.stringify(benchmark)}>
-                <thead>
-                  <tr>
-                    <th scope="col">Query</th>
-                    <th scope="col">ms</th>
-                    <th scope="col">rows</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {benchmark.results.map((entry) => (
-                    <tr key={entry.name}>
-                      <td>{entry.name}</td>
-                      <td>{entry.ms}</td>
-                      <td>{entry.rows}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            {diagnostics}
+          </Landing>
+        </>
+      ) : (
+        <>
+          <header className="topbar">
+            <div className="brand">
+              <h1>CVE Explorer</h1>
+              <span className="domain">cve.meenan.dev</span>
             </div>
-          </section>
-        )}
+            <nav className="panel-toggles" aria-label="Workspace panels">
+              <button
+                type="button"
+                className="quiet"
+                aria-expanded={panels.filters}
+                aria-controls="filters-panel"
+                data-toggle="filters"
+                onClick={() => togglePanel('filters')}
+              >
+                Filters
+              </button>
+              <button
+                type="button"
+                className="quiet"
+                aria-expanded={panels.sql}
+                aria-controls="sql-panel"
+                data-toggle="sql"
+                onClick={() => togglePanel('sql')}
+              >
+                SQL
+              </button>
+              <button
+                type="button"
+                className="quiet"
+                aria-expanded={panels.data}
+                aria-controls="data-panel"
+                data-toggle="data"
+                onClick={() => togglePanel('data')}
+              >
+                Data
+              </button>
+              <button
+                type="button"
+                className="quiet"
+                aria-expanded={panels.saved}
+                aria-controls="saved-panel"
+                data-toggle="saved"
+                onClick={() => togglePanel('saved')}
+              >
+                Saved
+                {store.saved.length > 0 && (
+                  <span className="tab-badge" aria-hidden="true">
+                    {store.saved.length}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
+                disabled={!ready || busy || blocked}
+              >
+                Sync
+              </button>
+              {/* A column, not a sixth panel: a question is usually *about*
+                  what is on the canvas, and chat is the primary way in. */}
+              <button
+                type="button"
+                data-chat-toggle={chatOpen ? 'open' : 'closed'}
+                aria-expanded={chatOpen}
+                onClick={() => setChatOpen((open) => !open)}
+              >
+                Chat
+              </button>
+            </nav>
+          </header>
 
-        {cancelled?.kind === 'demo' && (
-          <p className="muted">Query cancelled after {(cancelled.ms / 1000).toFixed(1)} s.</p>
-        )}
+          {banners}
 
-        {result && (
-          <section>
-            <h2>Most-reported vendors</h2>
-            <p className="muted">
-              {result.rows.length} rows in {result.ms} ms. PUBLISHED records only — REJECTED are
-              excluded by default.
-            </p>
-            <div className="scroll" tabIndex={0}>
-              <table className="results">
-                <thead>
-                  <tr>
-                    {result.columns.map((column) => (
-                      <th scope="col" key={column}>
-                        {column}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {result.rows.map((row, index) => (
-                    <tr key={index}>
-                      {row.map((cell, cellIndex) => (
-                        <td key={cellIndex}>{String(cell ?? '')}</td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          {/* Both of these stay outside the panels: the revision a number came
+              from and MITRE's notice attach to the *copy*, not to a view of it
+              (D-008), so no panel state may take either off the screen. */}
+          <div className="status-strip">
+            {revision !== null && (
+              <p className="muted" data-revision={revision}>
+                Local copy at revision {revision}
+                {sync && syncSummary(sync)}
+              </p>
+            )}
+
+            {/* Staleness, from the data's own build stamp rather than from a
+                comparison with the origin: `status` makes no network request,
+                which is what lets a reopen work offline (D-048). So this says
+                how old the data is — a fact — and prompts a check rather than
+                asserting there is something newer to fetch. */}
+            {freshness !== null && (
+              <p
+                className={freshness.stale ? 'stale' : 'muted'}
+                data-freshness={freshness.stale ? 'stale' : 'current'}
+                data-age-ms={Math.round(freshness.ageMs)}
+              >
+                Data as of <time dateTime={freshness.iso}>{localTime(freshness.iso)}</time> —{' '}
+                {freshness.age}.
+                {freshness.stale &&
+                  ' The corpus is published daily, so this copy is behind unless the origin has ' +
+                    'stopped publishing — Sync to find out.'}
+              </p>
+            )}
+
+            {/* KEV's freshness is its own line, because it is a different
+                dataset on a different cadence: CISA publishes about
+                business-daily and the corpus daily, so one number for both
+                would be wrong about whichever moved last. Read from the local
+                copy like the line above, so it is honest offline and agrees
+                across tabs (M6, D-076). The provenance is in the sentence:
+                "per CISA, as of …" keeps this a statement about CISA's catalog
+                rather than an endorsement by it. */}
+            {(kev !== null || kevError !== '') && (
+              <p
+                className={kevFreshness?.stale ? 'stale' : 'muted'}
+                data-kev={kev ? kev.version : 'none'}
+                data-kev-age-ms={kevFreshness ? Math.round(kevFreshness.ageMs) : undefined}
+              >
+                {kev ? (
+                  <>
+                    CISA KEV catalog {kev.version}, released{' '}
+                    <time dateTime={kev.released}>{localTime(kev.released)}</time>
+                    {kevFreshness && ` — ${kevFreshness.age}`}. {kev.entries.toLocaleString()}{' '}
+                    entries
+                    {kev.unmatched > 0 &&
+                      `, ${kev.unmatched.toLocaleString()} for CVEs this copy does not hold`}
+                    . Fetched by this browser{' '}
+                    <time dateTime={new Date(kev.fetched * 1000).toISOString()}>
+                      {localTime(new Date(kev.fetched * 1000).toISOString())}
+                    </time>
+                    .
+                  </>
+                ) : (
+                  'No CISA KEV catalog in this copy yet.'
+                )}
+                {kevError !== '' && ` Last refresh failed: ${kevError}`}
+              </p>
+            )}
+          </div>
+
+          {busy && (
+            <ProgressBar
+              progress={progress}
+              cancelFlag={cancelFlag}
+              stopping={stopping}
+              onCancel={cancel}
+            />
+          )}
+
+          <div className="workspace" data-chat-open={chatOpen ? '1' : undefined}>
+            {panels.filters && (
+              <aside id="filters-panel" className="side-panel">
+                <FiltersPanel
+                  report={report}
+                  onChange={setReport}
+                  onRunReport={runReport}
+                  onListRecords={runSearch}
+                  groupBy={groupBy}
+                  setGroupBy={setGroupBy}
+                  sort={sort}
+                  setSort={setSort}
+                  disabled={busy}
+                />
+              </aside>
+            )}
+
+            <div className="canvas-col">
+              <Canvas
+                view={view}
+                report={report}
+                onChangeReport={setReport}
+                onRun={runReport}
+                reportOutcome={reportOutcome}
+                searchOutcome={search}
+                disabled={busy}
+                run={runSeq}
+                cancelledMs={
+                  cancelled && (cancelled.kind === 'report' || cancelled.kind === 'search')
+                    ? cancelled
+                    : null
+                }
+                exportNote={exportNote}
+                onExport={(format, kind, definition) =>
+                  send({
+                    type: 'export',
+                    request: {
+                      format,
+                      kind,
+                      report:
+                        kind === 'records' && view === 'records'
+                          ? reportFor({ filters: report.filters, sort })
+                          : definition,
+                      title:
+                        kind === 'records' && view === 'records'
+                          ? 'CVE records'
+                          : definition.title?.trim() || 'CVE report',
+                    },
+                  })
+                }
+                onSave={(name) =>
+                  updateStore((current) => saveNamed(current, name, report, Date.now()))
+                }
+                onOpenRecord={openRecord}
+                detailId={detailId}
+                detail={detail}
+                onCloseDetail={() => {
+                  detailRequest.current = null
+                  setDetailId(null)
+                  setDetail(undefined)
+                }}
+                hiddenSeries={hiddenSeries}
+                onToggleSeries={(key) =>
+                  setHiddenSeries((current) => {
+                    const next = new Set(current)
+                    if (next.has(key)) next.delete(key)
+                    else next.add(key)
+                    return next
+                  })
+                }
+                seriesLabels={seriesLabels}
+                onSeriesLabel={(key, label) =>
+                  setSeriesLabels((current) => ({ ...current, [key]: label }))
+                }
+                dataAsOf={freshness ? freshness.iso.slice(0, 10) : null}
+              />
+
+              {panels.sql && (
+                <section id="sql-panel" className="bottom-panel">
+                  <Console
+                    disabled={busy}
+                    onRun={(sql: string) => send({ type: 'console', sql })}
+                    result={consoleResult}
+                    run={runSeq}
+                    error={consoleError}
+                    cancelledMs={cancelled?.kind === 'console' ? cancelled.ms : null}
+                    sql={sqlText}
+                    onSql={setSqlText}
+                  />
+                </section>
+              )}
+
+              {panels.data && (
+                <section id="data-panel" className="bottom-panel">
+                  <DataPanel
+                    ready={ready}
+                    busy={busy}
+                    blocked={blocked}
+                    onDownload={downloadNow}
+                    onRefreshKev={() => {
+                      setKevError('')
+                      send({ type: 'kev', options: importOptions(location.search) })
+                    }}
+                    onRunDemo={() => send({ type: 'query', sql: DEMO_QUERY })}
+                    onBench={() => {
+                      // Drop the previous table before re-running: the Worker
+                      // reports no progress for this, so a stale result on
+                      // screen is indistinguishable from a finished one.
+                      setBenchmark(null)
+                      send({ type: 'bench' })
+                    }}
+                    onReset={() => send({ type: 'reset' })}
+                    timings={timings}
+                    benchmark={benchmark}
+                    result={result}
+                    cancelledDemoMs={cancelled?.kind === 'demo' ? cancelled.ms : null}
+                    vfsWarning={vfs !== DEFAULT_VFS ? vfs : null}
+                  >
+                    {diagnostics}
+                  </DataPanel>
+                </section>
+              )}
+
+              {panels.saved && (
+                <section id="saved-panel" className="bottom-panel">
+                  <SavedTab
+                    store={store}
+                    storable={storable}
+                    onOpen={openReport}
+                    onRemove={(id) => updateStore((current) => removeSaved(current, id))}
+                    onClearRecent={() => updateStore((current) => clearRecent(current))}
+                  />
+                </section>
+              )}
             </div>
-          </section>
-        )}
-      </TabPanel>
 
-      <TabPanel id="explore" active={active === 'explore'}>
-        {ready && (
-          <Explore
-            draft={exploreDraft}
-            setDraft={setExploreDraft}
-            sort={exploreSort}
-            setSort={setExploreSort}
-            disabled={busy}
-            onRun={(request: SearchRequest) => send({ type: 'search', request })}
-            onOpenRecord={(cveId) => {
-              setDetailId(cveId)
-              send({ type: 'detail', cveId })
-            }}
-            onExport={(format, request) =>
-              send({
-                type: 'export',
-                request: {
-                  format,
-                  kind: 'records',
-                  report: reportFor(request),
-                  title: 'CVE records',
-                },
-              })
-            }
-            outcome={search}
-            run={runSeq}
-            cancelledMs={cancelled?.kind === 'search' ? cancelled.ms : null}
-            detailId={detailId}
-            detail={detail}
-            onCloseDetail={() => {
-              detailRequest.current = null
-              setDetailId(null)
-              setDetail(undefined)
-            }}
-            exportNote={exportNote}
-          />
-        )}
-      </TabPanel>
-
-      <TabPanel id="report" active={active === 'report'}>
-        {ready && (
-          <ReportTab
-            report={report}
-            onChange={setReport}
-            onRun={runReport}
-            onExport={(format, kind, definition) =>
-              send({
-                type: 'export',
-                request: {
-                  format,
-                  kind,
-                  // Export the definition that produced the visible result,
-                  // not edits made in the builder since that run.
-                  report: definition,
-                  title: definition.title?.trim() || 'CVE report',
-                },
-              })
-            }
-            onSave={(name) =>
-              updateStore((current) => saveNamed(current, name, report, Date.now()))
-            }
-            outcome={reportOutcome}
-            disabled={busy}
-            run={runSeq}
-            cancelledMs={cancelled?.kind === 'report' ? cancelled.ms : null}
-            exportNote={exportNote}
-          />
-        )}
-      </TabPanel>
-
-      <TabPanel id="saved" active={active === 'saved'}>
-        <SavedTab
-          store={store}
-          storable={storable}
-          onOpen={openReport}
-          onRemove={(id) => updateStore((current) => removeSaved(current, id))}
-          onClearRecent={() => updateStore((current) => clearRecent(current))}
-        />
-      </TabPanel>
-
-      <TabPanel id="sql" active={active === 'sql'}>
-        {ready && (
-          <Console
-            disabled={busy}
-            onRun={(sql: string) => send({ type: 'console', sql })}
-            result={consoleResult}
-            run={runSeq}
-            error={consoleError}
-            cancelledMs={cancelled?.kind === 'console' ? cancelled.ms : null}
-          />
-        )}
-      </TabPanel>
-
-      <ChatPanel
-        open={chatOpen}
-        turns={chatTurns}
-        running={chatRunning}
-        ready={ready}
-        consented={consented}
-        consentStorable={storable}
-        onConsent={(accepted) => {
-          setConsented(accepted)
-          setConsent(safeStorage(), accepted)
-          // Turning it back off also drops the conversation, because leaving it
-          // on screen after the tier is off would suggest it is still live.
-          if (!accepted) {
-            chatAbort.current?.abort()
-            setChatTurns([])
-            chatHistory.current = []
-          }
-        }}
-        onAsk={askChat}
-        onStop={stopChat}
-        onClose={() => setChatOpen(false)}
-        onOpenReport={openReport}
-        onOpenSearch={openSearch}
-        onOpenRecord={(cveId) => {
-          // To the surface that owns the record view, rather than a second copy
-          // of it inside the panel.
-          setTab('explore')
-          setDetailId(cveId)
-          send({ type: 'detail', cveId })
-        }}
-      />
+            <ChatPanel
+              open={chatOpen}
+              turns={chatTurns}
+              running={chatRunning}
+              ready={ready}
+              consented={consented}
+              consentStorable={storable}
+              onConsent={(accepted) => {
+                setConsented(accepted)
+                setConsent(safeStorage(), accepted)
+                // Turning it back off also drops the conversation, because
+                // leaving it on screen after the tier is off would suggest it
+                // is still live.
+                if (!accepted) {
+                  chatAbort.current?.abort()
+                  setChatTurns([])
+                  chatHistory.current = []
+                }
+              }}
+              onAsk={askChat}
+              onStop={stopChat}
+              onClose={() => setChatOpen(false)}
+              onOpenReport={openReport}
+              onOpenSearch={openSearch}
+              onOpenRecord={openRecord}
+            />
+          </div>
+        </>
+      )}
 
       {notice && <footer className="notice">{notice}</footer>}
     </main>
@@ -1500,7 +1479,7 @@ export default function Home() {
  * export uses only the filters and the sort; `rows` is filled with a valid
  * dimension because the definition has to be a whole one, not a partial.
  */
-function reportFor(request: SearchRequest): Report {
+function reportFor(request: Pick<SearchRequest, 'filters' | 'sort'>): Report {
   return {
     v: REPORT_VERSION,
     // Round-tripped through the draft conversions so an exported set is
@@ -1580,38 +1559,4 @@ function count(value: number, noun: string): string {
 function localTime(iso: string): string {
   const at = new Date(iso)
   return Number.isNaN(at.getTime()) ? iso : at.toLocaleString()
-}
-
-function Timing({ label, value }: { label: string; value: string }) {
-  return (
-    <>
-      <dt>{label}</dt>
-      <dd>{value}</dd>
-    </>
-  )
-}
-
-function phaseLabel(phase: Progress['phase']): string {
-  switch (phase) {
-    case 'manifest':
-      return 'Reading manifest'
-    case 'download':
-      return 'Downloading and decompressing'
-    case 'index':
-      return 'Building search indexes'
-    case 'sync':
-      return 'Applying updates'
-    case 'verify':
-      // Deliberately vague: three different steps report under this phase and
-      // each names itself in the detail, so a specific label here would either
-      // repeat the detail or contradict it — the `opfs-sahpool` path reports
-      // here too and does not verify or promote anything (D-051).
-      return 'Finishing up'
-    case 'query':
-      return 'Running query'
-    case 'export':
-      return 'Writing export'
-    default:
-      return 'Working'
-  }
 }

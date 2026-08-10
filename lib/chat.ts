@@ -365,7 +365,7 @@ export const CONSENT_TEXT = [
     'Nothing is stored — not the question, not the answer, not the results. The web server ' +
     'logs that the endpoint was reached, never what was asked.',
   'The conversation lives in this tab only. Reloading the page clears it, and it is never ' +
-    'written to disk. If you want to keep an answer, use “Open in Report”: a report is a ' +
+    'written to disk. If you want to keep an answer, use “Open on canvas”: a report is a ' +
     'definition you can save, share and re-run without the model.',
 ] as const
 

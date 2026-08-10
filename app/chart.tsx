@@ -18,11 +18,17 @@
  * Colours come from `lib/chart.ts` as `var(--…)` references and resolve in the
  * reader's own colour scheme (see `app/globals.css`). Severity is an ordinal
  * ramp with CRITICAL at the baseline; identity dimensions get categorical slots.
+ *
+ * The UI revamp added the legend as a control: each entry can hide its series
+ * from the *drawing* — the y-scale re-fits to what is visible — while the
+ * table below always renders the complete model, because the numbers are the
+ * audit channel and a toggle must not hide data. Series names can also carry
+ * display overrides (`labels`), which never travel in a definition.
  */
 
 import { useId } from 'react'
 
-import { niceTicks, shortCount, type ChartModel } from '@/lib/chart'
+import { niceTicks, relabelModel, shortCount, visibleModel, type ChartModel } from '@/lib/chart'
 import { DIMENSION_LABELS, TIME_DIMENSIONS, type Dimension } from '@/lib/filters'
 import type { ChartType } from '@/lib/report'
 
@@ -36,16 +42,27 @@ const PLOT_H = H - PAD.top - PAD.bottom
 /** Longest x-axis label drawn before it is cut; the full text stays in the table. */
 const LABEL_CHARS = 18
 
+const NO_HIDDEN: ReadonlySet<string> = new Set()
+
 export function Chart({
   model,
   type,
   rowsDimension,
   seriesDimension,
+  hidden = NO_HIDDEN,
+  labels,
+  onToggleSeries,
 }: {
   model: ChartModel
   type: ChartType
   rowsDimension: Dimension
   seriesDimension: Dimension | null
+  /** Series keys the reader has hidden from the drawing. */
+  hidden?: ReadonlySet<string>
+  /** Display-only series renames, keyed like `hidden`. */
+  labels?: Readonly<Record<string, string>>
+  /** Offered in the legend when provided; without it the legend is a list. */
+  onToggleSeries?: (key: string) => void
 }) {
   const titleId = useId()
   if (model.rows.length === 0) {
@@ -56,16 +73,19 @@ export function Chart({
     )
   }
 
+  const named = labels ? relabelModel(model, labels) : model
+  const view = visibleModel(named, hidden)
+
   const stacked = type === 'stackedBar'
-  const scaleMax = stacked ? model.maxTotal : model.max
+  const scaleMax = stacked ? view.maxTotal : view.max
   const ticks = niceTicks(scaleMax)
   const top = ticks[ticks.length - 1] || 1
   const y = (value: number) => PAD.top + PLOT_H * (1 - value / top)
-  const band = PLOT_W / model.rows.length
+  const band = PLOT_W / view.rows.length
   const summary =
     `${DIMENSION_LABELS[rowsDimension]} by ` +
     (seriesDimension ? DIMENSION_LABELS[seriesDimension] : 'CVE count') +
-    `, ${model.rows.length} buckets, ${model.total.toLocaleString()} CVEs in total. ` +
+    `, ${view.rows.length} buckets, ${view.total.toLocaleString()} CVEs in total. ` +
     'The same numbers are in the table below this chart.'
 
   return (
@@ -89,12 +109,12 @@ export function Chart({
         ))}
 
         {type === 'line'
-          ? model.series.map((entry, sIndex) => (
+          ? view.series.map((entry, sIndex) => (
               <polyline
                 key={entry.key}
                 className="series-line"
                 stroke={entry.color}
-                points={model.rows
+                points={view.rows
                   .map(
                     (row, rIndex) =>
                       `${PAD.left + band * (rIndex + 0.5)},${y(row.values[sIndex] ?? 0)}`
@@ -102,7 +122,7 @@ export function Chart({
                   .join(' ')}
               />
             ))
-          : model.rows.map((row, rIndex) => {
+          : view.rows.map((row, rIndex) => {
               const slot = PAD.left + band * rIndex
               const inner = band * 0.72
               const left = slot + (band - inner) / 2
@@ -110,7 +130,7 @@ export function Chart({
                 let base = 0
                 return (
                   <g key={row.key}>
-                    {model.series.map((entry, sIndex) => {
+                    {view.series.map((entry, sIndex) => {
                       const value = row.values[sIndex] ?? 0
                       const height = (value / top) * PLOT_H
                       const yTop = y(base + value)
@@ -133,10 +153,10 @@ export function Chart({
                   </g>
                 )
               }
-              const each = inner / Math.max(1, model.series.length)
+              const each = inner / Math.max(1, view.series.length)
               return (
                 <g key={row.key}>
-                  {model.series.map((entry, sIndex) => {
+                  {view.series.map((entry, sIndex) => {
                     const value = row.values[sIndex] ?? 0
                     if (value === 0) return null
                     const height = (value / top) * PLOT_H
@@ -168,7 +188,7 @@ export function Chart({
           y2={PAD.top + PLOT_H}
           className="axis-line"
         />
-        {model.rows.map((row, rIndex) => {
+        {view.rows.map((row, rIndex) => {
           const x = PAD.left + band * (rIndex + 0.5)
           const short =
             row.label.length > LABEL_CHARS ? `${row.label.slice(0, LABEL_CHARS - 1)}…` : row.label
@@ -188,14 +208,42 @@ export function Chart({
 
       <figcaption>
         {/* The legend is HTML rather than SVG text: it has to reflow on a narrow
-            screen, and a swatch beside a word is a list, not a drawing. */}
-        <ul className="legend" data-series={model.series.length}>
-          {model.series.map((entry) => (
-            <li key={entry.key}>
-              <span className="swatch" style={{ background: entry.color }} aria-hidden="true" />
-              {entry.label}
-            </li>
-          ))}
+            screen, and a swatch beside a word is a list, not a drawing. It lists
+            the *complete* series set — a hidden series stays in the legend, as
+            the control that brings it back. */}
+        <ul className="legend" data-series={named.series.length}>
+          {named.series.map((entry) => {
+            const isHidden = hidden.has(entry.key)
+            const swatch = (
+              <span
+                className="swatch"
+                style={{ background: entry.color }}
+                aria-hidden="true"
+                data-swatch-hidden={isHidden ? '1' : undefined}
+              />
+            )
+            return (
+              <li key={entry.key} data-series-hidden={isHidden ? '1' : undefined}>
+                {onToggleSeries ? (
+                  <button
+                    type="button"
+                    className="legend-toggle"
+                    aria-pressed={!isHidden}
+                    aria-label={`${isHidden ? 'Show' : 'Hide'} series: ${entry.label}`}
+                    onClick={() => onToggleSeries(entry.key)}
+                  >
+                    {swatch}
+                    {entry.label}
+                  </button>
+                ) : (
+                  <>
+                    {swatch}
+                    {entry.label}
+                  </>
+                )}
+              </li>
+            )
+          })}
         </ul>
         {(model.droppedRows > 0 || model.droppedSeries > 0) && (
           <p className="stale" data-chart-capped="1">
@@ -223,17 +271,22 @@ export function Chart({
  * keyboard user reaches, and what anyone checking a surprising bar looks at.
  * Row and column headers are real `<th scope>` cells, which is the difference
  * between a table a screen reader can navigate and a grid of unlabelled
- * numbers.
+ * numbers. It renders the complete model even when the chart above has series
+ * hidden — the table is the audit channel.
  */
 export function ChartTable({
   model,
   rowsDimension,
   seriesDimension,
+  labels,
 }: {
   model: ChartModel
   rowsDimension: Dimension
   seriesDimension: Dimension | null
+  /** The same display renames the chart applies, so the two agree. */
+  labels?: Readonly<Record<string, string>>
 }) {
+  const named = labels ? relabelModel(model, labels) : model
   const cross = seriesDimension !== null
   return (
     <div className="scroll" tabIndex={0}>
@@ -246,7 +299,7 @@ export function ChartTable({
         <thead>
           <tr>
             <th scope="col">{DIMENSION_LABELS[rowsDimension]}</th>
-            {model.series.map((entry) => (
+            {named.series.map((entry) => (
               <th scope="col" key={entry.key}>
                 {entry.label}
               </th>
@@ -255,12 +308,12 @@ export function ChartTable({
           </tr>
         </thead>
         <tbody>
-          {model.rows.map((row) => (
+          {named.rows.map((row) => (
             <tr key={row.key}>
               {/* Record content is a text node, never markup (rule 4). */}
               <th scope="row">{row.label}</th>
               {row.values.map((value, at) => (
-                <td key={model.series[at]?.key ?? at}>{value.toLocaleString()}</td>
+                <td key={named.series[at]?.key ?? at}>{value.toLocaleString()}</td>
               ))}
               {cross && <td className="total">{row.total.toLocaleString()}</td>}
             </tr>

@@ -110,6 +110,25 @@ export function csvRow(cells: readonly unknown[]): string {
 }
 
 /**
+ * One clipboard cell, never executable — `csvField`'s guard without the CSV
+ * quoting, for the TSV and HTML clipboard flavours (D-071's boundary, applied
+ * to the copy path). TSV has no quoting convention every consumer honours, so
+ * controls are stripped outright — which is also what keeps a description's
+ * embedded tab or newline from becoming a new cell or row — and a leading
+ * formula character gets the apostrophe every spreadsheet reads as "text".
+ * The HTML flavour needs the same guard: Excel evaluates formulas pasted from
+ * `text/html` tables exactly as it does from plain text.
+ *
+ * A finite number is emitted as-is: `-5` is a value, not an `-` formula, and
+ * guarding it would corrupt every negative count a grid ever carries.
+ */
+export function sheetCell(value: unknown): string {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  const text = stripControls(value === null || value === undefined ? '' : String(value))
+  return FORMULA_LEAD.test(text) ? `'${text}` : text
+}
+
+/**
  * What a JSON export carries for a text value.
  *
  * `JSON.stringify` already makes the *file* safe to parse; this is about what

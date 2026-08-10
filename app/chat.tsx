@@ -1,25 +1,25 @@
 'use client'
 
 /**
- * The chat panel (M7).
+ * The chat column (M7, revamped into the workspace's third pane — D-081).
  *
- * **A side panel, not a sixth tab.** It opens beside whatever tab is active, so
- * a question can be about what the reader is already looking at. That is a
- * product decision, but its consequence is D-044's: what the panel renders is
- * the *same* components the Report and Explore tabs use — `Chart`,
- * `ChartTable`, `RecordTable` — never a compact reimplementation of them. A
- * parallel renderer is how a chat answer and the tab beside it end up
- * disagreeing about the same numbers. The per-record view is the furthest case:
- * rather than mounting a second `Detail`, chat sends the reader to the Explore
- * tab, where the one that exists already lives.
+ * **A column beside the canvas, not a separate view.** A question is usually
+ * about what is on the canvas, and the canvas is where every answer lands: an
+ * aggregate or record search the model runs is applied there automatically by
+ * the page. What this panel renders inline is the *same* components the
+ * canvas uses — `Chart`, `ChartTable`, `RecordTable` — never a compact
+ * reimplementation of them (D-044). A parallel renderer is how a chat answer
+ * and the canvas beside it would end up disagreeing about the same numbers.
+ * The per-record view is the furthest case: rather than mounting a second
+ * `Detail`, chat sends the reader to the canvas's records view, where the one
+ * that exists already lives.
  *
  * **Every rendered definition can leave the conversation.** The durable
  * artifact is the report definition, not the prose: it is hand-editable,
  * permalinkable, saveable and re-runnable with no model in the loop (D-069,
  * D-072). The conversation itself is session-only and is gone on reload, which
  * is what makes the tier's "nothing is stored" disclosure true on the client as
- * well as on the server. An aggregate goes to the report builder and a record
- * search goes to Explore, because those are the surfaces that render each.
+ * well as on the server.
  *
  * **Model prose is text, always.** Rendered into a text node, no markdown
  * parsing, no linkification, no `dangerouslySetInnerHTML` anywhere in this
@@ -92,19 +92,19 @@ export function ChatPanel({
   onClose: () => void
   onOpenReport: (report: Report) => void
   /**
-   * Hand a record search to the Explore tab.
+   * Hand a record search to the canvas's records view.
    *
    * A record result and an aggregate result get *different* destinations, and
-   * the difference is not cosmetic: a record search opened in the report
-   * builder renders the same predicates as a year-by-year count, which is a
-   * different view of what the reader was looking at (`searchReport`).
+   * the difference is not cosmetic: a record search opened as a report renders
+   * the same predicates as a year-by-year count, which is a different view of
+   * what the reader was looking at (`searchReport`).
    */
   onOpenSearch: (report: Report) => void
   /**
    * Open one record. Deliberately *not* a detail panel of this component's
-   * own: the record view is `Detail`, it lives on the Explore tab, and two
-   * mounted copies of it would both grab focus and both claim the same
-   * headings. Chat sends the reader to the one that exists.
+   * own: the record view is `Detail`, it lives on the canvas, and two mounted
+   * copies of it would both grab focus and both claim the same headings. Chat
+   * sends the reader to the one that exists.
    */
   onOpenRecord: (cveId: string) => void
 }) {
@@ -124,7 +124,7 @@ export function ChatPanel({
   return (
     <aside className="chat" data-chat="open" aria-label="Ask about the corpus">
       <header className="chat-head">
-        <h2>Ask</h2>
+        <h2>Chat</h2>
         <button type="button" className="quiet" onClick={onClose} aria-label="Close chat">
           Close
         </button>
@@ -517,7 +517,7 @@ function Outcome({
               data-chat-open-search="1"
               onClick={() => onOpenSearch(outcome.report)}
             >
-              Open in Explore
+              Open in records view
             </button>
           </p>
           <Backing sql={outcome.result.sql} params={outcome.result.params} />
@@ -655,10 +655,11 @@ function Aggregate({
 /**
  * The action that makes a chat answer outlive the conversation.
  *
- * Not a convenience: the conversation is session-only by design, so without
- * this the only durable thing a chat turn produced would be prose. Handing the
- * definition to the builder is what makes it editable, permalinkable and
- * saveable — the shared primitive doing the job D-044 designed it for.
+ * The page already applies each aggregate to the canvas as it arrives; this
+ * button re-applies *this* step's definition — an earlier answer the
+ * conversation has scrolled past — and re-runs it fresh. The definition is the
+ * durable artifact: editable, permalinkable and saveable with no model in the
+ * loop (D-069, D-072).
  */
 function OpenInReport({
   report,
@@ -675,7 +676,7 @@ function OpenInReport({
         data-chat-open-report="1"
         onClick={() => onOpenReport(report)}
       >
-        Open in Report
+        Open on canvas
       </button>
     </p>
   )

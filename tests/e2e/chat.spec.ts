@@ -1,6 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
+import { awaitIdle, importCorpus, openChat, openPanel } from './ui'
 
 /**
  * The chat path, in a browser, with a scripted model (M7).
@@ -64,19 +65,23 @@ async function stubModel(page: Page, rounds: string[][]): Promise<{ bodies: unkn
   return { bodies }
 }
 
-/** Download the corpus once and open the panel, past the disclosure. */
+/** Download the corpus once and get the chat column past the disclosure. */
 async function ready(page: Page): Promise<void> {
   await page.goto('/')
   await requireLocalStorage(page)
-  await page.getByRole('button', { name: /Download data/ }).click()
-  await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
-  await page.getByRole('button', { name: 'Ask', exact: true }).click()
+  // `importCorpus` navigates again, which is fine: the probe above only needs
+  // a loaded page, not this particular load.
+  await importCorpus(page, 300_000)
+  // The chat column auto-opens at this viewport; being explicit costs nothing
+  // and keeps the spec honest if a future default changes.
+  await openChat(page)
   await page.getByRole('button', { name: 'Turn chat on' }).click()
 }
 
 async function ask(page: Page, question: string): Promise<void> {
   await page.getByLabel('Your question').fill(question)
-  await page.getByRole('button', { name: 'Ask', exact: true }).last().click()
+  // The submit button is unique now — the old header 'Ask' opener is gone.
+  await page.getByRole('button', { name: 'Ask', exact: true }).click()
 }
 
 test.describe('the chat panel', () => {
@@ -137,11 +142,27 @@ test.describe('the chat panel', () => {
     await ask(page, 'counts by severity')
     const step = page.locator('[data-chat-step="aggregate"]')
     await expect(step).toBeVisible({ timeout: 120_000 })
+    await expect(page.locator('[data-chat-answer]')).toContainText('Here you go.', {
+      timeout: 120_000,
+    })
+
+    // The aggregate has already auto-applied to the canvas (UI revamp), and
+    // the filter panel reflects the *model's* definition — `severity` rows,
+    // where the auto-run default report would say `year`.
+    await awaitIdle(page)
+    await openPanel(page, 'filters')
+    await expect(page.locator('#report-rows')).toHaveValue('severity')
+    const matches = page.locator('[data-report-matches]')
+    await expect(matches).toBeVisible({ timeout: 120_000 })
+    const before = await matches.getAttribute('data-run')
 
     // The durable artifact of a conversation is the definition, not the prose
-    // (D-069, D-072) — so this is the action that has to work.
+    // (D-069, D-072) — so this is the action that has to work: it hands the
+    // definition to the builder and re-runs it on the canvas, which a fresh
+    // `data-run` proves. The canvas already showing an identical result must
+    // not be able to satisfy this.
     await step.locator('[data-chat-open-report]').click()
-    await expect(page.getByRole('heading', { name: 'Report' })).toBeVisible()
+    await expect(matches).not.toHaveAttribute('data-run', before ?? '', { timeout: 120_000 })
     await expect(page.locator('#report-rows')).toHaveValue('severity')
     await expect(page.locator('[data-report-matches]')).toBeVisible({ timeout: 120_000 })
   })
@@ -165,6 +186,11 @@ test.describe('the chat panel', () => {
     await expect(firstId).toBeVisible()
     const cveId = (await firstId.textContent())?.trim() ?? ''
     expect(cveId).toMatch(/^CVE-\d{4}-\d+$/)
+
+    // Auto-apply (UI revamp): the same search also lands on the canvas's
+    // records view, through the same components — not a second renderer.
+    await expect(page.locator('section.canvas table.records')).toBeVisible({ timeout: 120_000 })
+    await expect(page.locator('section.canvas p[data-matches]')).toBeVisible()
 
     // …and *not* in what was sent to the model. This is the D-044 rule that is
     // invisible in the UI, so it is checked from the wire.
@@ -212,9 +238,13 @@ test.describe('the chat panel', () => {
       await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: done() })
     })
 
+    // Chat is a workspace column now, so reaching the gate takes a corpus —
+    // and the default report that auto-runs on readiness never touches the
+    // relay, which is part of what `hits` still proves.
     await page.goto('/')
     await requireLocalStorage(page)
-    await page.getByRole('button', { name: 'Ask', exact: true }).click()
+    await importCorpus(page, 300_000)
+    await openChat(page)
 
     // The gate, not a banner: there is no composer at all until it is accepted.
     await expect(page.locator('[data-chat-consent]')).toBeVisible()
@@ -269,7 +299,7 @@ test.describe('the chat panel', () => {
     })
 
     await page.reload()
-    await page.getByRole('button', { name: 'Ask', exact: true }).click()
+    await openChat(page)
     // The consent flag survives — that is a decision, not a conversation — and
     // the conversation does not, which is what makes "nothing is stored" true
     // on the client as well as on the server.
@@ -295,9 +325,12 @@ test.describe('the chat panel', () => {
     await expect(error).toBeVisible({ timeout: 120_000 })
     await expect(error).toContainText('model host')
     // The deterministic UI is untouched, and the message says so rather than
-    // reading as "the app is broken".
+    // reading as "the app is broken". The old assertion was the Report tab
+    // still being enabled; the workspace equivalent is that the filter panel
+    // still opens and can still run a report.
     await expect(error).toContainText('unaffected')
-    await expect(page.getByRole('tab', { name: 'Report' })).toBeEnabled()
+    await openPanel(page, 'filters')
+    await expect(page.getByRole('button', { name: 'Run report' })).toBeEnabled()
   })
 
   test('a rate-limited relay says to wait rather than that the app is broken', async ({ page }) => {

@@ -5,6 +5,8 @@ import { expect, test, type Browser, type Page } from '@playwright/test'
 
 import type { BenchResult, ImportOptions, Timings, Vfs } from '../../lib/protocol'
 
+import { downloadButton, openPanel } from './ui'
+
 /**
  * Q-003 and Q-004 at full scale: the sweep the M1 budgets come from.
  *
@@ -226,25 +228,33 @@ test.describe('full-scale measurement', () => {
 
       const started = Date.now()
       await page.reload()
-      await expect(page.getByRole('button', { name: 'Re-download data', exact: true })).toBeEnabled(
-        {
-          timeout: 120_000,
-        }
-      )
+      // The workspace header only renders once the Worker has reported the
+      // local copy, so the Sync button appearing is the moment the old Data
+      // tab's enabled Re-download button used to mark.
+      await expect(page.getByRole('button', { name: 'Sync', exact: true })).toBeVisible({
+        timeout: 120_000,
+      })
       const ready = Date.now() - started
 
+      // The demo query lives in the Data panel now, which a reload leaves
+      // closed. Note the canvas also auto-runs the most recent report on
+      // reopen, and the demo click waits behind it — `queried` includes that.
+      await openPanel(page, 'data')
       await page.getByRole('button', { name: 'Run query' }).click()
       // D-052: this query takes seconds on a cold page cache, so it has to say
       // it is running. Asserted here rather than in import.spec because only
       // the full corpus is slow enough for the check to mean anything.
       await expect(page.locator('.progress')).toContainText('Running query')
-      await expect(page.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+      // Scoped to the Data panel: the canvas's chart table is `.results` too.
+      await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+        timeout: 120_000,
+      })
       const queried = Date.now() - started
 
       record({
         kind: 'note',
         key: 'reopen',
-        note: `- reopen after a reload: **${ready} ms** to report the local copy, **${queried} ms** to rendered query results (cold page, warm OPFS).`,
+        note: `- reopen after a reload: **${ready} ms** to report the local copy, **${queried} ms** to rendered query results (cold page, warm OPFS; includes the canvas auto-running the most recent report ahead of the demo query).`,
       })
     } finally {
       await context.close()
@@ -281,11 +291,14 @@ test.describe('full-scale measurement', () => {
         })
 
         // Whatever the second tab did, the first must still work: a tab that
-        // breaks its sibling is a different failure from one that waits.
+        // breaks its sibling is a different failure from one that waits. Its
+        // Data panel is still open — it opened itself after the import.
         const survived = await bounded(
           (async () => {
             await first.getByRole('button', { name: 'Run query' }).click()
-            await expect(first.locator('.results tbody tr')).toHaveCount(15, { timeout: 120_000 })
+            await expect(first.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
+              timeout: 120_000,
+            })
             return 'still queries normally'
           })(),
           150_000,
@@ -331,12 +344,13 @@ test.describe('full-scale measurement', () => {
       const timings = await importInPage(page, {})
 
       // Bounded and asserted before anything is clicked. An import is followed
-      // by a catch-up (M2), and a catch-up that fails leaves the query tabs
-      // disabled — at which point clicking one waits for the *case* timeout
-      // with no CPU and no output, which is half an hour spent learning
-      // nothing. Naming the state here turns that into a sentence.
-      const reportTab = page.getByRole('tab', { name: 'Report', exact: true })
-      await expect(reportTab, `page errors: ${failures.join('; ')}`).toBeEnabled({
+      // by a catch-up (M2), and a failure there can leave the workspace not
+      // rendering — at which point clicking into it waits for the *case*
+      // timeout with no CPU and no output, which is half an hour spent
+      // learning nothing. Naming the state here turns that into a sentence.
+      // The Filters toggle only exists once the Worker reports a usable copy.
+      const filtersToggle = page.locator('[data-toggle="filters"]')
+      await expect(filtersToggle, `page errors: ${failures.join('; ')}`).toBeVisible({
         timeout: 300_000,
       })
       // An error banner is *recorded*, not fatal. The copy is queryable at the
@@ -354,11 +368,16 @@ test.describe('full-scale measurement', () => {
             `${banner || '(no banner)'}${failures.length ? ` — page errors: ${failures.join('; ')}` : ''}`,
         })
       }
-      await reportTab.click()
+      // The report axes and "Run report" live in the Filters panel now.
+      await openPanel(page, 'filters')
       // An import is followed by a catch-up (M2), and "Run report" is disabled
       // while the Worker is busy — so without this the *first* shape's wall
       // time is the sync's, not the query's. It read 284 s once, which is a
       // number nobody would have questioned in a table headed "report".
+      // The canvas also auto-runs a default report once the copy is ready —
+      // one extra query after the import. Harmless to the shapes measured
+      // below: each waits on its own data-run increment, and this wait
+      // outlasts the auto-run too.
       await expect(page.locator('.progress')).toBeHidden({ timeout: 600_000 })
 
       const lines: string[] = []
@@ -548,7 +567,16 @@ async function importInPage(page: Page, options: ImportOptions): Promise<Timings
   if (options.progressOps !== undefined) query.set('ops', String(options.progressOps))
   await page.goto(`/?${query}`)
 
-  await page.getByRole('button', { name: /Download data/ }).click()
+  // The landing CTA, once the Worker has spoken — clicking across the
+  // pre-status render is the click ui.ts's importCorpus guards against.
+  await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
+    timeout: 15_000,
+  })
+  await downloadButton(page).click()
+  // `.timings` renders in the Data panel, which opens itself on the import
+  // that filled it. The canvas then auto-runs a default report — one extra
+  // query after import, invisible to these timings, which the Worker stamps
+  // before it runs.
   await expect(page.locator('.timings')).toBeVisible({ timeout: IMPORT_TIMEOUT })
 
   const timings = JSON.parse(
@@ -597,20 +625,25 @@ async function bounded(work: Promise<string>, ms: number, onTimeout: string): Pr
 
 /** What a freshly opened second tab settled on, in words. */
 async function secondTabOutcome(page: Page): Promise<string> {
-  // exact, because getByRole matches accessible names by substring: without it
-  // `Download data` also matches `Re-download data`, i.e. the opposite state,
-  // and the verdict this function produces is D-051's central evidence.
-  const existing = page.getByRole('button', { name: 'Re-download data', exact: true })
-  const fresh = page.getByRole('button', { name: 'Download data', exact: true })
+  // The workspace header (and its Data toggle) renders only once the Worker
+  // reports an existing copy; the landing CTA renders while there is none.
+  // exact on the CTA, because `Download CVE dataset` is a substring-sibling of
+  // `Re-download CVE dataset` — the opposite state — and the verdict this
+  // function produces is D-051's central evidence.
+  const existing = page.locator('[data-toggle="data"]')
+  const fresh = page.getByRole('button', { name: 'Download CVE dataset', exact: true })
   const failed = page.locator('.error')
   const started = Date.now()
   for (;;) {
     if (await failed.isVisible().catch(() => false)) return `error: ${await failed.innerText()}`
-    if (await existing.isEnabled().catch(() => false)) {
+    if (await existing.isVisible().catch(() => false)) {
       // It sees the database — but seeing it and being able to read it are
-      // different questions, so ask it for rows.
+      // different questions, so open the Data panel and ask it for rows.
+      await openPanel(page, 'data')
       await page.getByRole('button', { name: 'Run query' }).click()
-      const rows = page.locator('.results tbody tr')
+      // Scoped to the panel: the canvas's auto-run chart table is `.results`
+      // too, and this tab may have run one.
+      const rows = page.locator('#data-panel table.results tbody tr')
       try {
         await expect(rows).toHaveCount(15, { timeout: 60_000 })
         return 'opened the existing database and queried it'

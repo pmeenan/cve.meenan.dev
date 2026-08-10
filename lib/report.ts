@@ -75,7 +75,7 @@ export interface Report {
   limit?: number
 }
 
-/** A report with nothing chosen: the state the Report tab opens in. */
+/** A report with nothing chosen: the state the report builder opens in. */
 export function emptyReport(): Report {
   return {
     v: REPORT_VERSION,
@@ -84,6 +84,24 @@ export function emptyReport(): Report {
     series: 'severity',
     chart: 'stackedBar',
     limit: CHART_ROWS,
+  }
+}
+
+/**
+ * The report a fresh workspace opens with (UI revamp): CVE counts by severity
+ * over time, the founding question, across every published year. Used only
+ * when there is no history to resume — a returning visitor gets their own most
+ * recent report instead.
+ */
+export function defaultReport(): Report {
+  return {
+    v: REPORT_VERSION,
+    title: 'CVEs by severity over time',
+    filters: { state: 'published' },
+    rows: 'year',
+    series: 'severity',
+    chart: 'stackedBar',
+    limit: 48,
   }
 }
 
