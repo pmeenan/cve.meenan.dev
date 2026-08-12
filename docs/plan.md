@@ -247,8 +247,54 @@ Scope, from the owner's direction:
 - **Test migration**: the e2e suite follows the UI it tests — a shared
   selector map (`tests/e2e/ui.ts`) replaces per-spec locator duplication.
 
-Exit: `pnpm check` and `pnpm e2e` green on both engines against the new UI;
-the owner has used the deployed workspace and the remaining rough edges are
+First round of owner iteration (2026-08-11), from use of the deployed
+workspace: no landing flash before the Worker reports whether a copy exists
+(neither view renders until then); severity re-coloured to the conventional
+hue palette (D-083); hover tooltips on every chart type; a stacked-area chart
+type; the numbers table shown only as the Table view — a sortable,
+zebra-striped spreadsheet — while staying in the DOM under a chart as the
+screen-reader and audit channel; and the copy buttons collapsed into one copy
+icon that copies the chart or the table, whichever is shown.
+
+Second round (2026-08-11): CRITICAL darkened to brick red (floors re-checked);
+the published-date window and a Monthly/Quarterly/Yearly bucket radio moved
+onto the canvas above the chart — the same predicates the drawer edits, so
+chips, drawer and permalinks agree; the chart-type dropdown became icon
+toggles; every chat turn now carries the canvas's current definition in the
+tool vocabulary (`canvasContext`, round-trip-tested against `parseToolCall`)
+so "change the date range" edits the chart on screen instead of starting
+blind; and the prompt now states that "the last N years" is a full window
+ending today, not the last N calendar-year labels.
+
+Third round (2026-08-12): the owner made the product call that the app is **no
+longer offline-first** (D-084). The download gate is replaced by a **hosted
+query tier** so a first visit starts in the workspace with no download: a
+same-origin `api/sql.php` executes the client's read-only SQL against a server
+copy of the same database (corpus + FTS + KEV, built by `pipeline/hosted.py`,
+refreshed by the daily ingest's `--hosted` hook and the 6-hourly KEV job's,
+replaced by atomic rename). The client seam is one branch — `lib/remote.ts`'s
+`RemoteDb` wears the Worker's database shape and issues a synchronous XHR — so
+both tiers run identical compiled SQL and handlers. "Make available offline"
+replaces "Sync" on the hosted tier; the status strip discloses which tier
+answers; `?remote=0` turns the tier off. The safeguard question was settled by
+measurement rather than recollection (php:8.3 in a container): a CPU-bound
+infinite statement is killed by `set_time_limit`+`zend.hard_timeout` at ~4 s,
+and the M3 authorizer ports directly. An in-engine memory bound
+(`PRAGMA hard_heap_limit`) was measured and then **removed** by owner decision
+(2026-08-12): it is process-global and a one-way ratchet that would clamp the
+whole shared fpm pool, so a value bomb can spike RSS to ~1 GB — accepted on the
+64 GB origin (amends D-084). The endpoint verifies the authorizer installed
+fail-closed (503, never a silently unguarded query). Verified: 6/6 hosted
+browser specs on chromium (including the offline upgrade flipping the tier),
+the parity test holding three implementations equal, and
+`scripts/verify-sql-php.sh` driving the real endpoint in the official PHP image
+(transport ladder, results, KEV join, fts5, every guard, fpm-respawn liveness).
+Left for deploy: the two nginx include files
+(`scripts/deploy-sql-nginx.sh`), confirming `zend.hard_timeout` is non-zero on
+the origin, and the cron additions.
+
+Exit: `pnpm check` and `pnpm e2e` green on both engines across both tiers; the
+owner has used the deployed workspace and the remaining rough edges are
 recorded here rather than open-ended.
 
 ## M8 — Other model tiers: BYO keys and in-browser local  `parked` (2026-08-09)

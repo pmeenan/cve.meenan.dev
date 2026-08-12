@@ -9,17 +9,31 @@ import { expect, type Locator, type Page } from '@playwright/test'
  * anything a single spec asserts (its own `data-*` payloads, copy strings)
  * stays with that spec, where the intent is.
  *
- * The workspace has two top-level states:
+ * The workspace has two top-level states — and a brief third before either:
+ * while `main[data-status]` is `pending` (and, with the hosted tier reachable,
+ * while the hosted probe is in flight) the page renders neither view, so
+ * nothing flashes before the Worker has said which one applies (M9, D-084).
+ * `importCorpus` already waits that state out.
  *
- * - **Landing** — no usable local copy. One CTA (`Download CVE dataset`,
+ * - **Landing** — neither tier can answer: no local copy, and the hosted tier
+ *   is off (`?remote=0`) or unreachable. One CTA (`Download CVE dataset`,
  *   `[data-download]`), the diagnostics disclosure, and the page-level
  *   banners. The download progress bar renders here while an import runs.
- * - **Workspace** — a usable copy. Header toggles open the panels: Filters
- *   (`#filters-panel`), SQL (`#sql-panel`), Data (`#data-panel`), Saved
- *   (`#saved-panel`), and the chat column. The Data panel opens itself after
- *   an import, which is why `importCorpus` can await the `Import` heading.
- *   The canvas auto-runs a default report the first time a copy is ready —
- *   `data-run` is never assumed to be zero.
+ * - **Workspace** — a tier can answer. On the **local** tier (a downloaded
+ *   copy) the header carries a `Sync` button; on the **hosted** tier (server
+ *   answering, no local copy) it carries `Make available offline` instead,
+ *   which is the same `[data-download]` action. `main[data-tier]` is `local`
+ *   or `hosted`. Header toggles open the panels: Filters (`#filters-panel`),
+ *   SQL (`#sql-panel`), Data (`#data-panel`), Saved (`#saved-panel`), and the
+ *   chat column. The canvas auto-runs a default report the first time a tier
+ *   is ready — `data-run` is never assumed to be zero.
+ *
+ * **The dev server cannot execute `sql.php`** (it serves PHP as bytes), so
+ * the hosted probe fails against it and the landing fallback renders — which
+ * is why the local-tier specs still see the landing CTA on a first visit.
+ * `importCorpus` pins that with `?remote=0` so it does not even depend on the
+ * probe failing; a spec that wants the *hosted* tier stubs `/api/sql.php`
+ * with `page.route` (see `hosted.spec.ts`).
  */
 
 /** The landing view's download CTA — also `Re-download CVE dataset` at a bump. */
@@ -27,6 +41,16 @@ export const DOWNLOAD = /download CVE dataset/i
 
 export function downloadButton(page: Page): Locator {
   return page.locator('[data-download]')
+}
+
+/**
+ * The hosted tier's upgrade action — the workspace header's `Make available
+ * offline` (`data-download` too, so `downloadButton` finds either). Distinct
+ * helper because a spec asserting the *hosted* header wants the label, not
+ * just the hook.
+ */
+export function makeOfflineButton(page: Page): Locator {
+  return page.getByRole('button', { name: /make available offline/i })
 }
 
 /** The workspace panels a header toggle controls. */
@@ -62,6 +86,18 @@ export async function openChat(page: Page): Promise<void> {
   await expect(page.locator('aside.chat')).toBeVisible()
 }
 
+/**
+ * Pick a chart type from the canvas's icon toggle group (M9) — the buttons'
+ * accessible names are the old dropdown's labels: `Stacked bars`,
+ * `Grouped bars`, `Lines over time`, `Stacked area`, `Table`.
+ */
+export async function setChartType(page: Page, label: string): Promise<void> {
+  await page
+    .locator('[data-chart-picker]')
+    .getByRole('button', { name: label, exact: true })
+    .click()
+}
+
 /** The canvas's collapsed share/export row, opened. */
 export async function openShare(page: Page): Promise<void> {
   const share = page.locator('details.share')
@@ -79,7 +115,11 @@ export async function openShare(page: Page): Promise<void> {
  * finish on its own; specs that need quiet use `awaitIdle`.
  */
 export async function importCorpus(page: Page, timeout = 90_000): Promise<void> {
-  await page.goto('/')
+  // `?remote=0` turns the hosted tier off (D-084), so a first visit lands on
+  // the download CTA deterministically — the local-tier flow every caller of
+  // this helper is a precondition for. Without it the flow still works (the
+  // dev server cannot answer the probe), but this does not lean on that.
+  await page.goto('/?remote=0')
   await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
     timeout: 15_000,
   })
@@ -104,6 +144,11 @@ export async function importCorpus(page: Page, timeout = 90_000): Promise<void> 
  * gap with more work still queued — which is how a click that follows lands
  * on a re-disabled button and is swallowed (RE-034). Two samples 300 ms
  * apart, both enabled, is beyond any gap those windows leave.
+ *
+ * **Local tier only.** The idle signal is the `Sync` button, which the header
+ * carries only on the local tier; on the hosted tier it is "Make available
+ * offline" instead and this would never settle (RE-032). Call it after a copy
+ * is local (as `importCorpus` does), never while on the hosted tier.
  */
 export async function awaitIdle(page: Page, timeout = 60_000): Promise<void> {
   const sync = page.getByRole('button', { name: 'Sync', exact: true })

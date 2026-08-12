@@ -16,8 +16,9 @@
  * is a real table with real headers.
  *
  * Colours come from `lib/chart.ts` as `var(--…)` references and resolve in the
- * reader's own colour scheme (see `app/globals.css`). Severity is an ordinal
- * ramp with CRITICAL at the baseline; identity dimensions get categorical slots.
+ * reader's own colour scheme (see `app/globals.css`). Severity is hue-coded
+ * with CRITICAL at the baseline (D-083); identity dimensions get categorical
+ * slots.
  *
  * The UI revamp added the legend as a control: each entry can hide its series
  * from the *drawing* — the y-scale re-fits to what is visible — while the
@@ -26,7 +27,7 @@
  * display overrides (`labels`), which never travel in a definition.
  */
 
-import { useId } from 'react'
+import { useId, useState } from 'react'
 
 import { niceTicks, relabelModel, shortCount, visibleModel, type ChartModel } from '@/lib/chart'
 import { DIMENSION_LABELS, TIME_DIMENSIONS, type Dimension } from '@/lib/filters'
@@ -65,6 +66,18 @@ export function Chart({
   onToggleSeries?: (key: string) => void
 }) {
   const titleId = useId()
+  /**
+   * The hovered bucket, for the tooltip — presentation only, the same numbers
+   * as the table. `x`/`y` are pixels relative to the figure; the flips keep
+   * the tooltip inside it near the right and bottom edges.
+   */
+  const [tip, setTip] = useState<{
+    index: number
+    x: number
+    y: number
+    flipX: boolean
+    flipY: boolean
+  } | null>(null)
   if (model.rows.length === 0) {
     return (
       <p className="muted" data-chart="empty">
@@ -76,12 +89,65 @@ export function Chart({
   const named = labels ? relabelModel(model, labels) : model
   const view = visibleModel(named, hidden)
 
-  const stacked = type === 'stackedBar'
+  // A stacked area is a stacked bar drawn continuously: same scale, same order.
+  const stacked = type === 'stackedBar' || type === 'area'
   const scaleMax = stacked ? view.maxTotal : view.max
   const ticks = niceTicks(scaleMax)
   const top = ticks[ticks.length - 1] || 1
   const y = (value: number) => PAD.top + PLOT_H * (1 - value / top)
   const band = PLOT_W / view.rows.length
+
+  /**
+   * Which bucket the pointer is over, from the pointer's place in the SVG's
+   * own coordinates. `preserveAspectRatio="meet"` letterboxes when the element
+   * is wider than the drawing, so the offset has to be undone before dividing
+   * by the band — a naive `x / width * W` points at the wrong bucket on a wide
+   * canvas.
+   */
+  const trackPointer = (event: React.PointerEvent<SVGSVGElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    const scale = Math.min(rect.width / W, rect.height / H)
+    if (scale <= 0) return
+    const plotX = (event.clientX - rect.left - (rect.width - W * scale) / 2) / scale
+    if (plotX < PAD.left || plotX > PAD.left + PLOT_W) {
+      setTip(null)
+      return
+    }
+    const index = Math.min(view.rows.length - 1, Math.max(0, Math.floor((plotX - PAD.left) / band)))
+    const x = event.clientX - rect.left
+    const pointerY = event.clientY - rect.top
+    setTip({
+      index,
+      x,
+      y: pointerY,
+      flipX: x > rect.width / 2,
+      flipY: pointerY > rect.height * 0.6,
+    })
+  }
+
+  /** The stacked-area bands: each series a strip between two cumulative sums. */
+  const areaBands = () => {
+    const running = view.rows.map(() => 0)
+    return view.series.map((entry, sIndex) => {
+      // The lower edge is the previous series' cumulative line — computed
+      // before `running` is advanced, which the upper edge then does.
+      const lower = view.rows.map(
+        (_, rIndex) => `${PAD.left + band * (rIndex + 0.5)},${y(running[rIndex] ?? 0)}`
+      )
+      const upper = view.rows.map((row, rIndex) => {
+        running[rIndex] = (running[rIndex] ?? 0) + (row.values[sIndex] ?? 0)
+        return `${PAD.left + band * (rIndex + 0.5)},${y(running[rIndex] ?? 0)}`
+      })
+      return (
+        <polygon
+          key={entry.key}
+          className="series-area"
+          fill={entry.color}
+          points={`${upper.join(' ')} ${lower.reverse().join(' ')}`}
+        />
+      )
+    })
+  }
   const summary =
     `${DIMENSION_LABELS[rowsDimension]} by ` +
     (seriesDimension ? DIMENSION_LABELS[seriesDimension] : 'CVE count') +
@@ -95,6 +161,8 @@ export function Chart({
         role="img"
         aria-labelledby={titleId}
         preserveAspectRatio="xMidYMid meet"
+        onPointerMove={trackPointer}
+        onPointerLeave={() => setTip(null)}
       >
         <title id={titleId}>{summary}</title>
 
@@ -108,75 +176,86 @@ export function Chart({
           </g>
         ))}
 
-        {type === 'line'
-          ? view.series.map((entry, sIndex) => (
-              <polyline
-                key={entry.key}
-                className="series-line"
-                stroke={entry.color}
-                points={view.rows
-                  .map(
-                    (row, rIndex) =>
-                      `${PAD.left + band * (rIndex + 0.5)},${y(row.values[sIndex] ?? 0)}`
-                  )
-                  .join(' ')}
-              />
-            ))
-          : view.rows.map((row, rIndex) => {
-              const slot = PAD.left + band * rIndex
-              const inner = band * 0.72
-              const left = slot + (band - inner) / 2
-              if (stacked) {
-                let base = 0
-                return (
-                  <g key={row.key}>
-                    {view.series.map((entry, sIndex) => {
-                      const value = row.values[sIndex] ?? 0
-                      const height = (value / top) * PLOT_H
-                      const yTop = y(base + value)
-                      base += value
-                      if (value === 0) return null
-                      return (
-                        <rect
-                          key={entry.key}
-                          x={left}
-                          y={yTop}
-                          width={inner}
-                          height={Math.max(height, 0.5)}
-                          fill={entry.color}
-                          className="bar"
-                        >
-                          <title>{`${row.label} — ${entry.label}: ${value.toLocaleString()}`}</title>
-                        </rect>
-                      )
-                    })}
-                  </g>
+        {/* The hovered bucket's band, behind the marks. */}
+        {tip && (
+          <rect
+            className="hover-band"
+            x={PAD.left + band * tip.index}
+            y={PAD.top}
+            width={band}
+            height={PLOT_H}
+          />
+        )}
+
+        {type === 'line' &&
+          view.series.map((entry, sIndex) => (
+            <polyline
+              key={entry.key}
+              className="series-line"
+              stroke={entry.color}
+              points={view.rows
+                .map(
+                  (row, rIndex) =>
+                    `${PAD.left + band * (rIndex + 0.5)},${y(row.values[sIndex] ?? 0)}`
                 )
-              }
-              const each = inner / Math.max(1, view.series.length)
+                .join(' ')}
+            />
+          ))}
+
+        {type === 'area' && areaBands()}
+
+        {(type === 'stackedBar' || type === 'groupedBar') &&
+          view.rows.map((row, rIndex) => {
+            const slot = PAD.left + band * rIndex
+            const inner = band * 0.72
+            const left = slot + (band - inner) / 2
+            if (stacked) {
+              let base = 0
               return (
                 <g key={row.key}>
                   {view.series.map((entry, sIndex) => {
                     const value = row.values[sIndex] ?? 0
-                    if (value === 0) return null
                     const height = (value / top) * PLOT_H
+                    const yTop = y(base + value)
+                    base += value
+                    if (value === 0) return null
                     return (
                       <rect
                         key={entry.key}
-                        x={left + each * sIndex}
-                        y={y(value)}
-                        width={Math.max(each - 1, 1)}
+                        x={left}
+                        y={yTop}
+                        width={inner}
                         height={Math.max(height, 0.5)}
                         fill={entry.color}
                         className="bar"
-                      >
-                        <title>{`${row.label} — ${entry.label}: ${value.toLocaleString()}`}</title>
-                      </rect>
+                      />
                     )
                   })}
                 </g>
               )
-            })}
+            }
+            const each = inner / Math.max(1, view.series.length)
+            return (
+              <g key={row.key}>
+                {view.series.map((entry, sIndex) => {
+                  const value = row.values[sIndex] ?? 0
+                  if (value === 0) return null
+                  const height = (value / top) * PLOT_H
+                  return (
+                    <rect
+                      key={entry.key}
+                      x={left + each * sIndex}
+                      y={y(value)}
+                      width={Math.max(each - 1, 1)}
+                      height={Math.max(height, 0.5)}
+                      fill={entry.color}
+                      className="bar"
+                    />
+                  )
+                })}
+              </g>
+            )
+          })}
 
         {/* The x axis, and its labels. Rotated because an identity bucket is a
             vendor name, not a year — and a horizontal label would either
@@ -205,6 +284,42 @@ export function Chart({
           )
         })}
       </svg>
+
+      {/* The hover tooltip: the hovered bucket's numbers, every visible series.
+          Presentation only (`aria-hidden`): the accessible form of these
+          numbers is the table, and a tooltip a screen reader cannot reach must
+          not be the only place a value lives. */}
+      {tip && view.rows[tip.index] && (
+        <div
+          className="chart-tip"
+          aria-hidden="true"
+          data-chart-tip={view.rows[tip.index]!.key}
+          style={{
+            left: tip.x,
+            top: tip.y,
+            transform:
+              `translate(${tip.flipX ? 'calc(-100% - 12px)' : '12px'}, ` +
+              `${tip.flipY ? 'calc(-100% - 12px)' : '12px'})`,
+          }}
+        >
+          <p className="tip-title">{view.rows[tip.index]!.label}</p>
+          {view.series.map((entry, at) => (
+            <p className="tip-row" key={entry.key}>
+              <span className="swatch" style={{ background: entry.color }} />
+              <span className="tip-label">{entry.label}</span>
+              <span className="tip-value">
+                {(view.rows[tip.index]!.values[at] ?? 0).toLocaleString()}
+              </span>
+            </p>
+          ))}
+          {view.series.length > 1 && (
+            <p className="tip-row total">
+              <span className="tip-label">Total</span>
+              <span className="tip-value">{view.rows[tip.index]!.total.toLocaleString()}</span>
+            </p>
+          )}
+        </div>
+      )}
 
       <figcaption>
         {/* The legend is HTML rather than SVG text: it has to reflow on a narrow
@@ -267,59 +382,144 @@ export function Chart({
 /**
  * The numbers, as a table.
  *
- * Always rendered, never a fallback: it is what a screen reader reads, what a
- * keyboard user reaches, and what anyone checking a surprising bar looks at.
- * Row and column headers are real `<th scope>` cells, which is the difference
- * between a table a screen reader can navigate and a grid of unlabelled
- * numbers. It renders the complete model even when the chart above has series
- * hidden — the table is the audit channel.
+ * Always rendered, never a fallback: it is what a screen reader reads and what
+ * anyone checking a surprising bar looks at. Row and column headers are real
+ * `<th scope>` cells, which is the difference between a table a screen reader
+ * can navigate and a grid of unlabelled numbers. It renders the complete model
+ * even when the chart above has series hidden — the table is the audit channel.
+ *
+ * Two presentations (M9): `audit` sits under a chart visually hidden — in the
+ * DOM for screen readers and anyone reading the page's structure, off the
+ * screen because the Table view is where the numbers are *shown* — and
+ * `spreadsheet` is that view: visible, zebra-striped, and sortable. Sorting is
+ * a view of the model, never a new query, and it does not travel in a
+ * definition.
  */
 export function ChartTable({
   model,
   rowsDimension,
   seriesDimension,
   labels,
+  view,
 }: {
   model: ChartModel
   rowsDimension: Dimension
   seriesDimension: Dimension | null
   /** The same display renames the chart applies, so the two agree. */
   labels?: Readonly<Record<string, string>>
+  /** `audit`: visually hidden under a chart. `spreadsheet`: the Table view. */
+  view: 'audit' | 'spreadsheet'
 }) {
+  /** Column 0 is the row label, 1..n the series, n+1 the Total (cross only). */
+  const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null)
   const named = labels ? relabelModel(model, labels) : model
   const cross = seriesDimension !== null
+  const columns = 1 + named.series.length + (cross ? 1 : 0)
+  // A sort from a previous, wider model is ignored rather than applied to
+  // whatever column now sits at that index.
+  const active = view === 'spreadsheet' && sort && sort.col < columns ? sort : null
+  const rows = active ? sortRows(named.rows, named.series.length, active) : named.rows
+
+  const columnName = (col: number) =>
+    col === 0 ? DIMENSION_LABELS[rowsDimension] : (named.series[col - 1]?.label ?? 'Total')
+
+  const header = (label: string, col: number) =>
+    view === 'spreadsheet' ? (
+      <button
+        type="button"
+        className="sort-header"
+        onClick={() =>
+          setSort((current) =>
+            current && current.col === col
+              ? { col, dir: -current.dir as 1 | -1 }
+              : // Labels sort forwards; numbers sort biggest-first, which is
+                // the question a count column is usually asked.
+                { col, dir: col === 0 ? 1 : -1 }
+          )
+        }
+      >
+        {label}
+      </button>
+    ) : (
+      label
+    )
+
+  const ariaSort = (col: number) =>
+    active?.col === col ? (active.dir === 1 ? 'ascending' : 'descending') : undefined
+
+  const table = (
+    <table
+      className={view === 'spreadsheet' ? 'results chart-data spreadsheet' : 'results chart-data'}
+    >
+      <caption className="muted">
+        {DIMENSION_LABELS[rowsDimension]}
+        {cross ? ` × ${DIMENSION_LABELS[seriesDimension]}` : ''} — CVE counts
+        {active
+          ? `, sorted by ${columnName(active.col)}, ${active.dir === 1 ? 'ascending' : 'descending'}`
+          : TIME_DIMENSIONS.has(rowsDimension)
+            ? ', oldest first'
+            : ', largest first'}
+      </caption>
+      <thead>
+        <tr>
+          <th scope="col" aria-sort={ariaSort(0)}>
+            {header(DIMENSION_LABELS[rowsDimension], 0)}
+          </th>
+          {named.series.map((entry, at) => (
+            <th scope="col" key={entry.key} aria-sort={ariaSort(at + 1)}>
+              {header(entry.label, at + 1)}
+            </th>
+          ))}
+          {cross && (
+            <th scope="col" aria-sort={ariaSort(columns - 1)}>
+              {header('Total', columns - 1)}
+            </th>
+          )}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => (
+          <tr key={row.key}>
+            {/* Record content is a text node, never markup (rule 4). */}
+            <th scope="row">{row.label}</th>
+            {row.values.map((value, at) => (
+              <td key={named.series[at]?.key ?? at}>{value.toLocaleString()}</td>
+            ))}
+            {cross && <td className="total">{row.total.toLocaleString()}</td>}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+
+  // The audit copy takes no tab stop: a focusable scroll region that cannot be
+  // seen is a keyboard trap in all but name.
+  if (view === 'audit') return <div className="visually-hidden">{table}</div>
   return (
     <div className="scroll" tabIndex={0}>
-      <table className="results chart-data">
-        <caption className="muted">
-          {DIMENSION_LABELS[rowsDimension]}
-          {cross ? ` × ${DIMENSION_LABELS[seriesDimension]}` : ''} — CVE counts
-          {TIME_DIMENSIONS.has(rowsDimension) ? ', oldest first' : ', largest first'}
-        </caption>
-        <thead>
-          <tr>
-            <th scope="col">{DIMENSION_LABELS[rowsDimension]}</th>
-            {named.series.map((entry) => (
-              <th scope="col" key={entry.key}>
-                {entry.label}
-              </th>
-            ))}
-            {cross && <th scope="col">Total</th>}
-          </tr>
-        </thead>
-        <tbody>
-          {named.rows.map((row) => (
-            <tr key={row.key}>
-              {/* Record content is a text node, never markup (rule 4). */}
-              <th scope="row">{row.label}</th>
-              {row.values.map((value, at) => (
-                <td key={named.series[at]?.key ?? at}>{value.toLocaleString()}</td>
-              ))}
-              {cross && <td className="total">{row.total.toLocaleString()}</td>}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {table}
     </div>
   )
+}
+
+/** The reader's sort, applied to a copy — the model's own order is the data's. */
+function sortRows(
+  rows: ChartModel['rows'],
+  seriesCount: number,
+  sort: { col: number; dir: 1 | -1 }
+): ChartModel['rows'] {
+  const value = (row: ChartModel['rows'][number]) =>
+    sort.col === 0
+      ? row.label
+      : sort.col <= seriesCount
+        ? (row.values[sort.col - 1] ?? 0)
+        : row.total
+  return [...rows].sort((a, b) => {
+    const [va, vb] = [value(a), value(b)]
+    const order =
+      typeof va === 'string' || typeof vb === 'string'
+        ? String(va).localeCompare(String(vb), undefined, { numeric: true })
+        : va - vb
+    return order * sort.dir
+  })
 }

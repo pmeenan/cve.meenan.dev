@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import { gateMessage, type CapabilityReport } from '@/lib/capabilities'
 import { newCancelFlag, requestCancel } from '@/lib/cancel'
 import { hasConsent, setConsent, streamChat, systemPrompt, type ChatMessage } from '@/lib/chat'
+import { canvasContext } from '@/lib/tools'
 import { runChatTurn, type ChatTurn } from '@/lib/chat-loop'
 import { NO_SHELL, registerShell, shellVersion, type ShellState } from '@/lib/shell'
 import { draftToFilters, filtersToDraft } from '@/lib/draft'
@@ -128,6 +129,10 @@ function importOptions(search: string): ImportOptions {
   // `?free=` makes the storage preflight see a smaller figure, never a larger.
   const freeRaw = params.get('free')
   const freeBytes = freeRaw !== null && /^\d+$/.test(freeRaw.trim()) ? Number(freeRaw.trim()) : null
+  // `?remote=0` turns the hosted query tier off for the session (D-084). It can
+  // only narrow: with it, no query leaves the browser; without it, nothing new
+  // is reachable that the page would not reach anyway.
+  const remote = params.get('remote') === '0' ? false : null
   return {
     concurrency: positive(params.get('concurrency')) ?? DEFAULT_CONCURRENCY,
     cacheMib: positive(params.get('cache')) ?? DEFAULT_CACHE_MIB,
@@ -139,6 +144,7 @@ function importOptions(search: string): ImportOptions {
     ...(analyze === null ? {} : { analyze }),
     ...(probe === null ? {} : { probe }),
     ...(freeBytes === null ? {} : { freeBytes }),
+    ...(remote === null ? {} : { remote }),
   }
 }
 
@@ -206,6 +212,21 @@ export default function Home() {
    */
   const [kev, setKev] = useState<KevStatus | null>(null)
   const [kevError, setKevError] = useState('')
+  /**
+   * What the hosted tier probe found (D-084) — the server copy's revision,
+   * build stamp, notice and KEV catalog, or why it cannot serve. Null while
+   * unasked or in flight. The ref mirrors it for the one reader that runs
+   * inside `onmessage`, where state would be a render behind.
+   */
+  const [hosted, setHosted] = useState<{
+    ok: boolean
+    error?: string
+    rev: number | null
+    generated: number | null
+    notice: string | null
+    kev: KevStatus | null
+  } | null>(null)
+  const hostedRef = useRef<typeof hosted>(null)
   const [error, setError] = useState('')
   /**
    * Whether the run that is on screen imported successfully.
@@ -436,7 +457,12 @@ export default function Home() {
             if (next && (!current || next.fetched > current.fetched)) setKevError('')
             return next
           })
-          if (!message.ready) {
+          // The hosted tier changes what "not ready" clears (D-084): with the
+          // tier live, results on screen describe the same corpus served from
+          // the origin, the workspace is not about to give way to a download
+          // pitch, and the Worker re-posts `status` after every failed query —
+          // so clearing here would wipe the canvas on any hosted-tier error.
+          if (!message.ready && hostedRef.current?.ok !== true) {
             setTimings(null)
             setResult(null)
             setSearch(null)
@@ -452,6 +478,27 @@ export default function Home() {
             autoRan.current = false
           }
           break
+        case 'hostedStatus': {
+          const value = message.ok
+            ? {
+                ok: true,
+                rev: message.rev ?? null,
+                generated: message.generated ?? null,
+                notice: message.notice ?? null,
+                kev: message.kev ?? null,
+              }
+            : {
+                ok: false,
+                error: message.error ?? 'the hosted query tier is unavailable',
+                rev: null,
+                generated: null,
+                notice: null,
+                kev: null,
+              }
+          hostedRef.current = value
+          setHosted(value)
+          break
+        }
         case 'environment':
           setEnvironment({ capabilities: message.capabilities, storage: message.storage })
           break
@@ -461,6 +508,14 @@ export default function Home() {
           importedThisRun.current = true
           setTimings(message.timings)
           setNotice(message.notice)
+          // The local copy now answers, so any hosted-tier probe result is
+          // stale — and must be dropped, not just shadowed. `tier` prefers the
+          // local copy while it is ready, but if this copy is later cleared the
+          // clearing guard reads `hostedRef` and a stale `{ok:true}` would keep
+          // the deleted copy's report on screen under a hosted badge. Nulling
+          // both here means a later clear re-probes from scratch (D-084).
+          hostedRef.current = null
+          setHosted(null)
           // The run that just happened reports where the reader is looking:
           // the data panel opens itself once, on the import that filled it.
           setPanels((current) => ({ ...current, data: true }))
@@ -729,6 +784,15 @@ export default function Home() {
     setStorable(writeStore(safeStorage(), next))
   }, [])
 
+  /**
+   * Which tier answers queries right now (D-084). A ready local copy always
+   * wins — the hosted tier is the *absence* of one — and null means neither:
+   * no copy, and the hosted probe failed or is off, which is where the
+   * download pitch stands. Declared above the callbacks that branch on it.
+   */
+  const tier: 'local' | 'hosted' | null = ready ? 'local' : hosted?.ok ? 'hosted' : null
+  const canQuery = tier !== null
+
   const send = useCallback((request: Request) => {
     setError('')
     setCancelled(null)
@@ -790,27 +854,27 @@ export default function Home() {
       setReport(definition)
       setView('report')
       setLinkError('')
-      if (ready) {
+      if (canQuery) {
         runReport(definition)
         return
       }
       pendingReport.current = definition
       setLinkPending(true)
     },
-    [ready, runReport]
+    [canQuery, runReport]
   )
 
   useEffect(() => {
     // A link opened on a browser with no local copy waits for one rather than
     // failing: the definition is complete, it is only the corpus that is
     // missing. Runs exactly once — the ref is cleared as it fires.
-    if (!ready || !pendingReport.current) return
+    if (!canQuery || !pendingReport.current) return
     const pending = pendingReport.current
     pendingReport.current = null
     setLinkPending(false)
     autoRan.current = true
     runReport(pending)
-  }, [ready, runReport])
+  }, [canQuery, runReport])
 
   /**
    * The default canvas (UI revamp): a workspace never opens empty. The most
@@ -821,11 +885,11 @@ export default function Home() {
    * report the reader explicitly opened always wins over the default.
    */
   useEffect(() => {
-    if (!ready || autoRan.current || pendingReport.current) return
+    if (!canQuery || autoRan.current || pendingReport.current) return
     autoRan.current = true
     const recent = storeRef.current.recent[0]?.report
     runReport(recent ?? defaultReport())
-  }, [ready, runReport])
+  }, [canQuery, runReport])
 
   /**
    * Stop the running query.
@@ -897,6 +961,18 @@ export default function Home() {
           signal: controller.signal,
           history: chatHistory.current,
           system: systemPrompt(),
+          // The canvas as it stands when the question is asked, so "change the
+          // date range" edits the chart on screen rather than starting blind
+          // (M9). Only once something has actually run — a fresh workspace has
+          // no state worth describing.
+          context:
+            reportOutcome || search
+              ? canvasContext(
+                  report,
+                  view,
+                  view === 'report' ? (reportOutcome?.matches ?? null) : (search?.matches ?? null)
+                )
+              : undefined,
         },
         id
       ).then((result) => {
@@ -917,7 +993,7 @@ export default function Home() {
         toolWaiters.current.clear()
       }
     },
-    [runToolCall]
+    [runToolCall, report, view, reportOutcome, search]
   )
 
   const stopChat = useCallback(() => {
@@ -983,7 +1059,15 @@ export default function Home() {
   )
 
   const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
-  const freshness = ready && now !== null ? describeFreshness(generated, now) : null
+  /**
+   * The copy the status strip describes: the local one when it is live, the
+   * server's when the hosted tier is answering. One set of variables so the
+   * strip, the freshness line and the KEV line cannot mix tiers.
+   */
+  const effGenerated = tier === 'hosted' ? (hosted?.generated ?? null) : generated
+  const effRevision = tier === 'hosted' ? (hosted?.rev ?? null) : revision
+  const effKev = tier === 'hosted' ? (hosted?.kev ?? null) : kev
+  const freshness = canQuery && now !== null ? describeFreshness(effGenerated, now) : null
   // The catalog's *release* age, not the fetch's: what matters is how old
   // CISA's list is, and a browser that re-fetched an unchanged catalog this
   // morning has not made it newer. Both numbers are on screen, so neither is
@@ -992,7 +1076,7 @@ export default function Home() {
   // so a Friday catalog would be flagged every weekend by a number justified by
   // a pipeline that runs every day (M6).
   const kevFreshness =
-    kev && now !== null ? describeFreshness(kev.releasedAt, now, KEV_STALE_AFTER_MS) : null
+    effKev && now !== null ? describeFreshness(effKev.releasedAt, now, KEV_STALE_AFTER_MS) : null
   // Read once on mount: the warning below has to be on screen *before* the
   // button is clicked, and D-061 accepts this path's destroy-then-download
   // behaviour only because it is diagnostic — an ordinary "Re-download data"
@@ -1014,6 +1098,37 @@ export default function Home() {
    * on every first paint.
    */
   const blocked = environment !== null && !environment.capabilities.supported
+
+  /** Whether `?remote=0` left the hosted tier reachable at all (D-084). */
+  const remoteEnabled = useSyncExternalStore(
+    () => () => undefined,
+    () => importOptions(location.search).remote !== false,
+    () => true
+  )
+
+  /**
+   * Ask the Worker to probe the hosted tier, once per "no local copy" state.
+   *
+   * Keyed on `hosted === null` so the probe is not re-fired by the `status`
+   * re-posts that follow every operation — and not retried in a loop when the
+   * tier is down, which would poll the origin from every open tab. Reload is
+   * the retry, exactly as it is for a failed status.
+   */
+  useEffect(() => {
+    // Only when the local check is *conclusive* that there is no usable copy:
+    // `empty` (nothing here) or `obsolete` (a copy this build cannot read).
+    // Deliberately NOT `unknown` — that means "could not read local storage",
+    // an error state whose banner asks the user to reload and whose local copy
+    // may still be there; firing the probe there would also clear that banner
+    // (`send` resets the error), which is the opposite of what it is for.
+    if (!remoteEnabled || hosted !== null) return
+    if (storage !== 'empty' && storage !== 'obsolete') return
+    /* eslint-disable-next-line react-hooks/set-state-in-effect --
+       A side effect on a state transition (a conclusive no-copy result, tier
+       not yet probed), not a value derivable during render: it posts a message
+       to the Worker, whose async reply drives `hosted`. */
+    send({ type: 'hosted', options: importOptions(location.search) })
+  }, [storage, hosted, remoteEnabled, send])
 
   const downloadNow = useCallback(() => {
     // Asked from the click, because Firefox prompts and a prompt outside a
@@ -1110,7 +1225,7 @@ export default function Home() {
           {linkError}
         </p>
       )}
-      {linkPending && !ready && (
+      {linkPending && !canQuery && (
         <p className="stale" data-link-pending="1">
           A report is waiting for a local copy of the corpus. Download it and the report will run by
           itself — a permalink carries its whole definition in the URL fragment, which is never sent
@@ -1120,10 +1235,41 @@ export default function Home() {
     </>
   )
 
+  // The hosted probe is only in flight for a conclusive no-copy result, and
+  // only until it answers — this is the render's version of the effect's gate,
+  // so `unknown` never waits behind a probe it will not fire (RE: staged
+  // "unknown, not deleted").
+  const probingHosted =
+    remoteEnabled && hosted === null && (storage === 'empty' || storage === 'obsolete')
+
   return (
-    <main data-status={storage}>
-      {!ready ? (
+    <main data-status={storage} data-tier={tier ?? undefined}>
+      {storage === 'pending' || probingHosted ? (
         <>
+          {/* No landing and no workspace until the Worker has said which one
+              this visit is — first the local check, then (with no local copy)
+              the hosted tier probe (D-084). Rendering the download pitch here
+              would flash it at every visitor the workspace is about to serve.
+              The banners stay — the capability gate must not wait. The
+              placeholder's own appearance is delayed in CSS, so a fast answer
+              shows nothing at all. */}
+          <header className="topbar">
+            <div className="brand">
+              <h1>CVE Explorer</h1>
+              <span className="domain">cve.meenan.dev</span>
+            </div>
+          </header>
+          {banners}
+          <p className="muted checking" data-checking="1">
+            Checking this browser for a local copy of the corpus…
+          </p>
+        </>
+      ) : !canQuery ? (
+        <>
+          {/* Neither tier can answer: no local copy, and the hosted tier is
+              off (`?remote=0`) or unreachable. This is where the old landing
+              gate stood, and it keeps the gate's job — explain, then offer
+              the one action that changes the situation (D-084). */}
           <header className="topbar">
             <div className="brand">
               <h1>CVE Explorer</h1>
@@ -1136,6 +1282,7 @@ export default function Home() {
             disabled={busy || blocked}
             busy={busy}
             obsolete={storage === 'obsolete'}
+            hostedError={remoteEnabled && hosted && !hosted.ok ? (hosted.error ?? null) : null}
             progress={
               busy ? (
                 <ProgressBar
@@ -1203,13 +1350,32 @@ export default function Home() {
                   </span>
                 )}
               </button>
-              <button
-                type="button"
-                onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
-                disabled={!ready || busy || blocked}
-              >
-                Sync
-              </button>
+              {tier === 'hosted' ? (
+                /* The hosted tier's one upgrade action, where Sync stands on
+                   the local tier (D-084): the same import the old landing CTA
+                   started, named for what it changes. `data-download` is the
+                   stable hook, as on the landing fallback. */
+                <button
+                  type="button"
+                  onClick={downloadNow}
+                  disabled={busy || blocked}
+                  data-download="1"
+                >
+                  {busy
+                    ? 'Downloading…'
+                    : storage === 'obsolete'
+                      ? 'Re-download for offline'
+                      : 'Make available offline'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => send({ type: 'sync', options: importOptions(location.search) })}
+                  disabled={!ready || busy || blocked}
+                >
+                  Sync
+                </button>
+              )}
               {/* A column, not a sixth panel: a question is usually *about*
                   what is on the canvas, and chat is the primary way in. */}
               <button
@@ -1229,11 +1395,23 @@ export default function Home() {
               from and MITRE's notice attach to the *copy*, not to a view of it
               (D-008), so no panel state may take either off the screen. */}
           <div className="status-strip">
-            {revision !== null && (
-              <p className="muted" data-revision={revision}>
-                Local copy at revision {revision}
-                {sync && syncSummary(sync)}
+            {tier === 'hosted' ? (
+              /* The per-tier disclosure D-084 owes: on this tier queries are
+                 executed by the server, which is the opposite of the offline
+                 tier's structural claim — so the strip says which tier is
+                 answering, in the place the local tier states its revision. */
+              <p className="muted" data-hosted="1" data-revision={effRevision ?? undefined}>
+                Queries run on this site&rsquo;s server for now
+                {effRevision !== null && ` (data revision ${effRevision})`} — sent same-origin, not
+                stored. &ldquo;Make available offline&rdquo; moves everything into your browser.
               </p>
+            ) : (
+              revision !== null && (
+                <p className="muted" data-revision={revision}>
+                  Local copy at revision {revision}
+                  {sync && syncSummary(sync)}
+                </p>
+              )
             )}
 
             {/* Staleness, from the data's own build stamp rather than from a
@@ -1263,25 +1441,34 @@ export default function Home() {
                 across tabs (M6, D-076). The provenance is in the sentence:
                 "per CISA, as of …" keeps this a statement about CISA's catalog
                 rather than an endorsement by it. */}
-            {(kev !== null || kevError !== '') && (
+            {(effKev !== null || kevError !== '') && (
               <p
                 className={kevFreshness?.stale ? 'stale' : 'muted'}
-                data-kev={kev ? kev.version : 'none'}
+                data-kev={effKev ? effKev.version : 'none'}
                 data-kev-age-ms={kevFreshness ? Math.round(kevFreshness.ageMs) : undefined}
               >
-                {kev ? (
+                {effKev ? (
                   <>
-                    CISA KEV catalog {kev.version}, released{' '}
-                    <time dateTime={kev.released}>{localTime(kev.released)}</time>
-                    {kevFreshness && ` — ${kevFreshness.age}`}. {kev.entries.toLocaleString()}{' '}
+                    CISA KEV catalog {effKev.version}, released{' '}
+                    <time dateTime={effKev.released}>{localTime(effKev.released)}</time>
+                    {kevFreshness && ` — ${kevFreshness.age}`}. {effKev.entries.toLocaleString()}{' '}
                     entries
-                    {kev.unmatched > 0 &&
-                      `, ${kev.unmatched.toLocaleString()} for CVEs this copy does not hold`}
-                    . Fetched by this browser{' '}
-                    <time dateTime={new Date(kev.fetched * 1000).toISOString()}>
-                      {localTime(new Date(kev.fetched * 1000).toISOString())}
-                    </time>
+                    {effKev.unmatched > 0 &&
+                      `, ${effKev.unmatched.toLocaleString()} for CVEs this copy does not hold`}
                     .
+                    {/* "Fetched by this browser" is a claim about the local
+                        overlay; the hosted copy's stamp is the server's build
+                        time, which the released line already bounds. */}
+                    {tier === 'local' && (
+                      <>
+                        {' '}
+                        Fetched by this browser{' '}
+                        <time dateTime={new Date(effKev.fetched * 1000).toISOString()}>
+                          {localTime(new Date(effKev.fetched * 1000).toISOString())}
+                        </time>
+                        .
+                      </>
+                    )}
                   </>
                 ) : (
                   'No CISA KEV catalog in this copy yet.'
@@ -1381,6 +1568,7 @@ export default function Home() {
                 <section id="sql-panel" className="bottom-panel">
                   <Console
                     disabled={busy}
+                    hosted={tier === 'hosted'}
                     onRun={(sql: string) => send({ type: 'console', sql })}
                     result={consoleResult}
                     run={runSeq}
@@ -1440,7 +1628,8 @@ export default function Home() {
               open={chatOpen}
               turns={chatTurns}
               running={chatRunning}
-              ready={ready}
+              ready={canQuery}
+              hostedTier={tier === 'hosted'}
               consented={consented}
               consentStorable={storable}
               onConsent={(accepted) => {
@@ -1466,7 +1655,11 @@ export default function Home() {
         </>
       )}
 
-      {notice && <footer className="notice">{notice}</footer>}
+      {/* D-008: MITRE's notice accompanies the data whichever copy is
+          answering — the local one's meta, or the hosted copy's. */}
+      {(notice || (tier === 'hosted' && hosted?.notice)) && (
+        <footer className="notice">{notice || hosted?.notice}</footer>
+      )}
     </main>
   )
 }

@@ -5,12 +5,14 @@ import { KEV_LISTED, RANSOMWARE_KNOWN, type KevStatus } from '../../lib/kev'
 import type { CveDetail, DetailKev, QueryResult, ToolOutcome } from '../../lib/protocol'
 import { REPORT_VERSION } from '../../lib/report'
 import {
+  canvasContext,
   describeToolResult,
   MAX_MODEL_CELLS,
   MAX_MODEL_RESULT_CHARS,
   MAX_MODEL_ROWS,
   MAX_MODEL_TEXT_CHARS,
   parseToolCall,
+  reportToToolArgs,
   searchReport,
   TOOLS,
   TOOL_NAMES,
@@ -696,5 +698,64 @@ describe('the surface has no way to reach the network', () => {
     for (const tool of TOOLS) {
       expect(tool.description.toLowerCase()).not.toMatch(/\bfetch\b|\bdownload\b|\bhttp/)
     }
+  })
+})
+
+describe('canvasContext — the canvas described back to the model (M9)', () => {
+  /** A definition using every filter shape the vocabulary has to invert. */
+  const report = {
+    v: REPORT_VERSION,
+    title: 'Everything at once',
+    filters: {
+      text: 'deserialization',
+      vendor: ['Cisco'],
+      product: ['IOS XE'],
+      cwe: ['CWE-787'],
+      severity: [4, 3],
+      cvssVersion: [31, 4],
+      ssvcExpl: [2, NOT_ASSESSED],
+      ssvcAuto: [1],
+      ssvcImpact: [0],
+      kev: [KEV_LISTED],
+      kevRansomware: [RANSOMWARE_KNOWN, NOT_ASSESSED],
+      scoreMin: 7.5,
+      yearFrom: 2020,
+      // UTC midnight, so the day survives the round trip exactly.
+      publishedFrom: Date.UTC(2024, 7, 11) / 1000,
+      state: 'all' as const,
+    },
+    rows: 'month' as const,
+    series: 'severity' as const,
+    chart: 'stackedBar' as const,
+    limit: 24,
+  }
+
+  it('round-trips through parseToolCall, so the two directions cannot drift', () => {
+    // The serializer speaks the same words-and-dates vocabulary the schemas
+    // advertise; feeding its output back through the parser must reproduce the
+    // definition it started from. A code the parser reads differently — or a
+    // word it no longer accepts — fails here rather than in a conversation.
+    const parsed = parseToolCall('aggregate', reportToToolArgs(report))
+    expect(parsed.ok, parsed.ok ? '' : parsed.error).toBe(true)
+    if (parsed.ok && parsed.call.name === 'aggregate') {
+      expect(parsed.call.report).toEqual(report)
+    }
+    // The context sentence carries the arguments and the match count, framed
+    // as app-provided state rather than the user's words.
+    const context = canvasContext(report, 'report', 1_234)
+    expect(context).toContain('"rows":"month"')
+    expect(context).toContain('"severity":["CRITICAL","HIGH"]')
+    expect(context).toContain('"publishedFrom":"2024-08-11"')
+    expect(context).toContain('1,234 records matched')
+    expect(context).toContain('from the app and not the user')
+  })
+
+  it('drops the chart-shaped fields for a record list, whose tool refuses them', () => {
+    const context = canvasContext({ ...report, sort: 'score' }, 'records', null)
+    expect(context).toContain('search_records')
+    expect(context).not.toContain('"rows"')
+    expect(context).not.toContain('"chart"')
+    expect(context).toContain('"sort":"score"')
+    expect(context).not.toContain('records matched')
   })
 })

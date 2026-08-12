@@ -5,19 +5,22 @@ List — the [cvelistV5](https://github.com/CVEProject/cvelistV5) corpus, 372,09
 records and growing — with an AI chat layer that turns plain-language questions
 into local queries (D-044): built in M7 against a model we host, which is the
 only tier today — M8's other tiers are parked (2026-08-09) while the
-single-tier product is exercised. The entire data plane runs
-in the browser: the corpus is normalized server-side into a ~63 MB compressed
-SQLite database, downloaded on demand into OPFS, and queried locally — so no
-search or report ever leaves the client. Chat is the opt-in exception: the
-only model tier is an Ollama instance we host, reached through a restricted
+single-tier product is exercised. The data plane runs in the browser: the
+corpus is normalized server-side into a ~63 MB compressed SQLite database,
+downloaded on demand into OPFS, and queried locally — so on that **offline
+tier** no search or report leaves the client. Since M9 the app no longer gates
+a first visit behind that download: a **hosted query tier** (D-084) lets a
+visitor with no local copy start immediately, their read-only SQL executed by a
+same-origin `api/sql.php` against a server copy of the same database, disclosed
+as a tier and replaced by "Make available offline". Chat is a further opt-in:
+the only model tier is an Ollama instance we host, reached through a restricted
 same-origin relay (D-057); in-browser models and user-supplied hosted-model
 keys (chat traffic browser-direct to that provider, D-045) remain the plan, but
-are parked rather than next. The
-server serves the snapshot and its deltas as static files and performs no
-analysis — the D-057 chat relay is its one dynamic endpoint, and it forwards
-chat to our own model without storing anything. Almost all code is written by
-AI agents working from the project documentation, directed and reviewed by a
-human.
+are parked rather than next. The server serves the snapshot and its deltas as
+static files and performs no *offline-tier* analysis — its two dynamic
+endpoints, the D-057 chat relay and the D-084 SQL tier, sit outside the data
+plane and store nothing. Almost all code is written by AI agents working from
+the project documentation, directed and reviewed by a human.
 
 **Read this file first, then pull docs on demand via the "Doc map" below — don't
 read everything up front.** This file is long-term project memory and the
@@ -29,16 +32,23 @@ Constraints evolve as we learn, but never by silent drift: changing one means
 making the case in [docs/decisions.md](docs/decisions.md) and updating the
 affected docs. Until then, these govern.
 
-- **The data plane is client-side.** Parsing, storage, indexing, querying,
-  charting, and export all happen in the browser. Any proposal to move analysis
-  server-side for performance is a constraint change, not an optimization.
-  (D-007)
-- **The server may learn fields and partitions, never predicates.** It must
-  never receive a filter value (`vendor = cisco`), a search term, or anything
-  else that would let it evaluate the query. Selecting data is allowed;
-  executing analysis is not. As built this is stronger than the rule requires —
-  the client sends no parameters at all — but the rule is the floor. (D-014,
-  D-032)
+- **The data plane is client-side on the offline tier — the hosted tier is the
+  one labelled exception.** Parsing, storage, indexing, querying, charting, and
+  export happen in the browser once a copy is downloaded. D-084 adds a single
+  hosted query tier so a first visit can start without the 63 MB download:
+  read-only SQL runs on `api/sql.php` against a server copy, disclosed as a
+  tier, replaced by "Make available offline". Any *other* move of analysis
+  server-side, or making the offline tier depend on the server, is a constraint
+  change. (D-007, D-084)
+- **On the data plane, the server may learn fields and partitions, never
+  predicates.** The snapshot/delta path must never receive a filter value
+  (`vendor = cisco`), a search term, or anything else that would let it evaluate
+  the query; selecting data is allowed, executing analysis is not, and as built
+  the client sends no parameters at all. The one exception is the hosted query
+  tier (D-084), which *is* the server executing a caller's SQL — it is not on
+  the data plane (the snapshot and deltas stay parameter-free), it is a
+  disclosed opt-in tier, read-only and same-origin, and the offline tier a
+  download away is where this floor holds absolutely. (D-014, D-032, D-084)
 - **The AI tool surface is read-only and render-only, permanently.** CVE text
   flows into LLM prompts, so injection is assumed: no tool may fetch a URL,
   write data, or reach the network. The first model tier is site-hosted: our
@@ -50,21 +60,25 @@ affected docs. Until then, these govern.
   today). (D-044, D-045, D-057)
 - **The app collects nothing — no telemetry, ever.** Not analytics, not error
   reporting, not opt-in. Do not add a reporting channel; improve the
-  diagnostics panel instead. **The claim this supports is the structural one**
-  (D-079): the corpus and every query over it run in the browser, and the
-  server never receives a search, a filter or a report — checkable in a network
-  panel rather than promised. It is *not* "nothing about you is recorded
-  anywhere": the origin keeps an ordinary web-server access log, with real
-  visitor addresses. (D-009, D-079)
+  diagnostics panel instead. **The claim this supports is per-tier** (D-079,
+  D-084): on the *offline* tier the corpus and every query over it run in the
+  browser and the server never receives a search, a filter or a report —
+  checkable in a network panel rather than promised. On the *hosted* tier that
+  precedes a download, the server executes the SQL (stored nowhere), so the app
+  names the tier rather than making the offline claim. Neither is "nothing
+  about you is recorded anywhere": the origin keeps an ordinary web-server
+  access log, with real visitor addresses. (D-009, D-079, D-084)
 - **The data plane is static files, and no request handler stands in it.** The
   snapshot, manifest, deltas, and KEV catalog are pre-built files served by
   nginx from `cve.pub/data/`, a peer of the document root — nothing under
-  `cve.data/` is web-reachable (D-053); the client sends no parameters. The
-  one dynamic endpoint is D-057's chat relay, which sits outside the data
-  plane and follows D-006's rules: it never accepts a caller-supplied URL,
-  path, or ref that reaches the filesystem or network, and it is
-  same-origin-restricted and rate-limited. Adding any other dynamic endpoint
-  is a constraint change. (D-006, D-032, D-057)
+  `cve.data/` is web-reachable (D-053); the client sends no parameters. Two
+  dynamic endpoints sit *outside* the data plane, both following D-006's rules
+  (no caller-supplied URL/path/ref reaching the filesystem or network,
+  same-origin-restricted, rate-limited): D-057's chat relay, and D-084's
+  `api/sql.php` hosted query tier — which executes only caller SQL, read-only,
+  against a server DB whose *path is the endpoint's own constant*, never a
+  caller's. Adding a *third* dynamic endpoint, or letting either reach a
+  caller-named path, is a constraint change. (D-006, D-032, D-057, D-084)
 - **The git clone lives on the server, never in the browser.** cvelistV5 is
   ~2.4 GB and every GitHub bulk-download path is CORS-blocked, so in-browser git
   is out. The server maintains the clone and derives baselines and deltas from
@@ -98,7 +112,7 @@ affected docs. Until then, these govern.
 | `pipeline/`  | Python ingest and publish (D-043). **Never in the docroot** — the crons run it from a git checkout at `~/src/meenan.dev/cve/` on `plex`, updated with `git pull` (D-059) |
 | `scripts/`   | Build, serve, deploy, license audit |
 | `tests/`     | `unit/` (Vitest) and `e2e/` (Playwright) |
-| `public/`    | Static passthrough into the export root — including `api/chat.php`, the one dynamic endpoint (D-057), which lives here so the ordinary `dist/` rsync deploys it |
+| `public/`    | Static passthrough into the export root — including the two dynamic endpoints `api/chat.php` (D-057) and `api/sql.php` (D-084, the hosted query tier), which live here so the ordinary `dist/` rsync deploys them |
 
 `pnpm check` runs typecheck, lint, format, unit tests and the license audit.
 `pnpm e2e` runs the browser path end to end.
@@ -153,19 +167,32 @@ build → commit loop, on-demand reviews, and the human commit gate.
 
 ## Current status
 
-**M9 in progress — the UI is now a landing gate plus a single-pane workspace
-(D-081), branded "CVE Explorer".** A visitor with no local copy gets a landing
-page with one "Download CVE dataset" action; with a copy, one report canvas
-sits at the centre with chat beside it as the primary interaction, and
-Filters / SQL / Data / Saved are collapsible panels off the header. The canvas
-never opens empty (most recent report, else severity-over-time), a chat
-aggregate lands on it as an *editable* report — populating the filter and SQL
-panels — and results copy out as PNG charts and TSV/HTML grids, formula-guarded
-per D-071 and attribution-free per D-082. Explore and Report merged into one filter
-form driving both an aggregate and a record list; the audit surfaces (full
-numbers table, backing SQL, provenance lines) are unchanged. The e2e suite's
-selector knowledge now lives in `tests/e2e/ui.ts` — update it first when the
-UI changes.
+**M9 in progress — the workspace is the landing experience, backed by a hosted
+query tier (D-084), branded "CVE Explorer".** The download gate is gone: a
+visitor with no local copy lands in the single-pane workspace, their queries
+executed server-side by `api/sql.php` against a copy of the same database
+(corpus + FTS + KEV, built by `pipeline/hosted.py`, replaced by atomic rename).
+The header carries **"Make available offline"** instead of "Sync" on that
+tier, and the status strip discloses which tier is answering; `main[data-tier]`
+is `local` or `hosted`. The client seam is one branch: `lib/remote.ts`'s
+`RemoteDb` wears the Worker's database shape and POSTs SQL synchronously (an XHR
+in the Worker, verified to work through `page.route` on both engines), so both
+tiers run the *same* compiled SQL and the same handlers — held equal by
+`tests/unit/hosted-parity.test.ts` and proven against real PHP by
+`scripts/verify-sql-php.sh`. The endpoint reuses `chat.php`'s posture (D-057)
+and the M3 authorizer, plus the D-078 guard stack server-side
+(`set_time_limit`+`zend.hard_timeout`, retained-byte-and-cell budget, read-only
+open, fail-closed authorizer self-check); its nginx limits are
+`scripts/nginx-sql.conf`. There is deliberately **no in-engine memory bound**
+(owner decision, 2026-08-12): `hard_heap_limit` is process-global and a one-way
+ratchet that would clamp the whole shared fpm pool, so a value bomb can spike
+RSS to ~1 GB — accepted on the 64 GB origin (amends D-084). **`?remote=0`**
+turns the tier off and restores the download gate (the local-tier e2e specs and
+`importCorpus` use it). Everything else about M9 stands: one report canvas with
+chat beside it, Filters / SQL / Data / Saved as collapsible panels, the canvas
+never opens empty, results copy out formula-guarded (D-071) and attribution-free
+(D-082). The e2e suite's selector knowledge lives in `tests/e2e/ui.ts` — update
+it first when the UI changes.
 
 **M7 complete — the AI chat layer is live.**
 Five read-only tools over the local corpus (`lib/tools.ts`), a same-origin PHP

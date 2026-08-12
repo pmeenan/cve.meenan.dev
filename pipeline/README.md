@@ -62,7 +62,18 @@ commit — it leaves the checkout dirty on purpose, and
 duration — the monthly snapshot cron must take the same one — and publishes
 nothing unless every guard passes:
 
-    17 4 * * * cd /var/www/meenan.dev && python3 /home/pmeenan/src/meenan.dev/cve/pipeline/ingest.py run cve.data/git/cvelistV5 cve.pub/data --state cve.data/state >> cve.data/state/ingest.log 2>&1
+    17 4 * * * cd /var/www/meenan.dev && python3 /home/pmeenan/src/meenan.dev/cve/pipeline/ingest.py run cve.data/git/cvelistV5 cve.pub/data --state cve.data/state --hosted cve.data/hosted/hosted.sqlite >> cve.data/state/ingest.log 2>&1
+
+`--hosted <path>` (D-084) rebuilds the hosted query tier's database after a
+publish — corpus + FTS + KEV, `hosted.py build`, replaced by atomic rename —
+and is **advisory**: it runs after the ingest's own lock is released (under
+`hosted.py`'s own `hosted.lock`), and a failure is reported in the run's JSON
+without failing the ingest, because a published delta with a stale hosted tier
+beats an unpublished delta. `hosted.py build <artifact> <pub_dir> <out>` is the
+by-hand repair. The 6-hourly KEV job takes the same `--hosted` flag to refresh
+only the overlay (`kev.py run … --hosted cve.data/hosted/hosted.sqlite`). The
+hosted DB lives under `cve.data/` — **never web-reachable** (D-053); it is
+reached only by `api/sql.php`, whose path constant points at it.
 
 **Installed in `pmeenan`'s crontab on `plex` since 2026-08-03**, with a comment
 line above it saying how to remove it. It is one physical line: `crontab(5)` has
@@ -356,7 +367,14 @@ it fail-closed, and publishes the verbatim upstream bytes to
 `cve.pub/data/kev.json` (D-010, D-076).
 
     mkdir -p /var/www/meenan.dev/cve.data/cache   # once: the redirect below cannot create it
-    41 */6 * * * cd /var/www/meenan.dev && python3 /home/pmeenan/src/meenan.dev/cve/pipeline/kev.py run cve.pub/data --cache cve.data/cache >> cve.data/cache/kev.log 2>&1
+    41 */6 * * * cd /var/www/meenan.dev && python3 /home/pmeenan/src/meenan.dev/cve/pipeline/kev.py run cve.pub/data --cache cve.data/cache --hosted cve.data/hosted/hosted.sqlite >> cve.data/cache/kev.log 2>&1
+
+`--hosted <path>` (D-084) refreshes only the `kev` table inside the hosted-tier
+database when this run actually changed the served catalog — a copy-and-rename
+so `api/sql.php`'s readers never see a partial write. Advisory and its own
+failure domain, like the ingest's `--hosted`: it runs after this job's lock is
+released, under `hosted.py`'s, and a failure is reported without failing the
+KEV run.
 
 One physical line, like the other two, for the same `crontab(5)` reason. Four
 times a day rather than hourly: CISA publishes about business-daily, an

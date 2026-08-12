@@ -68,6 +68,7 @@ export function ChatPanel({
   turns,
   running,
   ready,
+  hostedTier,
   consented,
   consentStorable,
   onConsent,
@@ -81,8 +82,14 @@ export function ChatPanel({
   open: boolean
   turns: ChatTurn[]
   running: boolean
-  /** There is a local corpus. Without one the tools have nothing to read. */
+  /** A corpus is answering — the local copy, or the hosted tier standing in. */
   ready: boolean
+  /**
+   * Queries run on the server rather than in this browser (D-084). The
+   * standing disclosure says results leave the browser; this changes *where
+   * the queries run*, which the tier line below states separately.
+   */
+  hostedTier?: boolean
   consented: boolean
   /** `localStorage` is usable, so the choice will be remembered. */
   consentStorable: boolean
@@ -139,8 +146,12 @@ export function ChatPanel({
               <p className="muted">
                 Ask a question about the CVE List in plain language — “stacked CVE counts by
                 severity over time”, “which Cisco products have the most CRITICAL CVEs”, “is
-                CVE-2021-44228 in CISA&rsquo;s KEV catalog”. Answers come from the copy of the
-                corpus in this browser; the model only decides which query to run.
+                CVE-2021-44228 in CISA&rsquo;s KEV catalog”.{' '}
+                {hostedTier
+                  ? 'Until the corpus is downloaded, the queries the model writes run on this ' +
+                    'site’s server; the model only decides which query to run.'
+                  : 'Answers come from the copy of the corpus in this browser; the model only ' +
+                    'decides which query to run.'}
               </p>
             )}
             {turns.map((turn) => (
@@ -172,7 +183,9 @@ export function ChatPanel({
                 value={question}
                 disabled={!ready}
                 placeholder={
-                  ready ? 'Ask about the corpus…' : 'Download the corpus first — chat queries it'
+                  ready
+                    ? 'Ask about the corpus…'
+                    : 'The corpus is unreachable — download it, then chat can query it'
                 }
                 onChange={(event) => setQuestion(event.target.value)}
                 onKeyDown={(event) => {
@@ -645,7 +658,12 @@ function Aggregate({
           seriesDimension={report.series}
         />
       )}
-      <ChartTable model={model} rowsDimension={report.rows} seriesDimension={report.series} />
+      <ChartTable
+        model={model}
+        rowsDimension={report.rows}
+        seriesDimension={report.series}
+        view={report.chart === 'table' ? 'spreadsheet' : 'audit'}
+      />
       <OpenInReport report={report} onOpenReport={onOpenReport} />
       <Backing sql={sql} params={params} />
     </>

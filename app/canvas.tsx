@@ -30,7 +30,7 @@ import { CHART_ROWS, TABLE_ROWS, toFragment, type ChartType, type Report } from 
 import { Chart, ChartTable } from './chart'
 import { Detail } from './detail'
 import { GroupTable, RecordTable, recordGrid, groupGrid, type SearchOutcome } from './explore'
-import { Field, FilterChips } from './filter-form'
+import { FilterChips } from './filter-form'
 
 export interface ReportOutcome {
   result: QueryResult
@@ -44,7 +44,8 @@ const CHART_LABELS: Record<ChartType, string> = {
   stackedBar: 'Stacked bars',
   groupedBar: 'Grouped bars',
   line: 'Lines over time',
-  table: 'Table only',
+  area: 'Stacked area',
+  table: 'Table',
 }
 
 export function Canvas({
@@ -116,6 +117,17 @@ export function Canvas({
   const ran = view === 'report' && reportOutcome ? reportOutcome.report : null
   const draft = filtersToDraft((ran ?? report).filters)
   const title = report.title?.trim() || describeReport(ran ?? report)
+  /**
+   * The *live* definition's filters, for the canvas's own editable controls
+   * (the date range) — the drawer edits the same object, so the two agree.
+   * Distinct from `draft` above, which is the ran definition and labels only.
+   */
+  const liveDraft = filtersToDraft(report.filters)
+
+  /** Edit the published-date window and re-run — the canvas's own range control. */
+  const setRange = (key: 'publishedFrom' | 'publishedTo', value: string) => {
+    onRun({ ...report, filters: draftToFilters({ ...liveDraft, [key]: value }) })
+  }
 
   const model = useMemo(
     () =>
@@ -189,71 +201,81 @@ export function Canvas({
         />
         {view === 'report' && (
           <div className="canvas-tools">
-            <Field label="Chart" id="report-chart">
-              <select
-                id="report-chart"
-                value={report.chart}
-                onChange={(event) => {
-                  const chart = event.target.value as ChartType
-                  onChangeReport({
-                    ...report,
-                    chart,
-                    limit:
-                      chart === 'table'
-                        ? TABLE_ROWS
-                        : report.chart === 'table' && report.limit === TABLE_ROWS
-                          ? CHART_ROWS
-                          : report.limit,
-                  })
-                }}
-              >
-                {(Object.keys(CHART_LABELS) as ChartType[]).map((type) => (
-                  <option
-                    key={type}
-                    value={type}
-                    // A line over vendors is a trend that does not exist; the
-                    // option stays visible so the reader sees why it is off.
-                    disabled={type === 'line' && !isTimeDimension(report.rows)}
-                  >
-                    {CHART_LABELS[type]}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <button type="button" className="quiet" onClick={copyPng} data-copy-png="1">
-              Copy chart as image
-            </button>
-            {model && (
-              <button
-                type="button"
-                className="quiet"
-                data-copy-table="1"
-                onClick={() =>
-                  reportOutcome &&
-                  // The relabelled model, complete: the copy matches the table
-                  // below the chart — display renames applied, every series
-                  // present, because the numbers are the audit channel.
-                  copyNumbers(
-                    chartGrid(
-                      relabelModel(model, seriesLabels),
-                      title,
-                      reportOutcome.report.rows,
-                      reportOutcome.report.series
+            {/* The chart types as a row of icon toggles (M9): each is one
+                click, the active one is pressed, and a type the axes cannot
+                draw stays visible but disabled — a line or area over vendors
+                is a trend that does not exist. */}
+            <div
+              className="chart-picker"
+              role="group"
+              aria-label="Chart type"
+              data-chart-picker="1"
+            >
+              {(Object.keys(CHART_LABELS) as ChartType[]).map((type) => (
+                <button
+                  key={type}
+                  type="button"
+                  className="quiet icon"
+                  aria-pressed={report.chart === type}
+                  aria-label={CHART_LABELS[type]}
+                  title={CHART_LABELS[type]}
+                  data-chart-type={type}
+                  disabled={(type === 'line' || type === 'area') && !isTimeDimension(report.rows)}
+                  onClick={() =>
+                    onChangeReport({
+                      ...report,
+                      chart: type,
+                      limit:
+                        type === 'table'
+                          ? TABLE_ROWS
+                          : report.chart === 'table' && report.limit === TABLE_ROWS
+                            ? CHART_ROWS
+                            : report.limit,
+                    })
+                  }
+                >
+                  <ChartTypeIcon type={type} />
+                </button>
+              ))}
+            </div>
+            {/* One copy control (M9): what it copies follows what is shown —
+                the chart as a PNG, or the Table view's numbers as a grid. The
+                relabelled model, complete: display renames applied, every
+                series present, because the numbers are the audit channel. */}
+            <button
+              type="button"
+              className="quiet icon"
+              data-copy={report.chart === 'table' ? 'table' : 'chart'}
+              aria-label={report.chart === 'table' ? 'Copy table' : 'Copy chart as image'}
+              title={report.chart === 'table' ? 'Copy table' : 'Copy chart as image'}
+              disabled={!model}
+              onClick={() =>
+                report.chart === 'table'
+                  ? model &&
+                    reportOutcome &&
+                    copyNumbers(
+                      chartGrid(
+                        relabelModel(model, seriesLabels),
+                        title,
+                        reportOutcome.report.rows,
+                        reportOutcome.report.series
+                      )
                     )
-                  )
-                }
-              >
-                Copy numbers
-              </button>
-            )}
+                  : copyPng()
+              }
+            >
+              <CopyIcon />
+            </button>
           </div>
         )}
         {view === 'records' && searchOutcome && (
           <div className="canvas-tools">
             <button
               type="button"
-              className="quiet"
-              data-copy-table="1"
+              className="quiet icon"
+              data-copy="table"
+              aria-label="Copy table"
+              title="Copy table"
               onClick={() =>
                 copyNumbers(
                   searchOutcome.groupBy
@@ -262,11 +284,67 @@ export function Canvas({
                 )
               }
             >
-              Copy table
+              <CopyIcon />
             </button>
           </div>
         )}
       </div>
+
+      {/* The published-date window and the time bucket, as canvas controls
+          (M9): the range is the filter every trend question edits, so it
+          lives at the top of the chart rather than in the drawer — the same
+          `publishedFrom`/`publishedTo` predicates, so the drawer, the chips
+          and a permalink all agree. Changing either re-runs immediately. */}
+      {view === 'report' && (
+        <div className="canvas-range" data-canvas-range="1">
+          <label className="field inline" htmlFor="canvas-pub-from">
+            <span>Published from</span>
+            <input
+              id="canvas-pub-from"
+              type="date"
+              value={liveDraft.publishedFrom}
+              disabled={disabled}
+              onChange={(event) => setRange('publishedFrom', event.target.value)}
+            />
+          </label>
+          <label className="field inline" htmlFor="canvas-pub-to">
+            <span>to</span>
+            <input
+              id="canvas-pub-to"
+              type="date"
+              value={liveDraft.publishedTo}
+              disabled={disabled}
+              onChange={(event) => setRange('publishedTo', event.target.value)}
+            />
+          </label>
+          {isTimeDimension(report.rows) && (
+            <fieldset className="granularity" data-granularity={report.rows}>
+              <legend className="visually-hidden">Time buckets</legend>
+              {(
+                [
+                  ['month', 'Monthly'],
+                  ['quarter', 'Quarterly'],
+                  ['year', 'Yearly'],
+                ] as const
+              ).map(([dimension, label]) => (
+                <label key={dimension} className="check">
+                  <input
+                    type="radio"
+                    name="canvas-granularity"
+                    value={dimension}
+                    checked={report.rows === dimension}
+                    // The split axis cannot double as the buckets — a report
+                    // refuses rows === series, so the radio does too.
+                    disabled={disabled || report.series === dimension}
+                    onChange={() => onRun({ ...report, rows: dimension })}
+                  />
+                  {label}
+                </label>
+              ))}
+            </fieldset>
+          )}
+        </div>
+      )}
 
       {/* What the visible result counted, as chips — from the ran definition,
           so an unapplied drawer edit never labels the old chart. Removing one
@@ -509,11 +587,14 @@ function ReportView({
         </details>
       )}
 
+      {/* Visible as the Table view's spreadsheet; under a chart it stays in
+          the DOM visually hidden — the screen-reader and audit channel (M9). */}
       <ChartTable
         model={model}
         rowsDimension={rows}
         seriesDimension={series}
         labels={seriesLabels}
+        view={report.chart === 'table' ? 'spreadsheet' : 'audit'}
       />
 
       <Backing sql={result.sql} params={result.params} />
@@ -602,6 +683,87 @@ function describeReport(report: Report): string {
 
 function isTimeDimension(dimension: Dimension): boolean {
   return dimension === 'year' || dimension === 'quarter' || dimension === 'month'
+}
+
+/**
+ * One glyph per chart type, drawn to read at a glance in 16 px. Decorative
+ * (`aria-hidden`); the button's aria-label and title carry the name.
+ */
+function ChartTypeIcon({ type }: { type: ChartType }) {
+  switch (type) {
+    case 'stackedBar':
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor">
+          <rect x="2" y="9" width="4" height="5" />
+          <rect x="2" y="5" width="4" height="3" opacity="0.5" />
+          <rect x="10" y="6" width="4" height="8" />
+          <rect x="10" y="2" width="4" height="3" opacity="0.5" />
+        </svg>
+      )
+    case 'groupedBar':
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor">
+          <rect x="1.5" y="6" width="2.6" height="8" />
+          <rect x="4.6" y="9" width="2.6" height="5" opacity="0.5" />
+          <rect x="9" y="3" width="2.6" height="11" />
+          <rect x="12.1" y="7" width="2.6" height="7" opacity="0.5" />
+        </svg>
+      )
+    case 'line':
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden="true" fill="none">
+          <polyline
+            points="1.5,12.5 6,6.5 10,9.5 14.5,3"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      )
+    case 'area':
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M1.5 13.5v-2l4.5-5 4 3 4.5-5.5v9.5z" fill="currentColor" opacity="0.6" />
+          <polyline
+            points="1.5,11.5 6,6.5 10,9.5 14.5,4"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            fill="none"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      )
+    case 'table':
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden="true" fill="none">
+          <path
+            d="M2 3h12v10H2zM2 6.5h12M2 10h12M6.5 3v10"
+            stroke="currentColor"
+            strokeWidth="1.3"
+          />
+        </svg>
+      )
+  }
+}
+
+/** The standard copy glyph — two stacked sheets. Decorative; the button labels itself. */
+function CopyIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  )
 }
 
 /** A chart model as a copyable grid — the same cells the table renders. */

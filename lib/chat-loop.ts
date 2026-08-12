@@ -96,6 +96,14 @@ export interface LoopDeps {
   /** The conversation so far, without the system message. Session-only. */
   history: ChatMessage[]
   system: string
+  /**
+   * What the canvas currently shows, in tool vocabulary (`canvasContext`).
+   *
+   * Prepended to the outgoing user message rather than sent as its own turn:
+   * the relay pins the system prompt (D-057), so conversation content is the
+   * only channel — and the panel still displays only the user's own words.
+   */
+  context?: string
   maxTurns?: number
 }
 
@@ -225,7 +233,12 @@ export async function runChatTurn(
   const emit = () => deps.onUpdate({ ...turn, steps: turn.steps.map((step) => ({ ...step })) })
   emit()
 
-  const conversation: ChatMessage[] = [...deps.history, { role: 'user', content: question }]
+  const conversation: ChatMessage[] = [
+    ...deps.history,
+    // Each turn carries the canvas as it stands *now* — an earlier turn's
+    // context describes what was on screen then, which is what it claims.
+    { role: 'user', content: deps.context ? `${deps.context}\n\n${question}` : question },
+  ]
   const maxTurns = deps.maxTurns ?? MAX_CHAT_TURNS
   /** Signatures of the calls already executed this turn, for the repeat check. */
   const alreadyRun = new Set<string>()

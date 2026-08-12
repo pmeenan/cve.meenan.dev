@@ -111,7 +111,9 @@ test.describe('the chat panel', () => {
     await expect(step).toBeVisible({ timeout: 120_000 })
     await expect(step.locator('[data-chat-buckets]')).toBeVisible()
     await expect(step.locator('svg')).toBeVisible()
-    await expect(step.locator('table')).toBeVisible()
+    // Present but visually hidden under a chart (M9): still the shared
+    // component's audit table, not a parallel renderer.
+    await expect(step.locator('table')).toBeAttached()
 
     // Vision criterion 7, in a chat: the query behind the number is one click
     // away, and it is a real bound-parameter query rather than model prose.

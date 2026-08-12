@@ -368,6 +368,15 @@ export interface ImportOptions {
    * comparison later (M3).
    */
   analyze?: boolean
+  /**
+   * Whether the hosted query tier may stand in when there is no local copy
+   * (D-084). Default true; `?remote=0` turns it off, which is how the
+   * no-hosted fallback (the download pitch) is reached deterministically in a
+   * test — and how a user who wants nothing sent to the server can say so in
+   * a link. There is no value that widens anything: the tier is same-origin
+   * and read-only whichever way this is set.
+   */
+  remote?: boolean
 }
 
 /**
@@ -642,6 +651,13 @@ export type Request =
    * because a copy imported before this build existed has no catalog at all.
    */
   | { type: 'kev'; options?: ImportOptions }
+  /**
+   * Probe the hosted query tier (D-084): read the server copy's `meta` — its
+   * schema, revision, build stamp, notice and KEV catalog — and answer with
+   * `hostedStatus`. Sent by the page when `status` reports no usable local
+   * copy; a success is what licenses the Worker to serve queries remotely.
+   */
+  | { type: 'hosted'; options?: ImportOptions }
   | { type: 'reset' }
 
 /**
@@ -834,6 +850,25 @@ export type Response =
    * wrong, and the page must not show it in red next to a stack of failures.
    */
   | { type: 'cancelled'; kind: QueryKind; ms: number }
+  /**
+   * What the hosted tier probe found (D-084).
+   *
+   * On `ok`, the fields mirror `status`'s — they describe the *server's* copy,
+   * read from its `meta` the same way `status` reads the local one — and the
+   * Worker will now answer query requests remotely until a local copy opens.
+   * On failure the page falls back to the download pitch: a visitor the
+   * hosted tier cannot serve is exactly where the old landing gate stood.
+   */
+  | {
+      type: 'hostedStatus'
+      ok: boolean
+      /** Present on failure. A sentence, not a stack trace. */
+      error?: string
+      rev?: number | null
+      generated?: number | null
+      notice?: string | null
+      kev?: KevStatus | null
+    }
   | { type: 'bench'; results: BenchResult[]; wasmHeapBytes: number }
   | {
       type: 'error'

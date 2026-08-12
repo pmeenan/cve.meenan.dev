@@ -89,6 +89,7 @@ import {
   type KevStatus,
 } from '../lib/kev'
 import { CHART_ROWS, parseReport, TABLE_ROWS } from '../lib/report'
+import { isRemoteDb, RemoteDb, remoteQuery } from '../lib/remote'
 import { isNotFound, readTextEntry, removeIfPresent, writeFully, writeTextEntry } from '../lib/opfs'
 import { BENCH_QUERIES } from '../lib/queries'
 import {
@@ -214,6 +215,21 @@ let cancelFlag: Int32Array | null = null
  * all, which is how the handler's own cost is priced (M3).
  */
 let progressOps = PROGRESS_OPS
+
+/**
+ * The hosted query tier standing in for a local copy (D-084).
+ *
+ * `remoteDb` is the shim `requireDb` hands out; `remoteEligible` is the
+ * license to hand it out, and it is granted in exactly one place — a
+ * `hosted` probe that read the server copy's `meta` and found a schema this
+ * build speaks. Until that has happened, "no local copy" stays the refusal it
+ * always was: a query must never fall through to the network because a status
+ * check simply had not finished yet.
+ */
+let remoteDb: Database | null = null
+let remoteEligible = false
+/** `?remote=0` — the page asked for the local tier or nothing. */
+let sessionRemote = true
 
 function post(message: WorkerMessage): void {
   ;(self as DedicatedWorkerGlobalScope).postMessage(message)
@@ -1988,6 +2004,9 @@ function bench(): void {
 }
 
 function benchAll(): void {
+  // The benchmark prices *this browser's* engine (Q-003); numbers measured
+  // through a network round trip to the server would be about the network.
+  if (!db) throw new Error('the benchmark measures the local engine, so it needs a local copy')
   const database = requireDb()
   const results: BenchResult[] = []
   for (const [index, query] of BENCH_QUERIES.entries()) {
@@ -2451,6 +2470,87 @@ async function status(): Promise<void> {
   }
 }
 
+/**
+ * Probe the hosted query tier (D-084) and answer with `hostedStatus`.
+ *
+ * Two remote queries, not eleven: the whole `meta` table in one, and the `kev`
+ * table's existence in the other. What it establishes mirrors what `status`
+ * establishes about a local copy — schema, revision, build stamp, notice, KEV
+ * catalog — because the page renders both through the same strip.
+ *
+ * The schema comparison is the gate. During a deploy the server's copy and
+ * this build can briefly disagree, and compiled SQL from one schema against
+ * the other is exactly the quiet wrongness `status` refuses for a local copy
+ * (M3) — so the hosted tier is refused the same way, with both numbers in the
+ * message.
+ */
+async function hostedStatus(): Promise<void> {
+  if (!sessionRemote) {
+    remoteEligible = false
+    post({ type: 'hostedStatus', ok: false, error: 'the hosted tier is off for this session' })
+    return
+  }
+  try {
+    const probe = (remoteDb ??= new RemoteDb() as unknown as Database)
+    const meta = new Map<string, unknown>()
+    probe.exec({
+      sql: 'SELECT k, v FROM meta',
+      rowMode: 'array',
+      callback: (row: unknown[]) => {
+        if (typeof row[0] === 'string') meta.set(row[0], row[1])
+      },
+    })
+    const schema = meta.get('schema')
+    if (typeof schema !== 'number') {
+      throw new Error('the hosted copy reports no schema version')
+    }
+    if (schema !== sessionSchema) {
+      throw new Error(
+        `the hosted copy speaks schema ${schema} and this build speaks ${sessionSchema} — ` +
+          'reload in a moment; a deploy is likely mid-flight'
+      )
+    }
+    const kevTable = probe.selectValue(
+      "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'kev'"
+    )
+    const version = meta.get(KEV_META.version)
+    const num = (key: string): number | null => {
+      const value = meta.get(key)
+      return typeof value === 'number' ? value : null
+    }
+    // The same two-part check `localKev` makes: the table, and the meta row
+    // the applying transaction wrote with it.
+    const kev: KevStatus | null =
+      kevTable === 1 && typeof version === 'string' && version
+        ? {
+            version,
+            released: String(meta.get(KEV_META.released) ?? ''),
+            releasedAt: num(KEV_META.releasedAt),
+            fetched: num(KEV_META.fetched) ?? 0,
+            entries: num(KEV_META.entries) ?? 0,
+            unmatched: num(KEV_META.unmatched) ?? 0,
+          }
+        : null
+    remoteEligible = true
+    post({
+      type: 'hostedStatus',
+      ok: true,
+      rev: typeof meta.get('rev') === 'number' ? (meta.get('rev') as number) : null,
+      generated:
+        typeof meta.get('generated') === 'number' ? (meta.get('generated') as number) : null,
+      notice: typeof meta.get('notice') === 'string' ? (meta.get('notice') as string) : null,
+      kev,
+    })
+  } catch (error) {
+    remoteEligible = false
+    post({
+      type: 'hostedStatus',
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
 /** Thrown by `runSql` when the user stopped the query. Not a failure. */
 class Cancelled extends Error {
   constructor(readonly ms: number) {
@@ -2495,6 +2595,25 @@ interface RunOptions {
  * problem, and the receiver is the main thread, which is idle.
  */
 function runSql(database: Database, sql: string, options: RunOptions): QueryResult {
+  // The hosted tier: the statement, its parameters and the row cap travel to
+  // `api/sql.php`, and every engine-side guard below — authorizer, length
+  // limit, character budget, deadline — is enforced by the server instead,
+  // uniformly and for *every* statement, because the server trusts nothing a
+  // browser sends (D-084). Cancellation has no remote analogue: the bound is
+  // the transport timeout plus the server's own deadline.
+  if (isRemoteDb(database)) {
+    const started = performance.now()
+    const remote = remoteQuery(sql, (options.params ?? []) as SqlParam[], options.limit)
+    return {
+      columns: remote.columns,
+      rows: remote.rows,
+      ms: Math.round(performance.now() - started),
+      truncated: remote.truncated,
+      ...(remote.overflowed ? { overflowed: true } : {}),
+      sql,
+      params: [...(options.params ?? [])],
+    }
+  }
   if (!sqlite3) throw new Error('sqlite3 not initialised')
   const capi = sqlite3.capi
   const handle = database.pointer
@@ -3271,6 +3390,15 @@ function localRevision(database: Database): number | null {
  * read as complete, which is worse than no export.
  */
 function exportData(request: ExportRequest): void {
+  // Local-only by design (D-084): a record export batches up to the export cap
+  // through repeated queries, which on the hosted tier is a stream of server
+  // round trips racing a rate limit — a partial file by construction. The
+  // refusal names the way out rather than the mechanism.
+  if (!db) {
+    throw new Error(
+      'exports run on your local copy of the corpus — use "Make available offline" first'
+    )
+  }
   const database = requireDb()
   const parsed = parseReport(request.report)
   if (!parsed.ok) throw new Error(parsed.error)
@@ -3419,8 +3547,16 @@ function exportData(request: ExportRequest): void {
 }
 
 function requireDb(): Database {
-  if (!db) throw new Error('no database — download the corpus first')
-  return db
+  if (db) return db
+  // The hosted tier (D-084): same compiled SQL, same handlers, executed by
+  // `api/sql.php` against the server's copy. Only after a `hosted` probe
+  // succeeded — the flag is the difference between "this visitor is on the
+  // hosted tier" and "the status check has not finished yet".
+  if (remoteEligible && sessionRemote) {
+    remoteDb ??= new RemoteDb() as unknown as Database
+    return remoteDb
+  }
+  throw new Error('no database — download the corpus first')
 }
 
 /**
@@ -3565,6 +3701,13 @@ async function handle(request: Request): Promise<void> {
     // as an argument through the crash-safety path (see `sessionSchema`).
     if ('options' in request) {
       sessionSchema = speaks(request.options)
+      // A latch, never a re-enable: `?remote=0` opts out of the hosted tier for
+      // the session, and the opt-out must survive a later request whose options
+      // happen not to carry the flag. Recomputing `!== false` each time would
+      // flip it back on the first such message, sending predicates off-device
+      // after the user said not to. Only `remote: false` moves it, and only in
+      // the off direction; reload is the way back on.
+      if (request.options?.remote === false) sessionRemote = false
       const forced = request.options?.probe
       const next = forced === 'async' || forced === 'unavailable' ? forced : null
       // Re-probe when the knob changes, or a reload with `?probe=` would be
@@ -3651,6 +3794,9 @@ async function handle(request: Request): Promise<void> {
         break
       case 'probe':
         post({ type: 'environment', ...(await environment()) })
+        break
+      case 'hosted':
+        await hostedStatus()
         break
       case 'reset':
         // A writer like the other two: `clearStorage` deletes every OPFS entry

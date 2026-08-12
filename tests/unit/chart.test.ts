@@ -15,11 +15,13 @@ import { buildChart, bucketLabel, niceTicks, seriesColor, shortCount } from '../
  * so they are tested as data rather than looked at.
  *
  * The **palette** is a claim about colour that would otherwise be "it looked
- * fine on my monitor". Severity is an *ordinal* encoding — a lightness-ordered
- * ramp — because hue alone puts MEDIUM and HIGH, the two largest bands, below
- * the separation floor. That is measurable: this test reads `app/globals.css`,
- * pulls both ramps out of it, and checks each against the background it is
- * actually drawn on. The stylesheet is the source, so the two cannot drift.
+ * fine on my monitor". Severity is hue-coded — dark red → red → orange →
+ * yellow → light blue, the owner's palette (D-083) — with the never-scored
+ * band a neutral gray off the scale. What is measurable is separation and
+ * visibility: this test reads `app/globals.css`, pulls both palettes out of
+ * it, and checks every band that touches another in a stack, against the
+ * background it is actually drawn on. The stylesheet is the source, so the
+ * two cannot drift.
  */
 
 // --- the palette --------------------------------------------------------
@@ -37,6 +39,37 @@ function luminance(hex: string): number {
 function contrast(a: string, b: string): number {
   const [high, low] = [luminance(a), luminance(b)].sort((x, y) => y - x)
   return (high! + 0.05) / (low! + 0.05)
+}
+
+/**
+ * OKLab, for the separation between bands that touch in a stack.
+ *
+ * The palette is hue-coded (D-083), so a pure luminance ratio no longer
+ * measures what a reader sees — yellow beside light blue is unmistakable at a
+ * luminance ratio of 1.02. OKLab distance is the standard perceptual measure
+ * that counts hue and chroma as well as lightness.
+ */
+function oklab(hex: string): [number, number, number] {
+  const value = Number.parseInt(hex.slice(1), 16)
+  const [r, g, b] = [(value >> 16) & 255, (value >> 8) & 255, value & 255].map((raw) => {
+    const c = raw / 255
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  }) as [number, number, number]
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+  return [
+    0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+  ]
+}
+
+/** OKLab distance ×100 — the scale on which ~2 is a just-noticeable difference. */
+function deltaE(a: string, b: string): number {
+  const [l1, a1, b1] = oklab(a)
+  const [l2, a2, b2] = oklab(b)
+  return Math.hypot(l1 - l2, a1 - a2, b1 - b2) * 100
 }
 
 const CSS = readFileSync('app/globals.css', 'utf-8')
@@ -61,76 +94,69 @@ function palette(scheme: 'light' | 'dark'): Record<string, string> {
 /**
  * The floors, stated once.
  *
- * `MIN_STEP` is the separation between adjacent bands of the ramp — they touch
- * in a stacked bar, so this is the contrast that decides whether a reader can
- * see the boundary at all. `MIN_BACKGROUND` is lower than WCAG's 3:1 for
- * graphical objects on purpose and is not a claim to meet it: a six-step ramp
- * cannot both span a useful range and hold 3:1 at the end nearest the page. The
- * hairline stroke in `--bg` on every bar (`.chart .bar` in globals.css) is what
- * carries the boundary against the background; this floor keeps the fill itself
- * from disappearing into it.
+ * `MIN_ADJACENT_DE` is the OKLab separation (×100) between bands that touch in
+ * a stacked bar — the boundary a reader has to see. Twelve is several times a
+ * just-noticeable difference; the hairline stroke in `--surface` on every band
+ * carries the boundary where two colours are closest. `MIN_BACKGROUND` is
+ * lower than WCAG's 3:1 for graphical objects on purpose and is not a claim to
+ * meet it: a six-band palette cannot both span the hue scale and hold 3:1 at
+ * the band nearest the page (dark red on white, dark red on near-black). The
+ * hairline is what carries the boundary against the background; this floor
+ * keeps the fill itself from disappearing into it.
  */
-const MIN_STEP = 1.4
+const MIN_ADJACENT_DE = 12
 const MIN_BACKGROUND = 2.0
 
-const RAMP = ['--sev-4', '--sev-3', '--sev-2', '--sev-1', '--sev-0'] as const
+/** The severity stack, baseline to top, plus the unscored neutral above NONE. */
+const STACK = ['--sev-4', '--sev-3', '--sev-2', '--sev-1', '--sev-0', '--sev-x'] as const
 
-describe('the severity ramp is ordinal, in both themes', () => {
+describe('the severity palette separates and stays visible, in both themes', () => {
   for (const scheme of ['light', 'dark'] as const) {
     describe(scheme, () => {
       const colors = palette(scheme)
       const background = colors['--bg']!
-      const ramp = RAMP.map((name) => {
+      const bands = STACK.map((name) => {
         const value = colors[name]
         if (!value) throw new Error(`${name} is not defined for the ${scheme} scheme`)
         return [name, value] as const
       })
 
-      it('is strictly ordered by lightness, CRITICAL furthest from the page', () => {
-        const luminances = ramp.map(([, hex]) => luminance(hex))
-        const ordered =
-          scheme === 'light'
-            ? luminances.every((value, at) => at === 0 || value > luminances[at - 1]!)
-            : luminances.every((value, at) => at === 0 || value < luminances[at - 1]!)
-        expect(ordered, `luminances: ${luminances.map((v) => v.toFixed(3)).join(', ')}`).toBe(true)
-      })
-
-      it('separates adjacent bands, which is what a stacked bar needs', () => {
-        for (let at = 1; at < ramp.length; at += 1) {
-          const ratio = contrast(ramp[at]![1], ramp[at - 1]![1])
-          expect(ratio, `${ramp[at]![0]} vs ${ramp[at - 1]![0]}`).toBeGreaterThanOrEqual(MIN_STEP)
+      it('separates every pair of bands that touch in the severity stack', () => {
+        // The stack order is fixed (SEVERITY_STACK): CRITICAL at the baseline,
+        // then HIGH, MEDIUM, LOW, NONE, with the unscored neutral on top. Each
+        // adjacency is a boundary a reader has to see. The palette is
+        // hue-coded (D-083), so the measure is perceptual distance rather than
+        // the old luminance ratio — yellow beside light blue is unmistakable
+        // at a luminance ratio near 1.
+        for (let at = 1; at < bands.length; at += 1) {
+          const separation = deltaE(bands[at]![1], bands[at - 1]![1])
+          expect(separation, `${bands[at]![0]} vs ${bands[at - 1]![0]}`).toBeGreaterThanOrEqual(
+            MIN_ADJACENT_DE
+          )
         }
       })
 
       it('keeps every band visible against the page it is drawn on', () => {
-        for (const [name, hex] of ramp) {
+        for (const [name, hex] of bands) {
           expect(contrast(hex, background), name).toBeGreaterThanOrEqual(MIN_BACKGROUND)
         }
       })
 
-      it('puts the unscored band off the ramp, distinct from its stack neighbour', () => {
-        // Records with no CVSS score are about half the corpus and are always
-        // shown as their own band. It is an absence rather than a level, so it
-        // is a neutral — and it sits directly above NONE in the stack, which is
-        // the only adjacency it has.
-        const unscored = colors['--sev-x']!
-        expect(contrast(unscored, colors['--sev-0']!)).toBeGreaterThanOrEqual(MIN_STEP)
-        expect(contrast(unscored, background)).toBeGreaterThanOrEqual(MIN_BACKGROUND)
-      })
-
       it('separates every adjacency an SSVC stack actually has (D-070)', () => {
-        // These axes are scales too, so they reuse the ramp — spaced across it
-        // — rather than taking categorical slots. The adjacencies are different
-        // from severity's: the neutral lands on *top of the highest* band here,
-        // not above NONE, so that pair needs its own assertion.
+        // These axes are scales and reuse the severity bands — spaced across
+        // them — rather than taking categorical slots. The adjacencies are
+        // different from severity's: the neutral lands on *top of the highest*
+        // band here, not above NONE, so those pairs need their own assertions.
         const stacks: string[][] = [
           ['--sev-0', '--sev-2', '--sev-4', '--sev-x'], // Exploitation
           ['--sev-0', '--sev-4', '--sev-x'], // Automatable, Technical impact
         ]
         for (const stack of stacks) {
           for (let at = 1; at < stack.length; at += 1) {
-            const ratio = contrast(colors[stack[at]!]!, colors[stack[at - 1]!]!)
-            expect(ratio, `${stack[at]} vs ${stack[at - 1]}`).toBeGreaterThanOrEqual(MIN_STEP)
+            const separation = deltaE(colors[stack[at]!]!, colors[stack[at - 1]!]!)
+            expect(separation, `${stack[at]} vs ${stack[at - 1]}`).toBeGreaterThanOrEqual(
+              MIN_ADJACENT_DE
+            )
           }
         }
       })

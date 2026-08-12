@@ -27,6 +27,178 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-084: A hosted query tier makes the workspace the landing experience — the server executes SQL, and offline becomes the upgrade  (2026-08-12, status: accepted, owner decision; reverses D-007/D-014's no-server-execution floor for one endpoint, amends D-079's claim to per-tier, replaces D-081's landing gate, adds a second dynamic endpoint under D-006's rules)
+
+**Decision (owner, 2026-08-12).** The project is no longer offline-first. A
+visitor with no local copy lands directly in the report workspace, served by a
+**hosted query tier**: the client sends read-only SQL to a same-origin endpoint
+(`api/sql.php`, beside the chat relay) which executes it against a
+server-held copy of the same SQLite database — corpus, FTS tables, and KEV
+materialized — and returns rows. The former landing gate is gone; the download
+action becomes **"Make available offline"**, which installs the local OPFS copy
+and switches every subsequent query to it. The local tier remains the full
+product; the hosted tier is the zero-friction entry.
+
+**Context.** The 63 MB download-before-anything gate was judged too much
+friction for a first visit. A static middle path (uncompressed DB queried over
+HTTP Range requests, sql.js-httpvfs-style) was considered — it would have
+preserved the no-server-execution floor — but the owner made the product call
+for hosted execution directly: simpler to reason about, no per-query
+page-fetch latency cliff on corpus-wide aggregates, and the server needs the
+queryable DB anyway. The safeguard question was answered by measurement
+(php:8.3.33, Linux) rather than recollection, after training-knowledge claims
+about PHP's bindings proved wrong twice:
+
+- A CPU-bound hostile query inside a **single** `sqlite3_step()` (infinite
+  recursive CTE under an aggregate) is killed by `set_time_limit(2)` +
+  `zend.hard_timeout` (default 2, Linux) at 4.0 s wall, six runs of six; the
+  process self-terminates (exit 124). No fpm-level backstop is required for
+  termination.
+- `PRAGMA hard_heap_limit=32MB` refuses `hex(zeroblob(100000000))` in-engine
+  instantly at 23 MB peak RSS; without it the same query succeeds at 309 MB.
+  This is the in-engine memory bound PHP's missing `sqlite3_limit` binding
+  cannot provide — `memory_limit` never sees libsqlite3's allocations.
+  (Measured and then **removed** — see the amendment below; it is
+  process-global and cannot be scoped to one request.)
+- `SQLite3::setAuthorizer()` (PHP ≥ 8.0) denies a caller's PRAGMA after our
+  setup pragmas have run.
+
+**The safeguard stack, per request:** read-only open of a file whose inode is
+never written — replacement is atomic rename, so `SQLITE3_OPEN_READONLY`
+suffices; `immutable=1` was the first choice and PHP's binding takes no URI
+filenames (measured in the container harness) → `PRAGMA query_only` (a
+per-connection read-only belt) → authorizer (ported from M3's, including
+RE-033's fts5 pragma nuance) → `set_time_limit` → exactly one prepared
+statement → D-078 retained-byte-and-cell budget in the row loop. The endpoint
+**verifies the authorizer installed** before touching caller SQL, else 503 —
+a guard that silently didn't take is worse than an outage (D-077's ethos).
+Concurrency and rate limits live in nginx, not a dedicated fpm pool:
+`limit_req` keyed on `CF-Connecting-IP` (RE-031) plus `limit_conn` with a
+constant key as a global cap on concurrent executions. Worst sustained cost is
+that cap × ~4 s of CPU per request. Known residuals, accepted: the hard abort
+skips destructors (leaks per timeout event; worker recycling absorbs it),
+`zend.hard_timeout` is system-INI and must be confirmed non-zero on the
+origin, the soft limit counts CPU not wall on Linux, and arbitrary
+internet-supplied SQL text is the historical precondition for SQLite
+engine bugs — the authorizer shrinks that surface but does not close it.
+
+**No in-engine memory bound (owner decision, 2026-08-12, amends this entry).**
+The stack originally set `PRAGMA hard_heap_limit=32MB` — the only in-engine
+bound PHP offers, since `memory_limit` never sees libsqlite3's `malloc` and
+there is no `sqlite3_limit` binding. It was removed: `hard_heap_limit` is
+**process-global and a one-way ratchet** — once set on a php-fpm worker it can
+only be lowered, never raised or reset (measured: `=0` and `=1TiB` were both
+ignored, the 32 MB cap kept enforcing), so on the shared pool one request here
+would clamp every other endpoint and app on that worker to 32 MB for the
+worker's whole life. The alternatives were a dedicated fpm pool (makes the
+ratchet harmless but adds a pool the owner did not want) or accepting the
+exposure. The owner accepted it: a `length()`-wrapped value bomb
+(`SELECT length(hex(zeroblob(1e8)))`, `length(group_concat(descr))`) now runs
+to completion, spiking RSS to the value size — **309 MB and 977 MB measured**,
+up to ~concurrency× that — but the origin has 64 GB and light load, the CPU
+deadline bounds the spike's duration, and the retained-byte budget bounds what
+reaches the client. The guard self-check narrows to the authorizer alone;
+`memory_limit` is left at the pool default. `SQLITE_LIMIT_LENGTH`, the local
+tier's clean per-value engine bound (D-078), remains unavailable from PHP.
+
+**The served DB** is a pipeline artifact like the snapshot: the daily ingest
+publishes the full hosted DB (corpus + FTS + KEV) and the 6-hourly KEV cron
+refreshes the KEV table, both landing by build-aside-then-atomic-rename
+so a read-only connection's inode never changes under it (PHP cannot express
+`immutable=1`; RE-036). `kev.json` and the compressed snapshot/delta path to
+local copies are unchanged (D-076/D-077).
+
+**Consequences.**
+- **The privacy claim is now per-tier, not structural.** "Your queries never
+  reach us" is true of the offline tier only; on the hosted tier the server
+  receives and executes full SQL — predicates, search terms, everything
+  D-014 forbade — under the chat relay's posture: same-origin, rate-limited,
+  nothing stored, no bodies logged. The vision non-goal ("not a hosted
+  analysis service"), D-079's wording, and every UI/doc claim must say which
+  tier they describe. The network-panel check still verifies the offline
+  tier's claim exactly as before.
+- The data plane is no longer static-files-only: `api/sql.php` is the second
+  dynamic endpoint, held to D-006's rules (no caller-supplied URL, path, or
+  ref; same-origin; rate-limited).
+- D-081's landing gate is replaced; its single-pane workspace shape is
+  unchanged.
+- The offline tier remains the only place chat's full guarantees hold as
+  stated, and remains the recommended mode; the UI should treat "Make
+  available offline" as the upgrade path, not a buried setting.
+
+**Reviewed adversarially (2026-08-12), and the residual risks accepted rather
+than left implicit:**
+- **KEV via the raw `sql` tool is un-provenanced on both tiers, and
+  unconditional on the hosted one.** A model can ask `SELECT … FROM kev …`
+  through the `sql` tool and get bare rows with no "per CISA / version /
+  released" decoration — the structured `kev_lookup`/`aggregate`/`search` tools
+  carry that (D-076) and are correctly gated through `RemoteDb.assertKevLoaded`,
+  but the `sql` escape hatch never did (D-078 accepted it returns bare rows).
+  On a *local* copy this only works when a catalog is loaded; the hosted DB
+  always carries one, so it works every time. Accepted as the same class as
+  D-078's bare-`sql` posture, not a new capability. The one thing that would
+  turn it into a *false* "not known-exploited" — a `kev` table present but
+  empty/partial — is prevented in `pipeline/hosted.py`, whose `_apply_kev` is
+  populated-or-absent in one transaction (never present-but-empty); that
+  invariant is now load-bearing and must hold on any refactor.
+- **Schema is validated at probe time, not per query.** A deploy that swaps the
+  server DB mid-session for a schema-incompatible-but-column-compatible build
+  could return silently wrong rows. Bounded to rare deploy windows (atomic
+  rename means a query hits one complete file or the other; most divergences
+  surface as a visible SQL error). Not re-checked per query by choice — a
+  schema tag on every response is more weight than the window warrants.
+- **PHP-side residuals:** no `sqlite3_limit` binding, so the 1 MiB per-cell
+  bound is enforced in the row loop rather than the engine (parity, not
+  identity); `CVE_HOSTED_DB` is an env override on the prod path, safe under
+  fpm's default `clear_env=yes`; the authorizer's *behaviour* (arg positions)
+  is exercised by `scripts/verify-sql-php.sh`, not `pnpm check`, which has no
+  PHP runtime. A record detail on the hosted tier fans out to ~13 sequential
+  synchronous requests (each `section()` plus `localKev`'s meta reads); it
+  works and stays within the rate-limit burst, but is chatty by construction.
+
+**Reopen if.** The endpoint becomes an abuse magnet the nginx caps can't
+price out; a SQLite parser/engine CVE class makes internet-reachable SQL
+untenable; the hosted `sql` KEV-provenance gap proves to matter in practice
+(gate it at runtime or attach provenance to any result touching `kev`); or
+hosted-tier latency/cost argues for the static Range-request design after all
+— it was the runner-up and remains compatible with this UI.
+
+## D-083: Severity is hue-coded — the conventional palette — and separation is checked perceptually  (2026-08-11, status: accepted; supersedes D-073's ordinal-ramp commitment)
+
+**Decision (owner, 2026-08-11).** The severity palette is the conventional
+hue reading of the scale: CRITICAL dark red, HIGH red, MEDIUM orange, LOW
+yellow, NONE light blue, and the never-scored band a neutral gray off the
+scale. Both themes' values live in `app/globals.css` as before, and
+`tests/unit/chart.test.ts` still reads that file — but the checks now match
+the encoding: **OKLab ΔE ≥ 12 (×100)** between every pair of bands that touch
+in a stack (severity's five adjacencies plus the neutral, and the SSVC
+stacks, which reuse sev-0/2/4), and **≥ 2:1 contrast** against the background
+each theme draws on. The old strictly-ordered-luminance and adjacent-ratio
+checks are retired with the ramp: a luminance ratio cannot see that yellow
+beside light blue is unmistakable, which is exactly the separation this
+palette leans on.
+
+**Context.** The lightness ramp was correct by its own argument (D-073) and
+looked like it: muted maroon-to-amber in light mode, washed salmon in dark
+mode, and the owner read the dark ramp as backwards — the most severe band
+the palest red on the page. A full lightness reversal is not available: dark
+red on a near-black page sits at 1.4:1, invisible. Hue is how every other
+severity UI (NVD included) says "worse", so the owner chose it, accepting
+that red/orange adjacency leans less on lightness than the ramp did — the
+values were still chosen numerically (every adjacency ≥ 12.5 ΔE, every band
+≥ 2:1 on its background, measured before landing) rather than by eye.
+
+**Consequences.** D-073's other two commitments stand unchanged: absence is
+its own band, never a zero, never placeable on the scale (the gray neutral);
+and every chart ships its numbers as a real table — visually hidden under a
+chart since the M9 Table view, but always in the DOM as the screen-reader and
+audit channel. The SSVC axes keep their reuse of the severity bands and now
+read blue → orange → dark red, benign end to worst.
+
+**Reopen if.** A CVD report shows the red/orange or red/dark-red adjacency
+failing in practice — the fallback is a texture or a wider hue spread, not a
+return to the lightness ramp the owner rejected.
+
 ## D-082: MITRE attribution lives in the application UI, not in what a user copies out  (2026-08-10, status: accepted; scopes D-008's copy rule)
 
 **Decision (owner, 2026-08-10).** The D-008 notice obligation is discharged
@@ -613,7 +785,7 @@ though that compiles to an `EXISTS` on `c` and so keeps `c` as the right
 driver — or SQLite's planner changes such that the free form no longer inverts.
 Either way the answer is a measurement, not a revert.
 
-## D-073: Severity is an ordinal encoding, and every absence is its own band  (2026-08-07, status: accepted, implements M4's charting scope)
+## D-073: Severity is an ordinal encoding, and every absence is its own band  (2026-08-07, status: first commitment superseded by D-083; the absence-band and numbers-as-table commitments stand)
 
 **Decision.** Charts are hand-rolled inline SVG with a palette that lives in
 `app/globals.css` and is **checked by a test that reads that file**

@@ -51,7 +51,7 @@ import {
  */
 export const REPORT_VERSION = 1
 
-export const CHART_TYPES = ['stackedBar', 'groupedBar', 'line', 'table'] as const
+export const CHART_TYPES = ['stackedBar', 'groupedBar', 'line', 'area', 'table'] as const
 export type ChartType = (typeof CHART_TYPES)[number]
 
 /** How many rows a chart shows before it stops being readable. */

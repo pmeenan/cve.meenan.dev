@@ -22,6 +22,42 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-036: PHP's `SQLite3` constructor takes no URI filename, so `immutable=1` (and any `file:` URI) silently fails to open  (2026-08-12, status: worked-around)
+
+**Environment:** PHP 8.3.33, `php:8.3-cli` docker image, sqlite3 extension
+(SQLite 3.53). Building the D-084 hosted query tier.
+
+**Repro:**
+```php
+new SQLite3('file:/path/to/db.sqlite?immutable=1', SQLITE3_OPEN_READONLY | 0x40);
+// 0x40 is SQLITE_OPEN_URI
+```
+
+**Observed:** `Unable to open database: unable to open database file`. The
+constructor treats the whole `file:…?immutable=1` string as a literal path and
+looks for a file named that, `SQLITE_OPEN_URI` bit notwithstanding — PHP's
+binding does not enable URI filename parsing and exposes no flag that does. A
+plain `new SQLite3('/path/to/db.sqlite', SQLITE3_OPEN_READONLY)` opens fine.
+Cost: the whole `verify-sql-php.sh` run failed at the *guard self-check* with a
+generic 503 (the open threw, caught, refused), so every downstream case
+reported "hosted query tier is unavailable" and the real cause — the open line
+— was three layers up. An isolated one-liner in the container found it in a
+minute; reading the code did not, because the code looked correct against the C
+API.
+
+**Expected:** `SQLITE_OPEN_URI` to make `file:` URIs parse, as it does in the C
+API and in every other binding (node:sqlite, python's `sqlite3` with
+`uri=True`).
+
+**Impact:** The hosted DB's read-only safety cannot lean on SQLite's
+`immutable=1` (skip-locking) from PHP. It does not need to: the publisher
+replaces the file only by atomic `os.replace` of a finished inode
+(`pipeline/hosted.py`), so a plain read-only open never sees a partial write,
+and locking overhead on a single-statement read is negligible. The lesson for
+the next PHP+SQLite surface: URI filenames are not available, and a mystery 503
+from an endpoint that self-checks its guards means "look at the open, not the
+guard".
+
 ## RE-035: CSS geometry properties beat SVG attributes, so a generic `.bar { height: 6px }` squashed every chart bar  (2026-08-09, status: fixed)
 
 **Environment.** Chromium and Firefox (SVG2 geometry properties as CSS,

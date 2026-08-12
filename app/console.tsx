@@ -50,6 +50,7 @@ LIMIT 20`,
 
 export function Console({
   disabled,
+  hosted,
   onRun,
   result,
   error,
@@ -59,6 +60,12 @@ export function Console({
   onSql,
 }: {
   disabled: boolean
+  /**
+   * The hosted tier is answering (D-084): the same read-only guard runs on the
+   * server, and the cancel claim does not hold — a remote statement is bounded
+   * by the server's deadline, not by a button.
+   */
+  hosted?: boolean
   onRun: (sql: string) => void
   result: QueryResult | null
   error: string
@@ -79,7 +86,11 @@ export function Console({
       <p className="muted">
         Read-only, and not by inspecting what you type: SQLite&rsquo;s own authorizer refuses every
         action but reading, for the duration of the statement. Results are capped at{' '}
-        {CONSOLE_ROW_LIMIT.toLocaleString()} rows, and a long query can be cancelled.
+        {CONSOLE_ROW_LIMIT.toLocaleString()} rows
+        {hosted
+          ? ', and until the corpus is downloaded your SQL runs on this site’s server, ' +
+            'bounded by its deadline rather than a Cancel button.'
+          : ', and a long query can be cancelled.'}
       </p>
       <form
         onSubmit={(event) => {

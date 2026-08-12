@@ -20,6 +20,7 @@ export function Landing({
   disabled,
   busy,
   obsolete,
+  hostedError,
   progress,
   children,
 }: {
@@ -29,6 +30,13 @@ export function Landing({
   busy: boolean
   /** The local copy exists but speaks an older schema — a re-download replaces it. */
   obsolete: boolean
+  /**
+   * Why the hosted tier is not serving this visit (D-084), or null when it was
+   * simply off. This view renders only when neither tier can answer, and the
+   * difference between "the server tier is down" and "you asked for local
+   * only" is worth a sentence.
+   */
+  hostedError?: string | null
   /** The shared progress bar, rendered by the page while a download runs. */
   progress?: React.ReactNode
   /** The diagnostics panel, rendered by the page so it exists in every view. */
@@ -54,6 +62,12 @@ export function Landing({
             One download of about 66&nbsp;MB, stored in this browser. Sync afterwards fetches only
             the day&rsquo;s changes.
           </p>
+          {hostedError && (
+            <p className="stale small" data-hosted-error="1">
+              Normally queries can start on this site&rsquo;s server before any download, but that
+              tier is not answering right now ({hostedError}), so the download is the way in.
+            </p>
+          )}
         </div>
 
         {progress}

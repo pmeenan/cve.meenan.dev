@@ -228,7 +228,7 @@ const KEV_ENUM = ['in kev', 'not in kev']
 const KEV_RANSOMWARE_ENUM = ['known', 'unknown', 'not in kev', 'not stated']
 const STATE_ENUM = ['published', 'rejected', 'all']
 const SORT_ENUM: SortKey[] = ['published', 'updated', 'score', 'cve']
-const CHART_ENUM: ChartType[] = ['stackedBar', 'groupedBar', 'line', 'table']
+const CHART_ENUM: ChartType[] = ['stackedBar', 'groupedBar', 'line', 'area', 'table']
 
 /**
  * The filter axes, flat, as JSON Schema properties.
@@ -356,6 +356,125 @@ export const DIMENSION_GUIDE = DIMENSIONS.map(
 
 /** Every filter field name, for the unknown-argument check. */
 const FILTER_KEYS = new Set(Object.keys(FILTER_PROPERTIES))
+
+// --- the canvas, described to the model (M9) --------------------------------
+
+/** Stored codes back to the words the schemas advertise — the parse maps, inverted. */
+const CVSS_VERSION_NAMES: Record<number, string> = { 2: 'v2.0', 30: 'v3.0', 31: 'v3.1', 4: 'v4.0' }
+const SSVC_EXPL_NAMES: Record<number, string> = { 0: 'none', 1: 'poc', 2: 'active' }
+const SSVC_AUTO_NAMES: Record<number, string> = { 0: 'no', 1: 'yes' }
+const SSVC_IMPACT_NAMES: Record<number, string> = { 0: 'partial', 1: 'total' }
+const KEV_NAMES: Record<number, string> = {
+  [KEV_LISTED]: 'in kev',
+  [KEV_NOT_LISTED]: 'not in kev',
+}
+const KEV_RANSOMWARE_NAMES: Record<number, string> = {
+  [RANSOMWARE_KNOWN]: 'known',
+  [RANSOMWARE_UNKNOWN]: 'unknown',
+  [RANSOMWARE_NOT_LISTED]: 'not in kev',
+}
+
+/** Unix seconds as the `YYYY-MM-DD` day the tool vocabulary speaks. */
+function dayOf(seconds: number): string {
+  return new Date(seconds * 1000).toISOString().slice(0, 10)
+}
+
+function codeWords(codes: readonly number[], names: Record<number, string>): string[] {
+  return codes.map((code) =>
+    code === NOT_ASSESSED ? 'not assessed' : (names[code] ?? String(code))
+  )
+}
+
+/**
+ * A report definition as the flat argument object `aggregate` would take to
+ * produce it — the inverse of `parseToolFilters`, in the same words-and-dates
+ * vocabulary the schemas advertise. `tests/unit/tools.test.ts` round-trips it
+ * through `parseToolCall`, so the two directions cannot drift apart.
+ */
+export function reportToToolArgs(report: Report): Record<string, unknown> {
+  const args: Record<string, unknown> = { rows: report.rows }
+  if (report.series) args.series = report.series
+  args.chart = report.chart
+  if (report.limit !== undefined) args.limit = report.limit
+  if (report.title) args.title = report.title
+  const f = report.filters
+  if (f.text) args.text = f.text
+  if (f.cveId) args.cveId = f.cveId
+  for (const axis of ['vendor', 'product', 'cna', 'cwe', 'host'] as const) {
+    const names = f[axis]
+    if (names?.length) args[axis] = names
+  }
+  if (f.severity?.length) {
+    args.severity = f.severity.map((code) => SEVERITY_ENUM[code] ?? String(code))
+  }
+  if (f.cvssVersion?.length) args.cvssVersion = codeWords(f.cvssVersion, CVSS_VERSION_NAMES)
+  if (f.ssvcExpl?.length) args.ssvcExploitation = codeWords(f.ssvcExpl, SSVC_EXPL_NAMES)
+  if (f.ssvcAuto?.length) args.ssvcAutomatable = codeWords(f.ssvcAuto, SSVC_AUTO_NAMES)
+  if (f.ssvcImpact?.length) args.ssvcImpact = codeWords(f.ssvcImpact, SSVC_IMPACT_NAMES)
+  if (f.kev?.length) args.kev = codeWords(f.kev, KEV_NAMES)
+  if (f.kevRansomware?.length) {
+    args.kevRansomware = f.kevRansomware.map((code) =>
+      code === NOT_ASSESSED ? 'not stated' : (KEV_RANSOMWARE_NAMES[code] ?? String(code))
+    )
+  }
+  if (f.scoreMin !== undefined) args.scoreMin = f.scoreMin
+  if (f.scoreMax !== undefined) args.scoreMax = f.scoreMax
+  if (f.yearFrom !== undefined) args.yearFrom = f.yearFrom
+  if (f.yearTo !== undefined) args.yearTo = f.yearTo
+  for (const key of [
+    'publishedFrom',
+    'publishedTo',
+    'updatedFrom',
+    'updatedTo',
+    'kevAddedFrom',
+    'kevAddedTo',
+    'kevDueFrom',
+    'kevDueTo',
+  ] as const) {
+    const value = f[key]
+    if (value !== undefined) args[key] = dayOf(value)
+  }
+  if (f.state && f.state !== 'published') args.state = f.state
+  return args
+}
+
+/**
+ * What a chat turn is told about the canvas before the question (M9).
+ *
+ * Without this the model starts every conversation blind: asked to "change the
+ * date range" it built a fresh chart of something else entirely, because
+ * nothing had told it a chart existed. The description speaks the tool
+ * vocabulary — the same arguments an `aggregate` call would take — so editing
+ * it is a copy-and-change rather than a translation the model has to invent.
+ */
+export function canvasContext(
+  report: Report,
+  view: 'report' | 'records',
+  matches: number | null
+): string {
+  const args = reportToToolArgs(report)
+  if (view === 'records') {
+    // The record list's tool takes only filters, a sort and a limit; the
+    // chart-shaped fields would be refused as unknown arguments if the model
+    // copied them into a `search_records` call.
+    delete args.rows
+    delete args.series
+    delete args.chart
+    delete args.title
+    if (report.sort) args.sort = report.sort
+  }
+  const shown =
+    view === 'report'
+      ? 'a chart from an `aggregate` call with these arguments'
+      : 'a record list from a `search_records` call with these arguments'
+  return (
+    `[Canvas state, from the app and not the user: the canvas currently shows ${shown}: ` +
+    `${JSON.stringify(args)}.` +
+    (matches !== null ? ` ${matches.toLocaleString()} records matched.` : '') +
+    ' When the user asks to change what is shown — the range, the buckets, the split, a ' +
+    'filter — start from these arguments and change only what they name.]'
+  )
+}
 
 export const TOOLS: readonly ToolSpec[] = [
   {

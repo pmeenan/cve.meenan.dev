@@ -76,6 +76,7 @@ import delta
 import ledger
 import manifest as manifest_module
 import normalize
+import hosted as hosted_module
 import state as state_module
 
 # D-031/D-042: a run that would tombstone more than 0.1% of the corpus (~370
@@ -783,6 +784,9 @@ def _cycle(
     published = _publish_pending(pending, pub_dir, quality, on_written=_pin(state, pending))
     state.commit_run(pending)
     summary["result"] = "published"
+    # For the hosted-tier rebuild (D-084): the artifact this revision was
+    # published from is the file `hosted.py build` copies.
+    summary["artifact"] = pending["artifact"]
     summary["delta"] = published["entry"]
     summary["lookups"] = published["lookups"]
     summary["rev"] = to_rev
@@ -1037,6 +1041,14 @@ def main() -> int:
     )
     runner.add_argument("--quality", type=int, default=delta.QUALITY)
     runner.add_argument("--keep", type=int, default=ARTIFACT_KEEP)
+    runner.add_argument(
+        "--hosted",
+        default=None,
+        help="Rebuild the hosted-tier database (D-084) here after a publish — "
+        "corpus + FTS + KEV, replaced by atomic rename. Advisory: a failure "
+        "is reported and does not fail the ingest, because a published delta "
+        "with a stale hosted tier beats an unpublished delta.",
+    )
 
     starter = sub.add_parser("init", help="Adopt a published data plane.")
     starter.add_argument("clone")
@@ -1077,6 +1089,32 @@ def main() -> int:
     except Abort as abort:
         print(f"error: {abort}", file=sys.stderr)
         return abort.code
+
+    # The hosted-tier rebuild (D-084), after the ingest's own lock is released
+    # — `hosted.py` has its own. Advisory by design: the data plane published,
+    # and a stale hosted tier is repairable by hand (`hosted.py build`) where a
+    # failed ingest is a missed day.
+    if args.command == "run" and args.hosted and not args.dry_run:
+        stale = (
+            report.get("result") == "published"
+            or "resumed" in report
+            or not os.path.exists(args.hosted)
+        )
+        if stale:
+            artifact = report.get("artifact")
+            if artifact is None:
+                with state_module.State(
+                    os.path.join(args.state, state_module.STATE_NAME)
+                ) as state:
+                    artifact = state.artifact if state.initialized else None
+            if artifact and os.path.exists(artifact):
+                try:
+                    report["hosted"] = hosted_module.build(artifact, args.pub_dir, args.hosted)
+                except state_module.Busy as busy:
+                    report["hosted"] = {"skipped": str(busy)}
+                except Exception as failure:  # advisory — see --hosted's help
+                    report["hosted"] = {"error": f"{type(failure).__name__}: {failure}"}
+                    print(f"hosted rebuild failed: {failure}", file=sys.stderr)
 
     print(json.dumps(report, indent=2))
     return EXIT_OK

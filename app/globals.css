@@ -15,28 +15,24 @@
   --surface-2: #eef0f4;
   --shadow: 0 1px 2px rgb(16 24 40 / 6%), 0 8px 24px rgb(16 24 40 / 6%);
 
-  /* --- The severity ramp (M4) ------------------------------------------
-     An *ordinal* encoding, not a categorical one: LOW → CRITICAL is an
-     ordered scale, and hue alone puts MEDIUM and HIGH — the two largest
-     bands — below the separation floor. So lightness carries the order and
-     hue only reinforces it.
+  /* --- The severity scale (M4, re-coloured in M9) ----------------------
+     Hue-coded, the owner's direction (D-083): CRITICAL dark red, HIGH red,
+     MEDIUM orange, LOW yellow, NONE light blue. `--sev-x` is off the scale
+     on purpose: it is the band for records that have never been scored
+     (about half the corpus), which is an *absence* rather than a level, so
+     it is a neutral gray a reader cannot place on the scale.
 
-     `--sev-x` is off the ramp on purpose. It is the band for records that
-     have never been scored (about half the corpus), which is an *absence*
-     rather than a level, so it is a neutral a reader cannot place on the
-     scale.
-
-     Both ramps are checked by `tests/unit/chart.test.ts`, which reads this
-     file: strictly ordered luminance, at least 1.4:1 between adjacent
-     bands, and at least 2:1 against the background they are drawn on. The
-     dark ramp runs the other way in absolute lightness for the same reason
-     the light one runs this way — the most severe band is the one furthest
-     from the page. */
-  --sev-4: #5b131f;
-  --sev-3: #872320;
-  --sev-2: #a34826;
-  --sev-1: #c16e25;
-  --sev-0: #df9e1c;
+     Both palettes are checked by `tests/unit/chart.test.ts`, which reads
+     this file: every band holds at least 2:1 against the background it is
+     drawn on, and bands that touch in a stack — severity's and the SSVC
+     stacks', which reuse sev-0/2/4 — are at least 12 apart in OKLab ΔE
+     (×100). Hue carries the identity now, so D-073's strictly-ordered
+     luminance check is retired with it. */
+  --sev-4: #8b2015;
+  --sev-3: #df2935;
+  --sev-2: #f7730b;
+  --sev-1: #e0a800;
+  --sev-0: #74b6e8;
   --sev-x: #7f899e;
 
   /* Categorical slots for identity dimensions — vendor, product, CWE, CNA,
@@ -66,11 +62,11 @@
     --surface-2: #1c2027;
     --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px rgb(0 0 0 / 35%);
 
-    --sev-4: #faa080;
-    --sev-3: #ed6f4c;
-    --sev-2: #dc4025;
-    --sev-1: #ad3429;
-    --sev-0: #82292c;
+    --sev-4: #9e2a24;
+    --sev-3: #f4544d;
+    --sev-2: #fb9026;
+    --sev-1: #f5c518;
+    --sev-0: #79b8f3;
     --sev-x: #737f96;
 
     --cat-1: #7cbdf5;
@@ -183,6 +179,21 @@ h3 {
   max-width: 62rem;
   margin: 0 auto;
   padding: 2.5rem 0 1rem;
+}
+
+/* The pre-status placeholder. Delayed so a fast answer never shows it at all —
+   a "checking" line that flashes for one frame is the flash it exists to
+   prevent. */
+.checking {
+  text-align: center;
+  padding: 4rem 0;
+  animation: show-checking 0s 0.5s backwards;
+}
+
+@keyframes show-checking {
+  from {
+    visibility: hidden;
+  }
 }
 
 .hero-kicker {
@@ -392,6 +403,37 @@ h3 {
   font-size: 0.78rem;
 }
 
+/* The chart-type toggles: a row of icon buttons, the active one pressed. */
+.chart-picker {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+
+.chart-picker button[aria-pressed='true'] {
+  background: var(--surface-2);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+/* The canvas's own range controls: the published window and the time bucket. */
+.canvas-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.canvas-range .field {
+  font-size: 0.82rem;
+}
+
+fieldset.granularity {
+  border: none;
+  padding: 0;
+  gap: 0.15rem 0.9rem;
+}
+
 /* --- Controls ------------------------------------------------------------ */
 
 .controls {
@@ -428,6 +470,21 @@ button.quiet:hover:not(:disabled) {
 button:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* An icon-only button: square, with the SVG as its content. The accessible
+   name is the aria-label; the title repeats it as a hover tooltip. */
+button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem;
+  line-height: 0;
+}
+
+button.icon svg {
+  width: 1rem;
+  height: 1rem;
 }
 
 .progress {
@@ -832,6 +889,8 @@ details.series-labels {
 
 .chart {
   margin: 1rem 0 0;
+  /* The hover tooltip positions against the figure. */
+  position: relative;
 }
 
 .chart svg {
@@ -868,6 +927,74 @@ details.series-labels {
   stroke-width: 2.5;
   stroke-linejoin: round;
   stroke-linecap: round;
+}
+
+/* Stacked-area bands take the same hairline as bars, so adjacent bands stay
+   separable where two colours are closest. */
+.chart .series-area {
+  stroke: var(--surface);
+  stroke-width: 0.75;
+}
+
+/* The hovered bucket, highlighted under the cursor. Very low opacity: it is a
+   locator for the tooltip, not a mark. */
+.chart .hover-band {
+  fill: currentcolor;
+  opacity: 0.06;
+  pointer-events: none;
+}
+
+/* The hover tooltip (M9). Presentation only — the same numbers are in the
+   Table view and the visually-hidden audit table, so this is never the only
+   channel. `pointer-events: none` so it cannot steal the hover it follows. */
+.chart-tip {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 0.45rem 0.7rem;
+  font-size: 0.8rem;
+  min-width: 11rem;
+  max-width: 20rem;
+}
+
+.chart-tip p {
+  margin: 0.1rem 0;
+}
+
+.chart-tip .tip-title {
+  font-weight: 600;
+}
+
+.chart-tip .tip-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.chart-tip .tip-row .swatch {
+  flex: 0 0 auto;
+  width: 0.6rem;
+  height: 0.6rem;
+}
+
+.chart-tip .tip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.chart-tip .tip-value {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-tip .tip-row.total .tip-value {
+  font-weight: 600;
 }
 
 .legend {
@@ -925,6 +1052,61 @@ details.series-labels {
 .chart-data caption {
   text-align: left;
   padding-bottom: 0.35rem;
+}
+
+/* --- The Table view (M9): a spreadsheet reading of the same model -------- */
+
+table.spreadsheet {
+  border: 1px solid var(--line);
+  width: 100%;
+}
+
+table.spreadsheet th,
+table.spreadsheet td {
+  border: 1px solid var(--line);
+  padding: 0.32rem 0.75rem;
+}
+
+table.spreadsheet thead th {
+  background: var(--surface-2);
+  position: sticky;
+  top: 0;
+}
+
+table.spreadsheet tbody tr:nth-child(even) {
+  background: var(--surface-2);
+}
+
+/* Numbers right-aligned, as a spreadsheet would; the row header stays left. */
+table.spreadsheet td {
+  text-align: right;
+}
+
+/* A column header that sorts. The indicator is a pseudo-element on purpose:
+   it must not leak into the header's text content, which tests and copied
+   grids read. */
+.sort-header {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  cursor: pointer;
+}
+
+.sort-header:hover {
+  color: var(--accent);
+}
+
+th[aria-sort='ascending'] .sort-header::after {
+  content: ' ▲';
+  font-size: 0.7em;
+}
+
+th[aria-sort='descending'] .sort-header::after {
+  content: ' ▼';
+  font-size: 0.7em;
 }
 
 .chart-data th[scope='row'] {

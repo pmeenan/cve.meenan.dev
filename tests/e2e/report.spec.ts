@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { expect, test, type Browser, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
-import { awaitIdle, downloadButton, importCorpus, openPanel, openShare } from './ui'
+import { awaitIdle, downloadButton, importCorpus, openPanel, openShare, setChartType } from './ui'
 
 import { KEV_COLUMNS, RECORD_COLUMNS } from '../../lib/export'
 
@@ -112,7 +112,7 @@ async function setReport(
       .locator('#report-series')
       .selectOption(fields.series === '' ? { value: '' } : { label: fields.series })
   }
-  if (fields.chart) await page.locator('#report-chart').selectOption({ label: fields.chart })
+  if (fields.chart) await setChartType(page, fields.chart)
 }
 
 /** Trigger an export and read the file the browser actually wrote. */
@@ -292,7 +292,7 @@ test('reports, charts, permalinks, saved reports, exports and the detail view', 
     await expect(page.locator('figure.chart polyline.series-line').first()).toBeVisible()
     const asLines = await chartRows(page)
 
-    await setReport(page, { chart: 'Table only' })
+    await setReport(page, { chart: 'Table' })
     await runReport(page)
     await expect(page.locator('figure.chart')).toHaveCount(0)
     // The table is still there — it is not the chart's fallback, it is the

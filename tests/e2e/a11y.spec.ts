@@ -9,6 +9,7 @@ import {
   openChat,
   openPanel,
   panelToggle,
+  setChartType,
   type PanelName,
 } from './ui'
 
@@ -138,12 +139,23 @@ test('every view passes an automated accessibility scan, and works from the keyb
     await expect(svg).toHaveAttribute('role', 'img')
     await expect(svg.locator('title').first()).toContainText('table below this chart')
 
-    // And the table is a real table: a header per column, a header per row.
+    // Under a chart the table is visually hidden but in the DOM (M9) — still
+    // the screen-reader channel, and a real table: a header per column, a
+    // header per row.
     const table = page.locator('table.chart-data')
+    await expect(table).toBeAttached()
+    await expect(table.locator('thead th[scope="col"]').first()).toBeAttached()
+    await expect(table.locator('tbody th[scope="row"]').first()).toBeAttached()
+    expect(await table.locator('tbody tr').count()).toBeGreaterThan(0)
+
+    // The Table view is where the numbers are *shown* — the same table, now a
+    // visible, sortable spreadsheet.
+    await setChartType(page, 'Table')
     await expect(table).toBeVisible()
     await expect(table.locator('thead th[scope="col"]').first()).toBeVisible()
-    await expect(table.locator('tbody th[scope="row"]').first()).toBeVisible()
-    expect(await table.locator('tbody tr').count()).toBeGreaterThan(0)
+    await scan(page, 'canvas (table view)')
+    await setChartType(page, 'Stacked bars')
+    await expect(svg).toBeVisible()
   })
 
   await test.step('a legend entry toggles its series, and says so beyond colour', async () => {

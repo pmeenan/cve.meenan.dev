@@ -18,6 +18,8 @@ the decision log, not by editing a row. The AI chat layer section was added
 
 | Feature | Status | Notes |
 | --- | --- | --- |
+| Hosted query tier — start with no download | `confirmed` | D-084, M9. A visitor with no local copy lands in the workspace; their read-only SQL runs on `api/sql.php` against a server copy of the same DB (corpus + FTS + KEV, `pipeline/hosted.py`). Disclosed as a tier (`main[data-tier]`), replaced by "Make available offline"; `?remote=0` turns it off. Same compiled SQL as the local tier (`lib/remote.ts`, `hosted-parity.test.ts`), same guards server-side (D-078), verified by `scripts/verify-sql-php.sh`. |
+| "Make available offline" — promote to the local tier | `confirmed` | D-084. The former "Download CVE dataset"/"Sync" download, renamed for what it changes: it installs the OPFS copy and switches every subsequent query off the server and into the browser, where the D-079 privacy claim is structural. |
 | Server-side git clone of cvelistV5 as source of record | `confirmed` | D-005. Server runs git; the browser never does. |
 | Same-origin data delivery, corpus data only | `confirmed` | D-006, and D-032 made it static files rather than a PHP endpoint — the client sends no parameters. |
 | Endpoint hardening — same-origin browser callers, no open-proxy behavior | `confirmed` | D-006. Owner-stated requirement, not polish. D-032 moves enforcement into nginx, since there is no handler to harden. |
@@ -89,7 +91,7 @@ as of the 2026-07-30 triage** — additions go through the decision log.
 | Search across CVE records | `confirmed` | Stated in the repository description. Shipped in M3: full-text over descriptions plus every filter axis, through one shared query layer (`lib/filters.ts`). |
 | Structured filtering (date, severity, CNA, CWE, product) | `confirmed` | The concrete form of "analyzing"; the axes follow from the extraction rows above. **Queryable as of M3** — every axis compiles to bound parameters with D-022's default inside the compiler, and counts by any dimension come from the same predicate. The filtering *UI* is M4; M3 ships a plain form over it. |
 | Aggregate reporting and trend views over time | `confirmed` | The main thing a local corpus enables over a search box — the reason the project exists. |
-| Charting for report output | `confirmed` | D-073. Aggregates without visualization push users back to a spreadsheet. Hand-rolled SVG, no dependency; severity is an ordinal ramp checked against both themes by test, and every chart ships its numbers as a table. |
+| Charting for report output | `confirmed` | D-073, D-083. Aggregates without visualization push users back to a spreadsheet. Hand-rolled SVG, no dependency; severity is the conventional hue palette checked against both themes by test, and every chart ships its numbers as a table. |
 | Raw SQL console | `confirmed` | Nearly free given D-004, and the escape hatch for every question the UI did not anticipate. Shipped in M3 (D-065): read-only by SQLite authorizer rather than by inspecting the text, capped at 1,000 rows, and cancellable. |
 | Saved queries and query history | `confirmed` | D-072. Analysis is iterative; losing a refined query on reload is a real cost. In `localStorage`, never in the SQLite copy — that copy is a rebuildable cache a schema bump destroys (D-013, D-068). |
 | Shareable query/report permalinks (query only, never data) | `confirmed` | Supports vision criterion 6 while preserving the privacy property. |

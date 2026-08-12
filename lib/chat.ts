@@ -506,7 +506,10 @@ export function systemPrompt(tools: readonly ToolSpec[] = TOOLS): string {
     `Today is ${TODAY_TOKEN}. Resolve every relative date — "recent", "this year", "the last ` +
       'two years" — against that, never against what you remember. Date windows over ' +
       'publication use `publishedFrom`/`publishedTo`; `yearFrom`/`yearTo` are the year in the ' +
-      'CVE identifier, which is when it was reserved and not when it was published.',
+      'CVE identifier, which is when it was reserved and not when it was published. ' +
+      '"The last N years" is the full window ending today: publishedFrom = today minus N ' +
+      'years — the last two years span 24 months back from today, not the two most recent ' +
+      'calendar-year labels.',
     '',
     `Your tools are: ${names}. Rules for using them:`,
     '- Never state a count, a date, a score or a CVE identifier that did not come back from a ' +

@@ -891,6 +891,14 @@ def main() -> int:
         help="Fetch, validate and guard, then report without publishing or "
         "touching state.",
     )
+    runner.add_argument(
+        "--hosted",
+        default=None,
+        help="After publishing a new catalog, refresh the KEV overlay inside "
+        "the hosted-tier database here (D-084). Advisory and its own failure "
+        "domain: it runs after this job's own lock is released, under "
+        "hosted.py's, and a failure is reported without failing the run.",
+    )
 
     reporter = sub.add_parser("status", help="What is served, and when it was last fetched.")
     reporter.add_argument("pub_dir")
@@ -923,6 +931,25 @@ def main() -> int:
     except Refuse as refusal:
         print(f"error: {refusal}", file=sys.stderr)
         return EXIT_FAIL
+
+    # The hosted-tier overlay refresh (D-084): only when this run actually
+    # changed the served catalog — an unchanged catalog is already in the
+    # hosted database from the daily rebuild or a previous refresh.
+    if (
+        args.command == "run"
+        and args.hosted
+        and not args.dry_run
+        and report.get("published") in ("published", "published-over-unorderable")
+    ):
+        import hosted as hosted_module
+
+        try:
+            report["hosted"] = hosted_module.refresh_kev(args.pub_dir, args.hosted)
+        except Busy as busy:
+            report["hosted"] = {"skipped": str(busy)}
+        except Exception as failure:  # advisory — see --hosted's help
+            report["hosted"] = {"error": f"{type(failure).__name__}: {failure}"}
+            print(f"hosted KEV refresh failed: {failure}", file=sys.stderr)
 
     print(json.dumps(report, indent=2))
     return EXIT_OK

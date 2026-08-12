@@ -103,26 +103,30 @@ a regression is visible.
    of the reference tables — which has no supporting index yet, and is M3's
    work. These depend on the 256 MiB page cache (D-050); at SQLite's stock
    2 MiB the same queries take up to 92 s.
-4. **What the server can learn is bounded and checkable.** With the network
-   panel open, a user can confirm that the app makes exactly two kinds of
-   request to this server: fetch the snapshot, and fetch deltas since a
-   watermark. Neither
-   carries a filter value, a search term, or any indication of what is being
-   asked. Analysis — filtering, aggregation, ranking, search — runs entirely on
-   the client. D-014 permits requests to name fields and partitions; D-025
-   removed even that, so the server learns nothing about the query at all.
-   The AI layer adds further request kinds, all user-initiated. One is
-   same-origin: chat on the site-hosted tier posts the question and its tool
-   results to this server's chat relay, which forwards them to our own model
-   and stores nothing — disclosed before first use, and still visible in the
-   network panel (D-057). The rest bypass this server entirely: model-weight
-   downloads from Hugging Face, and — only when the user supplies a key —
-   chat traffic direct to their chosen provider (D-045).
-5. **It works offline, fully.** Once downloaded, the client holds the entire
-   corpus (D-025), so search, analysis, and reporting all work with the network
-   disconnected. Only Download, Sync, and the optional model-weight download
-   need it — chat on the site-hosted or BYO-key tiers is the one feature that
-   inherently requires the network (D-045, D-057).
+4. **What the server can learn is per-tier, bounded, and checkable.** On the
+   **offline tier** — a downloaded local copy — the app makes exactly two kinds
+   of request to this server: fetch the snapshot, and fetch deltas since a
+   watermark. Neither carries a filter value, a search term, or any indication
+   of what is being asked; analysis runs entirely on the client, and D-025
+   removed even the field-and-partition projection D-014 had permitted, so the
+   server learns nothing about the query at all — verifiable with the network
+   panel open. The **hosted tier** (D-084) is the deliberate exception, and it
+   is disclosed as one rather than hidden: a visitor with no local copy has
+   their read-only SQL executed by `api/sql.php` against a server copy, so on
+   that tier the server *does* receive predicates and search terms — under the
+   chat relay's posture (same-origin, rate-limited, nothing stored, no bodies
+   logged). The app says which tier is answering, and "Make available offline"
+   is one action away. The AI layer adds further request kinds, all
+   user-initiated: chat on the site-hosted tier posts the question and its tool
+   results to the chat relay, which forwards them to our own model and stores
+   nothing (D-057); model-weight downloads and BYO-key chat bypass this server
+   entirely (D-045).
+5. **The offline tier works offline, fully.** Once "Make available offline" has
+   run, the client holds the entire corpus (D-025), so search, analysis, and
+   reporting all work with the network disconnected — this is the tier the
+   privacy and offline claims are made of. The hosted tier that precedes a
+   download (D-084) inherently needs the network, as chat does; Download, Sync
+   and the optional model-weight download need it too.
 6. **Reports are shareable without the data being shareable.** A user can hand
    someone a query or report definition that reproduces the analysis on their
    own local copy, and separately export result sets in a standard format —
@@ -149,9 +153,16 @@ a regression is visible.
 - **Not a vulnerability scanner.** The tool never looks at the user's systems,
   builds an asset inventory, or matches CVEs against installed software. It
   analyzes the corpus, not your machine.
-- **Not a hosted analysis service or public API.** Moving query execution
-  server-side would forfeit the privacy property that justifies the project
-  (D-007).
+- **Not a public API, and hosted analysis is a labelled opt-in, not the
+  default posture.** Query execution is client-side on the offline tier, where
+  the privacy property is structural and checkable (D-007, D-079). D-084 adds
+  one hosted tier — a same-origin `api/sql.php` that executes read-only SQL
+  against a server copy so a first visit can start without the 63 MB download —
+  but it is a *tier*, disclosed as one: the app says which tier is answering,
+  "Make available offline" moves everything into the browser, and there is
+  still no general-purpose API (the endpoint is same-origin, rate-limited,
+  read-only, and stores nothing). Turning the *offline* tier's execution
+  server-side, or exposing the endpoint cross-origin, remains out.
 - **Not a background alerting service.** Updates are pull-based when the user
   opens the app; standing alerts would require infrastructure that watches on
   the user's behalf, which contradicts the client-side model. In-app watchlists
@@ -172,8 +183,12 @@ a regression is visible.
 - **The app collects nothing.** No telemetry, no analytics, no error reporting,
   not even opt-in (D-009). The tradeoff is accepted knowingly: we are blind to
   production failures, and the diagnostics panel exists so users can tell us
-  what we cannot see. What this buys is the claim worth making — **your queries
-  never reach us**, because the corpus is downloaded once and every search,
-  filter and report runs against your own copy. It is deliberately *not* a
-  claim that the server records nothing at all: it keeps an ordinary access log
-  with real visitor addresses, like every other web server (D-079).
+  what we cannot see. What this buys is the claim worth making — **once you are
+  on the offline tier, your queries never reach us**, because the corpus is
+  downloaded once and every search, filter and report runs against your own
+  copy. On the hosted tier that precedes a download (D-084) that is not yet
+  true — the SQL is executed server-side, stored nowhere — which is why the app
+  names the tier and offers the download; the claim is a property of the
+  offline tier, not a blanket one. And in neither case is it a claim that the
+  server records nothing at all: it keeps an ordinary access log with real
+  visitor addresses, like every other web server (D-079).

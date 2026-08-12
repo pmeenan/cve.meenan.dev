@@ -16,8 +16,8 @@
  * whatever colour scheme the reader's system asks for, so a hex value baked
  * into a `fill` would be validated in one theme and shipped in two. The values
  * behind these names live in `app/globals.css` — one block per scheme — and
- * `tests/unit/chart.test.ts` reads that file and checks both ramps against the
- * background they are actually drawn on.
+ * `tests/unit/chart.test.ts` reads that file and checks both palettes against
+ * the background they are actually drawn on.
  */
 
 import {
@@ -47,14 +47,13 @@ const SEVERITY_SERIES_MAX = 6
 const SSVC_SERIES_MAX = 4
 
 /**
- * Where each SSVC code sits on the severity ramp.
+ * Where each SSVC code sits on the severity scale.
  *
  * The SSVC axes are **scales**, not identities — none → poc → active is an
- * escalation, and so is partial → total — so D-073's argument applies to them
- * unchanged: an ordered encoding, because hue alone puts adjacent bands below
- * the separation floor. Rather than build and contrast-check a second ramp in
- * two themes, they reuse the one that is already checked, spaced across it so
- * every adjacency is two ramp steps or more. The legend names the bands, so
+ * escalation, and so is partial → total. Rather than build and check a second
+ * palette in two themes, they reuse the severity bands (D-083's hue scale:
+ * blue for the benign end, orange between, dark red at the top), spaced so
+ * every adjacency clears the separation floor. The legend names the bands, so
  * there is no reading in which a red band means "CRITICAL" here.
  *
  * `tests/unit/chart.test.ts` asserts the resulting adjacencies — including the
@@ -182,12 +181,10 @@ function seriesCap(dimension: Dimension): number {
 /**
  * The colour for one series.
  *
- * Severity is an **ordinal** encoding — a lightness-ordered ramp — rather than a
- * categorical one, because LOW → CRITICAL is an ordered scale and hue alone
- * puts MEDIUM and HIGH, the two largest bands, below the separation floor. The
- * unscored band is deliberately *off* the ramp: it is a neutral, because it is
- * an absence rather than a level, and a reader must not be able to place it on
- * the scale.
+ * Severity is hue-coded (D-083): dark red for CRITICAL down to light blue for
+ * NONE, the conventional reading of a severity scale. The unscored band is
+ * deliberately *off* the scale: it is a neutral gray, because it is an absence
+ * rather than a level, and a reader must not be able to place it on the scale.
  *
  * Every other dimension is an identity, and identities get categorical slots.
  */
