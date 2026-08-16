@@ -98,6 +98,33 @@ export async function setChartType(page: Page, label: string): Promise<void> {
     .click()
 }
 
+/**
+ * The date range control (M9), by the `data-date-range` name its instances
+ * carry: `canvas-published` on the canvas strip, and `published`, `updated`,
+ * `kev-added`, `kev-due` in the filter drawer.
+ *
+ * Its two text boxes keep the ids the native inputs had — `#canvas-pub-from`,
+ * `#report-pub-from` and so on — so a spec that only wants to set a date can
+ * still `fill()` one. The value is committed on **Enter or blur**, never
+ * mid-typing (a commit re-runs the canvas report, and a running query disables
+ * the box under the reader's fingers), so a `fill()` must be followed by
+ * something that blurs it.
+ *
+ * The calendar is a fixed-position dialog outside the panel's scroll box, so
+ * `openCalendar` returns it rather than searching the panel.
+ */
+export async function openCalendar(page: Page, name: string): Promise<Locator> {
+  await page.locator(`[data-date-open="${name}"]`).click()
+  const popover = page.locator(`[data-date-pop="${name}"]`)
+  await expect(popover).toBeVisible()
+  return popover
+}
+
+/** One day cell in an open calendar, by the day it is. */
+export function calendarDay(page: Page, day: string): Locator {
+  return page.locator(`[data-day="${day}"]`)
+}
+
 /** The canvas's collapsed share/export row, opened. */
 export async function openShare(page: Page): Promise<void> {
   const share = page.locator('details.share')

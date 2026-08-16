@@ -131,6 +131,17 @@ test('the default report renders from server-executed SQL', async ({ page }) => 
   })
 })
 
+test('the date control is bounded by the server’s copy, not left unbounded', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.locator('main')).toHaveAttribute('data-tier', 'hosted', { timeout: 15_000 })
+  // `coverage` is answered from whichever copy is answering (D-085), so on this
+  // tier it is one more server-executed statement — and the boxes seed from its
+  // reply exactly as they do from a local copy.
+  const from = page.locator('#canvas-pub-from')
+  await expect(from).toHaveAttribute('data-soft', '1', { timeout: 15_000 })
+  await expect(from).toHaveValue(/^\d{4}-\d{2}-\d{2}$/)
+})
+
 test('the SQL console runs against the hosted tier', async ({ page }) => {
   await page.goto('/')
   await expect(page.locator('main')).toHaveAttribute('data-tier', 'hosted', { timeout: 15_000 })

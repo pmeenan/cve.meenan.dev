@@ -194,6 +194,16 @@ never opens empty, results copy out formula-guarded (D-071) and attribution-free
 (D-082). The e2e suite's selector knowledge lives in `tests/e2e/ui.ts` — update
 it first when the UI changes.
 
+**Dates are one control now (D-085), bounded by the copy that is answering.**
+`app/date-range.tsx` over `lib/dates.ts` replaces every `<input type="date">`:
+keystrokes are buffered and committed on **Enter or blur only** — a commit
+re-runs the report, a running query disables the box, and a disabled input eats
+the keys after it (RE-037) — a bare `2025` means the whole year per edge, and a
+date outside the data is clamped rather than accepted. An unset edge *displays*
+the copy's extent in muted text and filters nothing, because seeding it as a
+value would write today's boundaries into every permalink. The extent is the
+`coverage` Worker message, answered from the database on either tier.
+
 **M7 complete — the AI chat layer is live.**
 Five read-only tools over the local corpus (`lib/tools.ts`), a same-origin PHP
 relay to our own Ollama (`public/api/chat.php`, D-057), and a side panel that
@@ -323,7 +333,7 @@ never settle (RE-032). Verified by exceeding: **15 concurrent through
 Cloudflare → 4 × 429**; the access log carries `$request` and no
 `$request_body`.
 
-711 unit tests and 100 browser specs passing across two engines (42 skips, all
+771 unit tests and 116 browser specs passing across two engines (42 skips, all
 the opt-in `MEASURE=1` and `BENCH` suites), with the relay verified against the
 live origin (405 on GET, 403 cross-origin, 413 over 256 KB, caller-supplied
 `model` ignored, caller-supplied `system` or `tools` refused with 400, no CORS

@@ -27,6 +27,59 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
+## D-085: Date ranges are one bounded control, seeded by the data and never by a predicate  (2026-08-16, status: accepted)
+
+**Decision.** Every date pair in the app — the canvas's published window and
+the drawer's published / updated / KEV-added / KEV-due axes — is one component
+(`app/date-range.tsx`) over pure UTC arithmetic (`lib/dates.ts`), and it is
+bounded by the copy that is answering. Three parts are load-bearing:
+
+1. **A typed box commits on Enter or blur, never mid-typing.** Keystrokes are
+   local state; a value reaches the report only when the whole string parses.
+   A bare `2025` means the whole year — its start on the left edge, its end on
+   the right.
+2. **The extent comes from the database, not from a constant.** A new Worker
+   message (`coverage`, lib/protocol.ts) reports min/max `published`,
+   `updated`, identifier year and the KEV dates, answered on either tier by
+   this build's own constant SQL. Days outside it are refused by the calendar
+   and a typed date outside it is clamped into it.
+3. **An unset edge displays that extent, and filters nothing.** The boxes are
+   never blank: they show the range the report is actually covering, in muted
+   text, with no `publishedFrom` in the definition. Seeding them as *values*
+   was the obvious alternative and is the one to avoid — it would write today's
+   corpus boundaries into every permalink, saved report and chat-built
+   definition, so a link shared now would silently stop meaning "all time" the
+   day the corpus grew.
+
+**Context.** The owner's four observations from the deployed workspace, in
+order: the dates were not seeded from what was on screen; typing `2025` into a
+year jumped to `0002` and stopped; the range was not bounded by the dataset;
+and switching month or year took too many clicks. The first three are one
+defect each in the native control; the fourth is what a calendar with a
+shortcut rail, month and year selects and two visible months fixes.
+
+**Consequences.** `Filters` and `Draft` are untouched, so permalinks, saved
+reports and the M7 tool surface keep their meaning and their round trip. A
+control that has no coverage yet — the first frames after a tier is ready —
+behaves exactly as it did before: unbounded, and blank rather than seeded. The
+`coverage` message is one more query per state of the copy (index seeks for
+`published` and `year`, one column scan for `updated`).
+
+**Three rules keep that background question from behaving like a foreground
+one**, each of which cost a debugging round and is easy to undo by accident.
+The Worker runs it `quiet`: the progress handler's "still running" line is what
+puts the page into its busy state, and this handler posts no `ready` afterwards
+— a two-tab run hung with every button greyed out behind a query nobody ran. It
+never raises: a failure means unbounded controls, not an error banner about
+something the reader did not do. And the page does not *ask* while the Worker
+is busy, because on the hosted tier the answer is a blocking XHR inside the
+Worker and would sit in front of a download.
+
+**Reopen if** a copy appears whose extent is expensive to measure, or the
+soft-display convention is found to read as a filter that is applied — in which
+case the answer is to label it harder, not to commit predicates nobody asked
+for.
+
 ## D-084: A hosted query tier makes the workspace the landing experience — the server executes SQL, and offline becomes the upgrade  (2026-08-12, status: accepted, owner decision; reverses D-007/D-014's no-server-execution floor for one endpoint, amends D-079's claim to per-tier, replaces D-081's landing gate, adds a second dynamic endpoint under D-006's rules)
 
 **Decision (owner, 2026-08-12).** The project is no longer offline-first. A

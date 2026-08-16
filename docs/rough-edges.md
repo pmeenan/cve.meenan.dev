@@ -22,6 +22,65 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-038: `focus()` inside a `visibility: hidden` subtree is silently ignored, so a dialog that hides itself for one frame loses its keyboard entry  (2026-08-16, status: worked-around)
+
+**Environment:** Chromium 141 and Firefox 145 (Playwright 1.62), React 19.
+Building the D-085 date range popover.
+
+**Repro:** a `position: fixed` panel is rendered before it has been measured,
+hidden with `style={{ visibility: 'hidden' }}` until a layout effect writes its
+coordinates. A `ref` callback on the day button that should hold initial focus
+calls `node.focus()`.
+
+**Observed:** `document.activeElement` stays on the button that opened the
+dialog. No error, no warning; every arrow key then goes to the toggle instead
+of the grid, and `Enter` re-toggles the dialog shut. Both engines.
+
+**Expected:** naively, that focus is about the focus ring and the hidden panel
+would take it anyway. It does not: `visibility: hidden` makes a subtree
+non-focusable, exactly like `display: none`, and `HTMLElement.focus()` on a
+non-focusable element is a no-op rather than an error — which is what makes it
+cost time. `opacity: 0` does **not** do this; an element at zero opacity is
+focusable.
+
+**Impact:** the fix is one property — hide the unmeasured frame with `opacity`
+(plus `pointer-events: none`), not `visibility`. Worth remembering for any
+measure-then-place popover: the "hide it for one frame" trick and "move focus
+into it on open" are silently incompatible under `visibility`. Found by driving
+the real UI, not by reading it — nothing in the DOM says focus was refused.
+
+## RE-037: A controlled `<input type="date">` commits per *segment*, and a commit that disables the box eats the keystrokes after it  (2026-08-16, status: worked-around)
+
+**Environment:** Chromium 141, Firefox 145, React 19. The M9 filter surface.
+
+**Repro:** `<input type="date" value={state} onChange={e => setState(e.target.value)} />`
+over a corpus filter, then type `2025` into the year segment of an
+otherwise-complete date.
+
+**Observed:** the first keystroke produces a *complete, valid* value with the
+year `0002`, `change` fires, React re-renders the input with it, and the
+segment's accumulation is reset — so the remaining `025` lands somewhere else
+and the box holds a date nobody typed. This is not a React bug: the control
+reports a whole date as soon as every segment holds something, and a year
+segment holds `2` after one key.
+
+**And the obvious replacement has its own version of it.** A text box that
+commits as soon as the buffer parses as a whole day fixes the year problem and
+introduces a worse one *if the commit does anything expensive*: here a
+committed range re-runs the canvas report, a running query disables the box,
+and **a disabled input receives no key events at all** — so typing
+`2026-01-01` and continuing (or pressing Enter) lost everything after the
+tenth character, with no error and no visible cause. It reproduced under
+Playwright as "the `Enter` keydown never arrived", which is the same thing:
+the actionability check passed a frame before React disabled the element.
+
+**Expected:** keystrokes to reach the box the user is typing in.
+
+**Impact:** the working shape, and the one `app/date-range.tsx` uses: buffer
+keystrokes in local state, commit on **Enter or blur only**, and let the
+parser decide what a partial string means (`2025` → the whole year, per edge)
+rather than committing the first thing that happens to be valid. See D-085.
+
 ## RE-036: PHP's `SQLite3` constructor takes no URI filename, so `immutable=1` (and any `file:` URI) silently fails to open  (2026-08-12, status: worked-around)
 
 **Environment:** PHP 8.3.33, `php:8.3-cli` docker image, sqlite3 extension
@@ -112,6 +171,17 @@ samples 300 ms apart — a single "Sync enabled" sample can land in the
 effect-tick gap between two busy windows with more work still queued, which is
 how the race outlived the first workaround. If a new spec bypasses those
 helpers, it inherits the race — idle first, then click.
+
+**It is not only the import path (2026-08-16).** The same signature reproduced
+on the *sync* path, in three consecutive full-suite runs, at `query.spec.ts`'s
+row-cap step: a `Run SQL` click after a Sync silently did nothing, and the
+console kept the previous query's result for the full 120 s poll (the tell is
+that `send` clears the console result on every console request — a *stale*
+result means no request was ever sent). `.progress` hiding is not the end of
+the sequence a Sync starts; the KEV refresh and the page's own follow-up
+questions come after it. Fixed the same way: `awaitIdle` before the click.
+Worth stating plainly, because it moved: the failing test differs run to run,
+every one of them passes in isolation, and none of them is where the defect is.
 
 ## RE-033: fts5 issues `PRAGMA data_version` itself, so a SQLite authorizer that denies PRAGMA denies all full-text search  (2026-08-08, status: fixed)
 

@@ -1335,6 +1335,233 @@ button.link {
   margin: 0.2rem 0;
 }
 
+/* --- The date range control (M9) ---------------------------------------- */
+
+/* Two range controls to a row, each of which is three controls wide — they need
+   more air between them than a row of single fields does. */
+.filters .row.dates {
+  gap: 0.75rem 1.6rem;
+}
+
+.date-range {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+}
+
+.date-range.inline {
+  align-items: center;
+}
+
+.date-box {
+  width: 7.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* An edge that is not filtered shows the data's own boundary instead of
+   nothing — the range the report is actually covering. Muted, because it is a
+   description of the corpus rather than a value the reader chose. */
+.date-box[data-soft='1'] {
+  color: var(--muted);
+}
+
+.date-open {
+  /* Line the calendar button up with the boxes rather than their labels. */
+  margin-bottom: 0.05rem;
+}
+
+.date-range.inline .date-open {
+  margin-bottom: 0;
+}
+
+/* `position: fixed`, placed from the anchor in JS: the filter drawer scrolls
+   its own content, so an absolutely positioned panel would be clipped by the
+   panel it lives in. */
+.date-pop {
+  position: fixed;
+  z-index: 60;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 0.7rem 0.8rem 0.6rem;
+  /* Wide enough for the rail plus two whole months — measured, because a max
+     width a hair under that silently clips the second month rather than
+     wrapping it. */
+  max-width: min(44rem, calc(100vw - 1rem));
+}
+
+.date-pop-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+}
+
+.date-pop-title .muted {
+  font-weight: 400;
+}
+
+.date-pop-body {
+  display: flex;
+  gap: 0.9rem;
+  align-items: flex-start;
+}
+
+.date-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  border-right: 1px solid var(--line);
+  padding-right: 0.8rem;
+}
+
+.date-presets button {
+  text-align: left;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.date-presets button[aria-pressed='true'] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.date-cal-head {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.4rem;
+}
+
+.date-cal-head select {
+  font: inherit;
+  font-size: 0.88rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.15rem 0.3rem;
+}
+
+.date-cal-head button.icon {
+  padding: 0.15rem 0.45rem;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.date-months {
+  display: flex;
+  gap: 0.9rem;
+}
+
+.date-grid {
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.date-grid caption {
+  font-size: 0.82rem;
+  color: var(--muted);
+  padding-bottom: 0.2rem;
+}
+
+.date-grid th {
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 0.72rem;
+  padding: 0 0 0.15rem;
+  text-align: center;
+}
+
+.date-grid td {
+  padding: 0;
+  border: 0;
+  white-space: nowrap;
+}
+
+/* The band between the two endpoints, drawn on the cell rather than the button
+   so it runs edge to edge across a week. */
+.date-grid td.in-range {
+  background: color-mix(in oklab, var(--accent) 14%, transparent);
+}
+
+.date-day {
+  width: 2rem;
+  height: 1.9rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.date-day:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.date-day:disabled {
+  color: var(--muted);
+  opacity: 0.35;
+}
+
+.date-day[data-today='1'] {
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.date-day[data-selected='1'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.date-pop-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-top: 0.55rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--line);
+}
+
+.date-pop-foot p {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.date-pop-foot button {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.year-select {
+  min-width: 6.5rem;
+}
+
+/* One month at a time where two will not fit, and the shortcut rail above the
+   calendar rather than beside it. */
+@media (max-width: 40rem) {
+  .date-pop-body {
+    flex-direction: column;
+  }
+
+  .date-presets {
+    flex-direction: row;
+    flex-wrap: wrap;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 0 0 0.5rem;
+  }
+
+  .date-months .date-grid:last-child {
+    display: none;
+  }
+}
+
 /* A label that a screen reader announces and nothing else shows. The clip-path
    form rather than `display: none`, which removes it from the accessibility
    tree as well and would leave the composer unlabelled. */

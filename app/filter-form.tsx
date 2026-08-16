@@ -17,8 +17,12 @@
 
 import { useId } from 'react'
 
+import { axisBounds, yearBounds } from '@/lib/dates'
 import { clearChip, codeLabel, CODE_AXES, describeDraft, type Chip, type Draft } from '@/lib/draft'
 import { DIMENSION_LABELS, NOT_ASSESSED, type StateFilter } from '@/lib/filters'
+import type { Coverage } from '@/lib/protocol'
+
+import { DateRangeField } from './date-range'
 
 export function FilterChips({
   draft,
@@ -63,16 +67,20 @@ export function FilterForm({
   draft,
   onChange,
   idPrefix,
+  coverage,
 }: {
   draft: Draft
   onChange: (draft: Draft) => void
   /** Unique per instance: two forms on one route would otherwise share label targets. */
   idPrefix?: string
+  /** The extent of the copy answering, so every date control is bounded by it (M9). */
+  coverage?: Coverage | null
 }) {
   const auto = useId()
   const prefix = idPrefix ?? auto
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) =>
     onChange({ ...draft, [key]: value })
+  const years = yearBounds(coverage ?? null)
 
   return (
     <>
@@ -194,93 +202,73 @@ export function FilterForm({
             onChange={(event) => set('scoreMax', event.target.value)}
           />
         </Field>
-        <Field label="Published from" id={`${prefix}-pub-from`}>
-          <input
-            id={`${prefix}-pub-from`}
-            type="date"
-            value={draft.publishedFrom}
-            onChange={(event) => set('publishedFrom', event.target.value)}
-          />
-        </Field>
-        <Field label="to" id={`${prefix}-pub-to`}>
-          <input
-            id={`${prefix}-pub-to`}
-            type="date"
-            value={draft.publishedTo}
-            onChange={(event) => set('publishedTo', event.target.value)}
-          />
-        </Field>
-        <Field label="Updated from" id={`${prefix}-upd-from`}>
-          <input
-            id={`${prefix}-upd-from`}
-            type="date"
-            value={draft.updatedFrom}
-            onChange={(event) => set('updatedFrom', event.target.value)}
-          />
-        </Field>
-        <Field label="to" id={`${prefix}-upd-to`}>
-          <input
-            id={`${prefix}-upd-to`}
-            type="date"
-            value={draft.updatedTo}
-            onChange={(event) => set('updatedTo', event.target.value)}
-          />
-        </Field>
-        <Field label="Year from" id={`${prefix}-year-from`}>
-          <input
-            id={`${prefix}-year-from`}
-            type="number"
-            value={draft.yearFrom}
-            onChange={(event) => set('yearFrom', event.target.value)}
-          />
-        </Field>
-        <Field label="to" id={`${prefix}-year-to`}>
-          <input
-            id={`${prefix}-year-to`}
-            type="number"
-            value={draft.yearTo}
-            onChange={(event) => set('yearTo', event.target.value)}
-          />
-        </Field>
+        {/* The identifier year, as two bounded selects rather than free
+            numbers: it is a *year in the identifier*, not a date, and the copy
+            holds a known and small set of them — so the control can offer
+            exactly those, in one click, instead of accepting a year that can
+            only produce an empty report. */}
+        <Years
+          label="ID year from"
+          id={`${prefix}-year-from`}
+          field="yearFrom"
+          draft={draft}
+          set={set}
+          bounds={years}
+        />
+        <Years
+          label="to"
+          id={`${prefix}-year-to`}
+          field="yearTo"
+          draft={draft}
+          set={set}
+          bounds={years}
+        />
+      </div>
+
+      <div className="row dates">
+        <DateRangeField
+          label="Published"
+          name="published"
+          idPrefix={`${prefix}-pub`}
+          from={draft.publishedFrom}
+          to={draft.publishedTo}
+          bounds={axisBounds(coverage ?? null, 'published')}
+          onChange={(from, to) => onChange({ ...draft, publishedFrom: from, publishedTo: to })}
+        />
+        <DateRangeField
+          label="Updated"
+          name="updated"
+          idPrefix={`${prefix}-upd`}
+          from={draft.updatedFrom}
+          to={draft.updatedTo}
+          bounds={axisBounds(coverage ?? null, 'updated')}
+          onChange={(from, to) => onChange({ ...draft, updatedFrom: from, updatedTo: to })}
+        />
       </div>
 
       {/* The catalog's own dates (M6). Separate from the corpus's because they
           are CISA's timeline rather than the CVE Program's: when a record was
           added to the known-exploited list, and when federal agencies had to
           have acted on it. Either one implies membership. */}
-      <div className="row">
-        <Field label="Added to KEV from" id={`${prefix}-kev-added-from`}>
-          <input
-            id={`${prefix}-kev-added-from`}
-            type="date"
-            value={draft.kevAddedFrom}
-            onChange={(event) => set('kevAddedFrom', event.target.value)}
-          />
-        </Field>
-        <Field label="to" id={`${prefix}-kev-added-to`}>
-          <input
-            id={`${prefix}-kev-added-to`}
-            type="date"
-            value={draft.kevAddedTo}
-            onChange={(event) => set('kevAddedTo', event.target.value)}
-          />
-        </Field>
-        <Field label="KEV due date from" id={`${prefix}-kev-due-from`}>
-          <input
-            id={`${prefix}-kev-due-from`}
-            type="date"
-            value={draft.kevDueFrom}
-            onChange={(event) => set('kevDueFrom', event.target.value)}
-          />
-        </Field>
-        <Field label="to" id={`${prefix}-kev-due-to`}>
-          <input
-            id={`${prefix}-kev-due-to`}
-            type="date"
-            value={draft.kevDueTo}
-            onChange={(event) => set('kevDueTo', event.target.value)}
-          />
-        </Field>
+      <div className="row dates">
+        <DateRangeField
+          label="Added to KEV"
+          name="kev-added"
+          idPrefix={`${prefix}-kev-added`}
+          from={draft.kevAddedFrom}
+          to={draft.kevAddedTo}
+          bounds={axisBounds(coverage ?? null, 'kevAdded')}
+          onChange={(from, to) => onChange({ ...draft, kevAddedFrom: from, kevAddedTo: to })}
+        />
+        <DateRangeField
+          label="KEV due date"
+          name="kev-due"
+          idPrefix={`${prefix}-kev-due`}
+          from={draft.kevDueFrom}
+          to={draft.kevDueTo}
+          bounds={axisBounds(coverage ?? null, 'kevDue')}
+          onChange={(from, to) => onChange({ ...draft, kevDueFrom: from, kevDueTo: to })}
+        />
       </div>
     </>
   )
@@ -327,6 +315,58 @@ function Names({
         placeholder={placeholder}
         onChange={(event) => set(field, event.target.value)}
       />
+    </Field>
+  )
+}
+
+/**
+ * One end of the identifier-year range, bounded by the years the copy holds.
+ *
+ * A value from outside that set is still offered — a permalink or a chat answer
+ * can carry a year this copy no longer covers, and a select that cannot show
+ * its own value would silently rewrite the filter it was given.
+ */
+function Years({
+  label,
+  id,
+  field,
+  draft,
+  set,
+  bounds,
+}: {
+  label: string
+  id: string
+  field: 'yearFrom' | 'yearTo'
+  draft: Draft
+  set: <K extends keyof Draft>(key: K, value: Draft[K]) => void
+  bounds: { min: number; max: number } | null
+}) {
+  const current = draft[field].trim()
+  const years: number[] = []
+  if (bounds) {
+    for (let year = bounds.max; year >= bounds.min; year -= 1) years.push(year)
+  }
+  const held = Number(current)
+  if (current && Number.isFinite(held) && !years.includes(held)) years.unshift(held)
+  return (
+    <Field label={label} id={id}>
+      <select
+        id={id}
+        className="year-select"
+        value={current}
+        data-year={field}
+        // "to" on its own is four different boxes in this drawer; the
+        // accessible name says which range this one closes.
+        aria-label={`ID year ${field === 'yearFrom' ? 'from' : 'to'}`}
+        onChange={(event) => set(field, event.target.value)}
+      >
+        <option value="">{field === 'yearFrom' ? 'Earliest' : 'Latest'}</option>
+        {years.map((year) => (
+          <option key={year} value={String(year)}>
+            {year}
+          </option>
+        ))}
+      </select>
     </Field>
   )
 }

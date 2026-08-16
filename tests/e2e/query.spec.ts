@@ -184,9 +184,23 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     expect(high).toBeLessThanOrEqual(bySeverity.get('CRITICAL')!)
 
     await page.getByRole('button', { name: 'Reset filters' }).click()
-    await setFilter(page, 'Published from', '2099-01-01')
     await runFilters(page)
-    expect(await matches(page)).toBe(0)
+    const all = await matches(page)
+
+    // The date control is bounded by the copy (M9): a boundary outside the
+    // data is **clamped into it** rather than accepted, so this no longer
+    // produces the empty report it used to — it produces the last day the copy
+    // holds. Both halves are asserted, because the clamp is the behaviour and
+    // the count is the proof that the predicate still applies.
+    const from = page.locator('#report-pub-from')
+    const latest = await page.locator('#report-pub-to').inputValue()
+    await setFilter(page, 'Published from', '2099-01-01')
+    await from.press('Enter')
+    await expect(from).toHaveValue(latest)
+    await runFilters(page)
+    const lastDay = await matches(page)
+    expect(lastDay).toBeGreaterThan(0)
+    expect(lastDay).toBeLessThan(all)
   })
 
   await test.step('REJECTED records are excluded by default and never quietly (D-022)', async () => {
@@ -292,6 +306,12 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     await page.getByRole('button', { name: 'Sync', exact: true }).click()
     await expect(page.locator('.progress')).toBeHidden({ timeout: 300_000 })
     await expect(page.locator('[data-error]')).toHaveCount(0)
+    // The progress bar hiding is not the end of the sequence: a KEV refresh and
+    // the workspace's own follow-up questions come after it, each a short busy
+    // window. The next step clicks a button, and a click dispatched into one of
+    // those windows is silently swallowed (RE-034) — this is the idle-first
+    // half of that workaround.
+    await awaitIdle(page, 120_000)
   })
 
   await test.step('the row cap is applied and reported', async () => {

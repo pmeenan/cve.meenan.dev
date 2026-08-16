@@ -133,6 +133,17 @@ test('every view passes an automated accessibility scan, and works from the keyb
     await scan(page, 'canvas (chart)')
   })
 
+  await test.step('the date calendar, which is a dialog of tables and buttons', async () => {
+    // Scanned open, because closed it is not in the DOM at all — and it is the
+    // densest control in the app: a dialog holding two month grids, two
+    // selects and forty-odd day buttons whose only names are their labels.
+    await page.locator('[data-date-open="canvas-published"]').click()
+    await expect(page.locator('[data-date-pop]')).toBeVisible()
+    await scan(page, 'date range calendar')
+    await page.keyboard.press('Escape')
+    await expect(page.locator('[data-date-pop]')).toHaveCount(0)
+  })
+
   await test.step('the chart’s numbers are reachable, which is what makes it accessible', async () => {
     // The SVG says what it is and points at the table.
     const svg = page.locator('figure.chart svg')

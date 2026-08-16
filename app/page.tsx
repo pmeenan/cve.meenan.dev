@@ -17,6 +17,7 @@ import type { KevStatus } from '@/lib/kev'
 import { DEFAULT_CACHE_MIB, DEFAULT_CONCURRENCY, DEFAULT_VFS } from '@/lib/protocol'
 import type {
   BenchResult,
+  Coverage,
   CveDetail,
   ImportOptions,
   Progress,
@@ -212,6 +213,15 @@ export default function Home() {
    */
   const [kev, setKev] = useState<KevStatus | null>(null)
   const [kevError, setKevError] = useState('')
+  /**
+   * How far the copy that is answering actually reaches, per date axis (M9).
+   *
+   * It bounds every date control: the picker offers the corpus's own span
+   * rather than the calendar's, and shows it in place of an empty box. Null
+   * until the first answer arrives, which the controls treat as "unbounded" —
+   * the behaviour they had before this existed.
+   */
+  const [coverage, setCoverage] = useState<Coverage | null>(null)
   /**
    * What the hosted tier probe found (D-084) — the server copy's revision,
    * build stamp, notice and KEV catalog, or why it cannot serve. Null while
@@ -499,6 +509,9 @@ export default function Home() {
           setHosted(value)
           break
         }
+        case 'coverage':
+          setCoverage(message.coverage)
+          break
         case 'environment':
           setEnvironment({ capabilities: message.capabilities, storage: message.storage })
           break
@@ -793,6 +806,14 @@ export default function Home() {
   const tier: 'local' | 'hosted' | null = ready ? 'local' : hosted?.ok ? 'hosted' : null
   const canQuery = tier !== null
 
+  /**
+   * Whether the Worker is mid-operation. Declared here rather than beside the
+   * render it disables, because the background questions below wait on it too:
+   * nothing this page asks on its own initiative may compete with work the
+   * reader started.
+   */
+  const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
+
   const send = useCallback((request: Request) => {
     setError('')
     setCancelled(null)
@@ -875,6 +896,27 @@ export default function Home() {
     autoRan.current = true
     runReport(pending)
   }, [canQuery, runReport])
+
+  /**
+   * Ask what the answering copy covers, and ask again only when that can have
+   * moved: a new tier, a sync that advanced the revision, a KEV refresh that
+   * replaced the catalog. Posted directly rather than through `send`, which
+   * clears the error and cancellation panels — this is a background question
+   * about the data, not a run the reader started.
+   *
+   * **Never while the Worker is busy.** On the hosted tier this question is a
+   * *blocking* XHR inside the Worker (D-084), so asking it during an import
+   * would stall the download it is queued behind — for bounds on a control
+   * that works without them. The key means the wait costs nothing: it is asked
+   * once per state of the copy, when the Worker is next quiet.
+   */
+  const coverageKey = `${tier}:${revision}:${kev?.fetched ?? ''}`
+  const coverageAsked = useRef('')
+  useEffect(() => {
+    if (!canQuery || busy || coverageAsked.current === coverageKey) return
+    coverageAsked.current = coverageKey
+    workerRef.current?.postMessage({ type: 'coverage' } satisfies Request)
+  }, [canQuery, busy, coverageKey])
 
   /**
    * The default canvas (UI revamp): a workspace never opens empty. The most
@@ -1058,7 +1100,6 @@ export default function Home() {
     [send]
   )
 
-  const busy = progress.phase !== 'idle' && progress.phase !== 'ready' && progress.phase !== 'error'
   /**
    * The copy the status strip describes: the local one when it is live, the
    * server's when the hosted tier is answering. One set of variables so the
@@ -1500,6 +1541,7 @@ export default function Home() {
                   sort={sort}
                   setSort={setSort}
                   disabled={busy}
+                  coverage={coverage}
                 />
               </aside>
             )}
@@ -1562,6 +1604,7 @@ export default function Home() {
                   setSeriesLabels((current) => ({ ...current, [key]: label }))
                 }
                 dataAsOf={freshness ? freshness.iso.slice(0, 10) : null}
+                coverage={coverage}
               />
 
               {panels.sql && (

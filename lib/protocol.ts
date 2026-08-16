@@ -633,6 +633,15 @@ export type Request =
    * answers, which a queue position cannot do once one of them is cancelled.
    */
   | { type: 'tool'; id: string; call: ToolCall }
+  /**
+   * The date extent of the copy that is answering (M9).
+   *
+   * Asked for once a tier is ready, and again after anything that can move it
+   * — an import, a sync, a KEV refresh. It is what bounds the date controls:
+   * a picker that offers 1970 over a corpus that starts in 1999 is offering
+   * ranges whose only possible answer is an empty chart.
+   */
+  | { type: 'coverage' }
   | { type: 'bench' }
   /**
    * What this browser can do and what its storage looks like (M5).
@@ -686,6 +695,34 @@ export interface SyncOutcome {
   bytes: number
   /** Wall-clock in the Worker, fetch and apply together. */
   ms: number
+}
+
+/**
+ * How far the copy that is answering actually reaches, per date axis (M9).
+ *
+ * Every field is unix seconds, or null where the copy holds nothing to measure
+ * — an empty axis, or a copy with no KEV catalog. Null is a real answer here
+ * and not an error: the date control simply goes unbounded on that axis, which
+ * is where it was before this message existed.
+ *
+ * Read from the database rather than from the manifest on purpose. The
+ * manifest describes the *generation*; this describes the rows this reader can
+ * actually query, which after a partial slice or a hosted copy is not the same
+ * claim.
+ */
+export interface Coverage {
+  publishedMin: number | null
+  publishedMax: number | null
+  updatedMin: number | null
+  updatedMax: number | null
+  /** The identifier year, which is not the publication year (D-044's rename). */
+  yearMin: number | null
+  yearMax: number | null
+  /** CISA's own dates, present only when this copy holds a catalog (M6). */
+  kevAddedMin: number | null
+  kevAddedMax: number | null
+  kevDueMin: number | null
+  kevDueMax: number | null
 }
 
 /** One result set, whatever asked for it. */
@@ -869,6 +906,7 @@ export type Response =
       notice?: string | null
       kev?: KevStatus | null
     }
+  | { type: 'coverage'; coverage: Coverage }
   | { type: 'bench'; results: BenchResult[]; wasmHeapBytes: number }
   | {
       type: 'error'

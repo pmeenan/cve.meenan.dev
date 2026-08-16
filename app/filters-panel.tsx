@@ -22,6 +22,7 @@ import {
   type Dimension,
   type SortKey,
 } from '@/lib/filters'
+import type { Coverage } from '@/lib/protocol'
 import { CHART_ROWS, TABLE_ROWS, type Report } from '@/lib/report'
 
 import { Field, FilterForm } from './filter-form'
@@ -40,6 +41,7 @@ export function FiltersPanel({
   sort,
   setSort,
   disabled,
+  coverage,
 }: {
   report: Report
   onChange: (report: Report) => void
@@ -51,6 +53,8 @@ export function FiltersPanel({
   sort: SortKey
   setSort: (sort: SortKey) => void
   disabled: boolean
+  /** The date extent of the copy answering, for the date controls (M9). */
+  coverage: Coverage | null
 }) {
   const draft = filtersToDraft(report.filters)
   const setDraft = (next: Draft) => onChange({ ...report, filters: draftToFilters(next) })
@@ -141,7 +145,7 @@ export function FiltersPanel({
           </Field>
         </div>
 
-        <FilterForm draft={draft} onChange={setDraft} idPrefix="report" />
+        <FilterForm draft={draft} onChange={setDraft} idPrefix="report" coverage={coverage} />
 
         <div className="row">
           <Field label="Group by" id="explore-group">

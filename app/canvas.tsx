@@ -21,13 +21,15 @@ import { useMemo, useRef, useState } from 'react'
 
 import { buildChart, relabelModel, visibleModel, type ChartModel } from '@/lib/chart'
 import { copyChartPng, copyGrid, type GridData } from '@/lib/clipboard'
+import { axisBounds } from '@/lib/dates'
 import { describeDraft, draftToFilters, filtersToDraft } from '@/lib/draft'
 import { DIMENSION_LABELS, type Dimension } from '@/lib/filters'
 import { EXPORT_FORMATS, EXPORT_LIMIT, type ExportFormat } from '@/lib/export'
-import type { CveDetail, QueryResult, Unmatched } from '@/lib/protocol'
+import type { Coverage, CveDetail, QueryResult, Unmatched } from '@/lib/protocol'
 import { CHART_ROWS, TABLE_ROWS, toFragment, type ChartType, type Report } from '@/lib/report'
 
 import { Chart, ChartTable } from './chart'
+import { DateRangeField } from './date-range'
 import { Detail } from './detail'
 import { GroupTable, RecordTable, recordGrid, groupGrid, type SearchOutcome } from './explore'
 import { FilterChips } from './filter-form'
@@ -70,6 +72,7 @@ export function Canvas({
   seriesLabels,
   onSeriesLabel,
   dataAsOf,
+  coverage,
 }: {
   /** What the canvas is showing: the last thing that ran. */
   view: 'report' | 'records'
@@ -96,6 +99,8 @@ export function Canvas({
   onSeriesLabel: (key: string, label: string) => void
   /** The copy's build stamp, for the PNG subtitle. */
   dataAsOf: string | null
+  /** The copy's date extent, which bounds the range control (M9). */
+  coverage: Coverage | null
 }) {
   const [name, setName] = useState('')
   const [format, setFormat] = useState<ExportFormat>('csv')
@@ -124,9 +129,18 @@ export function Canvas({
    */
   const liveDraft = filtersToDraft(report.filters)
 
-  /** Edit the published-date window and re-run — the canvas's own range control. */
-  const setRange = (key: 'publishedFrom' | 'publishedTo', value: string) => {
-    onRun({ ...report, filters: draftToFilters({ ...liveDraft, [key]: value }) })
+  /**
+   * Edit the published-date window and re-run — the canvas's own range control.
+   *
+   * Both edges at once, because the picker commits a *range*: setting them one
+   * at a time would run the report against a half-applied window, which on the
+   * hosted tier is a second round trip for an answer nobody asked for.
+   */
+  const setRange = (from: string, to: string) => {
+    onRun({
+      ...report,
+      filters: draftToFilters({ ...liveDraft, publishedFrom: from, publishedTo: to }),
+    })
   }
 
   const model = useMemo(
@@ -297,26 +311,17 @@ export function Canvas({
           and a permalink all agree. Changing either re-runs immediately. */}
       {view === 'report' && (
         <div className="canvas-range" data-canvas-range="1">
-          <label className="field inline" htmlFor="canvas-pub-from">
-            <span>Published from</span>
-            <input
-              id="canvas-pub-from"
-              type="date"
-              value={liveDraft.publishedFrom}
-              disabled={disabled}
-              onChange={(event) => setRange('publishedFrom', event.target.value)}
-            />
-          </label>
-          <label className="field inline" htmlFor="canvas-pub-to">
-            <span>to</span>
-            <input
-              id="canvas-pub-to"
-              type="date"
-              value={liveDraft.publishedTo}
-              disabled={disabled}
-              onChange={(event) => setRange('publishedTo', event.target.value)}
-            />
-          </label>
+          <DateRangeField
+            label="Published"
+            name="canvas-published"
+            idPrefix="canvas-pub"
+            inline
+            from={liveDraft.publishedFrom}
+            to={liveDraft.publishedTo}
+            bounds={axisBounds(coverage, 'published')}
+            disabled={disabled}
+            onChange={setRange}
+          />
           {isTimeDimension(report.rows) && (
             <fieldset className="granularity" data-granularity={report.rows}>
               <legend className="visually-hidden">Time buckets</legend>

@@ -154,6 +154,7 @@ import {
   SCHEMA_VERSION,
   type BenchResult,
   type ChunkEntry,
+  type Coverage,
   type Delta,
   type DeltaEntry,
   type ImportOptions,
@@ -2794,6 +2795,95 @@ function finishQuery(kind: QueryKind, work: () => void, onCancel?: () => void): 
   }
 }
 
+/**
+ * The corpus's own date extent, one statement per axis pair (M9).
+ *
+ * Written as scalar subqueries rather than `SELECT min(a), max(a), min(b) …`
+ * for a reason worth keeping: SQLite optimizes a *lone* `min()` or `max()` into
+ * an index seek, and loses that the moment two aggregates share a query. Split
+ * this way, `published` and `year` are index seeks; only `updated` — which has
+ * no index — scans, and it scans one column of one table.
+ *
+ * Both tiers run it: on the hosted tier this is one more POST of read-only SQL
+ * whose text is this build's own constant (D-084).
+ */
+const COVERAGE_SQL =
+  'SELECT (SELECT min(published) FROM cve), (SELECT max(published) FROM cve),' +
+  ' (SELECT min(updated) FROM cve), (SELECT max(updated) FROM cve),' +
+  ' (SELECT min(year) FROM cve), (SELECT max(year) FROM cve)'
+
+/** Every axis unbounded — what a copy that cannot be measured reports. */
+const NO_COVERAGE: Coverage = {
+  publishedMin: null,
+  publishedMax: null,
+  updatedMin: null,
+  updatedMax: null,
+  yearMin: null,
+  yearMax: null,
+  kevAddedMin: null,
+  kevAddedMax: null,
+  kevDueMin: null,
+  kevDueMax: null,
+}
+
+const KEV_COVERAGE_SQL =
+  'SELECT (SELECT min(added_at) FROM kev), (SELECT max(added_at) FROM kev),' +
+  ' (SELECT min(due_at) FROM kev), (SELECT max(due_at) FROM kev)'
+
+/**
+ * Nobody asked for this query, and everything about how it runs follows from
+ * that.
+ *
+ * **It reports no phase.** `quiet` suppresses the progress handler's "still
+ * running" line, which is not cosmetic: the page derives *busy* from the phase
+ * and disables every button while it holds, and this handler posts no `ready`
+ * afterwards — so a coverage query that announced itself would leave the
+ * workspace disabled behind a query the reader never ran. It is exactly how a
+ * two-tab run hung with `Re-download data` permanently greyed out.
+ *
+ * **It never raises.** A failure here means the date controls stay unbounded,
+ * which is where they were before this message existed. An error banner over
+ * the workspace for a background probe would report a problem the reader
+ * cannot act on, about something they did not do.
+ */
+function coverage(): void {
+  try {
+    const database = requireDb()
+    const corpus = runSql(database, COVERAGE_SQL, { limit: 1, quiet: true }).rows[0] ?? []
+    // Guarded by the same rule every other KEV query is: the table exists only
+    // once a catalog has been applied, and a copy without one must answer "no
+    // KEV dates" rather than fail the whole message (M6, D-077).
+    const kev =
+      localKev(database) === null
+        ? []
+        : (runSql(database, KEV_COVERAGE_SQL, { limit: 1, quiet: true }).rows[0] ?? [])
+    post({
+      type: 'coverage',
+      coverage: {
+        publishedMin: seconds(corpus[0]),
+        publishedMax: seconds(corpus[1]),
+        updatedMin: seconds(corpus[2]),
+        updatedMax: seconds(corpus[3]),
+        yearMin: seconds(corpus[4]),
+        yearMax: seconds(corpus[5]),
+        kevAddedMin: seconds(kev[0]),
+        kevAddedMax: seconds(kev[1]),
+        kevDueMin: seconds(kev[2]),
+        kevDueMax: seconds(kev[3]),
+      } satisfies Coverage,
+    })
+  } catch {
+    // No copy, a reset that raced the tier check, or a stale cancellation flag
+    // interrupting a query this handler never armed.
+    post({ type: 'coverage', coverage: NO_COVERAGE })
+  }
+}
+
+/** A cell as a finite number, or null — an empty table's `min()` is NULL. */
+function seconds(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
 function query(sql: string): void {
   const database = requireDb()
   // Reported before the call, not after: `db.exec` blocks this Worker until it
@@ -3788,6 +3878,9 @@ async function handle(request: Request): Promise<void> {
         break
       case 'tool':
         runTool(request.id, request.call)
+        break
+      case 'coverage':
+        coverage()
         break
       case 'bench':
         bench()

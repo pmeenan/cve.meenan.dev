@@ -293,6 +293,26 @@ Left for deploy: the two nginx include files
 (`scripts/deploy-sql-nginx.sh`), confirming `zend.hard_timeout` is non-zero on
 the origin, and the cron additions.
 
+Fourth round (2026-08-16): the **date range control** (D-085), from the owner's
+use of the deployed workspace. Two `<input type="date">` boxes are replaced by
+one component used everywhere a date pair appears — the canvas strip and the
+drawer's four axes — because the native control failed at all four things the
+owner hit: typing `2025` into a year committed `0002` on the first keystroke
+(a controlled date input fires a change per *segment*); the boxes were blank
+over a report that was covering the whole corpus; the calendar offered 1970 and
+2099 over data that starts in 1999; and reaching a month took a click per
+month. It now buffers keystrokes and commits on Enter or blur (`2025` means the
+whole year, per edge), shows the copy's own extent in place of an empty box
+without committing a predicate, bounds and clamps every edge to that extent,
+and offers a shortcut rail, month and year selects, two months at once, a
+two-click range and full keyboard control. The extent is a new Worker message
+(`coverage`) answered from the database on either tier, so the bounds describe
+the copy that is actually answering. The ID-year boxes became bounded selects
+for the same reason. Verified in both engines, with the calendar in the axe
+pass; the arithmetic and the input parser are unit-tested under a pinned
+non-UTC zone, since a suite running in UTC cannot tell a correct implementation
+from one that reads local time.
+
 Exit: `pnpm check` and `pnpm e2e` green on both engines across both tiers; the
 owner has used the deployed workspace and the remaining rough edges are
 recorded here rather than open-ended.
