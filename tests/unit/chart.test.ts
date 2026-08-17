@@ -2,7 +2,17 @@ import { readFileSync } from 'node:fs'
 
 import { describe, expect, it } from 'vitest'
 
-import { buildChart, bucketLabel, niceTicks, seriesColor, shortCount } from '../../lib/chart'
+import {
+  buildChart,
+  bucketLabel,
+  fillTimeGaps,
+  niceTicks,
+  seriesColor,
+  shortCount,
+  TIME_FILL_MAX,
+  timeSpan,
+} from '../../lib/chart'
+import { daySeconds } from '../../lib/dates'
 
 /**
  * The chart model and the palette behind it (M4).
@@ -336,6 +346,314 @@ describe('buildChart', () => {
     const model = buildChart(rows, 'month', 'kevRansomware', 12)
     expect(model.series).toHaveLength(4)
     expect(model.droppedSeries).toBe(0)
+  })
+})
+
+// --- dense time axes ----------------------------------------------------
+
+describe('time axis gap fill', () => {
+  it('inserts a zero row for every bucket between the first and last present', () => {
+    // A `GROUP BY` returns only the buckets that hold a record, and the chart
+    // places buckets ordinally — so a filtered series (one product) with no
+    // CVE in March would draw February beside April, and a trend line would
+    // jump. The gap is a zero, and it is drawn as one.
+    const rows: unknown[][] = [
+      ['2025-01', '2025-01', 4, 4, 10],
+      ['2025-02', '2025-02', 4, 4, 5],
+      ['2025-05', '2025-05', 4, 4, 7],
+    ]
+    const model = buildChart(rows, 'month', 'severity', 400)
+    expect(model.rows.map((row) => row.key)).toEqual([
+      '2025-01',
+      '2025-02',
+      '2025-03',
+      '2025-04',
+      '2025-05',
+    ])
+    const march = model.rows.find((row) => row.key === '2025-03')!
+    expect(march.label).toBe('2025-03')
+    expect(march.values).toEqual([0])
+    expect(march.total).toBe(0)
+    // The filled rows change nothing about the numbers.
+    expect(model.total).toBe(22)
+    expect(model.maxTotal).toBe(10)
+    expect(model.droppedRows).toBe(0)
+  })
+
+  it('walks each grain in its own step, across a year boundary', () => {
+    expect(fillTimeGaps('year', ['2023', '2026'])).toEqual(['2023', '2024', '2025', '2026'])
+    expect(fillTimeGaps('quarter', ['2024-Q3', '2025-Q2'])).toEqual([
+      '2024-Q3',
+      '2024-Q4',
+      '2025-Q1',
+      '2025-Q2',
+    ])
+    expect(fillTimeGaps('month', ['2024-11', '2025-02'])).toEqual([
+      '2024-11',
+      '2024-12',
+      '2025-01',
+      '2025-02',
+    ])
+    // Weeks are Mondays (`WEEK_EXPR`); 2024-12-30 is the Monday that opens
+    // the week the year turns in.
+    expect(fillTimeGaps('week', ['2024-12-16', '2025-01-06'])).toEqual([
+      '2024-12-16',
+      '2024-12-23',
+      '2024-12-30',
+      '2025-01-06',
+    ])
+  })
+
+  it('widens to the report’s window, so a quiet vendor’s axis still runs to today', () => {
+    // "The last two years" of a vendor whose last record was in May: the
+    // weeks since are zeros, because the quiet is the finding.
+    const rows: unknown[][] = [
+      ['2025-03', '2025-03', 4, 4, 1],
+      ['2025-05', '2025-05', 4, 4, 1],
+    ]
+    const span = {
+      from: daySeconds('2025-01-15'),
+      to: daySeconds('2025-07-31'),
+      openAtFrom: true,
+    }
+    const model = buildChart(rows, 'month', 'severity', 400, span)
+    expect(model.rows.map((row) => row.key)).toEqual([
+      '2025-01',
+      '2025-02',
+      '2025-03',
+      '2025-04',
+      '2025-05',
+      '2025-06',
+      '2025-07',
+    ])
+    // A window edge inside the data changes nothing: it widens, never cuts.
+    const inside = buildChart(rows, 'month', 'severity', 400, {
+      from: daySeconds('2025-04-01'),
+      to: daySeconds('2025-04-01'),
+      openAtFrom: true,
+    })
+    expect(inside.rows.map((row) => row.key)).toEqual(['2025-03', '2025-04', '2025-05'])
+  })
+
+  it('opens where the data does unless the report set its lower edge', () => {
+    // "All time" for a vendor founded in 2015 is not sixteen years of zeros:
+    // with no lower edge of its own the axis opens on the first bucket that
+    // holds a record, and still runs on to the window's end.
+    const rows: unknown[][] = [
+      ['2025-03', '2025-03', 4, 4, 1],
+      ['2025-05', '2025-05', 4, 4, 1],
+    ]
+    const model = buildChart(rows, 'month', 'severity', 400, {
+      from: daySeconds('1999-01-04'),
+      to: daySeconds('2025-07-31'),
+      openAtFrom: false,
+    })
+    expect(model.rows.map((row) => row.key)).toEqual([
+      '2025-03',
+      '2025-04',
+      '2025-05',
+      '2025-06',
+      '2025-07',
+    ])
+  })
+
+  it('does not extend the old end when the query was narrowed to the cap', () => {
+    // The query layer keeps the *recent* end of an over-cap time axis. With the
+    // row count at the cap the old end may have been cut, and a fill down to
+    // the window's lower edge would draw zeros over months that had records.
+    // The recent end is still extended: it is the end that was kept.
+    const rows: unknown[][] = [
+      ['2025-03', '2025-03', 4, 4, 1],
+      ['2025-05', '2025-05', 4, 4, 1],
+    ]
+    const span = { from: daySeconds('2024-01-01'), to: daySeconds('2025-07-31'), openAtFrom: true }
+    const model = buildChart(rows, 'month', 'severity', 2, span)
+    expect(model.rows.map((row) => row.key)).toEqual([
+      '2025-03',
+      '2025-04',
+      '2025-05',
+      '2025-06',
+      '2025-07',
+    ])
+  })
+
+  it('fills nothing when nothing matched, so the empty report still says so', () => {
+    // A window of zeros with no series on it would replace "Nothing matched"
+    // (app/chart.tsx) with an axis and no bars.
+    const span = { from: daySeconds('2025-01-01'), to: daySeconds('2025-12-31'), openAtFrom: true }
+    expect(fillTimeGaps('month', [], span)).toEqual([])
+    expect(buildChart([], 'month', 'severity', 400, span).rows).toEqual([])
+  })
+
+  it('keeps the null bucket in front and leaves a non-time axis alone', () => {
+    // A record with no publication date buckets to NULL, which SQL sorts
+    // first; it is not on the timeline and is not stepped over.
+    expect(fillTimeGaps('year', ['', '2024', '2026'])).toEqual(['', '2024', '2025', '2026'])
+    const rows: unknown[][] = [
+      ['cisco', 'Cisco', 4, 4, 10],
+      ['juniper', 'Juniper', 4, 4, 5],
+    ]
+    const model = buildChart(rows, 'vendor', 'severity', 12)
+    expect(model.rows.map((row) => row.key)).toEqual(['cisco', 'juniper'])
+  })
+
+  it('leaves an axis alone rather than guessing when a key is not in the grain’s format', () => {
+    // A stray key — a Sunday on a Monday-labelled axis, a two-digit year —
+    // means the fill would be inventing buckets against a shape it does not
+    // understand. The chart then draws exactly what the query returned.
+    expect(fillTimeGaps('week', ['2025-01-05', '2025-01-20'])).toEqual(['2025-01-05', '2025-01-20'])
+    expect(fillTimeGaps('year', ['24', '26'])).toEqual(['24', '26'])
+    expect(fillTimeGaps('month', ['2025-13', '2026-01'])).toEqual(['2025-13', '2026-01'])
+  })
+
+  it('refuses a fill wider than the axis cap', () => {
+    // A hostile or absurd pair of keys must not ask for a million rows.
+    const wide = fillTimeGaps('year', ['0001', '2025'])
+    expect(wide).toEqual(['0001', '2025'])
+    // And a fill just inside it goes through — the corpus's every week is
+    // well under the cap.
+    const weeks = fillTimeGaps('week', ['1999-01-04', '2026-08-10'])
+    expect(weeks.length).toBeGreaterThan(1_400)
+    expect(weeks.length).toBeLessThan(TIME_FILL_MAX)
+  })
+})
+
+// --- partial buckets ----------------------------------------------------
+
+describe('partial time buckets', () => {
+  it('marks a bucket the answer does not cover whole, at either end', () => {
+    // The data's last day is a Wednesday, so the current week and month are
+    // both partial; the report's lower edge is the 15th, so the first month is
+    // too. Marked, faded and labelled — never dropped: the fall-off at the
+    // right-hand end is the most misread thing on a time series.
+    const rows: unknown[][] = [
+      ['2025-01', '2025-01', 4, 4, 10],
+      ['2025-02', '2025-02', 4, 4, 5],
+      ['2025-03', '2025-03', 4, 4, 2],
+    ]
+    const span = {
+      from: daySeconds('2025-01-15'),
+      to: daySeconds('2025-03-12'),
+      openAtFrom: true,
+    }
+    const model = buildChart(rows, 'month', 'severity', 400, span)
+    expect(model.rows.map((row) => [row.key, row.partial, row.label])).toEqual([
+      ['2025-01', true, '2025-01 (partial)'],
+      ['2025-02', false, '2025-02'],
+      ['2025-03', true, '2025-03 (partial)'],
+    ])
+    // A weekly axis over the same window: the week of the 10th runs to the
+    // 16th, past the data's last day; the week of the 13th January opens
+    // before the window's first day.
+    const weeks: unknown[][] = [
+      ['2025-01-13', '2025-01-13', 4, 4, 1],
+      ['2025-01-20', '2025-01-20', 4, 4, 1],
+      ['2025-03-10', '2025-03-10', 4, 4, 1],
+    ]
+    const weekly = buildChart(weeks, 'week', 'severity', 400, span)
+    const flags = new Map(weekly.rows.map((row) => [row.key, row.partial]))
+    expect(flags.get('2025-01-13')).toBe(true)
+    expect(flags.get('2025-01-20')).toBe(false)
+    expect(flags.get('2025-03-03')).toBe(false)
+    expect(flags.get('2025-03-10')).toBe(true)
+    // Years and quarters by the same rule.
+    const years = buildChart(
+      [
+        ['2024', '2024', 4, 4, 1],
+        ['2025', '2025', 4, 4, 1],
+      ],
+      'year',
+      'severity',
+      400,
+      {
+        from: daySeconds('2024-01-01'),
+        to: daySeconds('2025-03-12'),
+        openAtFrom: true,
+      }
+    )
+    expect(years.rows.map((row) => row.partial)).toEqual([false, true])
+    const quarters = buildChart([['2025-Q1', '2025-Q1', 4, 4, 1]], 'quarter', 'severity', 400, {
+      to: daySeconds('2025-03-31'),
+    })
+    expect(quarters.rows[0]!.partial).toBe(false)
+  })
+
+  it('marks nothing without a window to judge against, and nothing off a time axis', () => {
+    const rows: unknown[][] = [
+      ['2025-01', '2025-01', 4, 4, 10],
+      ['2025-02', '2025-02', 4, 4, 5],
+    ]
+    expect(buildChart(rows, 'month', 'severity', 400).rows.every((row) => !row.partial)).toBe(true)
+    // A window that covers every bucket whole marks none of them.
+    const whole = buildChart(rows, 'month', 'severity', 400, {
+      from: daySeconds('2025-01-01'),
+      to: daySeconds('2025-02-28'),
+      openAtFrom: true,
+    })
+    expect(whole.rows.every((row) => !row.partial)).toBe(true)
+    // A filled bucket at the window's end is partial like any other.
+    const filled = buildChart(rows, 'month', 'severity', 400, {
+      to: daySeconds('2025-03-05'),
+    })
+    expect(filled.rows.at(-1)).toMatchObject({ key: '2025-03', total: 0, partial: true })
+    // The null bucket and identity axes are never partial.
+    const vendors = buildChart([['cisco', 'Cisco', 4, 4, 1]], 'vendor', 'severity', 12, {
+      from: daySeconds('2025-01-15'),
+      to: daySeconds('2025-03-12'),
+    })
+    expect(vendors.rows[0]!.partial).toBe(false)
+    expect(vendors.rows[0]!.label).toBe('Cisco')
+    const nulls = buildChart([[null, null, 4, 4, 1]], 'month', 'severity', 12, {
+      to: daySeconds('2025-03-12'),
+    })
+    expect(nulls.rows[0]).toMatchObject({ key: '', partial: false, label: '(none recorded)' })
+  })
+})
+
+describe('timeSpan', () => {
+  const coverage = {
+    publishedMin: daySeconds('1999-01-04'),
+    publishedMax: daySeconds('2026-08-15'),
+    updatedMin: null,
+    updatedMax: null,
+    yearMin: null,
+    yearMax: null,
+    kevAddedMin: null,
+    kevAddedMax: null,
+    kevDueMin: null,
+    kevDueMax: null,
+  }
+
+  it('is the report’s window clamped into the copy, open where the report is', () => {
+    // An unset edge is the copy's own; a set one is kept, and says so.
+    expect(timeSpan({}, coverage)).toEqual({
+      from: coverage.publishedMin,
+      to: coverage.publishedMax,
+      openAtFrom: false,
+    })
+    const from = daySeconds('2024-08-12')
+    expect(timeSpan({ publishedFrom: from }, coverage)).toEqual({
+      from,
+      to: coverage.publishedMax,
+      openAtFrom: true,
+    })
+    // A "10 yr" edge on a copy holding one year draws one year, not nine of
+    // zeros; a future upper edge ends at the data.
+    expect(timeSpan({ publishedFrom: daySeconds('1990-01-01') }, coverage).from).toBe(
+      coverage.publishedMin
+    )
+    expect(timeSpan({ publishedTo: daySeconds('2030-01-01') }, coverage).to).toBe(
+      coverage.publishedMax
+    )
+  })
+
+  it('stands unclamped without coverage, and an unset edge is unknown', () => {
+    const from = daySeconds('1990-01-01')
+    expect(timeSpan({ publishedFrom: from }, null)).toEqual({
+      from,
+      to: undefined,
+      openAtFrom: true,
+    })
   })
 })
 

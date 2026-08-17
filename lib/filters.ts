@@ -1231,7 +1231,10 @@ export const GROUP_LIMIT = 400
  *
  * Ordered by count for the dimensions where "the top ones" is the question, and
  * by the key itself for the time-like ones, where a chart wants the axis in
- * order.
+ * order — cut, when over the cap, at the *old* end, the same end `crossSql`
+ * cuts (aligned 2026-08-16; it used to keep the oldest buckets, so a
+ * one-dimension "CVEs by month" answered about 1999 where the two-dimension
+ * one answered about now).
  */
 export function groupSql(
   filters: Filters,
@@ -1242,21 +1245,46 @@ export function groupSql(
   const shape = shapeOf(dimension)
   const { where, params } = compile(filters, resolved)
   const bounded = clampLimit(limit, GROUP_LIMIT, GROUP_LIMIT)
-  // Scales and time read in their own order; identities read biggest-first,
-  // because "which are the top ones" is the question being asked of them.
-  // `state` is the exception among the codes: PUBLISHED before REJECTED is the
-  // reading order, and its stored codes run the other way.
-  const ordered =
-    TIME_DIMENSIONS.has(dimension) || FIXED_ORDER_DIMENSIONS.has(dimension)
-      ? `${axisOrder(shape)} ASC`
-      : dimension === 'state'
-        ? `${shape.key} DESC`
-        : 'cves DESC'
+  const select =
+    `SELECT ${shape.key} AS bucket, ${shape.label} AS label, ${countFor([shape])} AS cves ` +
+    `FROM cve c ${joinsFor([shape])} WHERE ${where} GROUP BY ${shape.group}`
+
+  if (TIME_DIMENSIONS.has(dimension)) {
+    // A time axis over its cap keeps the *recent* end, as `crossSql`'s
+    // narrowing does — with 336 months in the corpus, `ORDER BY month ASC
+    // LIMIT 12` would silently answer about 1999 — and still reads oldest
+    // first. The two cannot be one ORDER BY, and the sentinel row (`bounded +
+    // 1`, which the Worker turns into a truncation flag by *stopping on it*)
+    // has to come out last: narrowed newest-first and re-sorted ascending, the
+    // extra row would be the oldest and come out first, and the Worker would
+    // keep it and drop the newest. So the narrowing takes `bounded + 1`
+    // newest-first, `extra` names the one row past the cap if there is one,
+    // and the final order puts that row after the rest. `IS` rather than `=`
+    // because a bucket can be NULL — a record with no publication date — and
+    // the EXISTS guard keeps a NULL bucket from matching an empty `extra`.
+    return {
+      sql:
+        `WITH recent AS (${select} ORDER BY ${shape.key} DESC LIMIT ?), ` +
+        `extra AS (SELECT bucket FROM recent ORDER BY bucket DESC LIMIT 1 OFFSET ?) ` +
+        `SELECT bucket, label, cves FROM recent ` +
+        `ORDER BY (EXISTS (SELECT 1 FROM extra) AND bucket IS (SELECT bucket FROM extra)), ` +
+        `bucket ASC LIMIT ?`,
+      params: [...params, bounded + 1, bounded, bounded + 1],
+      limit: bounded,
+    }
+  }
+
+  // Scales read in their own order; identities read biggest-first, because
+  // "which are the top ones" is the question being asked of them. `state` is
+  // the exception among the codes: PUBLISHED before REJECTED is the reading
+  // order, and its stored codes run the other way.
+  const ordered = FIXED_ORDER_DIMENSIONS.has(dimension)
+    ? `${axisOrder(shape)} ASC`
+    : dimension === 'state'
+      ? `${shape.key} DESC`
+      : 'cves DESC'
   return {
-    sql:
-      `SELECT ${shape.key} AS bucket, ${shape.label} AS label, ${countFor([shape])} AS cves ` +
-      `FROM cve c ${joinsFor([shape])} WHERE ${where} GROUP BY ${shape.group} ` +
-      `ORDER BY ${ordered} LIMIT ?`,
+    sql: `${select} ORDER BY ${ordered} LIMIT ?`,
     params: [...params, bounded + 1],
     limit: bounded,
   }

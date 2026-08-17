@@ -22,6 +22,42 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-039: An HTML entity in a multi-line JSX text node drops the text's leading space in the compiled bundle  (2026-08-16, status: worked-around)
+
+**Environment:** Next.js 16.2 (`next build`, its bundled SWC/Turbopack),
+React 19. Prettier 3 wrapping the JSX.
+
+**Repro:** prose after an inline element, wrapped by Prettier onto several
+lines, with an HTML entity anywhere in the run:
+
+```tsx
+<p>
+  Faded buckets marked <em>(partial)</em> are not covered whole — the period runs past the
+  last day the data holds, or the report&rsquo;s own date range cuts into it.
+</p>
+```
+
+**Observed:** the compiled chunk holds `jsx("em",{children:"(partial)"}),"are
+not covered whole …"` — the space that opened the text node is gone, and the
+page reads "(partial)are". The same shape with a literal `’` in place of
+`&rsquo;` compiles to `" are not covered whole …"`, space intact; so does the
+same shape without an entity elsewhere in this codebase (`</strong> — a
+withdrawn identifier` in `app/detail.tsx`, which is also multi-line). Only
+the entity-bearing text node loses its first-line leading whitespace, which
+is the one piece of leading whitespace the JSX rules say to keep.
+
+**Expected:** JSX whitespace handling not to depend on whether the text
+contains an entity — and Prettier, which formats on the assumption that it
+does not, would otherwise have emitted `{' '}` there.
+
+**Impact:** a missing space in shipped prose, invisible to `pnpm check`
+(unit tests import the source; only the browser runs the bundle — RE-028's
+lesson again). Worked around by writing the character (`’`) rather than the
+entity, which is also the simpler source. If a run of JSX prose has to carry
+an entity, keep it on one line or open the following text with `{' '}`.
+`scripts/check-bundle.mjs` is where a build-time check for `"}),"[a-z]` after
+an inline element would go, if it recurs.
+
 ## RE-038: `focus()` inside a `visibility: hidden` subtree is silently ignored, so a dialog that hides itself for one frame loses its keyboard entry  (2026-08-16, status: worked-around)
 
 **Environment:** Chromium 141 and Firefox 145 (Playwright 1.62), React 19.

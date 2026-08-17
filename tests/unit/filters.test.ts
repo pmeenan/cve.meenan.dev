@@ -419,6 +419,54 @@ describe('grouped counts', () => {
     }
   })
 
+  it('cuts an over-cap time axis at the old end, like crossSql, and still reads oldest first', () => {
+    // The fixture publishes across 2020–2024. Asked for two years, the answer
+    // is the two most recent — the one-dimension aggregate used to keep the
+    // oldest, so "CVEs by month" answered about 1999 where the cross-tab
+    // answered about now — in ascending order for the axis.
+    const all = groupSql({ state: 'all' }, {}, 'year')
+    const years = run(all.sql, all.params).map((row) => Number(row[0]))
+    expect(years.length).toBeGreaterThan(3)
+
+    const built = groupSql({ state: 'all' }, {}, 'year', 2)
+    const rows = run(built.sql, built.params)
+    // Three rows: the two kept, ascending, then the sentinel the Worker stops
+    // on — which has to be *last*, or the Worker would keep the sentinel and
+    // drop the newest bucket while reporting the answer as capped.
+    expect(rows).toHaveLength(3)
+    expect(rows.slice(0, 2).map((row) => Number(row[0]))).toEqual(years.slice(-2))
+    expect(Number(rows[2]![0])).toBe(years.at(-3))
+
+    // Under the cap nothing is re-ordered and nothing is marked.
+    const roomy = groupSql({ state: 'all' }, {}, 'year', years.length)
+    expect(run(roomy.sql, roomy.params).map((row) => Number(row[0]))).toEqual(years)
+  })
+
+  it('keeps a NULL time bucket in front and out of the sentinel’s way', () => {
+    // A record with no publication date buckets to NULL, which the axis
+    // shows as "(none recorded)" first. The narrowing sorts it *last* (NULL
+    // is last descending), so it is the first bucket to be cut — the same as
+    // `crossSql` — and under the cap it must not be mistaken for the sentinel
+    // by `bucket IS NULL` matching an empty `extra`.
+    db.exec(
+      "INSERT INTO cve (cve_id, year, state, published) VALUES ('CVE-2019-9999', 2019, 1, NULL)"
+    )
+    try {
+      const built = groupSql({ state: 'all' }, {}, 'year')
+      const buckets = run(built.sql, built.params).map((row) => row[0])
+      expect(buckets[0]).toBeNull()
+      expect(buckets.slice(1)).toEqual([...buckets.slice(1)].sort())
+
+      const capped = groupSql({ state: 'all' }, {}, 'year', 2)
+      const rows = run(capped.sql, capped.params).map((row) => row[0])
+      // Two newest years, then the sentinel — the third-newest, not the NULL.
+      expect(rows).toHaveLength(3)
+      expect(rows.every((bucket) => bucket !== null)).toBe(true)
+    } finally {
+      db.exec("DELETE FROM cve WHERE cve_id = 'CVE-2019-9999'")
+    }
+  })
+
   it('orders CVSS versions semantically rather than by their storage codes', () => {
     const built = groupSql({}, {}, 'cvssVersion')
     expect(run(built.sql, built.params).map((row) => Number(row[0]))).toEqual([2, 30, 31, 4])

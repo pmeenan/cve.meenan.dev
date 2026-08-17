@@ -34,12 +34,12 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 
-import { bucketLabel, buildChart } from '@/lib/chart'
+import { bucketLabel, buildChart, timeSpan } from '@/lib/chart'
 import type { StepFacts } from '@/lib/benchmark'
 import type { ChatStep, ChatTurn } from '@/lib/chat-loop'
 import { CONSENT_TEXT } from '@/lib/chat'
 import { DIMENSION_LABELS } from '@/lib/filters'
-import type { ToolOutcome } from '@/lib/protocol'
+import type { Coverage, ToolOutcome } from '@/lib/protocol'
 import { CHART_ROWS, TABLE_ROWS, type Report } from '@/lib/report'
 
 import { Chart, ChartTable } from './chart'
@@ -78,6 +78,7 @@ export function ChatPanel({
   onOpenReport,
   onOpenSearch,
   onOpenRecord,
+  coverage,
 }: {
   open: boolean
   turns: ChatTurn[]
@@ -108,6 +109,12 @@ export function ChatPanel({
    * sends the reader to the one that exists.
    */
   onOpenRecord: (cveId: string) => void
+  /**
+   * The copy's date extent, for the charts a turn draws: what a time axis is
+   * filled across and its partial buckets judged against, the same as the
+   * canvas (`timeSpan`). Null until the Worker has said.
+   */
+  coverage: Coverage | null
 }) {
   const [question, setQuestion] = useState('')
   const log = useRef<HTMLDivElement | null>(null)
@@ -153,6 +160,7 @@ export function ChatPanel({
                 onOpenReport={onOpenReport}
                 onOpenSearch={onOpenSearch}
                 onOpenRecord={onOpenRecord}
+                coverage={coverage}
               />
             ))}
           </div>
@@ -260,11 +268,13 @@ function Turn({
   onOpenReport,
   onOpenSearch,
   onOpenRecord,
+  coverage,
 }: {
   turn: ChatTurn
   onOpenReport: (report: Report) => void
   onOpenSearch: (report: Report) => void
   onOpenRecord: (cveId: string) => void
+  coverage: Coverage | null
 }) {
   return (
     <article className="chat-turn" data-chat-turn={turn.status}>
@@ -286,6 +296,7 @@ function Turn({
           onOpenReport={onOpenReport}
           onOpenSearch={onOpenSearch}
           onOpenRecord={onOpenRecord}
+          coverage={coverage}
         />
       ))}
 
@@ -373,11 +384,14 @@ export function Step({
   onOpenSearch,
   onOpenRecord,
   compact,
+  coverage,
 }: {
   step: ChatStep
   onOpenReport: (report: Report) => void
   onOpenSearch: (report: Report) => void
   onOpenRecord: (cveId: string) => void
+  /** The copy's date extent, for a chart drawn here (see `ChatPanel`). */
+  coverage: Coverage | null
   /**
    * Summarise a result that is already on the canvas — an aggregate, a
    * record search, SQL — instead of rendering a second chart or table beside
@@ -421,6 +435,7 @@ export function Step({
             onOpenReport={onOpenReport}
             onOpenSearch={onOpenSearch}
             onOpenRecord={onOpenRecord}
+            coverage={coverage}
           />
         ))}
     </section>
@@ -575,11 +590,13 @@ function Outcome({
   onOpenReport,
   onOpenSearch,
   onOpenRecord,
+  coverage,
 }: {
   outcome: ToolOutcome
   onOpenReport: (report: Report) => void
   onOpenSearch: (report: Report) => void
   onOpenRecord: (cveId: string) => void
+  coverage: Coverage | null
 }) {
   switch (outcome.kind) {
     case 'aggregate':
@@ -593,6 +610,7 @@ function Outcome({
           sql={outcome.result.sql}
           params={outcome.result.params}
           onOpenReport={onOpenReport}
+          coverage={coverage}
         />
       )
     case 'records':
@@ -732,6 +750,7 @@ function Aggregate({
   sql,
   params,
   onOpenReport,
+  coverage,
 }: {
   report: Report
   rows: readonly unknown[][]
@@ -741,18 +760,23 @@ function Aggregate({
   sql: string
   params: (string | number)[]
   onOpenReport: (report: Report) => void
+  coverage: Coverage | null
 }) {
   // The Report tab's own model builder, from the definition the Worker echoed
-  // back — not from anything the model said about it.
+  // back — not from anything the model said about it. A time axis is drawn
+  // across the window the call asked for over the copy that answered
+  // (`timeSpan`, the canvas's own arithmetic), so a bucket in it with no
+  // records is a zero rather than a gap and a partial bucket is marked.
   const model = useMemo(
     () =>
       buildChart(
         rows,
         report.rows,
         report.series,
-        report.limit ?? (report.chart === 'table' ? TABLE_ROWS : CHART_ROWS)
+        report.limit ?? (report.chart === 'table' ? TABLE_ROWS : CHART_ROWS),
+        timeSpan(report.filters, coverage)
       ),
-    [rows, report.rows, report.series, report.limit, report.chart]
+    [rows, report.rows, report.series, report.limit, report.chart, report.filters, coverage]
   )
   const state = report.filters.state ?? 'published'
 

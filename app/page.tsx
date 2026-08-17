@@ -1699,6 +1699,7 @@ export default function Home() {
                           onOpenReport={openReport}
                           onOpenSearch={openSearch}
                           onOpenRecord={openRecord}
+                          coverage={coverage}
                         />
                       ))}
                     </div>
@@ -1732,6 +1733,7 @@ export default function Home() {
               onOpenReport={openReport}
               onOpenSearch={openSearch}
               onOpenRecord={openRecord}
+              coverage={coverage}
             />
           </div>
         </>

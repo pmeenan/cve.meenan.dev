@@ -20,6 +20,7 @@
  * the background they are actually drawn on.
  */
 
+import { addDays, endOfMonth, isDay, secondsToDay, weekStart, type Day } from './dates'
 import {
   ABSENCE_DIMENSIONS,
   absenceLabel,
@@ -28,7 +29,9 @@ import {
   SSVC_DIMENSIONS,
   TIME_DIMENSIONS,
   type Dimension,
+  type Filters,
 } from './filters'
+import type { Coverage } from './protocol'
 
 /**
  * How many series a chart draws before the colours stop meaning anything.
@@ -100,10 +103,20 @@ export interface ChartSeries {
 
 export interface ChartRow {
   key: string
+  /** The bucket's name; a partial time bucket's carries " (partial)". */
   label: string
   /** One count per series, in `series` order. Absent cells are 0, not omitted. */
   values: number[]
   total: number
+  /**
+   * A time bucket the answer does not cover whole — the current week or
+   * month, cut by the data's last day, or a first or last bucket cut by the
+   * report's own window — whose count is therefore not comparable to its
+   * neighbours'. Marked rather than dropped: the reader asked for the window,
+   * and the drop at the right-hand end is the most misread thing on a time
+   * series.
+   */
+  partial: boolean
 }
 
 export interface ChartModel {
@@ -229,18 +242,74 @@ export function bucketLabel(dimension: Dimension, bucket: unknown, label: unknow
 }
 
 /**
+ * The window a time axis answers over, as unix seconds. `timeSpan` builds it
+ * from a report's `publishedFrom` / `publishedTo` and the copy's extent; either
+ * edge may be missing when neither is known, and the axis then ends where the
+ * data does.
+ */
+export interface TimeSpan {
+  /** The first day the answer covers: the report's lower edge, clamped into the copy, else the copy's first day. */
+  from?: number
+  /** The last day the answer covers: the report's upper edge, clamped, else the copy's last day. */
+  to?: number
+  /**
+   * Whether the axis *opens* at `from`. A report that set its lower edge asked
+   * for that window and gets zeros back to it; one that did not ("all time")
+   * opens where the data does, so a vendor founded in 2015 is not drawn on
+   * sixteen years of zeros before it existed. The axis always runs on to
+   * `to`, because "the last two years" of a vendor whose last record was in
+   * May runs to this week — the quiet is the finding. Partial-bucket marking
+   * uses both edges either way.
+   */
+  openAtFrom?: boolean
+}
+
+/**
+ * The span for a report's filters over the copy that answered it.
+ *
+ * Clamped into the copy's extent, so a "10 yr" edge on a copy holding one
+ * year draws one year of buckets rather than nine years of zeros. Without
+ * coverage (a chart drawn before the Worker has said what the copy holds) the
+ * report's own edges stand unclamped, and an unset one is unknown.
+ */
+export function timeSpan(filters: Filters, coverage: Coverage | null): TimeSpan {
+  const min = coverage?.publishedMin ?? undefined
+  const max = coverage?.publishedMax ?? undefined
+  const clamp = (value: number | undefined) => {
+    if (value === undefined) return undefined
+    const low = min === undefined ? value : Math.max(value, min)
+    return max === undefined ? low : Math.min(low, max)
+  }
+  return {
+    from: clamp(filters.publishedFrom ?? min),
+    to: clamp(filters.publishedTo ?? max),
+    openAtFrom: filters.publishedFrom !== undefined,
+  }
+}
+
+/**
  * Build the model from the query layer's rows.
  *
  * `rows` are the raw result rows: `[bucket, label, cves]` for a one-dimension
  * aggregate, `[bucket, label, series, series_label, cves]` for a cross-tab.
  * Row order is taken from SQL, which already ordered it for reading — time
  * ascending, everything else by the row's own total.
+ *
+ * **A time axis is dense.** `GROUP BY` returns only the buckets that hold a
+ * record, and the chart places buckets ordinally, so a week with no matching
+ * CVEs would not read as a zero — it would be *absent*, and its neighbours
+ * would close ranks. Every trend line and every bar chart over a sparse
+ * filter (one vendor, one product) was wrong that way: a jump from March to
+ * September drawn as two adjacent bars. The missing buckets are inserted here
+ * as zero rows, across the whole of `span` when the caller knows it and
+ * otherwise between the first and last bucket present (`fillTimeGaps`).
  */
 export function buildChart(
   rows: readonly unknown[][],
   rowsDimension: Dimension,
   seriesDimension: Dimension | null,
-  rowCap: number
+  rowCap: number,
+  span?: TimeSpan
 ): ChartModel {
   const cross = seriesDimension !== null
   const rowOrder: string[] = []
@@ -276,8 +345,25 @@ export function buildChart(
     color: cross ? seriesColor(seriesDimension, key, at) : 'var(--cat-1)',
   }))
 
-  const keptRows = rowOrder.slice(0, Math.max(1, rowCap))
-  const droppedRows = rowOrder.length - keptRows.length
+  const cappedRows = rowOrder.slice(0, Math.max(1, rowCap))
+  const droppedRows = rowOrder.length - cappedRows.length
+  // Filled *after* the cap, so the cap keeps counting buckets that hold data
+  // and a sparse axis is not cut for the zeros put between its buckets. The
+  // window's lower edge is trusted only when the query was not narrowed: the
+  // query layer (`groupSql`, `crossSql`) keeps the *recent* end of an over-cap
+  // time axis, so a row count at the cap means the old end may be missing, and
+  // a fill from `span.from` would draw zeros where there were records.
+  const timed = TIME_DIMENSIONS.has(rowsDimension)
+  const openAtFrom = span?.openAtFrom === true && cappedRows.length < rowCap
+  const keptRows = timed
+    ? fillTimeGaps(rowsDimension, cappedRows, {
+        from: openAtFrom ? span?.from : undefined,
+        to: span?.to,
+      })
+    : cappedRows
+  const grain = timed ? TIME_GRAINS[rowsDimension] : undefined
+  const fromDay = span?.from !== undefined ? secondsToDay(span.from) : ''
+  const toDay = span?.to !== undefined ? secondsToDay(span.to) : ''
 
   let max = 0
   let maxTotal = 0
@@ -291,7 +377,24 @@ export function buildChart(
     for (const value of values) max = Math.max(max, value)
     maxTotal = Math.max(maxTotal, rowTotal)
     total += rowTotal
-    return { key, label: rowMeta.get(key)!.label, values, total: rowTotal }
+    // A filled bucket has no SQL label; every time grain labels a bucket by
+    // its own key (lib/filters.ts), so the key is the label.
+    const label = rowMeta.get(key)?.label ?? key
+    // A bucket the window does not cover whole is partial: it opens before
+    // the first day the answer covers or closes after the last. The label
+    // carries the word so that every channel — axis, tooltip, table, copied
+    // numbers — says it, not just the drawing.
+    const extent = grain && key !== '' && grain.valid(key) ? grain.extent(key) : null
+    const partial =
+      extent !== null &&
+      ((fromDay !== '' && extent.start < fromDay) || (toDay !== '' && extent.end > toDay))
+    return {
+      key,
+      label: partial ? `${label} (partial)` : label,
+      values,
+      total: rowTotal,
+      partial,
+    }
   })
 
   return { rows: model, series, max, maxTotal, total, droppedSeries, droppedRows }
@@ -300,6 +403,137 @@ export function buildChart(
 /** A bucket value as a map key. `null` is its own bucket, spelled `''`. */
 function keyOf(value: unknown): string {
   return value === null || value === undefined ? '' : String(value)
+}
+
+/**
+ * How many buckets a fill may put on a time axis. Between two present buckets
+ * of one report the span is bounded by the corpus — 1999 to now is ~1,450
+ * weeks — and a dense axis at that width is still the right axis: the labels
+ * are decimated (`app/chart.tsx`) and the table below is the audit channel. The
+ * cap exists so a hostile or absurd key pair (a `year` bucket of `0001`)
+ * cannot ask for a million rows; past it the axis is left as the query
+ * returned it.
+ */
+export const TIME_FILL_MAX = 2_000
+
+/**
+ * The time buckets `keys` are missing, inserted as keys in order (M9 fix,
+ * 2026-08-16).
+ *
+ * `keys` are the query layer's row buckets in its own ascending order — the
+ * `''` null bucket, if any, first (SQLite sorts NULL first), then one key per
+ * bucket that holds a record. The result keeps that order and the null bucket
+ * where it was, and walks from the earliest bucket to the latest — widened to
+ * `span` when given — inserting every grain step between. A key that is not
+ * in the grain's own format is a reason to leave the axis alone rather than
+ * to guess at it: the fill is a courtesy to the reader, not a contract.
+ */
+export function fillTimeGaps(
+  dimension: Dimension,
+  keys: readonly string[],
+  span?: TimeSpan
+): string[] {
+  const grain = TIME_GRAINS[dimension]
+  if (!grain) return [...keys]
+  const nulls = keys.filter((key) => key === '')
+  const present = keys.filter((key) => key !== '')
+  // Nothing on the timeline is nothing to fill between: a report that
+  // matched no record says so (`app/chart.tsx`) rather than drawing a window
+  // of zeros with no series on it.
+  if (present.length === 0) return [...keys]
+  if (present.some((key) => !grain.valid(key))) return [...keys]
+
+  // The window widens the walk and never cuts it: an edge inside the data
+  // leaves the data's own end in place.
+  let first = present[0]!
+  let last = present.at(-1)!
+  const from = span?.from !== undefined ? grain.of(span.from) : undefined
+  const to = span?.to !== undefined ? grain.of(span.to) : undefined
+  if (from && from < first) first = from
+  if (to && to > last) last = to
+  if (first > last) return [...keys]
+
+  const dense: string[] = []
+  const have = new Set(present)
+  // The present keys are ordered by SQL; the walk re-derives that order and
+  // would drop a key that sorts out of sequence, so an unexpected order also
+  // leaves the axis alone.
+  let at = first
+  let seen = 0
+  while (at <= last) {
+    if (dense.length >= TIME_FILL_MAX) return [...keys]
+    dense.push(at)
+    if (have.has(at)) seen += 1
+    at = grain.next(at)
+  }
+  if (seen !== have.size) return [...keys]
+  return [...nulls, ...dense]
+}
+
+/**
+ * Each grain's bucket key as SQL spells it (`lib/filters.ts` — `YEAR_EXPR`
+ * and friends): the bucket a unix time falls in, whether a key is one, and
+ * the bucket after it. Keys are strings that sort chronologically, which is
+ * what lets the fill compare them.
+ */
+interface TimeGrain {
+  valid(key: string): boolean
+  of(seconds: number): string | undefined
+  next(key: string): string
+  /** The first and last day a bucket covers, both inclusive. */
+  extent(key: string): { start: Day; end: Day }
+}
+
+const TIME_GRAINS: Partial<Record<Dimension, TimeGrain>> = {
+  year: {
+    valid: (key) => /^\d{4}$/.test(key),
+    of: (seconds) => secondsToDay(seconds).slice(0, 4) || undefined,
+    next: (key) => String(Number(key) + 1).padStart(4, '0'),
+    extent: (key) => ({ start: `${key}-01-01`, end: `${key}-12-31` }),
+  },
+  quarter: {
+    valid: (key) => /^\d{4}-Q[1-4]$/.test(key),
+    of: (seconds) => {
+      const day = secondsToDay(seconds)
+      if (!day) return undefined
+      return `${day.slice(0, 4)}-Q${Math.floor((Number(day.slice(5, 7)) + 2) / 3)}`
+    },
+    next: (key) => {
+      const quarter = Number(key.slice(6))
+      return quarter === 4
+        ? `${String(Number(key.slice(0, 4)) + 1).padStart(4, '0')}-Q1`
+        : `${key.slice(0, 4)}-Q${quarter + 1}`
+    },
+    extent: (key) => {
+      const first = (Number(key.slice(6)) - 1) * 3 + 1
+      const year = key.slice(0, 4)
+      return {
+        start: `${year}-${String(first).padStart(2, '0')}-01`,
+        end: endOfMonth(`${year}-${String(first + 2).padStart(2, '0')}-01`),
+      }
+    },
+  },
+  month: {
+    valid: (key) => /^\d{4}-(0[1-9]|1[0-2])$/.test(key),
+    of: (seconds) => secondsToDay(seconds).slice(0, 7) || undefined,
+    next: (key) => {
+      const month = Number(key.slice(5, 7))
+      return month === 12
+        ? `${String(Number(key.slice(0, 4)) + 1).padStart(4, '0')}-01`
+        : `${key.slice(0, 4)}-${String(month + 1).padStart(2, '0')}`
+    },
+    extent: (key) => ({ start: `${key}-01`, end: endOfMonth(`${key}-01`) }),
+  },
+  week: {
+    // A week is its Monday (`WEEK_EXPR`), so a valid key is a day that is one.
+    valid: (key) => isDay(key) && weekStart(key) === key,
+    of: (seconds) => {
+      const day = secondsToDay(seconds)
+      return day ? weekStart(day) : undefined
+    },
+    next: (key) => addDays(key, 7),
+    extent: (key) => ({ start: key, end: addDays(key, 6) }),
+  },
 }
 
 /**

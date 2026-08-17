@@ -26,7 +26,7 @@ import {
   vendorIdsNamed,
   type CatalogIndex,
 } from '@/lib/catalog'
-import { buildChart, relabelModel, visibleModel, type ChartModel } from '@/lib/chart'
+import { buildChart, relabelModel, timeSpan, visibleModel, type ChartModel } from '@/lib/chart'
 import { copyChartPng, copyGrid, type GridData } from '@/lib/clipboard'
 import {
   axisBounds,
@@ -266,6 +266,16 @@ export function Canvas({
         }))
       : []
 
+  /**
+   * The window a time axis answers over — the ran definition's published
+   * range over the copy that answered (`timeSpan`): what `buildChart` fills
+   * zeros across and marks partial buckets against.
+   */
+  const span = useMemo(
+    () => (reportOutcome ? timeSpan(reportOutcome.report.filters, coverage) : undefined),
+    [reportOutcome, coverage]
+  )
+
   const model = useMemo(
     () =>
       reportOutcome
@@ -274,10 +284,11 @@ export function Canvas({
             reportOutcome.report.rows,
             reportOutcome.report.series,
             reportOutcome.report.limit ??
-              (reportOutcome.report.chart === 'table' ? TABLE_ROWS : CHART_ROWS)
+              (reportOutcome.report.chart === 'table' ? TABLE_ROWS : CHART_ROWS),
+            span
           )
         : null,
-    [reportOutcome]
+    [reportOutcome, span]
   )
 
   const copyLink = async () => {

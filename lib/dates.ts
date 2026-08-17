@@ -361,7 +361,7 @@ export function bucketsBetween(grain: Grain, from: Day, to: Day): number {
 /**
  * The finest grain, no finer than `grain`, whose buckets over a window fit
  * under `cap`. The canvas coarsens rather than truncates: a time axis over its
- * cap is cut at the *old* end (`crossSql` keeps the recent buckets), so
+ * cap is cut at the *old* end (the query layer keeps the recent buckets), so
  * "all time" by week would silently be the last eight years — and 1,400 bars
  * are not a chart anyway. Never refines: a reader who chose Yearly keeps it.
  */

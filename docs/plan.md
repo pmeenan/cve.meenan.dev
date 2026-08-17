@@ -359,6 +359,39 @@ rows whole. Both engines prove the boundary from inside the sandbox
 (`tests/e2e/compute.spec.ts`); Firefox found the first design (a static file)
 refused by this site's own CORP header, hence `srcdoc`.
 
+Then a defect the pickers exposed (2026-08-16): **a time axis was sparse**.
+`GROUP BY` returns only the buckets that hold a record and the chart places
+buckets ordinally, so a week with no matching CVEs was not a zero — it was
+absent, and its neighbours closed ranks: one vendor's trend line jumped from
+March to September as two adjacent points, and every bar chart over a sparse
+filter was drawn on an axis that was not a timeline. Invisible on the
+unfiltered corpus, which has a record in every week since 1999. The chart
+model (`fillTimeGaps`, lib/chart.ts) now inserts a zero row for every missing
+grain step, widened to the report's published window when the canvas knows it
+— clamped into the copy's extent, and the old end trusted only when the query
+was not narrowed to its cap, since the query layer keeps the recent end — so
+the chart, the tooltip, the table and the copied numbers all carry the zeros.
+Building it found the two aggregate builders disagreeing about *which* end:
+`crossSql` narrowed an over-cap time axis to the recent buckets, `groupSql`
+(the one-dimension aggregate, and what `crossSql` delegates to with no series)
+took `ORDER BY … ASC LIMIT n` — the oldest — so a chat "CVEs by month" with no
+window answered about 1999 where the cross-tab answered about now. Aligned:
+`groupSql` narrows newest-first in a CTE and re-sorts ascending, with the
+Worker's sentinel row (`limit + 1`, which it turns into the "capped" flag by
+stopping on it) sorted explicitly *last* — narrowed and merely re-sorted, the
+sentinel would be the oldest row, come out first, and the Worker would keep it
+and drop the newest bucket. And the same round marks **partial buckets**
+(owner's ask): a time bucket the answer does not cover whole — the current
+week or month, cut by the copy's last day, or an edge the report's own window
+falls inside (the "2 yr" lower edge is a Monday mid-month, so a monthly chart's
+first bucket is one) — carries " (partial)" in its label on every channel
+(axis, tooltip, table, copied numbers), draws faded over a shaded band, and
+the caption says why; `timeSpan` (lib/chart.ts) is the one place the window
+over the copy is computed, for the canvas and the chat panel alike (which now
+receives `coverage`). Building the caption found RE-039: an HTML entity in a
+multi-line JSX text node made the bundle drop the text's leading space, so
+"(partial) are" shipped as "(partial)are" — a literal `’` does not.
+
 Exit: `pnpm check` and `pnpm e2e` green on both engines across both tiers; the
 owner has used the deployed workspace and the remaining rough edges are
 recorded here rather than open-ended.

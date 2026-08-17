@@ -36,12 +36,16 @@ import type { ChartType } from '@/lib/report'
 /** The drawing box. Scaled to the container by `width: 100%` on the element. */
 const W = 860
 const H = 400
-const PAD = { top: 14, right: 14, bottom: 92, left: 64 }
+const PAD = { top: 14, right: 14, bottom: 100, left: 64 }
 const PLOT_W = W - PAD.left - PAD.right
 const PLOT_H = H - PAD.top - PAD.bottom
 
-/** Longest x-axis label drawn before it is cut; the full text stays in the table. */
-const LABEL_CHARS = 18
+/**
+ * Longest x-axis label drawn before it is cut; the full text stays in the
+ * table. Twenty is a week's Monday plus " (partial)" — the one long label a
+ * time axis carries — and `PAD.bottom` is sized for it at the label's slant.
+ */
+const LABEL_CHARS = 20
 /** Most x-axis labels drawn; past this every k-th bucket is labelled. */
 const MAX_LABELS = 26
 
@@ -179,6 +183,23 @@ export function Chart({
           </g>
         ))}
 
+        {/* Partial buckets — the current week or month, or an edge the window
+            cuts — shaded behind their marks, so a line or an area over them
+            reads as provisional too, not only a bar. The label says why. */}
+        {view.rows.map((row, rIndex) =>
+          row.partial ? (
+            <rect
+              key={row.key}
+              className="partial-band"
+              data-partial-band={row.key}
+              x={PAD.left + band * rIndex}
+              y={PAD.top}
+              width={band}
+              height={PLOT_H}
+            />
+          ) : null
+        )}
+
         {/* The hovered bucket's band, behind the marks. */}
         {tip && (
           <rect
@@ -230,7 +251,7 @@ export function Chart({
                         width={inner}
                         height={Math.max(height, 0.5)}
                         fill={entry.color}
-                        className="bar"
+                        className={row.partial ? 'bar partial' : 'bar'}
                       />
                     )
                   })}
@@ -252,7 +273,7 @@ export function Chart({
                       width={Math.max(each - 1, 1)}
                       height={Math.max(height, 0.5)}
                       fill={entry.color}
-                      className="bar"
+                      className={row.partial ? 'bar partial' : 'bar'}
                     />
                   )
                 })}
@@ -368,6 +389,13 @@ export function Chart({
             )
           })}
         </ul>
+        {view.rows.some((row) => row.partial) && (
+          <p className="muted small" data-chart-partial="1">
+            Faded buckets marked <em>(partial)</em> are not covered whole — the period runs past the
+            last day the data holds, or the report’s own date range cuts into it — so their counts
+            are not comparable to their neighbours’.
+          </p>
+        )}
         {(model.droppedRows > 0 || model.droppedSeries > 0) && (
           <p className="stale" data-chart-capped="1">
             {model.droppedRows > 0 &&
@@ -487,7 +515,7 @@ export function ChartTable({
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.key}>
+          <tr key={row.key} data-partial={row.partial ? '1' : undefined}>
             {/* Record content is a text node, never markup (rule 4). */}
             <th scope="row">{row.label}</th>
             {row.values.map((value, at) => (

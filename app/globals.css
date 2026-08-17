@@ -1068,6 +1068,21 @@ details.series-labels {
   stroke-width: 0.75;
 }
 
+/* A partial bucket — the current week or month, or an edge the report's window
+   cuts — is faded rather than dropped: the reader asked for the window, and
+   the fall-off at the right-hand end is the most misread thing on a time
+   series. The band behind the marks says so for a line or an area too, and the
+   bar's own opacity says it in a PNG copy, which carries `opacity` (lib/clipboard.ts). */
+.chart .partial-band {
+  fill: currentcolor;
+  opacity: 0.05;
+  pointer-events: none;
+}
+
+.chart .bar.partial {
+  opacity: 0.45;
+}
+
 /* The hovered bucket, highlighted under the cursor. Very low opacity: it is a
    locator for the tooltip, not a mark. */
 .chart .hover-band {
