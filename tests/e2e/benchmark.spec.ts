@@ -12,7 +12,7 @@ import {
 import type { Dimension } from '../../lib/filters'
 
 import { requireLocalStorage } from './support'
-import { importCorpus, openChat, openPanel } from './ui'
+import { awaitIdle, importCorpus, openChat, openPanel } from './ui'
 
 /**
  * The tool-calling benchmark (D-046), against the pinned model.
@@ -150,7 +150,10 @@ test.describe('D-046 tool-calling benchmark', () => {
     // nothing retries it — a refresh only runs on a download, a sync or an
     // explicit KEV action. Both KEV questions then scored zero with "no such
     // table: kev" from the *ground truth*, which reads like a model failure and
-    // is not: the model was never asked. The same idiom as `kev.spec.ts`.
+    // is not: the model was never asked. The same idiom as `kev.spec.ts`. The
+    // KEV line sits inside the footer's Data & diagnostics disclosure (UI
+    // polish, 2026-08-16), which the import opened; opened explicitly anyway.
+    await openPanel(page, 'data')
     const kevLine = page.locator('[data-kev]')
     await expect(kevLine).toBeVisible({ timeout: 300_000 })
     await expect(kevLine).not.toHaveAttribute('data-kev', 'none', { timeout: 300_000 })
@@ -176,6 +179,14 @@ test.describe('D-046 tool-calling benchmark', () => {
           // from the one a user asks first (D-046 scores the integration, not
           // the effect of context accumulating).
           await page.reload()
+          // A reloaded page re-runs the canvas report and — on a copy more
+          // than twelve hours behind, which a snapshot cut days ago is until
+          // its first catch-up — posts one sync by itself (UI polish,
+          // 2026-08-16). A turn started into a busy Worker queues its tool
+          // calls behind them, so wait for quiet first. (The reload was
+          // always inside the question's clock; against the deployed origin
+          // the copy is hours old and no catch-up fires.)
+          await awaitIdle(page, 300_000)
           // The column reopens itself once the copy is ready; `openChat` waits
           // for the workspace either way, and the consent flag survives the
           // reload so the composer is what renders.

@@ -11,28 +11,51 @@
  *
  * The audit properties are unchanged from M4: the chart is built from the
  * definition the Worker echoed back, the complete numbers are always one
- * step away, the backing SQL is disclosed on every result, and record content
- * is rendered as text (rule 4). What the revamp adds is presentation control —
+ * step away, the backing SQL of the last run is in the SQL panel, and record
+ * content is rendered as text (rule 4). What the revamp adds is presentation control —
  * chart type switching, series hiding, display renames, copy as PNG/table —
  * all of which are views of the result, never a new query.
  */
 
 import { useMemo, useRef, useState } from 'react'
 
+import {
+  productUnderVendors,
+  searchProducts,
+  searchVendors,
+  vendorIdsNamed,
+  type CatalogIndex,
+} from '@/lib/catalog'
 import { buildChart, relabelModel, visibleModel, type ChartModel } from '@/lib/chart'
 import { copyChartPng, copyGrid, type GridData } from '@/lib/clipboard'
-import { axisBounds } from '@/lib/dates'
+import {
+  axisBounds,
+  clampDay,
+  fitGrain,
+  GRAINS,
+  matchPreset,
+  quickRanges,
+  type Grain,
+} from '@/lib/dates'
 import { describeDraft, draftToFilters, filtersToDraft } from '@/lib/draft'
-import { DIMENSION_LABELS, type Dimension } from '@/lib/filters'
+import { DIMENSION_LABELS, TIME_DIMENSIONS, type Dimension } from '@/lib/filters'
 import { EXPORT_FORMATS, EXPORT_LIMIT, type ExportFormat } from '@/lib/export'
 import type { Coverage, CveDetail, QueryResult, Unmatched } from '@/lib/protocol'
-import { CHART_ROWS, TABLE_ROWS, toFragment, type ChartType, type Report } from '@/lib/report'
+import {
+  CHART_ROWS,
+  TABLE_ROWS,
+  TIME_ROWS,
+  toFragment,
+  type ChartType,
+  type Report,
+} from '@/lib/report'
 
 import { Chart, ChartTable } from './chart'
 import { DateRangeField } from './date-range'
 import { Detail } from './detail'
 import { GroupTable, RecordTable, recordGrid, groupGrid, type SearchOutcome } from './explore'
-import { FilterChips } from './filter-form'
+import { FilterChips } from './chips'
+import { Picker, PICKER_ROWS, type PickerItem } from './picker'
 
 export interface ReportOutcome {
   result: QueryResult
@@ -41,6 +64,16 @@ export interface ReportOutcome {
   /** The definition the Worker actually ran, echoed back rather than re-read. */
   report: Report
 }
+
+/** The grain radios' words; the ladder itself is `GRAINS` (lib/dates.ts). */
+const GRAIN_LABELS: Record<Grain, string> = { week: 'Weekly', month: 'Monthly', year: 'Yearly' }
+
+function isGrain(dimension: Dimension): dimension is Grain {
+  return (GRAINS as readonly string[]).includes(dimension)
+}
+
+/** Filter chips the canvas strip already shows as controls (see `FilterChips`). */
+const SHOWN_IN_STRIP: ReadonlySet<string> = new Set(['published', 'vendor', 'product'])
 
 const CHART_LABELS: Record<ChartType, string> = {
   stackedBar: 'Stacked bars',
@@ -73,6 +106,8 @@ export function Canvas({
   onSeriesLabel,
   dataAsOf,
   coverage,
+  catalog,
+  onReset,
 }: {
   /** What the canvas is showing: the last thing that ran. */
   view: 'report' | 'records'
@@ -101,6 +136,10 @@ export function Canvas({
   dataAsOf: string | null
   /** The copy's date extent, which bounds the range control (M9). */
   coverage: Coverage | null
+  /** Every vendor and product name, for the pickers; null until it has arrived. */
+  catalog: CatalogIndex | null
+  /** Back to the workspace's opening report. */
+  onReset: () => void
 }) {
   const [name, setName] = useState('')
   const [format, setFormat] = useState<ExportFormat>('csv')
@@ -129,19 +168,103 @@ export function Canvas({
    */
   const liveDraft = filtersToDraft(report.filters)
 
+  const bounds = axisBounds(coverage, 'published')
+
+  /**
+   * The grain a window is charted at: the current one, coarsened when the
+   * window holds more buckets than a time axis asks for (`TIME_ROWS`) —
+   * "all time" by week is 1,400 bars, and the query layer would keep only the
+   * recent 400. Never finer than the reader chose, and never the split axis,
+   * which a report refuses to double as the rows.
+   */
+  const grainFor = (from: string, to: string): Dimension => {
+    if (!isGrain(report.rows)) return report.rows
+    // Counted over the part of the window the data covers: a "10 yr" edge on
+    // a copy holding one year makes one year of buckets, not ten.
+    const start = bounds ? clampDay(from || bounds.min, bounds) : from
+    const end = bounds ? clampDay(to || bounds.max, bounds) : to
+    if (!start || !end) return report.rows
+    const fitted = fitGrain(report.rows, start, end, TIME_ROWS)
+    return fitted === report.series ? report.rows : fitted
+  }
+
   /**
    * Edit the published-date window and re-run — the canvas's own range control.
    *
    * Both edges at once, because the picker commits a *range*: setting them one
    * at a time would run the report against a half-applied window, which on the
-   * hosted tier is a second round trip for an answer nobody asked for.
+   * hosted tier is a second round trip for an answer nobody asked for. Every
+   * commit passes through `grainFor`, so a typed decade and a clicked "10 yr"
+   * chart the same way.
    */
   const setRange = (from: string, to: string) => {
     onRun({
       ...report,
+      rows: grainFor(from, to),
       filters: draftToFilters({ ...liveDraft, publishedFrom: from, publishedTo: to }),
     })
   }
+
+  /**
+   * The quick ranges (UI polish, 2026-08-16): a lower edge only, relative to
+   * today, through the same commit as a typed date. Today is read at render
+   * — a Date in a render body, like the calendar's — because the pressed
+   * state has to be judged against the same day the buttons would set.
+   */
+  const today = new Date().toISOString().slice(0, 10)
+  const quick = quickRanges(today)
+  const quickActive = matchPreset(quick, liveDraft.publishedFrom, liveDraft.publishedTo)
+
+  /**
+   * The vendor and product pickers (UI polish, 2026-08-16). Each commits one
+   * name into the same `filters.vendor` / `filters.product` lists a permalink
+   * or a chat call would set — so a chip, the chat context and the URL all
+   * agree — and re-runs. Choosing a vendor drops a product that is not one of
+   * its own, because "Cisco · Windows" is a report of nothing.
+   */
+  const vendorNames = report.filters.vendor ?? []
+  const productNames = report.filters.product ?? []
+  const vendorIds = catalog && vendorNames.length ? vendorIdsNamed(catalog, vendorNames) : null
+  const pickVendor = (name: string | null) => {
+    const filters = { ...report.filters }
+    if (name === null) delete filters.vendor
+    else filters.vendor = [name]
+    if (name !== null && catalog && filters.product?.length) {
+      if (!productUnderVendors(catalog, filters.product, vendorIdsNamed(catalog, [name]))) {
+        delete filters.product
+      }
+    }
+    onRun({ ...report, filters })
+  }
+  const pickProduct = (name: string | null) => {
+    const filters = { ...report.filters }
+    if (name === null) delete filters.product
+    else filters.product = [name]
+    onRun({ ...report, filters })
+  }
+  const vendorSearch = (query: string): PickerItem[] =>
+    catalog
+      ? searchVendors(catalog, query, PICKER_ROWS).map((vendor) => ({
+          key: String(vendor.id),
+          label: vendor.name,
+          hint: vendor.count.toLocaleString(),
+        }))
+      : []
+  const productSearch = (query: string): PickerItem[] =>
+    catalog
+      ? searchProducts(catalog, query, vendorIds, PICKER_ROWS).map((product) => ({
+          key: product.name.toLowerCase(),
+          label: product.name,
+          // With no vendor chosen a name can live under several; the picker
+          // says which, because the filter will match all of them.
+          detail:
+            vendorIds || product.vendors.length === 0
+              ? undefined
+              : product.vendors.slice(0, 3).join(', ') +
+                (product.vendors.length > 3 ? ` +${product.vendors.length - 3}` : ''),
+          hint: product.count.toLocaleString(),
+        }))
+      : []
 
   const model = useMemo(
     () =>
@@ -199,6 +322,10 @@ export function Canvas({
 
   return (
     <section className="canvas" aria-labelledby="canvas-title">
+      {/* The section's own heading level, for the outline: the visible title
+          is an input, and the calendar's and the record detail's h3s need an
+          h2 above them now that the filter drawer's is gone. */}
+      <h2 className="visually-hidden">Report</h2>
       <div className="canvas-head">
         {/* The title is the input: editing it is the common path for a chart
             headed somewhere public, and a separate edit mode would hide that
@@ -309,47 +436,98 @@ export function Canvas({
           lives at the top of the chart rather than in the drawer — the same
           `publishedFrom`/`publishedTo` predicates, so the drawer, the chips
           and a permalink all agree. Changing either re-runs immediately. */}
-      {view === 'report' && (
-        <div className="canvas-range" data-canvas-range="1">
-          <DateRangeField
-            label="Published"
-            name="canvas-published"
-            idPrefix="canvas-pub"
-            inline
-            from={liveDraft.publishedFrom}
-            to={liveDraft.publishedTo}
-            bounds={axisBounds(coverage, 'published')}
-            disabled={disabled}
-            onChange={setRange}
-          />
-          {isTimeDimension(report.rows) && (
-            <fieldset className="granularity" data-granularity={report.rows}>
-              <legend className="visually-hidden">Time buckets</legend>
-              {(
-                [
-                  ['month', 'Monthly'],
-                  ['quarter', 'Quarterly'],
-                  ['year', 'Yearly'],
-                ] as const
-              ).map(([dimension, label]) => (
-                <label key={dimension} className="check">
-                  <input
-                    type="radio"
-                    name="canvas-granularity"
-                    value={dimension}
-                    checked={report.rows === dimension}
-                    // The split axis cannot double as the buckets — a report
-                    // refuses rows === series, so the radio does too.
-                    disabled={disabled || report.series === dimension}
-                    onChange={() => onRun({ ...report, rows: dimension })}
-                  />
-                  {label}
-                </label>
+      <div className="canvas-range" data-canvas-range="1">
+        {view === 'report' && (
+          <>
+            <DateRangeField
+              label="Published"
+              name="canvas-published"
+              idPrefix="canvas-pub"
+              inline
+              from={liveDraft.publishedFrom}
+              to={liveDraft.publishedTo}
+              bounds={bounds}
+              disabled={disabled}
+              onChange={setRange}
+            />
+            <div className="quick-ranges" role="group" aria-label="Quick ranges">
+              {quick.map((preset) => (
+                <button
+                  key={preset.key}
+                  type="button"
+                  className="quiet"
+                  aria-pressed={quickActive === preset.key}
+                  data-quick-range={preset.key}
+                  title={
+                    preset.from
+                      ? `Published since ${preset.from}${preset.key === 'ytd' ? '' : ' (whole weeks)'}`
+                      : 'Every record the data holds'
+                  }
+                  disabled={disabled}
+                  onClick={() => setRange(preset.from, preset.to)}
+                >
+                  {preset.label}
+                </button>
               ))}
-            </fieldset>
-          )}
-        </div>
-      )}
+            </div>
+            {isTimeDimension(report.rows) && (
+              <fieldset className="granularity" data-granularity={report.rows}>
+                <legend className="visually-hidden">Time buckets</legend>
+                {GRAINS.map((dimension) => (
+                  <label key={dimension} className="check">
+                    <input
+                      type="radio"
+                      name="canvas-granularity"
+                      value={dimension}
+                      checked={report.rows === dimension}
+                      // The split axis cannot double as the buckets — a report
+                      // refuses rows === series, so the radio does too.
+                      disabled={disabled || report.series === dimension}
+                      // A time axis is bounded by the date range, not by a
+                      // top-N, so changing the grain asks for the whole window:
+                      // a chat-built chart capped at 12 months would otherwise
+                      // switch to the 12 most recent weeks.
+                      onChange={() => onRun({ ...report, rows: dimension, limit: TIME_ROWS })}
+                    />
+                    {GRAIN_LABELS[dimension]}
+                  </label>
+                ))}
+              </fieldset>
+            )}
+            <Picker
+              label="Vendor"
+              name="vendor"
+              value={vendorNames.join(', ')}
+              allLabel="All vendors"
+              search={vendorSearch}
+              onPick={pickVendor}
+              disabled={disabled}
+              loading={catalog === null}
+            />
+            <Picker
+              label="Product"
+              name="product"
+              value={productNames.join(', ')}
+              allLabel={vendorIds ? 'All its products' : 'All products'}
+              search={productSearch}
+              onPick={pickProduct}
+              disabled={disabled}
+              loading={catalog === null}
+            />
+          </>
+        )}
+        {/* Back to the opening report — at the end of the row of things it
+            undoes. A quiet button: it is a way out, not the main action. */}
+        <button
+          type="button"
+          className="quiet canvas-reset"
+          data-reset="1"
+          disabled={disabled}
+          onClick={onReset}
+        >
+          Reset
+        </button>
+      </div>
 
       {/* What the visible result counted, as chips — from the ran definition,
           so an unapplied drawer edit never labels the old chart. Removing one
@@ -357,6 +535,10 @@ export function Canvas({
           the live presentation fields (title, chart type). */}
       <FilterChips
         draft={draft}
+        // On the report canvas the published window, the vendor and the
+        // product each have a control of their own in the strip above, so a
+        // chip repeating them would be the same value twice.
+        hide={view === 'report' ? SHOWN_IN_STRIP : undefined}
         onChange={(next) =>
           onRun({
             ...(ran ?? report),
@@ -529,7 +711,25 @@ function ReportView({
   const series = outcome.report.series
 
   return (
-    <div className="outcome" ref={hostRef}>
+    // The run counter and the match count ride on the container as data
+    // attributes rather than as a sentence (UI polish, 2026-08-16): "12,345
+    // records match — 261 buckets × 6 series in 140 ms" was a developer's
+    // line, and a test still needs to wait for *this* answer (`data-run`) and
+    // to read what it counted.
+    <div
+      className="outcome"
+      ref={hostRef}
+      data-report-matches={matches ?? ''}
+      data-run={run}
+      data-json={JSON.stringify({
+        ms: result.ms,
+        buckets: model.rows.length,
+        series: model.series.length,
+        cells: result.rows.length,
+        truncated: result.truncated,
+        matches,
+      })}
+    >
       {unmatched.map((entry) => (
         <p key={entry.axis} className="error" data-unmatched={entry.axis}>
           No {entry.axis} in this copy is called {entry.values.map((v) => `“${v}”`).join(', ')}.
@@ -537,25 +737,11 @@ function ReportView({
         </p>
       ))}
       <StateWarning state={state} />
-
-      <p
-        className="muted"
-        data-report-matches={matches ?? ''}
-        data-run={run}
-        data-json={JSON.stringify({
-          ms: result.ms,
-          buckets: model.rows.length,
-          series: model.series.length,
-          cells: result.rows.length,
-          truncated: result.truncated,
-          matches,
-        })}
-      >
-        {matches === null ? 'Counted' : `${matches.toLocaleString()} records match`} —{' '}
-        {model.rows.length.toLocaleString()} buckets
-        {series ? ` × ${model.series.length.toLocaleString()} series` : ''} in {result.ms} ms
-        {result.truncated && ' (capped)'}
-      </p>
+      {result.truncated && (
+        <p className="muted small" data-report-capped="1">
+          Capped: the query returned more buckets than the chart shows.
+        </p>
+      )}
 
       {report.chart !== 'table' && (
         <Chart
@@ -601,8 +787,6 @@ function ReportView({
         labels={seriesLabels}
         view={report.chart === 'table' ? 'spreadsheet' : 'audit'}
       />
-
-      <Backing sql={result.sql} params={result.params} />
     </div>
   )
 }
@@ -640,7 +824,7 @@ function RecordsView({
               ? `${outcome.result.rows.length.toLocaleString()} rows`
               : `${outcome.matches.toLocaleString()} records match`}
             {outcome.groupBy ? ` — grouped by ${DIMENSION_LABELS[outcome.groupBy]},` : ' —'}{' '}
-            {outcome.result.rows.length.toLocaleString()} shown in {outcome.result.ms} ms
+            {outcome.result.rows.length.toLocaleString()} shown
             {outcome.result.truncated && ' (capped)'}
           </p>
           <div className="scroll" tabIndex={0}>
@@ -650,7 +834,6 @@ function RecordsView({
               <RecordTable result={outcome.result} onOpenRecord={onOpenRecord} />
             )}
           </div>
-          <Backing sql={outcome.result.sql} params={outcome.result.params} />
         </>
       )}
     </div>
@@ -668,17 +851,6 @@ function StateWarning({ state }: { state: string }) {
   )
 }
 
-/** The query behind the numbers, always available (vision criterion 7). */
-function Backing({ sql, params }: { sql: string; params: (string | number)[] }) {
-  return (
-    <details className="sql">
-      <summary>The SQL that produced this</summary>
-      <pre>{sql}</pre>
-      <p className="muted">Bound values: {params.map((p) => String(p)).join(' · ')}</p>
-    </details>
-  )
-}
-
 /** What an untitled report is called, from its own axes. */
 function describeReport(report: Report): string {
   return report.series
@@ -687,7 +859,7 @@ function describeReport(report: Report): string {
 }
 
 function isTimeDimension(dimension: Dimension): boolean {
-  return dimension === 'year' || dimension === 'quarter' || dimension === 'month'
+  return TIME_DIMENSIONS.has(dimension)
 }
 
 /**

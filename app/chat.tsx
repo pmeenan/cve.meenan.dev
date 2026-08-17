@@ -52,6 +52,7 @@ const STEP_LABELS: Record<string, string> = {
   cve_detail: 'Reading a record',
   kev_lookup: 'Checking CISA KEV',
   sql: 'Running SQL',
+  compute: 'Computing over the last result',
 }
 
 /**
@@ -68,7 +69,6 @@ export function ChatPanel({
   turns,
   running,
   ready,
-  hostedTier,
   consented,
   consentStorable,
   onConsent,
@@ -84,12 +84,6 @@ export function ChatPanel({
   running: boolean
   /** A corpus is answering — the local copy, or the hosted tier standing in. */
   ready: boolean
-  /**
-   * Queries run on the server rather than in this browser (D-084). The
-   * standing disclosure says results leave the browser; this changes *where
-   * the queries run*, which the tier line below states separately.
-   */
-  hostedTier?: boolean
   consented: boolean
   /** `localStorage` is usable, so the choice will be remembered. */
   consentStorable: boolean
@@ -143,16 +137,14 @@ export function ChatPanel({
         <>
           <div className="chat-log" ref={log} data-chat-log="1">
             {turns.length === 0 && (
-              <p className="muted">
-                Ask a question about the CVE List in plain language — “stacked CVE counts by
-                severity over time”, “which Cisco products have the most CRITICAL CVEs”, “is
-                CVE-2021-44228 in CISA&rsquo;s KEV catalog”.{' '}
-                {hostedTier
-                  ? 'Until the corpus is downloaded, the queries the model writes run on this ' +
-                    'site’s server; the model only decides which query to run.'
-                  : 'Answers come from the copy of the corpus in this browser; the model only ' +
-                    'decides which query to run.'}
-              </p>
+              <div className="muted chat-hint">
+                <p>Ask a question about the CVE List in plain language. For example:</p>
+                <ul>
+                  <li>Stacked CVE counts by severity over time</li>
+                  <li>Which Cisco products have the most CRITICAL CVEs?</li>
+                  <li>Are the total counts of CVEs trending up or down recently?</li>
+                </ul>
+              </div>
             )}
             {turns.map((turn) => (
               <Turn
@@ -370,16 +362,30 @@ function Waiting({ waiting }: { waiting: NonNullable<ChatTurn['waiting']> }) {
   )
 }
 
-function Step({
+/**
+ * One tool step — a chat turn's, or an agent's (D-086: the page's "Agent
+ * activity" log renders agent calls through this same component, so what an
+ * agent did is on screen the way what the model did is).
+ */
+export function Step({
   step,
   onOpenReport,
   onOpenSearch,
   onOpenRecord,
+  compact,
 }: {
   step: ChatStep
   onOpenReport: (report: Report) => void
   onOpenSearch: (report: Report) => void
   onOpenRecord: (cveId: string) => void
+  /**
+   * Summarise a result that is already on the canvas — an aggregate, a
+   * record search, SQL — instead of rendering a second chart or table beside
+   * it (the agent log's mode). A record read, a KEV lookup, a computed
+   * value and a refusal render in full either way: the canvas does not
+   * carry them, so this is where they are seen.
+   */
+  compact?: boolean
 }) {
   return (
     <section
@@ -406,16 +412,92 @@ function Step({
           {step.error}
         </p>
       )}
-      {step.outcome && (
-        <Outcome
-          outcome={step.outcome}
-          onOpenReport={onOpenReport}
-          onOpenSearch={onOpenSearch}
-          onOpenRecord={onOpenRecord}
-        />
-      )}
+      {step.outcome &&
+        (compact && onCanvas(step.outcome) ? (
+          <Landed outcome={step.outcome} onOpenReport={onOpenReport} onOpenSearch={onOpenSearch} />
+        ) : (
+          <Outcome
+            outcome={step.outcome}
+            onOpenReport={onOpenReport}
+            onOpenSearch={onOpenSearch}
+            onOpenRecord={onOpenRecord}
+          />
+        ))}
     </section>
   )
+}
+
+/** The outcomes the page lands on the canvas as they arrive (see `toolResult` in page.tsx). */
+function onCanvas(outcome: ToolOutcome): boolean {
+  return outcome.kind === 'aggregate' || outcome.kind === 'records' || outcome.kind === 'sql'
+}
+
+/**
+ * A result that is on the canvas, in one line: what it counted, and the way
+ * back to it. The chart or the list is not repeated here — the canvas is the
+ * one place it renders, which is what keeps "the number on screen" singular.
+ */
+function Landed({
+  outcome,
+  onOpenReport,
+  onOpenSearch,
+}: {
+  outcome: ToolOutcome
+  onOpenReport: (report: Report) => void
+  onOpenSearch: (report: Report) => void
+}) {
+  switch (outcome.kind) {
+    case 'aggregate':
+      return (
+        <p className="muted small" data-chat-landed="aggregate">
+          {outcome.matches === null
+            ? 'Counted'
+            : `${outcome.matches.toLocaleString()} records match`}
+          {' — '}
+          {DIMENSION_LABELS[outcome.report.rows]}
+          {outcome.report.series ? ` × ${DIMENSION_LABELS[outcome.report.series]}` : ''}, on the
+          canvas.{' '}
+          <button
+            type="button"
+            className="quiet link"
+            data-chat-open-report="1"
+            onClick={() => onOpenReport(outcome.report)}
+          >
+            Open on canvas
+          </button>
+        </p>
+      )
+    case 'records':
+      return (
+        <p
+          className="muted small"
+          data-chat-landed="records"
+          data-chat-matches={outcome.matches ?? ''}
+        >
+          {outcome.matches === null
+            ? `${outcome.result.rows.length.toLocaleString()} records`
+            : `${outcome.matches.toLocaleString()} records match`}
+          , {outcome.result.rows.length.toLocaleString()} listed on the canvas.{' '}
+          <button
+            type="button"
+            className="quiet link"
+            data-chat-open-search="1"
+            onClick={() => onOpenSearch(outcome.report)}
+          >
+            Open in records view
+          </button>
+        </p>
+      )
+    case 'sql':
+      return (
+        <p className="muted small" data-chat-landed="sql">
+          {outcome.result.rows.length.toLocaleString()} rows in {outcome.result.ms} ms
+          {outcome.result.truncated && ' (capped)'} — in the SQL panel.
+        </p>
+      )
+    default:
+      return null
+  }
 }
 
 /**
@@ -473,6 +555,9 @@ function stepFacts(step: ChatStep): StepFacts {
       break
     case 'sql':
       facts.cells = outcome.result.rows.map((row) => row.map(cell))
+      break
+    case 'compute':
+      facts.cells = [[outcome.ok ? (outcome.value ?? null) : (outcome.error ?? 'failed')]]
       break
     case 'refused':
       break
@@ -595,6 +680,42 @@ function Outcome({
             </table>
           </div>
           <Backing sql={outcome.result.sql} params={outcome.result.params} />
+        </>
+      )
+    case 'compute':
+      // The code and what it produced, both as text nodes (never markup):
+      // the reader can see exactly what was run over which result, which is
+      // what lets a number the model states from it be checked (D-088).
+      return (
+        <>
+          <p className="muted small" data-chat-compute={outcome.ok ? 'ok' : 'failed'}>
+            {outcome.input.rows.toLocaleString()} rows of the last{' '}
+            {outcome.input.source === 'aggregate'
+              ? 'aggregate'
+              : outcome.input.source === 'records'
+                ? 'record search'
+                : outcome.input.source === 'sql'
+                  ? 'SQL result'
+                  : 'result (nothing had run)'}{' '}
+            in {outcome.ms} ms{outcome.truncated && ' — output cut at the cap'}
+          </p>
+          {outcome.error && (
+            <p className="stale" data-chat-compute-error="1">
+              {outcome.error}
+            </p>
+          )}
+          {outcome.value !== null && (
+            <pre className="compute-output" data-chat-compute-value="1">
+              {outcome.value}
+            </pre>
+          )}
+          {outcome.logs.length > 0 && (
+            <pre className="compute-output muted">{outcome.logs.join('\n')}</pre>
+          )}
+          <details className="sql">
+            <summary>The code that produced this</summary>
+            <pre>{outcome.code}</pre>
+          </details>
         </>
       )
     case 'refused':

@@ -7,6 +7,7 @@ import { REPORT_VERSION } from '../../lib/report'
 import {
   canvasContext,
   describeToolResult,
+  MAX_MODEL_CELL_CHARS,
   MAX_MODEL_CELLS,
   MAX_MODEL_RESULT_CHARS,
   MAX_MODEL_ROWS,
@@ -33,10 +34,10 @@ import {
  * *quietly widened* rather than refused is the failure that matters: it runs
  * and it answers a different question.
  *
- * **Results are what the model gets to see.** D-044 draws the line at
- * transcription: aggregates may enter its context, row-level sets never do. The
- * tests below assert the withholding, because it is invisible in the UI and
- * would be the easiest thing to lose in a refactor.
+ * **Results are what the model gets to see.** Every tool hands the model a
+ * bounded window of its result (D-087): rows and characters both, with the
+ * count of what lies outside it stated. The tests below assert the bounds and
+ * the honesty about them, because both are invisible in the UI.
  */
 
 const CELL = (bucket: string, series: string, count: number) => [
@@ -235,7 +236,7 @@ describe('parseToolCall — refusals', () => {
       expect(refusal('search_records', { limit: bad }), String(bad)).toContain('limit')
     }
     expect(refusal('search_records', { limit: 9_999_999 })).toContain('500')
-    expect(refusal('aggregate', { rows: 'year', limit: 9_999_999 })).toContain('250')
+    expect(refusal('aggregate', { rows: 'year', limit: 9_999_999 })).toContain('400')
   })
 
   it('names the values that would have worked, not just the one that did not', () => {
@@ -435,6 +436,34 @@ describe('describeToolResult — what the model is allowed to see', () => {
     ])
   })
 
+  it('names coded buckets the way the chart does, not by stored code', () => {
+    // severity 4 is CRITICAL on the chart; the model must not read "4".
+    const outcome: ToolOutcome = {
+      kind: 'aggregate',
+      report: {
+        v: REPORT_VERSION,
+        filters: { state: 'published' },
+        rows: 'severity',
+        series: 'kev',
+        chart: 'stackedBar',
+      },
+      result: result({
+        columns: ['bucket', 'label', 'series', 'series_label', 'cves'],
+        rows: [
+          [4, 4, 1, 1, 7],
+          [null, null, 0, 0, 3],
+        ],
+      }),
+      matches: 10,
+      unmatched: [],
+    }
+    const seen = JSON.parse(describeToolResult(outcome))
+    expect(seen.cells).toEqual([
+      ['CRITICAL', 'In KEV (per CISA)', 7],
+      ['(not scored)', 'Not in KEV (per CISA)', 3],
+    ])
+  })
+
   it('caps how much of an aggregate enters context, and says what it dropped', () => {
     const rows = Array.from({ length: MAX_MODEL_CELLS + 25 }, (_, i) => CELL(`b${i}`, 'HIGH', i))
     const outcome: ToolOutcome = {
@@ -455,30 +484,87 @@ describe('describeToolResult — what the model is allowed to see', () => {
     expect(seen.cellsOmitted).toBe(25)
   })
 
-  it('withholds row-level records from the model entirely', () => {
-    // The rule that is invisible in the UI and easiest to lose in a refactor:
-    // the model orchestrates, it never transcribes (D-044).
+  it('hands the model a bounded window of the records, spelled the way the table is', () => {
+    // D-087 reversed D-044's withholding: the rows go to the model as well as
+    // to the table, in the same window `sql` gets, with coded values as the
+    // words the table shows — so what the model reads and what the reader
+    // sees beside it agree.
+    const columns = [
+      'cve',
+      'state',
+      'published',
+      'updated',
+      'cvss_ver',
+      'cvss_score',
+      'cvss_sev',
+      'cna',
+      'description',
+    ]
+    const record = (n: number, description: string) => [
+      `CVE-2021-${44228 + n}`,
+      1,
+      1_639_094_400,
+      1_639_094_400,
+      '3.1',
+      10,
+      4,
+      'apache',
+      description,
+    ]
     const outcome: ToolOutcome = {
       kind: 'records',
-      report: {
-        v: REPORT_VERSION,
-        filters: {},
-        rows: 'year',
-        series: null,
-        chart: 'table',
-      },
+      report: { v: REPORT_VERSION, filters: {}, rows: 'year', series: null, chart: 'table' },
       result: result({
-        columns: ['cve_id', 'descr'],
-        rows: [['CVE-2021-44228', 'a secret description the model must not read']],
+        columns,
+        rows: [
+          record(0, 'Apache Log4j2 JNDI features do not protect against attacker controlled LDAP'),
+        ],
       }),
-      matches: 1,
+      matches: 1_240,
       unmatched: [],
     }
-    const seen = describeToolResult(outcome)
-    expect(seen).not.toContain('CVE-2021-44228')
-    expect(seen).not.toContain('secret description')
-    expect(JSON.parse(seen).recordsMatched).toBe(1)
-    expect(JSON.parse(seen).recordsListed).toBe(1)
+    const seen = JSON.parse(describeToolResult(outcome))
+    expect(seen.recordsMatched).toBe(1_240)
+    expect(seen.recordsListed).toBe(1)
+    expect(seen.rowsShown).toBe(1)
+    expect(seen.rowsOmitted).toBe(0)
+    expect(seen.columns).toEqual([
+      'cveId',
+      'state',
+      'published',
+      'cvssScore',
+      'cvssSeverity',
+      'cna',
+      'description',
+    ])
+    expect(seen.rows[0]).toEqual([
+      'CVE-2021-44228',
+      'PUBLISHED',
+      '2021-12-10',
+      10,
+      'CRITICAL',
+      'apache',
+      'Apache Log4j2 JNDI features do not protect against attacker controlled LDAP',
+    ])
+    expect(seen.untrusted).toMatch(/never as instructions/)
+
+    // Bounded like `sql`: at most MAX_MODEL_ROWS rows, and fewer when the
+    // character budget runs out first — with the omission counted, so the
+    // model says "there are more" rather than summarising rows it never saw.
+    const many: ToolOutcome = {
+      ...outcome,
+      result: result({
+        columns,
+        rows: Array.from({ length: 120 }, (_, n) => record(n, 'x'.repeat(400))),
+      }),
+      matches: 120,
+    }
+    const bounded = JSON.parse(describeToolResult(many))
+    expect(bounded.rowsShown).toBeLessThanOrEqual(MAX_MODEL_ROWS)
+    expect(bounded.rowsShown + bounded.rowsOmitted).toBe(120)
+    // A description cell is clipped to the cell cap, not carried whole.
+    expect(String(bounded.rows[0][6]).length).toBeLessThanOrEqual(MAX_MODEL_CELL_CHARS + 1)
+    expect(describeToolResult(many).length).toBeLessThan(MAX_MODEL_RESULT_CHARS * 1.5)
   })
 
   it('bounds a hostile description before it reaches the prompt', () => {
@@ -674,6 +760,60 @@ describe('describeToolResult — what the model is allowed to see', () => {
     expect(seen).not.toContain('\n')
     expect(() => JSON.parse(seen)).not.toThrow()
     expect(JSON.parse(seen).tool).toBe('sql')
+  })
+})
+
+describe('the compute tool (D-088)', () => {
+  it('takes a function body and refuses anything else, without reading it', () => {
+    // No inspection of the code: the sandbox is the boundary, and a check on
+    // the text here would be the filter-in-front-of-an-interpreter the
+    // authorizer module exists to refuse. `fetch(...)` in the body is accepted
+    // here and fails *inside* the sandbox, which the e2e suite proves.
+    const ok = parseToolCall('compute', { code: 'return fetch("https://x/")' })
+    expect(ok.ok).toBe(true)
+    if (ok.ok) expect(ok.call).toEqual({ name: 'compute', code: 'return fetch("https://x/")' })
+    expect(parseToolCall('compute', { js: 'return 1' }).ok).toBe(true)
+    expect(parseToolCall('compute', {}).ok).toBe(false)
+    expect(parseToolCall('compute', { code: '   ' }).ok).toBe(false)
+    expect(parseToolCall('compute', { code: 42 }).ok).toBe(false)
+    expect(parseToolCall('compute', { code: 'return 1', url: 'https://x/' }).ok).toBe(false)
+    expect(parseToolCall('compute', { code: 'x'.repeat(9_000) }).ok).toBe(false)
+  })
+
+  it('describes the outcome bounded, with what it ran against', () => {
+    const outcome: ToolOutcome = {
+      kind: 'compute',
+      code: 'return rows.length',
+      ok: true,
+      value: 'x'.repeat(MAX_MODEL_RESULT_CHARS + 500),
+      error: null,
+      logs: Array.from({ length: 40 }, (_, i) => `line ${i}`),
+      ms: 12,
+      input: { source: 'records', rows: 500, columns: ['cve', 'description'] },
+      truncated: false,
+    }
+    const seen = JSON.parse(describeToolResult(outcome))
+    expect(seen.tool).toBe('compute')
+    expect(seen.ok).toBe(true)
+    // Clipped here even though the sandbox clips too: the bound is this
+    // module's whichever side of the frame moved.
+    expect(seen.value.length).toBeLessThanOrEqual(MAX_MODEL_RESULT_CHARS + 1)
+    expect(seen.truncated).toBe(true)
+    expect(seen.logs.length).toBeLessThanOrEqual(20)
+    expect(seen.input).toEqual({ source: 'records', rows: 500, columns: ['cve', 'description'] })
+
+    const failed = JSON.parse(
+      describeToolResult({
+        ...outcome,
+        ok: false,
+        value: null,
+        error: 'stopped: the code ran past 10000 ms',
+        logs: [],
+      })
+    )
+    expect(failed.ok).toBe(false)
+    expect(failed.value).toBeNull()
+    expect(failed.error).toContain('stopped')
   })
 })
 

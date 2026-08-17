@@ -1,0 +1,51 @@
+# CVE Explorer (cve.meenan.dev)
+
+> Browser-based search, analysis and AI chat over the complete CVE List
+> (cvelistV5, 370,000+ records) with a CISA KEV overlay. The data plane runs in
+> the browser: the corpus is a SQLite database downloaded into the browser's
+> storage and queried locally; before that download, a read-only hosted tier on
+> this site answers the same SQL. No telemetry.
+
+## For AI agents driving the page
+
+The page exposes the same six read-only tools its built-in chat uses, two ways:
+
+- **WebMCP** (`document.modelContext`, Chrome 146+ behind a flag or origin
+  trial; `navigator.modelContext` before Chrome 150): tools `cve_explorer_guide`,
+  `aggregate`, `search_records`, `cve_detail`, `kev_lookup`, `sql`, `compute`.
+  Every one is annotated `readOnlyHint: true`; every one but the guide
+  `untrustedContentHint: true`, because tool output is CVE record text.
+- **`window.cveExplorer`** (any extension with a JavaScript tool):
+  `tools()` lists the tools with JSON Schemas; `call(name, args)` runs one and
+  resolves to the same text a WebMCP execute would return; `guide()` returns the
+  full guide (rules, dimensions, dates); `schema` is the SQLite schema brief;
+  `last()` returns the most recent result whole — every row the query layer
+  returned for the last aggregate, record search or SQL, its columns, SQL and
+  match count, as a copy — for an agent that would rather process the data in
+  its own code; `ready` is false until a copy of the corpus can answer.
+
+`compute` runs a JavaScript function body over the full rows of that same most
+recent result — `rows` (arrays), `columns`, `data` (objects keyed by column);
+`return` a JSON-serialisable value — inside an iframe with an opaque origin and
+a `default-src 'none'` CSP: no network, no cookies, no storage, no OPFS, a
+10-second deadline enforced by terminating the worker, output cut at 12,000
+characters. It is for what a query cannot express or you already have the data
+for; prefer `sql` when SQLite can answer directly.
+
+Results are rendered on the page as well as returned: an `aggregate` becomes the
+chart on the canvas, a `search_records` becomes the record list, `cve_detail`
+opens the record, and `sql` fills the SQL panel. What is returned is a bounded
+window of what was rendered — an aggregate's cells, up to 50 rows of a record
+search or a SQL result within a character budget, a whole record for
+`cve_detail` — with the count of what lies outside the window (`rowsOmitted`,
+`cellsOmitted`, `recordsMatched`) stated, so narrow the question rather than
+guess at rows you were not given. Nothing here writes, fetches a URL, or
+reaches the network beyond the site's own read-only hosted query endpoint.
+
+Read `cve_explorer_guide` (or `window.cveExplorer.guide()`) first: it carries
+the schema, the dimension vocabulary and the date rules the tools expect.
+
+## Source
+
+- https://github.com/CVEProject/cvelistV5 — the corpus (MITRE's CVE terms apply)
+- https://www.cisa.gov/known-exploited-vulnerabilities-catalog — the KEV overlay (CC0)

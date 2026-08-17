@@ -172,7 +172,15 @@ export function DateRangeField({
           onKeyDown={(event) => {
             if (event.key === 'Enter') {
               event.preventDefault()
-              if (applyTyped(edge, typed)) setEditing(null)
+              if (applyTyped(edge, typed)) {
+                setEditing(null)
+                // The commit re-runs the report, which disables this box, and
+                // Firefox fires `blur` on a focused input that becomes disabled
+                // — so without this the blur handler above would see a changed
+                // box and commit the same edit a second time (a second, identical
+                // query, seen only on that engine).
+                atFocus.current = typed
+              }
             } else if (event.key === 'Escape' && editing === edge) {
               event.preventDefault()
               setEditing(null)

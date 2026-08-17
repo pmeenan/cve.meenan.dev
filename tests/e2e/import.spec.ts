@@ -41,8 +41,9 @@ test('imports, queries, and survives a reload', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'CVE Explorer' })).toBeVisible()
 
   await test.step('import', async () => {
-    // The landing view's CTA — the workspace and its Data panel do not exist
-    // until the import below produces a usable copy.
+    // The landing view's CTA — the workspace and the footer's Data &
+    // diagnostics disclosure do not exist until the import below produces a
+    // usable copy.
     await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
       timeout: 60_000,
     })
@@ -67,9 +68,9 @@ test('imports, queries, and survives a reload', async ({ page }) => {
     // placeholder an unmeasurable phase renders.
     await expect(page.locator('.progress .fill')).toHaveAttribute('data-indeterminate', 'false')
 
-    // The Import heading lives inside the Data panel, which opens itself on
-    // the import that filled it — so this asserts the import and the panel
-    // behaviour at once.
+    // The Import heading lives inside the footer's Data & diagnostics
+    // disclosure, which opens itself on the import that filled it — so this
+    // asserts the import and the disclosure behaviour at once.
     await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
 
     const timings = await page.locator('.timings').innerText()
@@ -162,11 +163,13 @@ test('imports, queries, and survives a reload', async ({ page }) => {
   await test.step('persistence, notice included (D-008)', async () => {
     await page.reload()
     // No download this time: the page comes straight back up ready, and the
-    // query runs against what OPFS kept. The Data panel is closed after a
-    // reload — it opens itself only on an import — so open it, and check that
-    // its download button reports an existing local copy ("Re-download", not
-    // "Download"). The generous enabled-timeout covers the report the canvas
-    // auto-runs when a copy first becomes ready.
+    // query runs against what OPFS kept. The footer's Data & diagnostics
+    // disclosure is closed after a reload — it opens itself only on an import
+    // — so open it, and check that its download button reports an existing
+    // local copy ("Re-download", not "Download"). The generous enabled-timeout
+    // covers the report the canvas auto-runs when a copy first becomes ready
+    // and, on a copy more than twelve hours behind, the sync the page then
+    // posts by itself (UI polish, 2026-08-16).
     await expect(page.locator('main')).toHaveAttribute('data-status', 'ready', {
       timeout: 30_000,
     })

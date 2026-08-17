@@ -42,9 +42,9 @@ const question = BENCH_QUESTIONS.find((entry) => entry.id === 'severity-over-tim
 const counted = BENCH_QUESTIONS.find((entry) => entry.id === 'cisco-criticals')!
 
 describe('the question set', () => {
-  it('has ten questions with unique ids', () => {
-    expect(BENCH_QUESTIONS).toHaveLength(10)
-    expect(new Set(BENCH_QUESTIONS.map((entry) => entry.id)).size).toBe(10)
+  it('has eleven questions with unique ids', () => {
+    expect(BENCH_QUESTIONS).toHaveLength(11)
+    expect(new Set(BENCH_QUESTIONS.map((entry) => entry.id)).size).toBe(11)
   })
 
   it('exercises every tool at least once (D-046)', () => {
@@ -141,6 +141,46 @@ describe('the question set', () => {
 })
 
 describe('scoreQuestion', () => {
+  it('accepts a grounded answer through an `also` route, and says so', () => {
+    // The compute question (D-088) is a ratio over a result set; a model that
+    // writes it as one SELECT has answered well. Scored as a tool match with
+    // the route in the note, so a scorecard reader sees which way it went —
+    // and a wrong number through either route is still wrong.
+    const computed = BENCH_QUESTIONS.find((entry) => entry.id === 'compute-perfect-share')!
+    const truth = [[0.12]]
+    const viaCompute = scoreQuestion(
+      computed,
+      [step({ tool: 'search_records', cells: [] }), step({ tool: 'compute', cells: [['0.12']] })],
+      truth,
+      1,
+      900
+    )
+    expect(viaCompute.toolMatch).toBe(true)
+    expect(viaCompute.dataMatch).toBe(true)
+    expect(viaCompute.note).toBe('exact')
+    const viaSql = scoreQuestion(computed, [step({ tool: 'sql', cells: [[0.12]] })], truth, 1, 900)
+    expect(viaSql.toolMatch).toBe(true)
+    expect(viaSql.dataMatch).toBe(true)
+    expect(viaSql.note).toBe('exact (via sql)')
+    const wrong = scoreQuestion(computed, [step({ tool: 'sql', cells: [[0.5]] })], truth, 1, 900)
+    expect(wrong.toolMatch).toBe(true)
+    expect(wrong.dataMatch).toBe(false)
+    expect(wrong.note).toMatch(/via sql/)
+    // The final answer is what is scored: a wrong compute the model then
+    // corrected with SQL is a right answer via sql, not a wrong one via compute.
+    const corrected = scoreQuestion(
+      computed,
+      [step({ tool: 'compute', cells: [['0.9']] }), step({ tool: 'sql', cells: [[0.12]] })],
+      truth,
+      2,
+      900
+    )
+    expect(corrected.dataMatch).toBe(true)
+    expect(corrected.note).toBe('exact (via sql)')
+    const other = scoreQuestion(computed, [step({ tool: 'aggregate' })], truth, 1, 900)
+    expect(other.toolMatch).toBe(false)
+  })
+
   it('scores a correct top-N chart as correct', () => {
     // The correction that matters: `crossSql` narrows each axis by design, so a
     // chart shows 12 of 336 months. Set equality would fail every right answer

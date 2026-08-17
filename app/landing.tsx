@@ -93,9 +93,9 @@ export function Landing({
         <div className="feature">
           <h3>The whole corpus, filterable</h3>
           <p>
-            Filter 370,000+ records by vendor, product, CWE, CVSS, SSVC, dates and full text — with
-            CISA&rsquo;s Known Exploited Vulnerabilities catalog overlaid, and a raw SQL console
-            when you want it.
+            370,000+ records by vendor, product and date at a click, and by CWE, CVSS, SSVC and full
+            text through chat or SQL — with CISA&rsquo;s Known Exploited Vulnerabilities catalog
+            overlaid.
           </p>
         </div>
         <div className="feature">

@@ -1,7 +1,7 @@
 /**
  * The tool-calling benchmark (D-046, M7).
  *
- * Ten analyst questions, each with **hand-written SQL ground truth** computed
+ * Eleven analyst questions, each with **hand-written SQL ground truth** computed
  * against the real corpus in the same browser, in the same session, moments
  * apart. Scoring is a data comparison — no LLM judge — which is what D-044's
  * report definitions bought: the model's output is a definition and a result
@@ -15,7 +15,7 @@
  * local copy the model just queried, and the comparison is between two answers
  * to the same question at the same moment.
  *
- * **"Over time" has three right answers.** Year, quarter and month are all
+ * **"Over time" has four right answers.** Year, quarter, month and week are all
  * legitimate readings, and a benchmark that demanded one would be scoring
  * prompt-guessing rather than tool use. So a question can accept a *set* of
  * axes, and the truth SQL is written per grain — still hand-written, just three
@@ -52,6 +52,14 @@ export interface BenchQuestion {
   what: string
   /** The tool a grounded answer has to go through. */
   tool: ToolName
+  /**
+   * Other tools through which a grounded answer is *also* correct — scored as
+   * a tool match, with the route noted. For the `compute` question, `sql`: a
+   * model that writes the whole thing as one SELECT has answered well, and a
+   * benchmark that called that wrong would be scoring our preference for
+   * one route over the answer (the `cisco-criticals` tension, made explicit).
+   */
+  also?: readonly ToolName[]
   compare: Compare
   /**
    * Which `rows` axes are acceptable. Absent means the axis is not scored —
@@ -83,6 +91,7 @@ const GRAIN: Record<string, string> = {
   quarter:
     "strftime('%Y', c.published, 'unixepoch') || '-Q' || " +
     "((CAST(strftime('%m', c.published, 'unixepoch') AS INTEGER) + 2) / 3)",
+  week: "date(c.published, 'unixepoch', 'weekday 0', '-6 days')",
 }
 
 /**
@@ -128,7 +137,7 @@ export const BENCH_QUESTIONS: readonly BenchQuestion[] = [
     what: "D-046 item #1 — the owner's founding question, and the milestone's exit criterion",
     tool: 'aggregate',
     compare: 'cells',
-    rows: ['year', 'quarter', 'month'],
+    rows: ['year', 'quarter', 'month', 'week'],
     series: 'severity',
     truth: (rows) =>
       `SELECT ${isTimeGrain(rows) ? GRAIN[rows as string] : GRAIN.year} AS bucket, ` +
@@ -252,6 +261,21 @@ export const BENCH_QUESTIONS: readonly BenchQuestion[] = [
       `SELECT max(cvss_score), count(*) FROM cve WHERE state = 1 AND cvss_score = ` +
       `(SELECT max(cvss_score) FROM cve WHERE state = 1)`,
   },
+  {
+    id: 'compute-perfect-share',
+    ask:
+      'Of the 200 most recently published CRITICAL CVEs, what share have a CVSS score of ' +
+      'exactly 10.0? Give it as a decimal fraction rounded to two places.',
+    what:
+      'a ratio over a result set — the shape the compute tool exists for (D-088): list the ' +
+      'records, then work on the rows; one SELECT is also a grounded route, and is accepted',
+    tool: 'compute',
+    also: ['sql'],
+    compare: 'row',
+    truth: () =>
+      `SELECT round(1.0 * sum(CASE WHEN cvss_score = 10 THEN 1 ELSE 0 END) / count(*), 2) FROM ` +
+      `(SELECT cvss_score FROM cve WHERE state = 1 AND cvss_sev = 4 ORDER BY published DESC LIMIT 200)`,
+  },
 ]
 
 /** What the panel exposes per step, so a score is read from data and not from prose. */
@@ -318,8 +342,17 @@ export function scoreQuestion(
   ms: number
 ): Score {
   const called = steps.map((step) => step.tool)
-  const step = steps.find((entry) => entry.tool === question.tool && entry.status === 'done')
+  // The model's *final* grounded answer, through any accepted route: the last
+  // completed step whose tool is the preferred one or an `also`. Last, not
+  // first — a model that computes wrongly and then corrects itself with SQL
+  // has answered with the SQL, and scoring its abandoned first attempt would
+  // score the retry as the failure it recovered from.
+  const accepted = new Set<string>([question.tool, ...(question.also ?? [])])
+  const step = [...steps]
+    .reverse()
+    .find((entry) => accepted.has(entry.tool) && entry.status === 'done')
   const base = { id: question.id, expected: question.tool, called, turns, ms }
+  const via = step && step.tool !== question.tool ? ` (via ${step.tool})` : ''
 
   if (!step) {
     return {
@@ -357,7 +390,7 @@ export function scoreQuestion(
       axesMatch,
       dataMatch,
       coverage: null,
-      note: dataMatch ? 'exact' : difference(got, want),
+      note: (dataMatch ? 'exact' : difference(got, want)) + via,
     }
   }
 

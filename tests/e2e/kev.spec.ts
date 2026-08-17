@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
-import { awaitIdle, importCorpus, openPanel } from './ui'
+import { agentCall, awaitIdle, importCorpus, openPanel } from './ui'
 
 /**
  * The CISA KEV overlay, in a browser (M6, D-010, D-076).
@@ -69,31 +69,28 @@ test.describe('CISA KEV overlay', () => {
     })
 
     await test.step('membership is filterable and the counts agree (M3’s pattern)', async () => {
-      await openPanel(page, 'filters')
-      // Grouped count first, then the filter, then the two have to agree — the
-      // check that would catch a filter and an aggregate disagreeing about what
-      // "in KEV" means.
-      await page.locator('#explore-group').selectOption('kev')
-      await page.getByRole('button', { name: 'List records' }).click()
-      const rows = page.locator('.results tbody tr')
-      await expect(rows.first()).toBeVisible({ timeout: 180_000 })
-      const grouped = await rows.first().innerText()
+      // There is no filter drawer any more: membership is asked for through
+      // the agent surface (D-086), the same `aggregate` / `search_records`
+      // calls chat makes, and the answer lands on the canvas. Grouped count
+      // first, then the filter, then the two have to agree — the check that
+      // would catch a filter and an aggregate disagreeing about what "in KEV"
+      // means.
+      const grouped = await agentCall(page, 'aggregate', { rows: 'kev' })
+      expect(grouped.refused).toBeUndefined()
+      const cells = grouped.cells as [string, number][]
+      expect(cells.length).toBeGreaterThan(0)
       // The listed band is first on the axis: it is the small one, and a stack's
-      // baseline is the only position a reader can compare across buckets.
-      expect(grouped).toContain('In KEV')
-      const listedCount = Number(grouped.replace(/[^\d]/g, ''))
+      // baseline is the only position a reader can compare across buckets. The
+      // canvas's audit table carries the label; the tool result carries the
+      // count in the same order.
+      const labels = page.locator('.chart-data tbody tr th')
+      await expect(labels.first()).toContainText('In KEV', { timeout: 180_000 })
+      const listedCount = cells[0]![1]
       expect(listedCount).toBeGreaterThan(0)
 
-      // `exact`, because "In KEV (per CISA)" is a substring of "Not in KEV
-      // (per CISA)" — which is inherent to the clearest possible pair of
-      // labels, so the test accommodates it rather than the labels getting
-      // worse.
-      await page
-        .getByRole('group', { name: 'CISA KEV', exact: true })
-        .getByLabel('In KEV (per CISA)', { exact: true })
-        .check()
-      await page.locator('#explore-group').selectOption('')
-      await page.getByRole('button', { name: 'List records' }).click()
+      const listed = await agentCall(page, 'search_records', { kev: ['in kev'] })
+      expect(listed.recordsMatched).toBe(listedCount)
+      // …and the record list on the canvas is the same answer.
       await expect(page.locator('[data-matches]')).toHaveAttribute(
         'data-matches',
         String(listedCount),
@@ -102,13 +99,10 @@ test.describe('CISA KEV overlay', () => {
     })
 
     await test.step('a KEV × severity report renders reconciled with its table', async () => {
-      // One form now drives both shapes (UI revamp), so the KEV membership
-      // filter checked above would knock the "Not in KEV" band off this chart.
-      // Clear it first: the report must see the whole denominator.
-      await page.getByRole('button', { name: 'Reset filters' }).click()
-      await page.locator('#report-rows').selectOption('kev')
-      await page.locator('#report-series').selectOption('severity')
-      await page.getByRole('button', { name: 'Run report' }).click()
+      // No membership filter on this one: the report must see the whole
+      // denominator, and a filter would knock the "Not in KEV" band off it.
+      const cross = await agentCall(page, 'aggregate', { rows: 'kev', series: 'severity' })
+      expect(cross.refused).toBeUndefined()
       const chart = page.locator('[data-chart]')
       await expect(chart).toBeVisible({ timeout: 180_000 })
       // Both membership bands on the chart. A KEV chart showing only the listed
@@ -121,13 +115,8 @@ test.describe('CISA KEV overlay', () => {
 
     await test.step('the detail view renders the KEV block under the reference hardening', async () => {
       // The listed record is found through the KEV filter rather than named, so
-      // this works against either data plane — re-checked here because the
-      // report step reset the shared form.
-      await page
-        .getByRole('group', { name: 'CISA KEV', exact: true })
-        .getByLabel('In KEV (per CISA)', { exact: true })
-        .check()
-      await page.getByRole('button', { name: 'List records' }).click()
+      // this works against either data plane.
+      await agentCall(page, 'search_records', { kev: ['in kev'] })
       const first = page.locator('.results.records tbody button').first()
       await expect(first).toBeVisible({ timeout: 180_000 })
       await first.click()
@@ -173,6 +162,12 @@ test.describe('CISA KEV overlay', () => {
       // handshake.
       const second = await page.context().newPage()
       await second.goto('/')
+      // The KEV line lives in the footer's Data & diagnostics disclosure now
+      // (UI polish, 2026-08-16), closed on a fresh tab: open it to see it.
+      await expect(second.locator('main')).toHaveAttribute('data-tier', 'local', {
+        timeout: 180_000,
+      })
+      await openPanel(second, 'data')
       const secondLine = second.locator('[data-kev]')
       await expect(secondLine).toBeVisible({ timeout: 180_000 })
       const [a, b] = await Promise.all([
@@ -198,6 +193,10 @@ test.describe('CISA KEV overlay', () => {
       await page.context().setOffline(true)
       const reopened = await page.context().newPage()
       await reopened.goto('/')
+      await expect(reopened.locator('main')).toHaveAttribute('data-tier', 'local', {
+        timeout: 180_000,
+      })
+      await openPanel(reopened, 'data')
       const line = reopened.locator('[data-kev]')
       await expect(line).toBeVisible({ timeout: 180_000 })
       await expect(line).not.toHaveAttribute('data-kev', 'none')
@@ -217,9 +216,12 @@ test.describe('CISA KEV overlay', () => {
     await requireLocalStorage(page)
     test.skip(!(await catalogPresent(page)), 'this data plane serves no kev.json')
 
-    // The data panel opens itself on the import that filled it, which is where
-    // "Refresh KEV" and "Run query" live now.
+    // The footer's Data & diagnostics disclosure opens itself on the import
+    // that filled it, and it is where "Refresh KEV", "Run query" and the KEV
+    // freshness line live now — opened explicitly so this does not lean on
+    // that behaviour.
     await importCorpus(page, 300_000)
+    await openPanel(page, 'data')
     const line = page.locator('[data-kev]')
     await expect(line).toBeVisible({ timeout: 300_000 })
     const before = await line.getAttribute('data-kev')
@@ -279,15 +281,16 @@ test.describe('CISA KEV overlay', () => {
     await importCorpus(page, 300_000)
     await awaitIdle(page, 60_000)
 
-    await openPanel(page, 'filters')
-    await page.locator('#explore-group').selectOption('kev')
-    await page.getByRole('button', { name: 'List records' }).click()
-    // By name, and actionable: the message says what to do and that nothing
-    // else about the copy is affected.
-    await expect(page.locator('[data-error="1"]')).toContainText('no CISA KEV catalog', {
-      timeout: 120_000,
-    })
-    await expect(page.locator('[data-error="1"]')).toContainText('Refresh KEV')
+    // A KEV question through the agent surface (D-086) — the same Worker gate
+    // a chat tool call and a permalink reach — comes back as a refusal, by
+    // name and actionable: the reason says what to do and that nothing else
+    // about the copy is affected. This is the M7 rule one level up: a copy
+    // that cannot answer says so rather than answering that nothing is known
+    // to be exploited (D-077).
+    const listed = await agentCall(page, 'search_records', { kev: ['in kev'] })
+    expect(listed.refused).toBe(true)
+    expect(String(listed.reason)).toContain('no CISA KEV catalog')
+    expect(String(listed.reason)).toContain('Refresh KEV')
 
     await test.step('and every other KEV surface refuses the same way', async () => {
       // The record-list path is not the only gate. A report, an export and the
@@ -296,26 +299,29 @@ test.describe('CISA KEV overlay', () => {
       // catalog-less copy would die with `no such table` — which is the
       // "makes the overlay's absence look like a broken record" failure its
       // own comment names.
-      await page.locator('#report-rows').selectOption('kev')
-      await page.getByRole('button', { name: 'Run report' }).click()
-      await expect(page.locator('[data-error="1"]')).toContainText('no CISA KEV catalog', {
-        timeout: 120_000,
-      })
+      const grouped = await agentCall(page, 'aggregate', { rows: 'kev' })
+      expect(grouped.refused).toBe(true)
+      expect(String(grouped.reason)).toContain('no CISA KEV catalog')
+      const ransomware = await agentCall(page, 'search_records', { kevRansomware: ['known'] })
+      expect(ransomware.refused).toBe(true)
+      expect(String(ransomware.reason)).toContain('no CISA KEV catalog')
 
-      await page.locator('#explore-group').selectOption('')
-      await page.getByRole('button', { name: 'List records' }).click()
+      const records = await agentCall(page, 'search_records', {})
+      expect(records.refused).toBeUndefined()
       const first = page.locator('.results.records tbody button').first()
       await expect(first).toBeVisible({ timeout: 180_000 })
       await first.click()
       // Opens, renders, and simply has no KEV block.
       await expect(page.locator('[data-detail]')).toBeVisible({ timeout: 60_000 })
+      await expect(page.locator('[data-detail-loaded]')).toBeVisible({ timeout: 60_000 })
       await expect(page.locator('[data-kev-entry]')).toHaveCount(0)
     })
 
     await test.step('while every other query still works', async () => {
-      await page.locator('#explore-group').selectOption('severity')
-      await page.getByRole('button', { name: 'List records' }).click()
-      await expect(page.locator('.results tbody tr').first()).toBeVisible({
+      const bySeverity = await agentCall(page, 'aggregate', { rows: 'severity' })
+      expect(bySeverity.refused).toBeUndefined()
+      expect((bySeverity.cells as unknown[]).length).toBeGreaterThan(0)
+      await expect(page.locator('.chart-data tbody tr').first()).toBeAttached({
         timeout: 180_000,
       })
     })

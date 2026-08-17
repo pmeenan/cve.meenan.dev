@@ -40,6 +40,7 @@ import {
   type SortKey,
   type StateFilter,
 } from './filters'
+import { daySeconds, secondsToDay, yearsBack } from './dates'
 
 /**
  * The definition's own version.
@@ -58,6 +59,17 @@ export type ChartType = (typeof CHART_TYPES)[number]
 export const CHART_ROWS = 12
 /** The cap a table view asks for. Bounded again in `crossSql`. */
 export const TABLE_ROWS = 250
+/**
+ * The cap a time-bucketed chart asks for. Time buckets are bounded by the date
+ * range rather than by a top-N, so the canvas asks for the whole window —
+ * seven years of weeks — and coarsens the grain when a window would not fit
+ * (`fitGrain`, lib/dates.ts) rather than let `crossSql` cut the old end.
+ * Bounded again there (`CROSS_ROW_LIMIT`).
+ */
+export const TIME_ROWS = 400
+
+/** How far back the workspace's opening report looks: the "2 yr" quick range. */
+export const DEFAULT_YEARS = 2
 
 export interface Report {
   v: number
@@ -89,19 +101,32 @@ export function emptyReport(): Report {
 
 /**
  * The report a fresh workspace opens with (UI revamp): CVE counts by severity
- * over time, the founding question, across every published year. Used only
- * when there is no history to resume — a returning visitor gets their own most
- * recent report instead.
+ * over time, the founding question — by week, over the last two years
+ * (UI polish, 2026-08-16). Used when there is no history to resume, and by
+ * the canvas's Reset.
+ *
+ * `now` is unix milliseconds, so the window is anchored to the day this is
+ * called and the caller (a React effect, never a render body) decides when
+ * that is. The lower edge is what the strip's "2 yr" quick range would set
+ * (`yearsBack`: the Monday of the week two years back, so the first weekly
+ * bucket is whole), which is what lets that button read pressed on opening.
+ * Without a clock the report is unbounded, which is what a unit test that
+ * only wants the shape asks for.
  */
-export function defaultReport(): Report {
+export function defaultReport(now?: number): Report {
+  const filters: Filters = { state: 'published' }
+  if (now !== undefined) {
+    const today = secondsToDay(Math.floor(now / 1000))
+    if (today) filters.publishedFrom = daySeconds(yearsBack(today, DEFAULT_YEARS))
+  }
   return {
     v: REPORT_VERSION,
     title: 'CVEs by severity over time',
-    filters: { state: 'published' },
-    rows: 'year',
+    filters,
+    rows: 'week',
     series: 'severity',
     chart: 'stackedBar',
-    limit: 48,
+    limit: TIME_ROWS,
   }
 }
 

@@ -7,6 +7,9 @@
  */
 
 import type { CapabilityReport } from './capabilities'
+import type { Catalog } from './catalog'
+
+export type { Catalog } from './catalog'
 import type { Dimension, Filters, SortKey, StateFilter } from './filters'
 import type { ExportFormat } from './export'
 import type { KevStatus } from './kev'
@@ -548,6 +551,35 @@ export type ToolCall =
   | { name: 'cve_detail'; cveId: string }
   | { name: 'kev_lookup'; cveId: string }
   | { name: 'sql'; sql: string }
+  /**
+   * JavaScript over the most recent result, in the page's sandbox (D-088) —
+   * the one tool the Worker never sees: `page.tsx` routes it to
+   * `lib/sandbox.ts` before the `tool` message would be sent.
+   */
+  | { name: 'compute'; code: string }
+
+/**
+ * The most recent result, whole (D-088): what `window.cveExplorer.last()`
+ * returns and what the `compute` tool runs against. Every rows-producing
+ * surface writes it — a canvas report or record list, a chat or agent
+ * `aggregate` / `search_records` / `sql`, the SQL console — so "the last
+ * query" means the last thing that ran, whoever ran it.
+ */
+export interface LastResult {
+  /** What produced it: an aggregate, a record search, or SQL (tool or console). */
+  source: 'aggregate' | 'records' | 'sql'
+  columns: string[]
+  /** Every row the query layer returned — bounded by its own caps, not the model's window. */
+  rows: unknown[][]
+  /** Records the filter matched, where the source counted them. */
+  matches: number | null
+  truncated: boolean
+  sql: string
+  /** The definition, for an aggregate or a record search. */
+  report?: Report
+  /** Unix milliseconds. */
+  at: number
+}
 
 /**
  * What a tool did, as the Worker reports it.
@@ -594,6 +626,22 @@ export type ToolOutcome =
        * is called.
        */
       known: boolean
+    }
+  | {
+      kind: 'compute'
+      code: string
+      ok: boolean
+      /** The returned value as JSON text, clipped; null when it threw or returned nothing. */
+      value: string | null
+      error: string | null
+      /** `console.log` lines the code wrote, bounded. */
+      logs: string[]
+      /** Wall-clock in the sandbox. */
+      ms: number
+      /** What it ran against. */
+      input: { source: LastResult['source'] | null; rows: number; columns: string[] }
+      /** The value was cut at the output cap. */
+      truncated: boolean
     }
   | { kind: 'sql'; result: QueryResult }
   | { kind: 'refused'; tool: string; error: string }
@@ -642,6 +690,13 @@ export type Request =
    * ranges whose only possible answer is an empty chart.
    */
   | { type: 'coverage' }
+  /**
+   * Every vendor and product name the answering copy holds, for the canvas
+   * pickers (UI polish, 2026-08-16). Read once per state of the copy, like
+   * `coverage`, and searched in memory on the page — never queried per
+   * keystroke. Answered with `catalog: null` when it cannot be read.
+   */
+  | { type: 'catalog' }
   | { type: 'bench' }
   /**
    * What this browser can do and what its storage looks like (M5).
@@ -907,6 +962,7 @@ export type Response =
       kev?: KevStatus | null
     }
   | { type: 'coverage'; coverage: Coverage }
+  | { type: 'catalog'; catalog: Catalog | null }
   | { type: 'bench'; results: BenchResult[]; wasmHeapBytes: number }
   | {
       type: 'error'

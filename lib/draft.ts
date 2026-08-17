@@ -260,25 +260,23 @@ export interface Chip {
 /**
  * Describe a draft as chips.
  *
- * The record-state chip is always present. D-022's PUBLISHED-only default is
- * the single filter that changes every number on screen, and a default that is
- * *implied* is a default nobody checks — so it is stated in the same row as
- * everything the user chose, and states which of the three it is.
+ * The record-state chip appears only when the state is *not* D-022's
+ * PUBLISHED-only default (UI polish, 2026-08-16): the default used to be
+ * stated as a standing chip on every report, and it read as noise to a
+ * consumer. A widening is still a choice that changes every number on screen,
+ * so it is shown — and the canvas's state warning restates it — and dismissing
+ * the chip restores the default.
  */
 export function describeDraft(draft: Draft): Chip[] {
-  const chips: Chip[] = [
-    {
+  const chips: Chip[] = []
+  if (draft.state !== 'published') {
+    chips.push({
       key: 'state',
       label:
-        draft.state === 'published'
-          ? 'PUBLISHED records only (default)'
-          : draft.state === 'rejected'
-            ? 'REJECTED records only'
-            : 'All records, REJECTED included',
-      clears: [],
-      standing: draft.state === 'published',
-    },
-  ]
+        draft.state === 'rejected' ? 'REJECTED records only' : 'All records, REJECTED included',
+      clears: ['state'],
+    })
+  }
   if (draft.text.trim()) {
     chips.push({ key: 'text', label: `Description: ${draft.text.trim()}`, clears: ['text'] })
   }

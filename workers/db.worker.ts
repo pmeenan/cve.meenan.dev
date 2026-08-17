@@ -153,6 +153,7 @@ import {
   DEFAULT_VFS,
   SCHEMA_VERSION,
   type BenchResult,
+  type Catalog,
   type ChunkEntry,
   type Coverage,
   type Delta,
@@ -2879,6 +2880,74 @@ function coverage(): void {
   }
 }
 
+/**
+ * One page of the vendor or product catalog (UI polish, 2026-08-16).
+ *
+ * Keyset pagination on the primary key rather than one statement, because the
+ * hosted tier caps a statement at 20,000 rows (`MAX_ROWS` in `api/sql.php`)
+ * and there are 80,213 products. The same page size runs locally, so both
+ * tiers walk the same statements — the hosted-parity property (D-084).
+ *
+ * The product page carries how many CVE-product rows list each product, from
+ * the `(product_id, cve_id)` index — a range count per row, cheap enough for
+ * a one-off read and what lets the picker rank Cisco above "Francisco".
+ */
+const CATALOG_PAGE = 20_000
+const CATALOG_VENDOR_SQL = 'SELECT id, name FROM vendor WHERE id > ? ORDER BY id LIMIT ?'
+const CATALOG_PRODUCT_SQL =
+  'SELECT p.id, p.vendor_id, p.name, ' +
+  '(SELECT count(*) FROM cve_prod cp WHERE cp.product_id = p.id) ' +
+  'FROM product p WHERE p.id > ? ORDER BY p.id LIMIT ?'
+/** A hard stop on how many pages are walked, so a corrupt copy cannot loop. */
+const CATALOG_MAX_PAGES = 40
+
+/**
+ * Every vendor and product name, for the canvas pickers. The same discipline
+ * as `coverage`: nobody asked, so it reports no phase and never raises — a
+ * copy whose catalog cannot be read gets pickers that accept typed names,
+ * which is what a filter is anyway.
+ */
+function catalog(): void {
+  try {
+    const database = requireDb()
+    const vendors: Catalog['vendors'] = []
+    let after = 0
+    for (let page = 0; page < CATALOG_MAX_PAGES; page += 1) {
+      const rows = runSql(database, CATALOG_VENDOR_SQL, {
+        params: [after, CATALOG_PAGE],
+        limit: CATALOG_PAGE,
+        quiet: true,
+      }).rows
+      for (const row of rows) {
+        const id = Number(row[0])
+        if (!Number.isInteger(id)) continue
+        vendors.push([id, String(row[1] ?? '')])
+        after = id
+      }
+      if (rows.length < CATALOG_PAGE) break
+    }
+    const products: Catalog['products'] = []
+    after = 0
+    for (let page = 0; page < CATALOG_MAX_PAGES; page += 1) {
+      const rows = runSql(database, CATALOG_PRODUCT_SQL, {
+        params: [after, CATALOG_PAGE],
+        limit: CATALOG_PAGE,
+        quiet: true,
+      }).rows
+      for (const row of rows) {
+        const id = Number(row[0])
+        if (!Number.isInteger(id)) continue
+        products.push([id, Number(row[1]), String(row[2] ?? ''), Number(row[3]) || 0])
+        after = id
+      }
+      if (rows.length < CATALOG_PAGE) break
+    }
+    post({ type: 'catalog', catalog: { vendors, products } })
+  } catch {
+    post({ type: 'catalog', catalog: null })
+  }
+}
+
 /** A cell as a finite number, or null — an empty table's `min()` is NULL. */
 function seconds(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
@@ -3446,6 +3515,16 @@ function executeTool(database: Database, call: ToolCall): ToolOutcome {
       })
       return { kind: 'sql', result }
     }
+    case 'compute':
+      // Never runs here: the page routes `compute` to its sandbox (D-088)
+      // before a `tool` message would be sent. Refused by name rather than
+      // run, so a stray message cannot make this Worker — which holds the
+      // database and OPFS — evaluate anything.
+      return {
+        kind: 'refused',
+        tool: 'compute',
+        error: 'compute runs in the page sandbox, not in the database worker',
+      }
     default:
       // Unreachable through `parseToolCall`, and reachable if anything ever
       // posts a `tool` request without going through it. Falling off the end of
@@ -3881,6 +3960,9 @@ async function handle(request: Request): Promise<void> {
         break
       case 'coverage':
         coverage()
+        break
+      case 'catalog':
+        catalog()
         break
       case 'bench':
         bench()

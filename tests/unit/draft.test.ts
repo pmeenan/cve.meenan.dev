@@ -131,19 +131,16 @@ describe('filtersToDraft', () => {
 })
 
 describe('describeDraft', () => {
-  it('always states the record-state default, and marks it as one (D-022)', () => {
-    // The single filter that changes every number on screen. A default that is
-    // implied is a default nobody checks.
-    const chips = describeDraft(EMPTY_DRAFT)
-    expect(chips[0]!.key).toBe('state')
-    expect(chips[0]!.label).toMatch(/PUBLISHED records only/)
-    expect(chips[0]!.standing).toBe(true)
-  })
-
-  it('marks a deliberate widening as a choice, not a default', () => {
+  it('says nothing about the record-state default, and names a widening (D-022)', () => {
+    // The PUBLISHED-only default is restated by the canvas's state warning
+    // when it is *not* in force; as a chip on every report it was noise.
+    expect(describeDraft(EMPTY_DRAFT)).toHaveLength(0)
     const chips = describeDraft({ ...EMPTY_DRAFT, state: 'all' })
+    expect(chips[0]!.key).toBe('state')
     expect(chips[0]!.standing).toBeFalsy()
     expect(chips[0]!.label).toMatch(/REJECTED included/)
+    // Dismissing it restores the default rather than leaving the widening.
+    expect(clearChip({ ...EMPTY_DRAFT, state: 'all' }, chips[0]!).state).toBe('published')
   })
 
   it('names every filter that is set, and nothing that is not', () => {
@@ -153,7 +150,7 @@ describe('describeDraft', () => {
     expect(keys).toContain('severity')
     expect(keys).toContain('published')
     expect(keys).toContain('score')
-    expect(describeDraft(EMPTY_DRAFT)).toHaveLength(1)
+    expect(describeDraft(EMPTY_DRAFT)).toHaveLength(0)
   })
 
   it('shows severity by name rather than by stored code', () => {

@@ -3,9 +3,10 @@ import { cpus, release } from 'node:os'
 import { dirname } from 'node:path'
 import { expect, test, type Browser, type Page } from '@playwright/test'
 
+import { DIMENSION_LABELS, type Dimension } from '../../lib/filters'
 import type { BenchResult, ImportOptions, Timings, Vfs } from '../../lib/protocol'
 
-import { downloadButton, openPanel } from './ui'
+import { agentCall, awaitIdle, downloadButton, openPanel } from './ui'
 
 /**
  * Q-003 and Q-004 at full scale: the sweep the M1 budgets come from.
@@ -236,25 +237,33 @@ test.describe('full-scale measurement', () => {
       })
       const ready = Date.now() - started
 
-      // The demo query lives in the Data panel now, which a reload leaves
-      // closed. Note the canvas also auto-runs the most recent report on
-      // reopen, and the demo click waits behind it — `queried` includes that.
+      // The canvas auto-runs the most recent report on reopen, and a copy
+      // more than twelve hours behind then posts one sync by itself (UI
+      // polish, 2026-08-16) — a full artifact served from a directory is
+      // exactly that old. Neither is the reopen path, so both are waited out
+      // and the demo query is timed on its own: click to rendered rows, on
+      // a page cache the auto-run has only partly warmed.
+      await awaitIdle(page, 600_000)
+      const settled = Date.now() - started
+      // The demo query lives in the footer's Data & diagnostics disclosure,
+      // which a reload leaves closed.
       await openPanel(page, 'data')
+      const clicked = Date.now()
       await page.getByRole('button', { name: 'Run query' }).click()
       // D-052: this query takes seconds on a cold page cache, so it has to say
       // it is running. Asserted here rather than in import.spec because only
       // the full corpus is slow enough for the check to mean anything.
       await expect(page.locator('.progress')).toContainText('Running query')
-      // Scoped to the Data panel: the canvas's chart table is `.results` too.
+      // Scoped to the disclosure: the canvas's chart table is `.results` too.
       await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
         timeout: 120_000,
       })
-      const queried = Date.now() - started
+      const queried = Date.now() - clicked
 
       record({
         kind: 'note',
         key: 'reopen',
-        note: `- reopen after a reload: **${ready} ms** to report the local copy, **${queried} ms** to rendered query results (cold page, warm OPFS; includes the canvas auto-running the most recent report ahead of the demo query).`,
+        note: `- reopen after a reload: **${ready} ms** to report the local copy, **${settled} ms** until the canvas auto-run (and any automatic catch-up) settled, then **${queried} ms** from clicking the demo query to rendered rows (cold page, warm OPFS).`,
       })
     } finally {
       await context.close()
@@ -283,6 +292,10 @@ test.describe('full-scale measurement', () => {
         // asserted. "It hangs" is a legitimate answer to Q-004 — the first run
         // of this spent 30 minutes proving that and then reported nothing but a
         // Playwright timeout, which is the one outcome that teaches nothing.
+        // Note the second tab now also *writes* on its own: a copy more than
+        // twelve hours behind posts one sync once its first report answers
+        // (UI polish, 2026-08-16), which is a second connection taking the
+        // writer lock — part of what a second tab does, so part of the verdict.
         const outcome = await bounded(secondTabOutcome(second), 150_000, 'it stopped responding')
         record({
           kind: 'note',
@@ -292,7 +305,7 @@ test.describe('full-scale measurement', () => {
 
         // Whatever the second tab did, the first must still work: a tab that
         // breaks its sibling is a different failure from one that waits. Its
-        // Data panel is still open — it opened itself after the import.
+        // footer disclosure is still open — it opened itself after the import.
         const survived = await bounded(
           (async () => {
             await first.getByRole('button', { name: 'Run query' }).click()
@@ -348,11 +361,12 @@ test.describe('full-scale measurement', () => {
       // rendering — at which point clicking into it waits for the *case*
       // timeout with no CPU and no output, which is half an hour spent
       // learning nothing. Naming the state here turns that into a sentence.
-      // The Filters toggle only exists once the Worker reports a usable copy.
-      const filtersToggle = page.locator('[data-toggle="filters"]')
-      await expect(filtersToggle, `page errors: ${failures.join('; ')}`).toBeVisible({
-        timeout: 300_000,
-      })
+      // `main[data-tier]` is `local` only once the Worker reports a usable copy.
+      await expect(page.locator('main'), `page errors: ${failures.join('; ')}`).toHaveAttribute(
+        'data-tier',
+        'local',
+        { timeout: 300_000 }
+      )
       // An error banner is *recorded*, not fatal. The copy is queryable at the
       // snapshot's revision whether or not the catch-up that follows an import
       // succeeded, and these numbers are about query cost — but an unexplained
@@ -368,29 +382,28 @@ test.describe('full-scale measurement', () => {
             `${banner || '(no banner)'}${failures.length ? ` — page errors: ${failures.join('; ')}` : ''}`,
         })
       }
-      // The report axes and "Run report" live in the Filters panel now.
-      await openPanel(page, 'filters')
-      // An import is followed by a catch-up (M2), and "Run report" is disabled
-      // while the Worker is busy — so without this the *first* shape's wall
-      // time is the sync's, not the query's. It read 284 s once, which is a
-      // number nobody would have questioned in a table headed "report".
-      // The canvas also auto-runs a default report once the copy is ready —
-      // one extra query after the import. Harmless to the shapes measured
-      // below: each waits on its own data-run increment, and this wait
-      // outlasts the auto-run too.
-      await expect(page.locator('.progress')).toBeHidden({ timeout: 600_000 })
+      // An import is followed by a catch-up (M2), and a report asked for
+      // while the Worker is busy queues behind it — so without this the
+      // *first* shape's wall time is the sync's, not the query's. It read
+      // 284 s once, which is a number nobody would have questioned in a table
+      // headed "report". The canvas also auto-runs a default report once the
+      // copy is ready — one extra query after the import. Harmless to the
+      // shapes measured below: each waits on its own data-run increment, and
+      // this wait outlasts the auto-run too. (The automatic catch-up a stale
+      // copy posts on reopen does not fire here: the import latches it.)
+      await awaitIdle(page, 600_000)
 
       const lines: string[] = []
       for (const [rows, series] of SHAPES) {
-        await page.locator('#report-rows').selectOption({ label: rows })
-        await page
-          .locator('#report-series')
-          .selectOption(series === null ? { value: '' } : { label: series })
-        const cold = await runOneReport(page)
-        const warm = await runOneReport(page)
+        // Through the agent surface (D-086): there is no axis picker to drive
+        // since the filter drawer went, and `aggregate` is the same compiled
+        // report the canvas runs, landing on the canvas as one.
+        const cold = await runOneReport(page, rows, series)
+        const warm = await runOneReport(page, rows, series)
         lines.push(
-          `| ${rows}${series ? ` × ${series}` : ''} | ${cold.ms} | ${warm.ms} | ` +
-            `${cold.wallMs} | ${warm.cells}${warm.truncated ? ' (capped)' : ''} |`
+          `| ${DIMENSION_LABELS[rows]}${series ? ` × ${DIMENSION_LABELS[series]}` : ''} | ` +
+            `${cold.ms} | ${warm.ms} | ${cold.wallMs} | ` +
+            `${warm.cells}${warm.truncated ? ' (capped)' : ''} |`
         )
         // Written after *every* shape, under one key so the table stays whole:
         // notes are last-write-wins, and this file's own header records what it
@@ -413,22 +426,22 @@ function reportNote(records: number, lines: string[]): string {
     `  | --- | --- | --- | --- | --- |\n` +
     lines.map((line) => `  ${line}`).join('\n') +
     `\n\n  \`ms\` is SQLite's own time for the cross-tab statement; ` +
-    `\`wall ms\` is click to rendered answer, which also carries the ` +
+    `\`wall ms\` is agent call to rendered answer, which also carries the ` +
     `\`count(*)\` the UI asks for beside every report.`
   )
 }
 
 /** The report shapes the sweep times. `null` series is a one-axis aggregate. */
-const SHAPES: [string, string | null][] = [
-  ['Month', 'Severity'],
-  ['Year', 'Severity'],
-  ['Vendor', 'Severity'],
-  ['Product', 'Severity'],
-  ['CWE', 'Severity'],
-  ['CNA', 'Severity'],
-  ['Reference host', 'Severity'],
-  ['Vendor', 'CWE'],
-  ['Month', null],
+const SHAPES: [Dimension, Dimension | null][] = [
+  ['month', 'severity'],
+  ['year', 'severity'],
+  ['vendor', 'severity'],
+  ['product', 'severity'],
+  ['cwe', 'severity'],
+  ['cna', 'severity'],
+  ['host', 'severity'],
+  ['vendor', 'cwe'],
+  ['month', null],
 ]
 
 /** This surface's answer counter, or null when it has not answered yet. */
@@ -446,14 +459,21 @@ interface ReportRun {
 }
 
 /**
- * Run the report on screen and read the Worker's own timing back.
+ * Run one report shape through the agent surface and read the Worker's own
+ * timing back off the canvas.
  *
- * Waits on the answer counter rather than on the progress bar: a report that
- * finishes quickly may never render one, and the assertion would then read the
- * previous shape's numbers — which is how a sweep records the same query nine
- * times (the same trap `report.spec.ts` documents).
+ * Waits on the canvas's answer counter rather than on the tool call resolving:
+ * the call resolves with the model-facing summary, and the numbers wanted here
+ * are the ones the canvas stamps when it renders *this* answer — reading them
+ * before the counter moves would report the previous shape's, which is how a
+ * sweep records the same query nine times (the same trap `report.spec.ts`
+ * documents).
  */
-async function runOneReport(page: Page): Promise<ReportRun> {
+async function runOneReport(
+  page: Page,
+  rows: Dimension,
+  series: Dimension | null
+): Promise<ReportRun> {
   // Read through `count()` rather than straight off the locator. Before the
   // first report has ever run the element does not exist, and `getAttribute`
   // has no timeout of its own here — so it waits for the *case* timeout, with
@@ -461,7 +481,8 @@ async function runOneReport(page: Page): Promise<ReportRun> {
   // it is how this helper was first written.
   const before = await answeredRun(page)
   const started = Date.now()
-  await page.getByRole('button', { name: 'Run report' }).click()
+  const answer = await agentCall(page, 'aggregate', series ? { rows, series } : { rows })
+  expect(answer.refused, `the aggregate was refused: ${String(answer.reason)}`).toBeUndefined()
   await expect
     .poll(
       async () => {
@@ -573,8 +594,9 @@ async function importInPage(page: Page, options: ImportOptions): Promise<Timings
     timeout: 15_000,
   })
   await downloadButton(page).click()
-  // `.timings` renders in the Data panel, which opens itself on the import
-  // that filled it. The canvas then auto-runs a default report — one extra
+  // `.timings` renders in the footer's Data & diagnostics disclosure, which
+  // opens itself on the import that filled it. The canvas then auto-runs a
+  // default report — one extra
   // query after import, invisible to these timings, which the Worker stamps
   // before it runs.
   await expect(page.locator('.timings')).toBeVisible({ timeout: IMPORT_TIMEOUT })
@@ -625,8 +647,9 @@ async function bounded(work: Promise<string>, ms: number, onTimeout: string): Pr
 
 /** What a freshly opened second tab settled on, in words. */
 async function secondTabOutcome(page: Page): Promise<string> {
-  // The workspace header (and its Data toggle) renders only once the Worker
-  // reports an existing copy; the landing CTA renders while there is none.
+  // The workspace — and the footer's Data & diagnostics disclosure, whose
+  // summary is the Data toggle — renders only once the Worker reports an
+  // existing copy; the landing CTA renders while there is none.
   // exact on the CTA, because `Download CVE dataset` is a substring-sibling of
   // `Re-download CVE dataset` — the opposite state — and the verdict this
   // function produces is D-051's central evidence.
@@ -638,7 +661,7 @@ async function secondTabOutcome(page: Page): Promise<string> {
     if (await failed.isVisible().catch(() => false)) return `error: ${await failed.innerText()}`
     if (await existing.isVisible().catch(() => false)) {
       // It sees the database — but seeing it and being able to read it are
-      // different questions, so open the Data panel and ask it for rows.
+      // different questions, so open the data disclosure and ask it for rows.
       await openPanel(page, 'data')
       await page.getByRole('button', { name: 'Run query' }).click()
       // Scoped to the panel: the canvas's auto-run chart table is `.results`

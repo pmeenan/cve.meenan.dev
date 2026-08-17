@@ -41,8 +41,8 @@ test('the app reopens with no network, and never serves /data/ from its cache', 
   })
 
   await test.step('with a local copy', async () => {
-    // The landing view's CTA; the Import heading is inside the Data panel,
-    // which opens itself on the import that filled it.
+    // The landing view's CTA; the Import heading is inside the footer's Data
+    // & diagnostics disclosure, which opens itself on the import that filled it.
     await downloadButton(page).click()
     await expect(page.getByRole('heading', { name: 'Import' })).toBeVisible({ timeout: 300_000 })
     // Quiet before the next step: the post-import catch-up and auto-run
@@ -97,8 +97,14 @@ test('the app reopens with no network, and never serves /data/ from its cache', 
           `page errors:\n${offlineFailures.join('\n')}\n${String(error)}`
       )
     }
-    // A reopened page starts with the Data panel closed; the demo query is in
-    // it, and opening it must work offline like everything else.
+    // A reopened page starts with the footer's Data & diagnostics disclosure
+    // closed; the demo query is in it, and opening it must work offline like
+    // everything else. Idle first: a reopened copy that is more than twelve
+    // hours behind posts one sync by itself once the first report answers
+    // (UI polish, 2026-08-16), and with no network that sync fails — the
+    // *correct* answer, asserted deliberately in the last step. Waiting it out
+    // here keeps its busy window from swallowing the click below.
+    await awaitIdle(reopened)
     await openPanel(reopened, 'data')
     await reopened.getByRole('button', { name: 'Run query' }).click()
     await expect(reopened.locator('#data-panel table.results tbody tr').first()).toBeVisible({
@@ -111,6 +117,10 @@ test('the app reopens with no network, and never serves /data/ from its cache', 
 
   await test.step('and a sync offline fails as a network error rather than silently', async () => {
     const reopened = context.pages().at(-1)!
+    // Clicked explicitly even though the automatic catch-up above may already
+    // have failed the same way: an explicit click clears any earlier banner
+    // (`send` resets the error), so the one asserted below is this sync's, and
+    // the step does not depend on how old the served copy happens to be.
     await reopened.getByRole('button', { name: 'Sync' }).click()
     // `/data/` passes through the worker, so with no network this is a real
     // failure — which is the correct answer. A cached manifest here would make

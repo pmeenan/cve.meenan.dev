@@ -4,6 +4,7 @@ import { requireLocalStorage } from './support'
 
 import { awaitIdle, downloadButton, openPanel } from './ui'
 
+import { AUTO_SYNC_AFTER_MS } from '../../lib/freshness'
 import { DATA_ROOT } from '../../lib/protocol'
 
 /**
@@ -57,6 +58,7 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
       head: manifest.rev as number,
       snapshot: (manifest.snapshot.rev ?? null) as number | null,
       deltas: (manifest.deltas ?? []).length as number,
+      generated: manifest.generated as number,
     }
   }, DATA_ROOT)
   test.info().annotations.push({
@@ -64,11 +66,14 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
     description: `snapshot rev ${plane.snapshot}, head ${plane.head}, ${plane.deltas} delta(s)`,
   })
 
+  // The revision line lives in the footer's Data & diagnostics disclosure
+  // since the UI polish; its attribute and text are readable whether or not
+  // the disclosure is open, so nothing below has to open it to assert on it.
   const revision = page.locator('[data-revision]')
 
   await test.step('download, which ends by catching up', async () => {
-    // The landing view's CTA; the Import heading is inside the Data panel,
-    // which opens itself on the import that filled it.
+    // The landing view's CTA; the Import heading is inside the footer's Data
+    // & diagnostics disclosure, which opens itself on the import that filled it.
     await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
       timeout: 60_000,
     })
@@ -136,6 +141,33 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
     await assertSearchable(page)
   })
 
+  await test.step('a reopened copy that is behind catches itself up', async () => {
+    // The automatic catch-up (UI polish, 2026-08-16): a page that opens on a
+    // local copy more than twelve hours behind posts one `sync` by itself,
+    // once the first report has answered. Whether it *should* have fired here
+    // depends on the plane: the development slice is dated days ago, so it
+    // does; the live origin's copy is hours old at most, so it does not. The
+    // proof is the summary on the revision line — a fresh page starts with no
+    // sync outcome, so one being there after a reload nobody clicked on is the
+    // automatic sync and nothing else. `assertSearchable` above already waited
+    // for the Worker to go quiet, which is what makes the negative half safe.
+    const age = Date.now() - plane.generated * 1000
+    const behind = age > AUTO_SYNC_AFTER_MS
+    test.info().annotations.push({
+      type: 'auto-sync',
+      description: `copy ${(age / 3_600_000).toFixed(1)} h old — ${behind ? 'expected' : 'not expected'} to fire`,
+    })
+    if (behind) {
+      await expect(revision).toContainText(/already current|update(s)? applied/, {
+        timeout: 120_000,
+      })
+      await expect(revision).toHaveAttribute('data-revision', String(plane.head))
+      await expect(page.locator('[data-error]')).toHaveCount(0)
+    } else {
+      await expect(revision).not.toContainText(/already current|update(s)? applied/)
+    }
+  })
+
   expect(failures, 'the page logged errors').toEqual([])
 })
 
@@ -147,9 +179,10 @@ test('catches a fresh download up to the head the origin advertises', async ({ p
  * about a corpus a delta has touched.
  */
 async function assertSearchable(page: Page): Promise<void> {
-  // After a reload the Data panel is closed; the demo query lives inside it.
-  // Idle first — a reload re-fires the canvas auto-run, whose busy window
-  // would otherwise swallow the click below.
+  // After a reload the footer's Data & diagnostics disclosure is closed; the
+  // demo query lives inside it. Idle first — a reload re-fires the canvas
+  // auto-run and, on a copy that is behind, the automatic catch-up after it,
+  // and either busy window would otherwise swallow the click below.
   await awaitIdle(page)
   await openPanel(page, 'data')
   await page.getByRole('button', { name: 'Run query' }).click()

@@ -1,7 +1,16 @@
 import { expect, test, type Page } from '@playwright/test'
 
 import { requireLocalStorage } from './support'
-import { awaitIdle, downloadButton, importCorpus, openPanel } from './ui'
+import {
+  agentCall,
+  awaitIdle,
+  closePanel,
+  downloadButton,
+  importCorpus,
+  openPanel,
+  pick,
+  pickerClear,
+} from './ui'
 
 import { SCHEMA_VERSION } from '../../lib/protocol'
 
@@ -9,6 +18,15 @@ import { SCHEMA_VERSION } from '../../lib/protocol'
  * M3's exit criteria in a browser: every confirmed filter axis answering, a
  * long query reporting and cancellable, hostile SQL refused by the database
  * itself, and a schema bump announced.
+ *
+ * The filter drawer is gone (UI polish, 2026-08-16), so a filter is expressed
+ * the way an agent expresses one: `agentCall(page, 'search_records', {...})`
+ * and `agentCall(page, 'aggregate', {...})` are the same five tools the chat
+ * layer and `window.cveExplorer` run (D-086), through the same Worker path,
+ * and each result lands on the canvas exactly as a chat call's would — so a
+ * spec can assert on the JSON the model would read *and* on the canvas hooks.
+ * The property under test is the query layer's, not a widget's, and it holds
+ * or fails the same way through either.
  *
  * One import, then everything else — an import is the expensive part and OPFS
  * is scoped to the browser context, so a test per criterion would mean a
@@ -35,32 +53,9 @@ function watchConsole(page: Page): string[] {
   return failures
 }
 
-/**
- * The filter drawer's form, as a scope for every field lookup.
- *
- * Scoped twice over. Page-wide, the SQL drawer's textarea would answer to
- * `getByLabel('Group by')` whenever it is open, because an accessible name
- * includes the value of the control a label wraps and a report's SQL contains
- * a `GROUP BY`. And the panel id pins the lookup to the one copy of the form
- * the workspace has — the revamp's merge of the old Explore and Report forms.
- */
-function filterForm(page: Page) {
-  return page.locator('#filters-panel form.filters')
-}
-
-/**
- * Run the filter form as a record search and wait for *this* run's result.
- *
- * Waiting on the progress bar is not enough and was actively misleading: a
- * query that finishes in milliseconds may never render one, so the assertion
- * then reads the previous result and a filter that never applied looks correct.
- * The page stamps each answer with a counter for exactly this (`data-run`).
- */
-async function runFilters(page: Page): Promise<void> {
-  const before = await answered(page, '[data-matches]')
-  await filterForm(page).getByRole('button', { name: 'List records' }).click()
-  await waitForAnswer(page, '[data-matches]', before)
-}
+/** The canvas's two answer surfaces: the chart's container and the record list's summary line. */
+const REPORT = '[data-report-matches]'
+const RECORDS = '[data-matches]'
 
 /** The answer counter currently on screen for a surface, or null if it is empty. */
 async function answered(page: Page, selector: string): Promise<string | null> {
@@ -69,7 +64,20 @@ async function answered(page: Page, selector: string): Promise<string | null> {
   return element.getAttribute('data-run')
 }
 
-async function waitForAnswer(page: Page, selector: string, before: string | null): Promise<void> {
+/**
+ * Do something that runs a query, and wait for *this* run's answer to land on
+ * the canvas.
+ *
+ * Waiting on the progress bar is not enough and was actively misleading: a
+ * query that finishes in milliseconds may never render one, so the assertion
+ * then reads the previous result and a filter that never applied looks correct.
+ * The page stamps each answer with a counter for exactly this (`data-run`).
+ * An `agentCall` resolves when the Worker has answered, but the render that
+ * shows the answer is a tick behind it — so the counter is waited on even then.
+ */
+async function ran<T>(page: Page, selector: string, action: () => Promise<T>): Promise<T> {
+  const before = await answered(page, selector)
+  const out = await action()
   // Starting a new run deliberately removes the previous result. That empty
   // interval is not an answer: require a new, non-null counter or a fast test
   // can continue against an empty table before the Worker replies.
@@ -82,33 +90,48 @@ async function waitForAnswer(page: Page, selector: string, before: string | null
       { timeout: 120_000 }
     )
     .toBe(true)
-}
-
-/** The grouped table's rows as [label, count]. */
-async function groups(page: Page): Promise<[string, number][]> {
-  const rows = page.locator('table.groups tbody tr')
-  const out: [string, number][] = []
-  for (let at = 0; at < (await rows.count()); at += 1) {
-    const cells = rows.nth(at).locator('td')
-    out.push([
-      (await cells.nth(0).innerText()).trim(),
-      Number((await cells.nth(1).innerText()).replace(/[^\d]/g, '')),
-    ])
-  }
   return out
 }
 
-/** How many records the current filters match, from the summary line. */
-async function matches(page: Page): Promise<number> {
-  return Number(await page.locator('[data-matches]').first().getAttribute('data-matches'))
+/**
+ * An `aggregate` result's cells as [label, count] — the one-axis shape. The
+ * label is what the chart shows: a name for the lookup axes, the band's name
+ * for the coded ones (severity's CRITICAL is `"CRITICAL"`), and a bracketed
+ * absence — `(none recorded)`, `(not scored)` — for the bucket of records that
+ * carry no value.
+ */
+function cells(result: Record<string, unknown>): [string, number][] {
+  return result.cells as [string, number][]
 }
 
-async function setFilter(page: Page, label: string, value: string): Promise<void> {
-  await filterForm(page).getByLabel(label, { exact: true }).fill(value)
+/** The cells that name a value: the absence band cannot be filtered on by name. */
+function named(result: Record<string, unknown>): [string, number][] {
+  return cells(result).filter((cell) => cell[0] !== null && !cell[0].startsWith('('))
 }
 
-async function groupBy(page: Page, label: string): Promise<void> {
-  await filterForm(page).getByLabel('Group by').selectOption({ label })
+/** How many records the current filters match, from the canvas. */
+async function matches(page: Page, selector: string): Promise<number> {
+  const attribute = selector === REPORT ? 'data-report-matches' : 'data-matches'
+  return Number(await page.locator(selector).first().getAttribute(attribute))
+}
+
+/**
+ * The chart's own table as label → count, for a one-axis report. The rendered
+ * labels rather than the tool's cells, which carry the stored codes: this is
+ * where a renderer that chose labels by position rather than by dimension
+ * would show.
+ */
+async function bucketTable(page: Page): Promise<Map<string, number>> {
+  const rows = page.locator('table.chart-data tbody tr')
+  const out = new Map<string, number>()
+  for (let at = 0; at < (await rows.count()); at += 1) {
+    const row = rows.nth(at)
+    out.set(
+      (await row.locator('th').innerText()).trim(),
+      Number((await row.locator('td').first().innerText()).replace(/[^\d]/g, ''))
+    )
+  }
+  return out
 }
 
 test('filters, the console, cancellation and a schema bump', async ({ page }) => {
@@ -117,10 +140,6 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
   await page.goto('/')
   await requireLocalStorage(page)
   await importCorpus(page, 300_000)
-  // The canvas auto-runs a default report the first time a copy is ready, and
-  // the drawer's buttons are disabled while it does — wait it out.
-  await awaitIdle(page, 120_000)
-  await openPanel(page, 'filters')
 
   /**
    * Each lookup axis is checked against itself: group by the dimension, take
@@ -130,131 +149,164 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
    * failure that matters, a filter and an aggregate disagreeing about what a
    * record is (one CVE with eight products is not eight CVEs).
    */
-  for (const [dimension, field] of [
-    ['Vendor', 'Vendor'],
-    ['CNA', 'CNA'],
-    ['CWE', 'CWE'],
-    ['Reference host', 'Reference host'],
-  ] as const) {
+  for (const dimension of ['vendor', 'cna', 'cwe', 'host'] as const) {
     await test.step(`filter by ${dimension} agrees with grouping by it`, async () => {
-      await page.getByRole('button', { name: 'Reset filters' }).click()
-      await groupBy(page, dimension)
-      await runFilters(page)
-      const rows = await groups(page)
-      expect(rows.length, `no ${dimension} buckets`).toBeGreaterThan(0)
-      const [label, count] = rows[0]!
+      const grouped = await ran(page, REPORT, () =>
+        agentCall(page, 'aggregate', { rows: dimension })
+      )
+      const buckets = named(grouped)
+      expect(buckets.length, `no ${dimension} buckets`).toBeGreaterThan(0)
+      const [label, count] = buckets[0]!
       // The CWE bucket is labelled `CWE-79 — Cross-site Scripting`; the filter
       // takes the identifier.
-      const value = dimension === 'CWE' ? label.split(' ')[0]! : label
+      const value = dimension === 'cwe' ? label.split(' ')[0]! : label
 
-      await page.getByRole('button', { name: 'Reset filters' }).click()
-      await setFilter(page, field, value)
-      await runFilters(page)
-      expect(await matches(page), `${dimension} ${value}`).toBe(count)
+      if (dimension === 'vendor') {
+        // The vendor picker on the canvas strip is the one direct control the
+        // lookup axes kept. Picking the top vendor commits the same
+        // `filters.vendor` a tool call sets and re-runs the chart, so its
+        // match count is the bucket's; clearing it is the unfiltered report
+        // again.
+        const total = grouped.recordsMatched as number
+        await ran(page, REPORT, () => pick(page, 'vendor', value))
+        expect(await matches(page, REPORT), `picked ${value}`).toBe(count)
+        await ran(page, REPORT, () => pickerClear(page, 'vendor'))
+        expect(await matches(page, REPORT)).toBe(total)
+      }
+
+      const found = await ran(page, RECORDS, () =>
+        agentCall(page, 'search_records', { [dimension]: [value] })
+      )
+      expect(found.recordsMatched, `${dimension} ${value}`).toBe(count)
+      expect(await matches(page, RECORDS)).toBe(count)
+      expect(found.unmatchedFilterValues).toEqual([])
       await expect(page.locator('[data-unmatched]')).toHaveCount(0)
     })
   }
 
   await test.step('a name that matches nothing says so, rather than showing zero results', async () => {
-    await page.getByRole('button', { name: 'Reset filters' }).click()
-    await setFilter(page, 'Vendor', 'zzz-no-such-vendor')
-    await runFilters(page)
+    const found = await ran(page, RECORDS, () =>
+      agentCall(page, 'search_records', { vendor: ['zzz-no-such-vendor'] })
+    )
+    expect(found.recordsMatched).toBe(0)
+    // Said to the model and shown to the reader, in the same words: a typo is
+    // not an empty result.
+    expect(found.unmatchedFilterValues).toEqual([
+      { axis: 'vendor', values: ['zzz-no-such-vendor'] },
+    ])
     await expect(page.locator('[data-unmatched="vendor"]')).toContainText('zzz-no-such-vendor')
-    expect(await matches(page)).toBe(0)
   })
 
-  await test.step('severity, score, dates and years', async () => {
-    await page.getByRole('button', { name: 'Reset filters' }).click()
-    await groupBy(page, 'Severity')
-    await runFilters(page)
-    const bySeverity = new Map(await groups(page))
+  await test.step('severity, score and dates', async () => {
+    const grouped = await ran(page, REPORT, () =>
+      agentCall(page, 'aggregate', { rows: 'severity' })
+    )
+    // The tool's cells carry the band's *name*, as the chart does — a model
+    // told `["4", 120]` says "severity 4" — and the never-scored band is
+    // labelled too.
+    const bySeverity = new Map(cells(grouped))
     expect(bySeverity.size).toBeGreaterThan(1)
+    const critical = bySeverity.get('CRITICAL')!
+    expect(critical).toBeGreaterThan(0)
 
-    await page.getByRole('button', { name: 'Reset filters' }).click()
-    await filterForm(page).getByLabel('CRITICAL').check()
-    await runFilters(page)
-    expect(await matches(page)).toBe(bySeverity.get('CRITICAL'))
+    const found = await ran(page, RECORDS, () =>
+      agentCall(page, 'search_records', { severity: ['CRITICAL'] })
+    )
+    expect(found.recordsMatched).toBe(critical)
 
     // A score floor is a subset of the severity band above it: CRITICAL starts
     // at 9.0, so everything at 9.5 or more is CRITICAL and there are fewer.
-    await setFilter(page, 'CVSS score from', '9.5')
-    await runFilters(page)
-    const high = await matches(page)
-    expect(high).toBeGreaterThan(0)
-    expect(high).toBeLessThanOrEqual(bySeverity.get('CRITICAL')!)
+    const high = await ran(page, RECORDS, () =>
+      agentCall(page, 'search_records', { severity: ['CRITICAL'], scoreMin: 9.5 })
+    )
+    expect(high.recordsMatched as number).toBeGreaterThan(0)
+    expect(high.recordsMatched as number).toBeLessThanOrEqual(critical)
 
-    await page.getByRole('button', { name: 'Reset filters' }).click()
-    await runFilters(page)
-    const all = await matches(page)
-
+    // The published-date window is the canvas strip's own control, shown with
+    // the chart. An unbounded report first, so the boxes display the copy's
+    // extent rather than a filter.
+    const unbounded = await ran(page, REPORT, () =>
+      agentCall(page, 'aggregate', { rows: 'month', series: 'severity' })
+    )
+    const all = unbounded.recordsMatched as number
     // The date control is bounded by the copy (M9): a boundary outside the
     // data is **clamped into it** rather than accepted, so this no longer
     // produces the empty report it used to — it produces the last day the copy
     // holds. Both halves are asserted, because the clamp is the behaviour and
     // the count is the proof that the predicate still applies.
-    const from = page.locator('#report-pub-from')
-    const latest = await page.locator('#report-pub-to').inputValue()
-    await setFilter(page, 'Published from', '2099-01-01')
-    await from.press('Enter')
+    const from = page.locator('#canvas-pub-from')
+    const latest = await page.locator('#canvas-pub-to').inputValue()
+    await ran(page, REPORT, async () => {
+      await from.fill('2099-01-01')
+      await from.press('Enter')
+    })
     await expect(from).toHaveValue(latest)
-    await runFilters(page)
-    const lastDay = await matches(page)
+    const lastDay = await matches(page, REPORT)
     expect(lastDay).toBeGreaterThan(0)
     expect(lastDay).toBeLessThan(all)
   })
 
   await test.step('REJECTED records are excluded by default and never quietly (D-022)', async () => {
-    await page.getByRole('button', { name: 'Reset filters' }).click()
-    await runFilters(page)
-    const published = await matches(page)
+    const defaulted = await ran(page, RECORDS, () => agentCall(page, 'search_records', {}))
+    const published = defaulted.recordsMatched as number
     await expect(page.locator('[data-state-warning]')).toHaveCount(0)
 
-    await filterForm(page).getByLabel('All records').check()
-    // Editing the next request must not relabel the answer already on screen.
-    await expect(page.locator('[data-state-warning]')).toHaveCount(0)
-    await runFilters(page)
-    const all = await matches(page)
+    const widened = await ran(page, RECORDS, () =>
+      agentCall(page, 'search_records', { state: 'all' })
+    )
+    const all = widened.recordsMatched as number
     expect(all).toBeGreaterThan(published)
     // Including them changes the denominator of everything on screen, so it has
-    // to be visible rather than implied by a radio button.
+    // to be visible rather than implied by an argument.
     await expect(page.locator('[data-state-warning="all"]')).toContainText('REJECTED')
 
-    await filterForm(page).getByLabel('REJECTED only').check()
-    await runFilters(page)
-    expect(await matches(page)).toBe(all - published)
+    const rejected = await ran(page, RECORDS, () =>
+      agentCall(page, 'search_records', { state: 'rejected' })
+    )
+    expect(rejected.recordsMatched).toBe(all - published)
 
     // State and severity both use numeric codes 1 and 2. The renderer must use
     // the dimension to choose labels, or these appear as LOW and MEDIUM.
-    await page.getByRole('button', { name: 'Reset filters' }).click()
-    await filterForm(page).getByLabel('All records').check()
-    await groupBy(page, 'State')
-    await runFilters(page)
-    const states = new Map(await groups(page))
+    await ran(page, REPORT, () => agentCall(page, 'aggregate', { rows: 'state', state: 'all' }))
+    const states = await bucketTable(page)
     expect(states.get('PUBLISHED')).toBe(published)
     expect(states.get('REJECTED')).toBe(all - published)
   })
 
   await test.step('full-text search, and the SQL behind every number', async () => {
-    await page.getByRole('button', { name: 'Reset filters' }).click()
-    await setFilter(page, 'Search descriptions', 'buffer overflow')
-    await runFilters(page)
-    expect(await matches(page)).toBeGreaterThan(0)
-    // The query is inspectable and carries no interpolated value — the values
-    // are bound (rule 4, and the property D-044 will need from the chat layer).
-    // `textContent`, not `innerText`: the disclosure is closed, and innerText
-    // reports what is *rendered*.
-    const sql = (await page.locator('details.sql pre').textContent()) ?? ''
-    expect(sql).toContain('fts MATCH ?')
-    expect(sql).not.toContain('buffer')
+    const found = await ran(page, RECORDS, () =>
+      agentCall(page, 'search_records', { text: 'buffer overflow' })
+    )
+    expect(found.recordsMatched as number).toBeGreaterThan(0)
+    // The query is inspectable: the SQL panel is filled with whatever last ran
+    // on the canvas — while it is closed, so an edit underway is never
+    // replaced. What it shows is the statement made runnable for a reader,
+    // which means the search terms are there as one quoted fts5 literal (the
+    // parse `ftsQuery` did, `lib/inline-sql.ts`) and nowhere else: the query
+    // layer bound them (rule 4), and the display quoted them. Whether the
+    // panel's copy really reproduces the number is then a matter of running
+    // it.
+    await openPanel(page, 'sql')
+    const sql = await page.locator('textarea.sql-input').inputValue()
+    expect(sql).toContain('fts MATCH')
+    expect(sql).toContain(`'"buffer" AND "overflow"'`)
+    expect(sql).not.toMatch(/MATCH \?/)
+    await page.getByRole('button', { name: 'Run SQL' }).click()
+    await expect(page.locator('[data-console-rows]')).toBeVisible({ timeout: 120_000 })
+    expect(
+      Number(await page.locator('[data-console-rows]').getAttribute('data-console-rows'))
+    ).toBeGreaterThan(0)
+    await closePanel(page, 'sql')
 
-    await setFilter(page, 'Search descriptions', 'zzqqxx-not-a-word')
-    await runFilters(page)
-    expect(await matches(page)).toBe(0)
+    const none = await ran(page, RECORDS, () =>
+      agentCall(page, 'search_records', { text: 'zzqqxx-not-a-word' })
+    )
+    expect(none.recordsMatched).toBe(0)
   })
 
   await test.step('the console reads', async () => {
     await openPanel(page, 'sql')
-    await page.getByRole('button', { name: 'What the schema looks like' }).click()
+    await page.getByRole('button', { name: 'Schema' }).click()
     await page.getByRole('button', { name: 'Run SQL' }).click()
     await expect(page.locator('[data-console-rows]')).toBeVisible({ timeout: 120_000 })
     expect(
@@ -301,8 +353,8 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     // The authorizer is installed for the duration of one console query and
     // removed afterwards, on the connection that also applies deltas. If
     // removal failed, this is where it would show: sync would be refused by the
-    // guard the console left behind. Sync is a header button now — no panel
-    // needed, and the SQL drawer stays open underneath.
+    // guard the console left behind. Sync is a header button — no panel
+    // needed, and the SQL panel stays open underneath.
     await page.getByRole('button', { name: 'Sync', exact: true }).click()
     await expect(page.locator('.progress')).toBeHidden({ timeout: 300_000 })
     await expect(page.locator('[data-error]')).toHaveCount(0)
@@ -382,12 +434,11 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     await expect(announcement).toContainText('Download the corpus again')
     // Not offered as a query surface: a copy this build cannot read must not be
     // queried, so the app shows the landing view rather than the workspace —
-    // the filter drawer and the SQL console are not in the DOM to reach.
+    // the canvas and the SQL console are not in the DOM to reach.
     await expect(page.locator('[data-landing]')).toBeVisible()
-    await expect(page.locator('[data-toggle="filters"]')).toHaveCount(0)
     await expect(page.locator('[data-toggle="sql"]')).toHaveCount(0)
-    await expect(page.locator('#filters-panel')).toHaveCount(0)
     await expect(page.locator('#sql-panel')).toHaveCount(0)
+    await expect(page.locator('section.canvas')).toHaveCount(0)
     await expect(downloadButton(page)).toHaveText('Re-download CVE dataset')
   })
 
@@ -409,15 +460,28 @@ test('filters, the console, cancellation and a schema bump', async ({ page }) =>
     // D-013 licenses *replacing* the local database, not deleting it out from
     // under someone who has been told to download again. Without the override
     // the same copy is live and queryable — the workspace opens on it, and the
-    // data panel offers a replacement rather than a first download.
+    // footer's Data & diagnostics disclosure offers a replacement rather than a
+    // first download.
     await page.goto('/')
+    // A reopened copy that is more than twelve hours behind — the dev fixture
+    // always is — syncs itself once after its first report answers, and its
+    // outcome lands in the revision line. Waited for before anything is
+    // clicked, because `awaitIdle` alone can return in the gap before that
+    // sync's first progress message (RE-034's window, one layer up).
+    await expect(page.locator('[data-revision]')).toContainText(/already current|applied/, {
+      timeout: 120_000,
+    })
     await awaitIdle(page, 120_000)
     await openPanel(page, 'data')
     await expect(page.getByRole('button', { name: 'Re-download data' })).toBeEnabled({
       timeout: 120_000,
     })
     await page.getByRole('button', { name: 'Run query' }).click()
-    await expect(page.locator('.results tbody tr').first()).toBeVisible({ timeout: 120_000 })
+    // Scoped to the panel: the canvas's chart table is `results` too, and it
+    // is visually hidden under a chart.
+    await expect(page.locator('#data-panel table.results tbody tr').first()).toBeVisible({
+      timeout: 120_000,
+    })
   })
 
   expect(failures, `console/page errors:\n${failures.join('\n')}`).toEqual([])

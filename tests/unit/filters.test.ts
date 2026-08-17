@@ -368,6 +368,23 @@ describe('grouped counts', () => {
     }
   })
 
+  it('buckets a week by the Monday that opened it, Monday to Sunday', () => {
+    // 2021-12-10 is a Friday, so its week opened on Monday 2021-12-06;
+    // 2022-03-01 is a Tuesday, whose Monday is 2022-02-28 — across a month
+    // boundary, which is exactly what `%W` cannot label as a date.
+    const built = groupSql({ state: 'all' }, {}, 'week')
+    const labels = run(built.sql, built.params).map((row) => String(row[1]))
+    expect(labels).toContain('2021-12-06')
+    expect(labels).toContain('2022-02-28')
+    // Sortable as text, so the axis reads in order without a separate key.
+    expect([...labels].sort()).toEqual(labels)
+    // A Sunday stays in the week its Monday opened: 2021-12-12 → 2021-12-06.
+    const sunday = run("SELECT date(?, 'unixepoch', 'weekday 0', '-6 days')", [
+      Math.floor(Date.parse('2021-12-12T12:00:00Z') / 1000),
+    ])
+    expect(sunday[0]?.[0]).toBe('2021-12-06')
+  })
+
   it('counts a record once per bucket, not once per link row', () => {
     const built = groupSql({}, resolve({}), 'vendor')
     const rows = run(built.sql, built.params)

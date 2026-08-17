@@ -6,7 +6,7 @@ import { expect, test } from '@playwright/test'
 import { SCHEMA_VERSION } from '../../lib/protocol'
 
 import { requireLocalStorage } from './support'
-import { awaitIdle, downloadButton, importCorpus, openPanel } from './ui'
+import { agentCall, awaitIdle, downloadButton, importCorpus, openPanel } from './ui'
 
 /**
  * The half of a schema bump that needs **two real data planes** — the claim M3
@@ -129,15 +129,18 @@ test('an old client refuses the new data plane, before a byte of it', async ({ p
   })
 
   await test.step('and a title is searchable, which is what put it in the index', async () => {
-    await openPanel(page, 'filters')
-    await page.locator('#filters-panel').getByLabel('Search descriptions').fill('traversal')
-    await page.getByRole('button', { name: 'List records' }).click()
-    await expect(page.locator('[data-matches]')).toBeVisible({ timeout: 120_000 })
+    // A full-text search through the agent surface (D-086) — the same
+    // `search_records` tool chat uses, since there is no filter drawer to type
+    // into any more — which also lands the record list on the canvas.
+    const found = await agentCall(page, 'search_records', { text: 'traversal' })
+    expect(found.refused).toBeUndefined()
     // Not an assertion about *which* records match — the slice is whatever the
     // corpus holds — only that the two-column index answers at all.
-    expect(
-      Number(await page.locator('[data-matches]').getAttribute('data-matches'))
-    ).toBeGreaterThan(0)
+    expect(found.recordsMatched).toBeGreaterThan(0)
+    await expect(page.locator('p[data-matches]')).toBeVisible({ timeout: 120_000 })
+    expect(Number(await page.locator('p[data-matches]').getAttribute('data-matches'))).toBe(
+      found.recordsMatched
+    )
   })
 
   expect(failures, `page errors:\n${failures.join('\n')}`).toEqual([])

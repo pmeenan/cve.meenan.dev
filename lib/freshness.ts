@@ -46,6 +46,15 @@ export const STALE_AFTER_MS = 2 * DAY
  */
 export const KEV_STALE_AFTER_MS = 8 * DAY
 
+/**
+ * How far behind a local copy may be before the workspace catches it up by
+ * itself on opening (UI polish, 2026-08-16). Half a day: the corpus is
+ * published daily, so a copy older than this is behind more often than not,
+ * and a sync is a few small deltas — cheap enough to do unasked, visible
+ * enough (the progress bar names it) not to be a surprise.
+ */
+export const AUTO_SYNC_AFTER_MS = 12 * 60 * 60 * 1000
+
 export interface Freshness {
   /** Milliseconds since the data was built, clamped at zero. */
   ageMs: number

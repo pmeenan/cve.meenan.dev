@@ -29,9 +29,9 @@ async function settled(page: Page): Promise<void> {
 
 /**
  * The first download starts from the landing view's CTA; every later one is
- * the Data panel's "Re-download data" button inside the workspace — two
- * different surfaces since the UI revamp, so two helpers rather than one
- * label regex.
+ * the "Re-download data" button inside the footer's Data & diagnostics
+ * disclosure — two different surfaces since the UI revamp, so two helpers
+ * rather than one label regex.
  */
 async function download(page: Page): Promise<void> {
   await downloadButton(page).click()
@@ -104,12 +104,21 @@ test('a second tab queries while the first writes, and follows the replacement',
   watch(b, 'tab B')
   await b.goto('/')
   await settled(b)
+  // Tab B opens on a copy that is days behind (the development slice is dated
+  // at build time), so once its first report answers it posts one sync by
+  // itself (UI polish, 2026-08-16) — a *write*, from the tab this test is about
+  // to treat as the reader. Let it finish before the choreography below, so
+  // every write from here on is one this test asked for; A's own import already
+  // caught up, so A never fires one.
+  await idle(b)
 
   await test.step('both tabs see the same copy — the point of the `opfs` VFS (D-051)', async () => {
     // `opfs-sahpool` froze the second tab entirely, which is what D-051 chose
-    // against. This is the behaviour that choice bought.
-    await expect(b.locator('[data-revision]')).toBeVisible({ timeout: 120_000 })
+    // against. This is the behaviour that choice bought. The revision line is
+    // inside the footer's Data & diagnostics disclosure, closed on a fresh
+    // page; `query` opens it.
     await query(b)
+    await expect(b.locator('[data-revision]')).toBeVisible({ timeout: 120_000 })
     const [revA, revB] = await Promise.all([
       a.locator('[data-revision]').getAttribute('data-revision'),
       b.locator('[data-revision]').getAttribute('data-revision'),
@@ -216,6 +225,9 @@ test('a second tab queries while the first writes, and follows the replacement',
     // that disagree are two tabs looking at different generations.
     const freshness = async (page: Page) =>
       page.locator('[data-freshness]').getAttribute('data-freshness')
+    // Both lines live in the footer disclosure; B's is open from `query`, but
+    // say so rather than depend on it.
+    await openPanel(b, 'data')
     await expect(b.locator('[data-freshness]')).toBeVisible({ timeout: 120_000 })
     expect(await freshness(b)).toBe(await freshness(a))
     const revs = await Promise.all([

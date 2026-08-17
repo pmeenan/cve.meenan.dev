@@ -290,7 +290,11 @@ test('a discovery failure leaves the local copy alone', async ({ page }) => {
   // in the *other* slot is no reason to take the user's database away from
   // them. What it does cost is the sweep.
   await expect(page.locator('main')).toHaveAttribute('data-status', 'ready')
-  await openPanel(page, 'data')
+  // Idle before the query and before the listing below: this stale copy
+  // catches itself up once its first report answers, and navigating away
+  // mid-write leaves a `-journal` beside the live file that the exact-set
+  // assertion would count (see `openDataControls`).
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Run query' }).click()
   await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
     timeout: 120_000,
@@ -725,7 +729,9 @@ test('a counter on a corpus with no client-built indexes does not win discovery'
 
   await page.goto('/')
   await expect(page.locator('main')).toHaveAttribute('data-status', 'ready', { timeout: 60_000 })
-  await openPanel(page, 'data')
+  // Idle first, so the listing below is taken after the automatic catch-up
+  // has finished writing (see `openDataControls`).
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Run query' }).click()
   await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
     timeout: 120_000,
@@ -787,9 +793,10 @@ test('a high counter on a database this build would not serve does not win disco
   }, DECOY_DATABASE)
 
   await page.goto('/')
-  // The real copy is still live and still answers.
+  // The real copy is still live and still answers. Idle first, so the listing
+  // below is taken after the automatic catch-up has finished writing.
   await expect(page.locator('main')).toHaveAttribute('data-status', 'ready', { timeout: 60_000 })
-  await openPanel(page, 'data')
+  await openDataControls(page)
   await page.getByRole('button', { name: 'Run query' }).click()
   await expect(page.locator('#data-panel table.results tbody tr')).toHaveCount(15, {
     timeout: 120_000,
@@ -1067,8 +1074,9 @@ async function snapshotChunks(page: Page): Promise<string[]> {
 
 /**
  * Start the first download of this origin from the landing view's CTA — the
- * workspace and its Data panel do not exist until a copy is usable. Waiting
- * out `pending` first keeps the click from racing the Worker's first status.
+ * workspace and the footer's Data & diagnostics disclosure do not exist until
+ * a copy is usable. Waiting out `pending` first keeps the click from racing
+ * the Worker's first status.
  */
 async function startDownload(page: Page): Promise<void> {
   await expect(page.locator('main')).not.toHaveAttribute('data-status', 'pending', {
@@ -1078,12 +1086,20 @@ async function startDownload(page: Page): Promise<void> {
 }
 
 /**
- * Wait for the workspace to report the live copy, then open the Data panel —
- * where the re-download, demo-query and clear controls live since the UI
- * revamp. The idle wait asserts the same facts the old "Re-download data is
- * enabled" wait did: a status message arrived, a copy is live, and the Worker
- * is not busy (which also covers the report the canvas auto-runs when a copy
- * first becomes ready in a page load).
+ * Wait for the workspace to report the live copy, then open the footer's Data
+ * & diagnostics disclosure — where the re-download, demo-query and clear
+ * controls live since the UI revamp (`#data-panel`, moved from the header to
+ * the footer by the 2026-08-16 polish; `openPanel` knows where). The idle wait
+ * asserts the same facts the old "Re-download data is enabled" wait did: a
+ * status message arrived, a copy is live, and the Worker is not busy — which
+ * covers the report the canvas auto-runs when a copy first becomes ready in a
+ * page load, *and* the sync the page then posts by itself when that copy is
+ * more than twelve hours behind (UI polish, 2026-08-16). Every `page.goto('/')`
+ * in this file lands on such a copy — the development slice is dated at build
+ * time — so each one is followed by that automatic catch-up, which on a plane
+ * with no deltas fetches the manifest and reports itself current. `awaitIdle`
+ * holds through it, so the clicks below never land in its busy window and the
+ * OPFS entry sets are listed only after it has finished writing.
  */
 async function openDataControls(page: Page): Promise<void> {
   await awaitIdle(page, 60_000)

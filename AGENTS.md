@@ -51,7 +51,14 @@ affected docs. Until then, these govern.
   download away is where this floor holds absolutely. (D-014, D-032, D-084)
 - **The AI tool surface is read-only and render-only, permanently.** CVE text
   flows into LLM prompts, so injection is assumed: no tool may fetch a URL,
-  write data, or reach the network. The first model tier is site-hosted: our
+  write data, or reach the network. The one tool that runs model-written
+  code, `compute` (D-088), does so inside an opaque-origin `srcdoc` frame
+  with a `default-src 'none'` CSP and a terminated-at-the-deadline worker —
+  no network, no storage, no OPFS — proved from inside the sandbox by
+  `tests/e2e/compute.spec.ts` on both engines; weakening that frame is a
+  constraint change. The same six tools are the *agent surface* — WebMCP and
+  `window.cveExplorer` (D-086) — on the same terms; anything a third-party
+  agent can reach, the chat model could already. The first model tier is site-hosted: our
   own Ollama on the private `llm` box, relayed through a restricted
   same-origin endpoint that pins the model — `qwen3:8b` since 2026-08-09,
   chosen by the D-046 benchmark — stores nothing, and logs no bodies (D-057). Third-party hosted models are the user's own key — stored
@@ -164,6 +171,16 @@ build → commit loop, on-demand reviews, and the human commit gate.
 8. **Scratch files stay out of the tree.** Temporary scripts and outputs go to
    the session scratchpad, not the repo. Delete throw-away diagnostics before
    concluding.
+9. **The agent surface is a first-class integration point (D-086).** AI
+   extensions and browser agents drive the app through WebMCP and
+   `window.cveExplorer` — the same tools, schemas, prompt and schema brief as
+   chat. Any change to a tool's schema or description, the filter vocabulary,
+   the dimensions, `SCHEMA_BRIEF`, the system prompt, or what a result carries
+   *is* a change to that surface: it flows through `lib/agent.ts` by
+   construction, and the prose that does not — `public/llms.txt`, the in-page
+   agent note, the guide text — is updated in the same unit of work
+   (`tests/unit/agent.test.ts` fails when a tool or a global member goes
+   unmentioned). See docs/architecture.md, "The agent surface".
 
 ## Current status
 
@@ -173,7 +190,7 @@ visitor with no local copy lands in the single-pane workspace, their queries
 executed server-side by `api/sql.php` against a copy of the same database
 (corpus + FTS + KEV, built by `pipeline/hosted.py`, replaced by atomic rename).
 The header carries **"Make available offline"** instead of "Sync" on that
-tier, and the status strip discloses which tier is answering; `main[data-tier]`
+tier, and a footer line discloses which tier is answering; `main[data-tier]`
 is `local` or `hosted`. The client seam is one branch: `lib/remote.ts`'s
 `RemoteDb` wears the Worker's database shape and POSTs SQL synchronously (an XHR
 in the Worker, verified to work through `page.route` on both engines), so both
@@ -189,10 +206,42 @@ ratchet that would clamp the whole shared fpm pool, so a value bomb can spike
 RSS to ~1 GB — accepted on the 64 GB origin (amends D-084). **`?remote=0`**
 turns the tier off and restores the download gate (the local-tier e2e specs and
 `importCorpus` use it). Everything else about M9 stands: one report canvas with
-chat beside it, Filters / SQL / Data / Saved as collapsible panels, the canvas
-never opens empty, results copy out formula-guarded (D-071) and attribution-free
-(D-082). The e2e suite's selector knowledge lives in `tests/e2e/ui.ts` — update
-it first when the UI changes.
+chat beside it, SQL and Saved as collapsible panels, the canvas never opens
+empty, results copy out formula-guarded (D-071) and attribution-free (D-082).
+The e2e suite's selector knowledge lives in `tests/e2e/ui.ts` — update it
+first when the UI changes.
+
+**The workspace is cut to what a consumer uses (D-086, 2026-08-16).** The
+Filters drawer, the Data panel and the status strip are gone; over the chart
+sits one strip — published range, **weekly / monthly / yearly** grain (`week`
+is a Monday-labelled dimension; `quarter` stays valid but is not offered),
+**Vendor** and **Product** hybrid comboboxes over an in-memory catalog of every
+name (`catalog` Worker message, `lib/catalog.ts`; a vendor narrows the
+products; nothing is queried per keystroke), and **Reset** to the opening
+report — week × severity over the last two years (`defaultReport(now)`) — with
+**quick ranges** (all time, 10 / 5 / 2 / 1 yr, YTD) that set a lower edge
+relative to today and coarsen the grain when the window would not fit. A
+local copy more than twelve hours behind catches itself up on opening, once,
+with the progress bar saying why. The Data panel's contents and the
+revision / freshness / KEV lines live in a footer "Data & diagnostics"
+disclosure. **The six chat tools are the agent surface**: `lib/agent.ts` /
+`app/agent-bridge.ts` register them (plus `cve_explorer_guide`, which returns
+the chat prompt, dimensions and schema) on WebMCP (`document.modelContext`)
+where the browser has it, and always as `window.cveExplorer` — same
+descriptors, `parseToolCall`, Worker path and canvas as chat, annotated
+read-only and untrusted-content; `public/llms.txt` and a hidden in-page note
+say so in prose, and every agent call — refusals included — renders in an
+"Agent activity" log through the chat step component, so what an agent did
+is on screen for the person at the page. The e2e suite drives the query layer through that surface
+(`agentCall`) now that there is no drawer. **Every tool's result reaches the
+model, bounded** (D-087, reversing D-044's "never transcribes"): a record
+search returns its rows in the same 50-row / 12,000-character window `sql`
+has, with the remainder counted — the model may still not state a number that
+did not come from a tool, and every row it reads is rendered beside it. And
+**a `compute` tool** (D-088) runs a model-written JavaScript function over
+the *full* rows of the most recent result — the last aggregate, record search
+or SQL, whoever ran it — in the sandbox described above, returning a bounded
+value; `window.cveExplorer.last()` hands an agent the same rows whole.
 
 **Dates are one control now (D-085), bounded by the copy that is answering.**
 `app/date-range.tsx` over `lib/dates.ts` replaces every `<input type="date">`:
@@ -333,7 +382,7 @@ never settle (RE-032). Verified by exceeding: **15 concurrent through
 Cloudflare → 4 × 429**; the access log carries `$request` and no
 `$request_body`.
 
-771 unit tests and 116 browser specs passing across two engines (42 skips, all
+800 unit tests and 124 browser specs passing across two engines (42 skips, all
 the opt-in `MEASURE=1` and `BENCH` suites), with the relay verified against the
 live origin (405 on GET, 403 cross-origin, 413 over 256 KB, caller-supplied
 `model` ignored, caller-supplied `system` or `tools` refused with 400, no CORS

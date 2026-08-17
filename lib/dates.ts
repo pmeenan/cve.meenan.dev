@@ -285,6 +285,92 @@ export function datePresets(bounds: DayBounds | null, today: Day): DatePreset[] 
   return presets
 }
 
+/**
+ * The Monday on or before a day. Weekly buckets are labelled by their Monday
+ * (`WEEK_EXPR`, lib/filters.ts), so a window that opens on one opens on a
+ * whole week rather than a stub that would read as a dip at the left edge.
+ */
+export function weekStart(day: Day): Day {
+  // getUTCDay() is 0 for Sunday, so a Sunday steps back six.
+  return addDays(day, -((new Date(`${day}T00:00:00Z`).getUTCDay() + 6) % 7))
+}
+
+/**
+ * The lower edge of a "last N years" window: `years` back from `today`, then
+ * back to the Monday of that week — the arithmetic the opening report and the
+ * canvas's quick ranges share, so "2 years" reads pressed on the report the
+ * workspace opens with.
+ */
+export function yearsBack(today: Day, years: number): Day {
+  const [year, month, date] = parts(today)
+  return weekStart(format(year - years, month, date))
+}
+
+/**
+ * The quick ranges over the chart (UI polish, 2026-08-16): a relative window
+ * from a lower edge only. The upper edge is left *unset* on purpose — it
+ * displays the copy's last day and filters nothing — because "the last two
+ * years" is a question about the data's head, not about the day it was
+ * asked, and writing today into the range would pin every permalink to it.
+ *
+ * Unlike the calendar's shortcuts these are **not clamped** into the copy:
+ * they are relative to today, not to the data, so a permalink for "10 yr"
+ * means the same on the one-year development slice as on the corpus, and a
+ * lower edge before the first record filters nothing. The opening report
+ * (`defaultReport`) is built the same way, which is what lets "2 yr" read
+ * pressed on it before the copy's extent is even known.
+ */
+export const QUICK_RANGES: readonly { key: string; label: string; years: number | 'ytd' | null }[] =
+  [
+    { key: 'all', label: 'All time', years: null },
+    { key: '10y', label: '10 yr', years: 10 },
+    { key: '5y', label: '5 yr', years: 5 },
+    { key: '2y', label: '2 yr', years: 2 },
+    { key: '1y', label: '1 yr', years: 1 },
+    { key: 'ytd', label: 'YTD', years: 'ytd' },
+  ]
+
+export function quickRanges(today: Day): DatePreset[] {
+  return QUICK_RANGES.map(({ key, label, years }) => ({
+    key,
+    label,
+    from:
+      years === null
+        ? ''
+        : years === 'ytd'
+          ? format(dayYear(today), 1, 1)
+          : yearsBack(today, years),
+    to: '',
+  }))
+}
+
+/** A time grain the canvas offers, finest first. */
+export type Grain = 'week' | 'month' | 'year'
+export const GRAINS: readonly Grain[] = ['week', 'month', 'year']
+
+/** How many buckets of a grain a window spans, both ends inclusive. */
+export function bucketsBetween(grain: Grain, from: Day, to: Day): number {
+  if (compareDay(from, to) > 0) return 0
+  const [fromYear, fromMonth] = parts(from)
+  const [toYear, toMonth] = parts(to)
+  if (grain === 'year') return toYear - fromYear + 1
+  if (grain === 'month') return (toYear - fromYear) * 12 + (toMonth - fromMonth) + 1
+  return Math.round((daySeconds(weekStart(to)) - daySeconds(weekStart(from))) / 604_800) + 1
+}
+
+/**
+ * The finest grain, no finer than `grain`, whose buckets over a window fit
+ * under `cap`. The canvas coarsens rather than truncates: a time axis over its
+ * cap is cut at the *old* end (`crossSql` keeps the recent buckets), so
+ * "all time" by week would silently be the last eight years — and 1,400 bars
+ * are not a chart anyway. Never refines: a reader who chose Yearly keeps it.
+ */
+export function fitGrain(grain: Grain, from: Day, to: Day, cap: number): Grain {
+  let at = GRAINS.indexOf(grain)
+  while (at < GRAINS.length - 1 && bucketsBetween(GRAINS[at]!, from, to) > cap) at++
+  return GRAINS[at]!
+}
+
 function overlaps(preset: DatePreset, bounds: DayBounds | null): boolean {
   if (!bounds) return true
   if (preset.from && compareDay(preset.from, bounds.max) > 0) return false

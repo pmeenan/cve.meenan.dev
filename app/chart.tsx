@@ -42,6 +42,8 @@ const PLOT_H = H - PAD.top - PAD.bottom
 
 /** Longest x-axis label drawn before it is cut; the full text stays in the table. */
 const LABEL_CHARS = 18
+/** Most x-axis labels drawn; past this every k-th bucket is labelled. */
+const MAX_LABELS = 26
 
 const NO_HIDDEN: ReadonlySet<string> = new Set()
 
@@ -96,6 +98,7 @@ export function Chart({
   const top = ticks[ticks.length - 1] || 1
   const y = (value: number) => PAD.top + PLOT_H * (1 - value / top)
   const band = PLOT_W / view.rows.length
+  const labelStep = Math.max(1, Math.ceil(view.rows.length / MAX_LABELS))
 
   /**
    * Which bucket the pointer is over, from the pointer's place in the SVG's
@@ -268,6 +271,11 @@ export function Chart({
           className="axis-line"
         />
         {view.rows.map((row, rIndex) => {
+          // A weekly axis over the cap's seven years is 400 buckets in 782 px: every
+          // label drawn is a smear. Every k-th is drawn instead, k chosen so at
+          // most `MAX_LABELS` land; the tooltip and the table still carry all
+          // of them.
+          if (rIndex % labelStep !== 0) return null
           const x = PAD.left + band * (rIndex + 0.5)
           const short =
             row.label.length > LABEL_CHARS ? `${row.label.slice(0, LABEL_CHARS - 1)}…` : row.label

@@ -26,8 +26,9 @@ import { downloadButton, makeOfflineButton, awaitIdle } from './ui'
  *
  * What it uniquely proves: a first visit with no local copy lands in the
  * *workspace* (not the old download gate), the header offers "Make available
- * offline" rather than "Sync", the status strip carries the per-tier
- * disclosure, a report renders from server-executed SQL, and the offline
+ * offline" rather than "Sync", the page footer carries the per-tier
+ * disclosure on every page (no strip, no disclosure to open — UI polish,
+ * 2026-08-16), a report renders from server-executed SQL, and the offline
  * upgrade downloads and switches the answering tier to local.
  *
  * The dev server cannot execute PHP, so without this stub the probe fails and
@@ -113,12 +114,15 @@ test('a first visit lands in the workspace on the hosted tier', async ({ page })
   await expect(downloadButton(page))
     .toHaveCount(0)
     .catch(() => undefined)
-  // The header's upgrade action, and the per-tier disclosure.
+  // The header's upgrade action, and the per-tier disclosure — a line in the
+  // page footer, visible with nothing opened: the tier that is answering is
+  // never behind a click (D-084).
   await expect(makeOfflineButton(page)).toBeVisible()
   await expect(page.getByRole('button', { name: 'Sync', exact: true })).toHaveCount(0)
-  await expect(page.locator('[data-hosted="1"]')).toContainText(
-    /queries run on this site.s server/i
-  )
+  const disclosure = page.locator('footer.about [data-hosted="1"]')
+  await expect(disclosure).toBeVisible()
+  await expect(disclosure).toContainText(/queries run on this site.s server/i)
+  await expect(disclosure).toContainText(/make available offline/i)
 })
 
 test('the default report renders from server-executed SQL', async ({ page }) => {
@@ -135,11 +139,14 @@ test('the date control is bounded by the server’s copy, not left unbounded', a
   await page.goto('/')
   await expect(page.locator('main')).toHaveAttribute('data-tier', 'hosted', { timeout: 15_000 })
   // `coverage` is answered from whichever copy is answering (D-085), so on this
-  // tier it is one more server-executed statement — and the boxes seed from its
-  // reply exactly as they do from a local copy.
-  const from = page.locator('#canvas-pub-from')
-  await expect(from).toHaveAttribute('data-soft', '1', { timeout: 15_000 })
-  await expect(from).toHaveValue(/^\d{4}-\d{2}-\d{2}$/)
+  // tier it is one more server-executed statement — and an unset edge shows
+  // its reply exactly as it does from a local copy. The *to* edge is the unset
+  // one: the default report sets `publishedFrom` (two years back), so the
+  // from box carries a real value rather than the copy's extent.
+  const to = page.locator('#canvas-pub-to')
+  await expect(to).toHaveAttribute('data-soft', '1', { timeout: 15_000 })
+  await expect(to).toHaveValue(/^\d{4}-\d{2}-\d{2}$/)
+  await expect(page.locator('#canvas-pub-from')).toHaveValue(/^\d{4}-\d{2}-\d{2}$/)
 })
 
 test('the SQL console runs against the hosted tier', async ({ page }) => {

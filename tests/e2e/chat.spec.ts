@@ -21,10 +21,11 @@ import { awaitIdle, importCorpus, openChat, openPanel } from './ui'
  * and every unit test passed.
  *
  * What is asserted here is the set of claims no unit test can reach: that a
- * question produces a chart drawn by the Report tab's own components, that the
- * backing SQL is on screen, that "Open in Report" hands a real definition to
- * the builder, that nothing is sent before the disclosure is accepted, and that
- * chat traffic goes to this origin and nowhere else.
+ * question produces a chart drawn by the canvas's own components, that the
+ * backing SQL is on screen (the chat step's own disclosure — the canvas keeps
+ * its last query's SQL in the SQL panel), that "Open in Report" hands a real
+ * definition to the canvas, that nothing is sent before the disclosure is
+ * accepted, and that chat traffic goes to this origin and nowhere else.
  */
 
 /** One NDJSON frame, as Ollama shapes them and the relay forwards them. */
@@ -46,7 +47,7 @@ const done = () =>
  * Answer the relay with a scripted round per request.
  *
  * Returns the request bodies, so a test can assert what was *sent* — which is
- * how "row-level records never enter the model's context" is checked from
+ * how "the model is handed the records it listed" (D-087) is checked from
  * outside rather than by reading `describeToolResult` again.
  */
 async function stubModel(page: Page, rounds: string[][]): Promise<{ bodies: unknown[] }> {
@@ -149,29 +150,30 @@ test.describe('the chat panel', () => {
     })
 
     // The aggregate has already auto-applied to the canvas (UI revamp), and
-    // the filter panel reflects the *model's* definition — `severity` rows,
-    // where the auto-run default report would say `year`.
+    // the canvas reflects the *model's* definition — `severity` rows, where
+    // the auto-run default report would say `week`. There is no filter drawer
+    // to read the axes from any more; the canvas title's placeholder names
+    // them, and a time-grain radio row exists only for a time axis.
     await awaitIdle(page)
-    await openPanel(page, 'filters')
-    await expect(page.locator('#report-rows')).toHaveValue('severity')
+    const title = page.locator('#canvas-title')
+    await expect(title).toHaveAttribute('placeholder', 'Severity')
+    await expect(page.locator('fieldset.granularity')).toHaveCount(0)
     const matches = page.locator('[data-report-matches]')
     await expect(matches).toBeVisible({ timeout: 120_000 })
     const before = await matches.getAttribute('data-run')
 
     // The durable artifact of a conversation is the definition, not the prose
     // (D-069, D-072) — so this is the action that has to work: it hands the
-    // definition to the builder and re-runs it on the canvas, which a fresh
-    // `data-run` proves. The canvas already showing an identical result must
-    // not be able to satisfy this.
+    // definition to the canvas and re-runs it there, which a fresh `data-run`
+    // proves. The canvas already showing an identical result must not be able
+    // to satisfy this.
     await step.locator('[data-chat-open-report]').click()
     await expect(matches).not.toHaveAttribute('data-run', before ?? '', { timeout: 120_000 })
-    await expect(page.locator('#report-rows')).toHaveValue('severity')
+    await expect(title).toHaveAttribute('placeholder', 'Severity')
     await expect(page.locator('[data-report-matches]')).toBeVisible({ timeout: 120_000 })
   })
 
-  test('row-level records are rendered for the user and withheld from the model', async ({
-    page,
-  }) => {
+  test('row-level records are rendered for the user and handed to the model', async ({ page }) => {
     test.setTimeout(600_000)
     const { bodies } = await stubModel(page, [
       [callTool('search_records', { severity: ['CRITICAL'], limit: 5 }), done()],
@@ -194,12 +196,62 @@ test.describe('the chat panel', () => {
     await expect(page.locator('section.canvas table.records')).toBeVisible({ timeout: 120_000 })
     await expect(page.locator('section.canvas p[data-matches]')).toBeVisible()
 
-    // …and *not* in what was sent to the model. This is the D-044 rule that is
-    // invisible in the UI, so it is checked from the wire.
+    // …*and* in what was sent to the model (D-087, reversing D-044's
+    // withholding): the same identifier the table shows, in a bounded window
+    // that says how many matched. Invisible in the UI, so checked from the wire.
     const second = bodies[1] as { messages: { role: string; content: string }[] }
     const toolMessage = second.messages.find((message) => message.role === 'tool')!
-    expect(toolMessage.content).not.toContain(cveId)
-    expect(toolMessage.content).toContain('recordsMatched')
+    expect(toolMessage.content).toContain(cveId)
+    const seen = JSON.parse(toolMessage.content) as { rowsShown: number; recordsMatched: number }
+    expect(seen.rowsShown).toBe(5)
+    expect(seen.recordsMatched).toBeGreaterThanOrEqual(5)
+  })
+
+  test('a compute step shows the code, the output and what it ran over', async ({ page }) => {
+    test.setTimeout(600_000)
+    const { bodies } = await stubModel(page, [
+      [callTool('search_records', { severity: ['CRITICAL'], limit: 30 }), done()],
+      [
+        callTool('compute', {
+          code: 'console.log("n", rows.length); return { n: rows.length, ids: data.slice(0, 2).map((r) => r.cve) }',
+        }),
+        done(),
+      ],
+      [delta('Thirty critical records; the first two are listed.'), done()],
+    ])
+
+    await ready(page)
+    await ask(page, 'how many critical records, and name two')
+
+    // The step renders the value and the code as text nodes — never markup —
+    // beside the search it ran over, so a number the model states from it
+    // can be checked (D-088).
+    const step = page.locator('[data-chat-step="compute"]')
+    await expect(step).toBeVisible({ timeout: 120_000 })
+    await expect(step.locator('[data-chat-compute]')).toHaveAttribute('data-chat-compute', 'ok')
+    await expect(step.locator('[data-chat-compute]')).toContainText(
+      '30 rows of the last record search'
+    )
+    await expect(step.locator('[data-chat-compute-value]')).toContainText('"n":30')
+    await step.getByText('The code that produced this').click()
+    await expect(step.locator('details pre')).toContainText('rows.length')
+
+    // …and the model was told the same, bounded and structured.
+    const third = bodies[2] as { messages: { role: string; content: string }[] }
+    const toolMessages = third.messages.filter((message) => message.role === 'tool')
+    const computed = JSON.parse(toolMessages[toolMessages.length - 1]!.content) as {
+      tool: string
+      ok: boolean
+      value: string
+      logs: string[]
+      input: { source: string; rows: number }
+    }
+    expect(computed.tool).toBe('compute')
+    expect(computed.ok).toBe(true)
+    expect(JSON.parse(computed.value).n).toBe(30)
+    expect(computed.logs).toEqual(['n 30'])
+    expect(computed.input).toMatchObject({ source: 'records', rows: 30 })
+    await expect(page.locator('[data-chat-answer]')).toContainText('Thirty critical')
   })
 
   test('an invented tool is refused to the model, not shown as a failure', async ({ page }) => {
@@ -328,11 +380,13 @@ test.describe('the chat panel', () => {
     await expect(error).toContainText('model host')
     // The deterministic UI is untouched, and the message says so rather than
     // reading as "the app is broken". The old assertion was the Report tab
-    // still being enabled; the workspace equivalent is that the filter panel
-    // still opens and can still run a report.
+    // still being enabled; the workspace equivalent is that the canvas strip
+    // still runs (Reset is enabled) and the SQL panel still opens with its
+    // Run button live.
     await expect(error).toContainText('unaffected')
-    await openPanel(page, 'filters')
-    await expect(page.getByRole('button', { name: 'Run report' })).toBeEnabled()
+    await expect(page.locator('[data-reset]')).toBeEnabled()
+    await openPanel(page, 'sql')
+    await expect(page.getByRole('button', { name: 'Run SQL' })).toBeEnabled()
   })
 
   test('a rate-limited relay says to wait rather than that the app is broken', async ({ page }) => {

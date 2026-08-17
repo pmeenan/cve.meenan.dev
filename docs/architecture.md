@@ -652,7 +652,7 @@ hand its id to a different value (D-056).
 Sits entirely above the client described previously; the data plane below it is
 unchanged, and the two Fixed points it touches — one origin, upstream sources —
 carry their D-045/D-057 annotations above. **Built in M7** for the site-hosted
-tier: `lib/tools.ts` (five tools), `lib/chat.ts` and `lib/chat-loop.ts` (the
+tier: `lib/tools.ts` (six tools), `lib/chat.ts` and `lib/chat-loop.ts` (the
 transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
 `public/api/chat.php` (the relay). These are the structural commitments:
 
@@ -660,13 +660,15 @@ transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
   presentation tools emit the same serializable object the deterministic UI
   builds, renders, and shares. Charts, clickable CVE lists, and drill-downs are
   the existing UI components fed by the model rather than duplicated for it.
-- **The model orchestrates; it never transcribes.** Small aggregate results may
-  enter model context for trend interpretation; row-level result sets from the
-  curated tools are returned as handles and rendered straight from SQLite. A
-  number the user sees is a query result by construction. One narrowing, taken
-  deliberately in D-078: the `SELECT`-only tool gets a bounded window of its own
-  result, because a model that writes the query and is told only "1 row
-  returned" cannot answer the question it just asked.
+- **The model reasons over what its tools return, bounded** (D-087, reversing
+  D-044's "never transcribes"). Every result reaches the model — an
+  aggregate's cells, up to 50 rows of a record search or a SQL result within a
+  12,000-character budget (D-078's window, generalised), a whole record for
+  `cve_detail` — with the count of what lies outside the window stated. Every
+  result also travels whole to the fixed UI components, rendered straight from
+  SQLite: that copy is where a reader checks a claim, and the model may still
+  not state a count, date, score or identifier that did not come back from a
+  tool.
 - **Tool surface: read-only, render-only, forever.** Curated high-level tools
   with tight schemas, plus a `SELECT`-only SQL tool that is row-capped,
   **byte-capped** and timed out — enforced structurally (SQLite authorizer,
@@ -696,6 +698,65 @@ transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
 - **Model selection is benchmarked, not assumed (D-046).** Ground-truth analyst
   questions scored by data comparison against the real corpus, run through the
   actual integration.
+
+## The agent surface — a first-class integration point (D-086)
+
+The same six tools, offered to any AI agent that can reach the page — a
+browser's own agent through **WebMCP** and any extension with a JavaScript tool
+through **`window.cveExplorer`** — plus one, `cve_explorer_guide`, that carries
+what WebMCP has no primitive for: the guide (the chat system prompt with
+today's date filled in, the dimension guide, the schema brief, and how the page
+renders each result). Files: `lib/agent.ts` (pure: descriptors, guide, result
+envelope), `app/agent-bridge.ts` (registration on `document.modelContext` /
+`navigator.modelContext` with an `AbortSignal`, and the window global),
+`public/llms.txt` and the visually-hidden `section[data-agent-notes]` in the
+workspace (prose for agents that read the accessibility tree). **Every agent
+call is on screen for the person at the page**: the bridge reports each one —
+refusals included, an invented name included — and the workspace renders them
+in an "Agent activity" log (`section[data-agent-log]`, newest first, bounded)
+through the chat panel's own step component, so a KEV claim, a computed value
+or a record read an agent relayed has the same visible audit trail a chat
+answer has; an aggregate, a record search or SQL also lands on the canvas as a
+chat call's would, and a record read opens the record — or the "no record"
+state, so a lookup that finds nothing never leaves an older record open. Two
+things
+exist for agents and models that want the *data* rather than a window of it
+(D-088): `window.cveExplorer.last()` returns the most recent result whole —
+every row the query layer returned for the last aggregate, record search or
+SQL, whoever ran it, as a copy — and the `compute` tool runs a JavaScript
+function body over those same rows inside a sandbox: an `<iframe
+sandbox="allow-scripts" srcdoc=…>` (opaque origin: no cookies, storage or
+OPFS; `srcdoc` because this site's `Cross-Origin-Resource-Policy: same-origin`
+would refuse a file to an opaque requester on Firefox) whose own CSP is
+`default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob:;
+worker-src blob:` — no network, engine-enforced — with the code run in a blob:
+Worker so it can be terminated at the 10-second deadline, and its output
+clipped to the model's result budget on both sides of the frame
+(`lib/sandbox-doc.ts`, `lib/sandbox.ts`; the page-side `Sandbox` is the one
+tool `runToolCall` handles without the database Worker, which refuses
+`compute` by name). The boundary is checked from inside the sandbox by
+`tests/e2e/compute.spec.ts` on both engines — fetch, storage, origin and the
+deadline — not read off the config.
+
+**This surface is a product interface, not a by-product of chat, and it is
+kept current by construction wherever it can be:**
+
+| What an agent sees | Where it comes from | What keeps it current |
+| --- | --- | --- |
+| Tool names, descriptions, JSON Schemas | `TOOLS` in `lib/tools.ts` — the chat descriptors, verbatim | `tests/unit/agent.test.ts` asserts the agent list is `TOOLS` plus the guide |
+| Argument validation and refusals | `parseToolCall` — the chat loop's | the same function; there is no second parser |
+| The rules (dates, dimensions, aggregate vs sql) | `systemPrompt()` and `DIMENSION_GUIDE` | built from `DIMENSIONS`/`DIMENSION_LABELS`; a new dimension cannot arrive undescribed |
+| The schema | `SCHEMA_BRIEF` | `tests/unit/chat.test.ts` checks it against `pipeline/schema.sql` |
+| Result text | `describeToolResult` — the chat model's bounded JSON | the same function; coded buckets labelled as the chart labels them |
+| The prose notes (`llms.txt`, in-page section) | hand-written | `tests/unit/agent.test.ts` asserts both name every tool and every `window.cveExplorer` member |
+
+**Rule (AGENTS.md rule 9).** A change to the tool schemas, the filter
+vocabulary, the dimensions, the schema brief, the prompt, or what a result
+carries *is* a change to the agent surface. Most of it flows through the table
+above by construction; what does not — the prose notes, the guide's own text,
+`docs/decisions.md` for a change of posture — is owed in the same unit of work,
+and the unit tests are written to fail when a tool or a global member goes
+unmentioned.
 
 ## Schema
 

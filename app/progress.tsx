@@ -13,15 +13,19 @@ export function ProgressBar({
   cancelFlag,
   stopping,
   onCancel,
+  lead,
 }: {
   progress: Progress
   /** Null on a browser with no SharedArrayBuffer — the UI says so instead. */
   cancelFlag: Int32Array | null
   stopping: boolean
   onCancel: () => void
+  /** Why this is running, when the page started it rather than the reader. */
+  lead?: string | null
 }) {
   return (
-    <section className="progress" aria-live="polite">
+    <section className="progress" aria-live="polite" data-auto-sync={lead ? '1' : undefined}>
+      {lead && <p className="progress-lead">{lead}</p>}
       <div className="bar">
         <div
           className="fill"

@@ -4,20 +4,26 @@ import {
   addDays,
   addMonths,
   axisBounds,
+  bucketsBetween,
   clampDay,
   datePresets,
   endOfMonth,
+  fitGrain,
   format,
   formatDayLong,
   isDay,
   matchPreset,
   monthGrid,
   parseDayInput,
+  quickRanges,
   secondsToDay,
   startOfMonth,
+  weekStart,
   withinBounds,
   yearBounds,
+  yearsBack,
 } from '../../lib/dates'
+import { defaultReport } from '../../lib/report'
 import type { Coverage } from '../../lib/protocol'
 
 /**
@@ -232,5 +238,60 @@ describe('the shortcut rail', () => {
     expect(matchPreset(presets, '', '')).toBe('all')
     expect(matchPreset(presets, '2026-07-18', '2026-08-16')).toBe('30d')
     expect(matchPreset(presets, '2026-07-19', '2026-08-16')).toBeNull()
+  })
+})
+
+describe('the quick ranges over the chart', () => {
+  const wide = { min: '1999-01-01', max: '2026-08-16' }
+
+  it('steps back N years and then to the Monday, so the first week is whole', () => {
+    // 2026-08-16 is a Sunday; two years back is a Friday, whose week began on
+    // Monday the 12th. A Monday stays put.
+    expect(weekStart('2026-08-16')).toBe('2026-08-10')
+    expect(weekStart('2026-08-10')).toBe('2026-08-10')
+    expect(yearsBack('2026-08-16', 2)).toBe('2024-08-12')
+    // Feb 29 minus a year lands on a day that exists (`format` rolls it
+    // forward to March 1, which that year is itself a Monday).
+    expect(yearsBack('2028-02-29', 1)).toBe('2027-03-01')
+  })
+
+  it('sets a lower edge only, relative to today and not to the copy', () => {
+    const ranges = quickRanges('2026-08-16')
+    expect(ranges.map((range) => range.key)).toEqual(['all', '10y', '5y', '2y', '1y', 'ytd'])
+    const byKey = Object.fromEntries(ranges.map((range) => [range.key, range]))
+    expect(byKey.all).toEqual({ key: 'all', label: 'All time', from: '', to: '' })
+    expect(byKey['2y']).toEqual({ key: '2y', label: '2 yr', from: '2024-08-12', to: '' })
+    expect(byKey['10y']?.from).toBe('2016-08-15')
+    expect(byKey.ytd?.from).toBe('2026-01-01')
+    // Every range leaves the upper edge unset: "the last two years" is a
+    // question about the data's head, and today in a permalink would pin it.
+    expect(ranges.every((range) => range.to === '')).toBe(true)
+  })
+
+  it('reads pressed on the report the workspace opens with', () => {
+    // `defaultReport` and the "2 yr" button share `yearsBack`, so Reset and
+    // the button land on the same window and the button shows it — on any
+    // copy, because neither is clamped into one.
+    const ranges = quickRanges('2026-08-16')
+    const opening = defaultReport(Date.UTC(2026, 7, 16, 15, 0, 0)).filters.publishedFrom!
+    expect(secondsToDay(opening)).toBe('2024-08-12')
+    expect(matchPreset(ranges, secondsToDay(opening), '')).toBe('2y')
+    expect(matchPreset(ranges, '', '')).toBe('all')
+    // An upper edge that is set is a hand-made window, not a quick range.
+    expect(matchPreset(ranges, '2024-08-12', '2026-08-16')).toBeNull()
+  })
+
+  it('coarsens a grain the window would overflow, and never refines one', () => {
+    expect(bucketsBetween('year', '1999-01-01', '2026-08-16')).toBe(28)
+    expect(bucketsBetween('month', '2024-08-12', '2026-08-16')).toBe(25)
+    expect(bucketsBetween('week', '2024-08-12', '2026-08-16')).toBe(105)
+    expect(bucketsBetween('week', '2026-08-16', '2026-08-16')).toBe(1)
+    expect(bucketsBetween('week', '2026-08-17', '2026-08-16')).toBe(0)
+    // Two years of weeks fits; all time by week does not, and by month does.
+    expect(fitGrain('week', '2024-08-12', '2026-08-16', 400)).toBe('week')
+    expect(fitGrain('week', '1999-01-01', '2026-08-16', 400)).toBe('month')
+    // Nor would month over a window a cap of twelve cannot hold: year is the top.
+    expect(fitGrain('week', '1999-01-01', '2026-08-16', 12)).toBe('year')
+    expect(fitGrain('year', '2026-01-01', '2026-08-16', 400)).toBe('year')
   })
 })

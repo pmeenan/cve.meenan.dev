@@ -23,10 +23,19 @@ import { expect, type Locator, type Page } from '@playwright/test'
  *   copy) the header carries a `Sync` button; on the **hosted** tier (server
  *   answering, no local copy) it carries `Make available offline` instead,
  *   which is the same `[data-download]` action. `main[data-tier]` is `local`
- *   or `hosted`. Header toggles open the panels: Filters (`#filters-panel`),
- *   SQL (`#sql-panel`), Data (`#data-panel`), Saved (`#saved-panel`), and the
- *   chat column. The canvas auto-runs a default report the first time a tier
- *   is ready — `data-run` is never assumed to be zero.
+ *   or `hosted`. Header toggles open the panels: SQL (`#sql-panel`), Saved
+ *   (`#saved-panel`), and the chat column. The **Data & diagnostics**
+ *   disclosure — the old Data panel's contents, `#data-panel` — lives in the
+ *   page footer (`details[data-data-disclosure]`, whose `<summary>` carries
+ *   `data-toggle="data"`), not the header (UI polish, 2026-08-16). There is
+ *   no filter drawer any more: the canvas strip carries the published range,
+ *   the quick ranges (`[data-quick-range="all|10y|5y|2y|1y|ytd"]`, the
+ *   current one `aria-pressed`), the time grain, the Vendor and Product
+ *   pickers (`[data-picker]`) and Reset (`[data-reset]`); everything else a
+ *   filter used to express is
+ *   driven through the agent surface (`agentCall`, D-086) or a permalink.
+ *   The canvas auto-runs a default report the first time a tier is ready —
+ *   `data-run` is never assumed to be zero.
  *
  * **The dev server cannot execute `sql.php`** (it serves PHP as bytes), so
  * the hosted probe fails against it and the landing fallback renders — which
@@ -53,8 +62,12 @@ export function makeOfflineButton(page: Page): Locator {
   return page.getByRole('button', { name: /make available offline/i })
 }
 
-/** The workspace panels a header toggle controls. */
-export type PanelName = 'filters' | 'sql' | 'data' | 'saved'
+/**
+ * The workspace panels a toggle controls. `data` is the footer's Data &
+ * diagnostics disclosure; its toggle is the `<summary>`, which carries the
+ * same `data-toggle` / `aria-expanded` hooks as the header buttons.
+ */
+export type PanelName = 'sql' | 'data' | 'saved'
 
 export function panelToggle(page: Page, panel: PanelName): Locator {
   return page.locator(`[data-toggle="${panel}"]`)
@@ -64,7 +77,7 @@ export function panelToggle(page: Page, panel: PanelName): Locator {
 export async function openPanel(page: Page, panel: PanelName): Promise<void> {
   const toggle = panelToggle(page, panel)
   if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click()
-  await expect(page.locator(`#${panel === 'data' ? 'data-panel' : `${panel}-panel`}`)).toBeVisible()
+  await expect(page.locator(`#${panel}-panel`)).toBeVisible()
 }
 
 /** Close a workspace panel if it is open. */
@@ -100,12 +113,12 @@ export async function setChartType(page: Page, label: string): Promise<void> {
 
 /**
  * The date range control (M9), by the `data-date-range` name its instances
- * carry: `canvas-published` on the canvas strip, and `published`, `updated`,
- * `kev-added`, `kev-due` in the filter drawer.
+ * carry: `canvas-published` on the canvas strip is the one left since the
+ * filter drawer went.
  *
- * Its two text boxes keep the ids the native inputs had — `#canvas-pub-from`,
- * `#report-pub-from` and so on — so a spec that only wants to set a date can
- * still `fill()` one. The value is committed on **Enter or blur**, never
+ * Its two text boxes keep the ids the native inputs had — `#canvas-pub-from`
+ * and `#canvas-pub-to` — so a spec that only wants to set a date can still
+ * `fill()` one. The value is committed on **Enter or blur**, never
  * mid-typing (a commit re-runs the canvas report, and a running query disables
  * the box under the reader's fingers), so a `fill()` must be followed by
  * something that blurs it.
@@ -125,6 +138,54 @@ export function calendarDay(page: Page, day: string): Locator {
   return page.locator(`[data-day="${day}"]`)
 }
 
+/**
+ * Drive the page through its agent surface (D-086): the same six read-only
+ * tools the built-in chat uses (`compute` runs JavaScript over the last
+ * result in a sandbox, D-088; `window.cveExplorer.last()` returns that
+ * result whole), reached as `window.cveExplorer.call(name, args)`. Every
+ * call also lands in the workspace's "Agent activity" log
+ * (`[data-agent-log]`, newest first, each a `[data-chat-step]` rendered by the
+ * chat panel's step component). Resolves to the tool's text result — the bounded JSON the chat model
+ * gets — parsed; the result also lands on the canvas exactly as a chat call's
+ * would (an `aggregate` is the chart, `search_records` the record list), so a
+ * spec can assert on either. This is how the suite expresses a filter now
+ * that there is no drawer: `agentCall(page, 'search_records', { vendor:
+ * ['Cisco'] })` is what "Vendor: Cisco, List records" used to be.
+ */
+export async function agentCall(
+  page: Page,
+  name: string,
+  args: Record<string, unknown> = {}
+): Promise<Record<string, unknown>> {
+  const text = await page.evaluate(
+    ([toolName, toolArgs]) =>
+      (
+        window as unknown as {
+          cveExplorer: { call(n: string, a: unknown): Promise<string> }
+        }
+      ).cveExplorer.call(toolName as string, toolArgs),
+    [name, args] as const
+  )
+  return JSON.parse(text) as Record<string, unknown>
+}
+
+/**
+ * The vendor or product picker on the canvas strip (`[data-picker="vendor"]`
+ * / `"product"`): type into its combobox and commit with Enter, which picks
+ * the highlighted match — the best-ranked name containing the text — or the
+ * text itself when nothing matches. `pickerClear` restores "All".
+ */
+export async function pick(page: Page, picker: 'vendor' | 'product', text: string): Promise<void> {
+  const box = page.locator(`[data-picker="${picker}"] input`)
+  await box.click()
+  await box.fill(text)
+  await box.press('Enter')
+}
+
+export async function pickerClear(page: Page, picker: 'vendor' | 'product'): Promise<void> {
+  await page.locator(`[data-picker-clear="${picker}"]`).click()
+}
+
 /** The canvas's collapsed share/export row, opened. */
 export async function openShare(page: Page): Promise<void> {
   const share = page.locator('details.share')
@@ -136,10 +197,11 @@ export async function openShare(page: Page): Promise<void> {
 /**
  * Download the corpus from the landing view and wait for the workspace.
  *
- * The `Import` heading is inside the Data panel, which opens itself on the
- * import that filled it — so awaiting it asserts both the import and the
- * panel behaviour. The default report that auto-runs afterwards is left to
- * finish on its own; specs that need quiet use `awaitIdle`.
+ * The `Import` heading is inside the footer's Data & diagnostics disclosure,
+ * which opens itself on the import that filled it — so awaiting it asserts
+ * both the import and the disclosure behaviour. The default report that
+ * auto-runs afterwards is left to finish on its own; specs that need quiet
+ * use `awaitIdle`.
  */
 export async function importCorpus(page: Page, timeout = 90_000): Promise<void> {
   // `?remote=0` turns the hosted tier off (D-084), so a first visit lands on

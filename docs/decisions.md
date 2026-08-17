@@ -27,7 +27,253 @@ Decision / Context / Consequences / Reopen if
 
 ---
 
-## D-085: Date ranges are one bounded control, seeded by the data and never by a predicate  (2026-08-16, status: accepted)
+## D-088: A `compute` tool runs model-written JavaScript over the whole last result, inside a sandbox the page cannot be reached from — and `window.cveExplorer.last()` hands an agent that result whole  (2026-08-16, status: accepted; extends D-044's tool surface by one tool under its read-only, no-network rule; builds on D-087)
+
+**Decision.** Two additions to the tool surface, one mechanism behind both.
+
+**1. The page keeps the most recent result whole** — every row the query
+layer returned for the last aggregate, record search or SQL, whoever ran it
+(canvas, chat, agent, console), with columns, SQL, match count and the
+definition — and `window.cveExplorer.last()` returns a copy of it. An agent is
+*code*; handing it 500 rows costs no context, and it can process them itself.
+
+**2. A sixth tool, `compute`**, takes a JavaScript function body and runs it
+over that same result — `rows` (arrays), `columns`, `data` (objects keyed by
+column), a bounded `console.log` — returning a JSON-serialisable value clipped
+to `MAX_MODEL_RESULT_CHARS`, with `rowsShown`-style honesty about the input
+(`input.rows`, `input.source`) and the deadline. The model never needs the raw
+rows in its window: it sends the program to the data. The chat panel renders
+the code and its output as text nodes in the step, so a number the model
+states from it is one a reader can see computed. **`sql` remains preferred**
+where SQLite can answer; the prompt and the tool description both say so.
+`compute` is for a result you already have: text matching over every
+description, ratios, ranking, picking, joining two results.
+
+**The sandbox.** The code runs in an `<iframe sandbox="allow-scripts"
+srcdoc=…>` — no `allow-same-origin`, so the document has an **opaque origin**:
+no cookies, no localStorage, no IndexedDB, no Cache API, no OPFS (the corpus
+lives there), no claim on this site's origin. The document carries its own
+policy, **`default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'
+blob:; worker-src blob:`**, so `connect-src` is empty and fetch,
+XMLHttpRequest, WebSocket, EventSource and sendBeacon are refused *by the
+engine*; a `srcdoc` document also inherits the page's `connect-src 'self'`,
+and a request must satisfy both. Inside the frame the code runs in a **blob:
+Worker**, which inherits that policy (CSP3 §7.2), can be `terminate()`d at
+the 10-second deadline where a window's infinite loop could not be, and has
+no RTCPeerConnection, no `<img>`, no `<link>`, no navigation — the exits CSP
+does not govern are simply absent. The worker also removes `fetch` and its
+kin from its global before running the code, so a program that types `fetch`
+gets a ReferenceError it can read rather than a violation it cannot; that is
+a courtesy, not the boundary. Output is clipped inside the worker, again in
+the frame, and again in `describeToolResult`. The page waits a little past
+the worker's deadline and, if the frame itself has stopped answering, tears
+it down; the next call builds a fresh one. The database Worker refuses
+`compute` by name, so a stray `tool` message can never make the process that
+holds OPFS evaluate anything.
+
+**Why `srcdoc` and not a file.** The first build served the sandbox as
+`public/sandbox.html`. Chromium loaded it; **Firefox refused it** — every
+response this origin serves carries `Cross-Origin-Resource-Policy:
+same-origin` (D-034), and a navigation into an opaque-origin frame is a
+cross-origin request that CORP rejects. Opening a header exception for one
+path would be an nginx change on the server for a client concern; a `srcdoc`
+document is never fetched, so there is nothing for CORP to refuse, and it is
+sandboxed and policed identically. Measured, not reasoned:
+`tests/e2e/compute.spec.ts` builds the frame the same way and proves, on
+**both engines, from inside the sandbox**, that the window and a blob: worker
+cannot fetch (`TypeError`, engine-refused), that storage APIs are absent, that
+`location.origin` is `null`, and that `while (true) {}` is stopped at the
+deadline with the next call answering.
+
+**Context.** The owner's questions (2026-08-16): is there a way for chat to
+get the *full* raw data of the last query for processing, and would running
+JavaScript against the data set make sense if it could be isolated? The
+answers are one design. For an agent, "the full data" is `last()` — free. For
+a model, "the full data" is bounded by D-080 whatever it is called: 500
+records at 400 characters is more than the window; paging would fill the
+window rather than help a model reason. What actually gives chat the whole
+result *for processing* is a place to process it that is not the context
+window. The load-bearing rule — read-only, render-only, no network, no
+writes — is what the sandbox exists to keep: a program that can only compute
+over data handed to it and return text is all three, *if* the isolation is
+real, and a same-origin Worker would not have been (it sees OPFS, IndexedDB
+and `fetch`).
+
+**Consequences.** One more tool on the permanent surface (WebMCP and the
+window global carry it by construction, D-086); `public/llms.txt`, the
+in-page note and the guide name it and `last()`, and the unit tests fail if
+they stop. `chat.php`'s pinned surface grows to six tools at build. The
+sandbox document ships inside the page bundle (`lib/sandbox-doc.ts`), not as
+a file, so the offline shell needs nothing new. Model quality on this tool is
+a D-046 measurement to take: `qwen3:8b` writes passable SQL; whether it
+writes correct JavaScript against `data` first time, and whether it reaches
+for `compute` where `sql` would do, is not yet known.
+
+**Reopen if** an engine ships that does not bind a meta CSP to a blob: worker
+in a sandboxed `srcdoc` document (the spec would catch it — that is what it is
+for), or if the scorecard shows the tool lowering answer quality, or if a
+richer input than "the last result" is wanted (a named earlier result, or
+rows the model supplies) — the message shape has room for it.
+
+---
+
+## D-087: The model is handed every tool's result, bounded — the record list included  (2026-08-16, status: accepted; reverses D-044's "never transcribes" and generalises D-078's window)
+
+**Decision.** `search_records` returns its rows to the model: identifier,
+state, published day, CVSS score and severity, CNA and the start of the
+description, in the same window the `sql` tool has had since D-078 — up to
+`MAX_MODEL_ROWS` (50) within `MAX_MODEL_RESULT_CHARS` (12,000), coded values
+spelled as the words the record table shows, `rowsShown` / `rowsOmitted` /
+`recordsMatched` stated so the model knows what it did not see. D-044's rule
+that "row-level result sets never enter the model's context" is withdrawn;
+what remains of it is the part that was always about *rendering*: every result
+still travels whole to the fixed UI components, and the model is told the
+rendered copy is where a reader checks a claim. The system prompt's line
+changes from "row-level records are deliberately not given to you" to "reason
+over the rows you were given; if the window is smaller than the match, say so
+and narrow the question". The bounds are context-window economics (D-080), not
+a handicap: a model that wants more narrows the filter or asks `sql`.
+
+**Context.** The owner's call (2026-08-16), on reading the chat panel's
+opening line — *"the model only decides which query to run"* — and taking it
+for the architecture rather than the disclosure it was: the model already
+received aggregates, SQL rows, whole records and KEV entries; the record list
+was the one tool that withheld what it had rendered. The withholding was
+D-044's, made for traceability (vision criterion 7: every number the user sees
+came from a query) and kept in D-078 as a matter of course. The owner's
+reasoning for reversing it: **the point of the chat layer is answers the UI
+cannot give on its own** — "which of these have deserialization in common",
+"pick the three worth reading first" — and a model that cannot see the list it
+just produced cannot give them; and the privacy argument for holding data back
+from the model does not belong here, because the model tier a privacy-minded
+user will want is the parked one — their own key, or a local model they run
+(D-045) — not a general tier handicapped for everyone. Traceability survives:
+the model still may not state a count, a date, a score or an identifier that
+did not come back from a tool, and every row it reads is on screen beside it.
+
+**Consequences.** More attacker-written text reaches the model per turn —
+which `cve_detail` had already made true; containment was never the prompt but
+the read-only, render-only surface (D-044, D-057), and every text value is
+labelled untrusted in the result. D-080's eviction carries the volume: a
+50-row window is about the size of one `sql` result. The agent surface (D-086)
+carries the same change by construction — `describeToolResult` is what
+`window.cveExplorer.call` and a WebMCP execute return — and `public/llms.txt`
+now says what a result carries and how it is bounded. The unit test that
+asserted the withholding now asserts the window and its honesty; the e2e spec
+that read the wire for the *absence* of an identifier reads it for its
+presence.
+
+**Reopen if** a model tier appears whose context cannot carry the window (the
+bounds are constants), or if the scorecard (D-046) shows the rows *lowering*
+answer quality — a small model summarising fifty rows instead of reading the
+count was the failure D-044's rule was written against, and it is now a
+measured question rather than a settled one.
+
+---
+
+## D-086: The workspace is chart, chat and SQL — and the chat tools are offered to any agent, on WebMCP and as a page global  (2026-08-16, status: accepted; scopes D-081, amends D-085's drawer references, extends D-044's read-only surface to third-party agents; every agent call renders in an "Agent activity" log since the same-day review — see docs/architecture.md)
+
+**Decision.** Two things, taken together because the second is what makes the
+first tenable.
+
+1. **The direct-control surface is cut to what a consumer uses.** The Filters
+   drawer, the Data panel and the status strip are gone from the workspace.
+   What is left over the chart is a strip — the published range (D-085), the
+   time grain (**weekly / monthly / yearly**; quarterly is no longer offered,
+   though `quarter` stays a dimension a permalink or a model may name), a
+   **Vendor** and a **Product** picker, and **Reset** — plus the SQL panel,
+   Saved, and chat. The pickers are hybrid comboboxes over an **in-memory
+   catalog** of every vendor and product name (a `catalog` Worker message,
+   read once per state of the copy in ≤20,000-row pages so both tiers walk
+   the same statements), searched by case-insensitive substring and ranked
+   by how many CVE-product rows carry the name; a chosen vendor narrows the
+   product list to its own. They commit into the same `filters.vendor` /
+   `filters.product` name lists a permalink or a chat call sets — so a chip,
+   the chat's canvas context and the URL keep agreeing — and nothing is queried
+   per keystroke. Over the range boxes sits a row of **quick ranges** — all
+   time, 10 / 5 / 2 / 1 years, year to date — each a lower edge relative to
+   today with the upper edge left unset (so a permalink never carries the day
+   it was made), the current one shown pressed; a range too wide for the
+   grain **coarsens** it (week → month → year, `fitGrain`) rather than let
+   `crossSql` cut the old end, and never refines. The workspace opens on
+   **week × severity over the last two years** (`defaultReport(now)`, the
+   same arithmetic as the "2 yr" button, so it reads pressed), and a local
+   copy more than **twelve hours**
+   behind catches itself up on opening, once, with the progress bar saying
+   why. What the Data panel held moves, whole, into a footer disclosure
+   ("Data & diagnostics") together with the revision, freshness and KEV lines
+   the strip used to show; the hosted tier's disclosure (D-084) becomes a
+   footer line that is always on screen on that tier. The state chip appears
+   only for a widening; the "N records match — buckets × series in N ms" line
+   and the per-result "The SQL that produced this" disclosure are gone — the
+   SQL panel carries the last query.
+
+2. **The five chat tools are the agent surface, offered to any agent that can
+   reach the page.** Registered on **WebMCP** (`document.modelContext`, Chrome
+   146+ behind a flag or origin trial; `navigator.modelContext` before Chrome
+   150) where the browser has it, and always as **`window.cveExplorer`**
+   (`tools()`, `call(name, args)`, `guide()`, `schema`, `ready`) for any
+   extension with a JavaScript tool. One extra tool, `cve_explorer_guide`,
+   returns the chat model's own system prompt (today's date filled in), the
+   dimension guide and the schema brief — WebMCP has no page-level
+   instructions primitive, so the guide travels as a tool. Every descriptor
+   is built from `TOOLS` (one description, one schema per tool, for chat and
+   agents alike), validated by the same `parseToolCall`, executed by the same
+   Worker bridge, and rendered on the same canvas; every tool is annotated
+   `readOnlyHint`, and every result but the guide's `untrustedContentHint`,
+   because tool output is CVE text (rule 4). A visually-hidden section in the
+   workspace and `public/llms.txt` say the same thing in prose for agents that
+   read the accessibility tree — a description of an API, not an instruction.
+   No polyfill is bundled: `@mcp-b/global` (MIT) would reach the MCP-B
+   extension but rewrites `document.modelContext` and opens a `postMessage`
+   server to `'*'`, which is a new surface for a bridge nobody asked for.
+
+**Context.** The owner's list of 2026-08-16: quarterly out and weekly in, a
+five-year weekly default, no state chip, no developer stats under the chart, no
+backing-SQL disclosure (the SQL panel already tracks the last query), no
+Filters panel ("chat and SQL are the main direct-control interfaces beyond the
+date range and bucket selection"), auto-sync past twelve hours with a visible
+syncing state, no status strip, Vendor and Product selectors that are fast and
+in-memory with the product list narrowed by vendor, a Reset, no Data panel,
+Run + Schema only in the SQL panel — and "make it easy for AI-chat extensions
+from Anthropic, OpenAI and Google to drive the UI as well as the built-in chat
+and have access to all of the same tooling", at a minimum through WebMCP.
+
+Research (2026-08-16, checked against the spec and Chromium source): WebMCP's
+entry point moved to `document.modelContext` on 2026-05-27, `unregisterTool`
+was replaced by an `AbortSignal`, and the API is `[Exposed=Window]` — main
+thread only, which is why the bridge is a page hook over the Worker rather
+than in the Worker. Chrome ships it behind `chrome://flags/#enable-webmcp-testing`
+from M146 and in an origin trial M149–M156 (planned ship M157); Edge 150 has
+an origin trial; Mozilla is neutral and WebKit opposed. **No shipping
+extension reads WebMCP tools today** — Claude in Chrome's tool set has no
+listing (its feature request was closed), Gemini in Chrome was "soon" as of
+I/O 2026, OpenAI's is unverified — which is why the window global exists:
+every one of those extensions has a JavaScript tool, and `window.cveExplorer`
+is what a JavaScript tool can call.
+
+**Consequences.** The e2e suite lost its filter drawer and drives the query
+layer through `agentCall` (the window global) and permalinks instead —
+which is also the first automated exercise of that surface. `GROUP_LIMIT` and
+`CROSS_ROW_LIMIT` rose from 250 to 400 for the weekly grain (seven years of
+weeks; `TIME_ROWS` is what a time axis asks for, and the grain coarsens
+beyond it), and the chart thins x-axis labels past 26. Exposing tools to third-party agents is a new
+opt-in-by-the-user surface — the user installed the agent — but nothing new
+is reachable through it, no data leaves that the agent could not already
+read off the page, and no consent flow is owed: the D-057 disclosure is about
+sending to *our* model, and this sends nothing anywhere. `quarter` stays a
+`Dimension` so old permalinks and saved reports keep opening.
+
+**Reopen if** a browser agent that consumes WebMCP ships and needs a manifest
+or origin-trial token to see the tools (an `<meta http-equiv="origin-trial">`
+in the static head is the one-line change); if the catalog read — ~2 MB of
+names, several blocking XHRs on the hosted tier — is measured to hurt the
+first chart (it is sequenced after the first answer for that reason); or if a
+consumer surface for the filters the drawer used to express (CNA, CWE, host,
+score, SSVC, KEV) is wanted back, in which case the shape is more strip
+controls over the same `Filters`, not the drawer.
+
+## D-085: Date ranges are one bounded control, seeded by the data and never by a predicate  (2026-08-16, status: accepted; the drawer instances it names left with D-086, the canvas one remains)
 
 **Decision.** Every date pair in the app — the canvas's published window and
 the drawer's published / updated / KEV-added / KEV-due axes — is one component
@@ -439,7 +685,7 @@ is out of the chat path entirely for anyone who chooses it.
 the cost is the rate limiting, not the logging, and RE-031 records what that
 workaround looked like.
 
-## D-078: The SQL tool's results enter model context, bounded by characters rather than by rows — and the row cap was never a memory bound  (2026-08-08, status: accepted, narrows D-044's transcription rule and hardens D-065)
+## D-078: The SQL tool's results enter model context, bounded by characters rather than by rows — and the row cap was never a memory bound  (2026-08-08, status: accepted, narrows D-044's transcription rule and hardens D-065; the window is generalised to every tool by D-087)
 
 **Decision.** Two things, taken together because the second is what makes the
 first safe.
@@ -4032,7 +4278,7 @@ moved three times in the first half of 2026), a provider ships a *sanctioned*
 OAuth flow for third-party browser apps, or WebGPU/WebNN availability shifts
 enough to change the local tier's floor.
 
-## D-044: An AI chat layer augments the deterministic UI, driving it through shared report definitions  (2026-08-01, status: accepted)
+## D-044: An AI chat layer augments the deterministic UI, driving it through shared report definitions  (2026-08-01, status: accepted; the "never transcribes" rule is reversed by D-087 — every tool's result now reaches the model, bounded)
 
 **Decision.** The product grows a free-form chat surface: an LLM translates
 plain-language analyst questions into local queries and presents results. Four

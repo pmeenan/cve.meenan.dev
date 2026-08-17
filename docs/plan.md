@@ -313,6 +313,52 @@ pass; the arithmetic and the input parser are unit-tested under a pinned
 non-UTC zone, since a suite running in UTC cannot tell a correct implementation
 from one that reads local time.
 
+Fifth round (2026-08-16): the **consumer cut** (D-086), from the owner's list.
+The Filters drawer, the Data panel and the status strip left the workspace,
+which is now the canvas (with a strip over the chart: the published range, a
+weekly / monthly / yearly grain — quarterly withdrawn from the radio, weekly
+new as a Monday-labelled `week` dimension — a Vendor and a Product picker, and
+Reset), chat, the SQL panel (Run and Schema only) and Saved. The pickers are
+hybrid comboboxes over an in-memory catalog of every vendor and product name
+(`catalog` Worker message, paged for the hosted tier; `lib/catalog.ts` ranks
+by substring tier then by how many CVE-product rows carry the name; a chosen
+vendor narrows the products), committing into the same `filters.vendor` /
+`filters.product` lists a permalink or chat call sets. Quick ranges over the
+chart (all time, 10 / 5 / 2 / 1 years, YTD) set a lower edge relative to
+today, and a window too wide for the grain coarsens it rather than being cut.
+The workspace opens on week × severity over the last two years, and a local
+copy more than twelve hours behind catches itself up on opening with the
+progress bar saying why.
+The Data panel's contents and the strip's revision / freshness / KEV lines
+moved whole into a footer "Data & diagnostics" disclosure; the hosted tier's
+disclosure is a footer line. Under the chart the state chip (default), the
+"records match — buckets × series in ms" line and the backing-SQL disclosure
+went — the SQL panel carries the last query. And the chat tools became
+the **agent surface**: registered on WebMCP (`document.modelContext`) where
+the browser has it, and always as `window.cveExplorer` for any extension with
+a JavaScript tool, plus a `cve_explorer_guide` tool that returns the chat
+prompt, dimensions and schema — same descriptors, same validation, same
+Worker path, same canvas; a hidden agent note in the page and `/llms.txt` say
+so in prose. The e2e suite drives the query layer through that surface now
+that there is no drawer (`agentCall` in `tests/e2e/ui.ts`). And the model now
+**reads every tool's result** (D-087, reversing D-044's "never transcribes"):
+`search_records` hands back its rows in the same bounded window `sql` has —
+50 rows within 12,000 characters, the remainder counted — so chat and agents
+can summarise, compare and pick among the records they listed; the owner's
+call, on the grounds that the chat layer exists for answers the UI cannot
+give and the privacy-minded tier is the parked bring-your-own model, not a
+handicapped general one. Then, on the same reasoning, **a sixth tool and an
+accessor** (D-088): `compute` runs a model-written JavaScript function over
+the *full* rows of the most recent result — the whole record list, not the
+window — inside a sandbox (opaque-origin `srcdoc` frame, `default-src 'none'`
+CSP, blob: worker terminated at 10 s, output clipped), so chat can do what
+neither a query nor a 50-row window can — text matching over every
+description, ratios, ranking, joining two results — and its code and output
+render as a chat step; `window.cveExplorer.last()` gives an agent the same
+rows whole. Both engines prove the boundary from inside the sandbox
+(`tests/e2e/compute.spec.ts`); Firefox found the first design (a static file)
+refused by this site's own CORP header, hence `srcdoc`.
+
 Exit: `pnpm check` and `pnpm e2e` green on both engines across both tiers; the
 owner has used the deployed workspace and the remaining rough edges are
 recorded here rather than open-ended.

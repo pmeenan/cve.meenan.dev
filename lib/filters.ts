@@ -918,21 +918,26 @@ export function countSql(
 }
 
 /**
- * The axes an aggregate can group by — every filter axis, plus three time
+ * The axes an aggregate can group by — every filter axis, plus four time
  * grains.
  *
- * All three are computed from `c.published`. The stored `c.year` is the year in
+ * All four are computed from `c.published`. The stored `c.year` is the year in
  * the CVE identifier, not necessarily the year the record was published. They
  * are separate dimensions rather
  * than one dimension with a grain parameter because that keeps the report
  * definition flat — one field naming an axis — which is both simpler to
  * validate coming out of a URL fragment and simpler for a small model to emit
  * correctly (D-044, M7).
+ *
+ * `quarter` stays a dimension the definition accepts — a permalink or a saved
+ * report may still carry it, and a model may still ask for it — but the canvas
+ * offers `week`, `month` and `year` (UI polish, 2026-08-16).
  */
 export const DIMENSIONS = [
   'year',
   'quarter',
   'month',
+  'week',
   'severity',
   'cvssVersion',
   'ssvcExpl',
@@ -951,7 +956,7 @@ export const DIMENSIONS = [
 export type Dimension = (typeof DIMENSIONS)[number]
 
 /** Dimensions whose buckets are points in time, ordered by the axis not by size. */
-export const TIME_DIMENSIONS = new Set<Dimension>(['year', 'quarter', 'month'])
+export const TIME_DIMENSIONS = new Set<Dimension>(['year', 'quarter', 'month', 'week'])
 
 /** What each axis is called on screen. Beside the other label maps, and typed
  * against `Dimension`, so adding an axis cannot leave a picker showing a key. */
@@ -959,6 +964,7 @@ export const DIMENSION_LABELS: Record<Dimension, string> = {
   year: 'Year',
   quarter: 'Quarter',
   month: 'Month',
+  week: 'Week',
   severity: 'Severity',
   cvssVersion: 'CVSS version',
   ssvcExpl: 'SSVC exploitation',
@@ -1053,6 +1059,14 @@ const MONTH_EXPR = "strftime('%Y-%m', c.published, 'unixepoch')"
 const QUARTER_EXPR =
   `${YEAR_EXPR} || '-Q' || ` +
   "((CAST(strftime('%m', c.published, 'unixepoch') AS INTEGER) + 2) / 3)"
+/**
+ * A week is labelled by its Monday, as a `YYYY-MM-DD` day: `'weekday 0'` moves
+ * a date forward to the next Sunday (or leaves a Sunday alone), and six days
+ * back from that Sunday is the Monday that opened the week. Weeks are
+ * Monday-to-Sunday rather than `%W`, whose week 00 is a stub that changes size
+ * every year and whose labels are not dates a reader can place.
+ */
+const WEEK_EXPR = "date(c.published, 'unixepoch', 'weekday 0', '-6 days')"
 
 /** Storage codes are identifiers: 4 (v4.0) belongs after 31 (v3.1). */
 const CVSS_VERSION_ORDER =
@@ -1158,6 +1172,7 @@ const DIMENSION_SQL: Record<Dimension, DimensionSql> = {
   // against indexes), and a grouped scan is doing the work either way.
   quarter: { key: QUARTER_EXPR, label: QUARTER_EXPR, group: QUARTER_EXPR },
   month: { key: MONTH_EXPR, label: MONTH_EXPR, group: MONTH_EXPR },
+  week: { key: WEEK_EXPR, label: WEEK_EXPR, group: WEEK_EXPR },
   severity: { key: 'c.cvss_sev', label: 'c.cvss_sev', group: 'c.cvss_sev' },
   cvssVersion: {
     key: 'c.cvss_ver',
@@ -1207,8 +1222,9 @@ const DIMENSION_SQL: Record<Dimension, DimensionSql> = {
 
 /** Aggregate rows a grouped query may return. Generous: 2026 has 28 years of
  * data and a CWE breakdown has 797 possible rows, but a vendor breakdown has
- * 24,436 and nothing renders that. */
-export const GROUP_LIMIT = 250
+ * 24,436 and nothing renders that. Raised from 250 for the weekly grain: five
+ * years of weeks is 261 buckets, and the workspace opens on exactly that. */
+export const GROUP_LIMIT = 400
 
 /**
  * Counts by one dimension, under the same filters as the list.
@@ -1277,7 +1293,7 @@ function countFor(shapes: DimensionSql[]): string {
  * result set the Worker would hold in memory and structured-clone to the page
  * (the same reasoning as ROW_LIMIT).
  */
-export const CROSS_ROW_LIMIT = 250
+export const CROSS_ROW_LIMIT = 400
 export const CROSS_SERIES_LIMIT = 24
 export const CROSS_CELL_LIMIT = 3_000
 

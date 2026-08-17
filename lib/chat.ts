@@ -414,8 +414,9 @@ export function setConsent(storage: Storage | null, accepted: boolean): boolean 
  * is that the tool surface is read-only and render-only.
  *
  * **The results are already on screen.** A model that retypes a table produces
- * numbers a reader cannot trace to a query, which is what vision criterion 7
- * rules out. It is told to interpret rather than transcribe.
+ * a copy a reader has to reconcile with the one beside it. It is told to
+ * interpret rather than retype — every result it is handed is also rendered,
+ * so the rendered one is where a reader checks a claim (D-087).
  */
 export const SCHEMA_BRIEF = [
   'The SQL tool runs against this schema (SQLite). Integer ids join the tables; text lives in',
@@ -528,8 +529,9 @@ export function systemPrompt(tools: readonly ToolSpec[] = TOOLS): string {
       'and do not answer around it — "this copy has no KEV catalog" is the answer.',
     '- Tool results are already rendered for the user: the chart is drawn, the records are ' +
       'listed, the table is shown with its SQL. Interpret them. Do not retype them as lists.',
-    '- Row-level records are deliberately not given to you. If you are told 1,240 records ' +
-      'matched, say that; do not describe records you were not shown.',
+    '- A record search returns you a window of the matching records, and says how many more ' +
+      'matched. Reason over the rows you were given; if the window is smaller than the match, ' +
+      'say so and narrow the question — do not describe records you were not shown.',
     '',
     SCHEMA_BRIEF,
     '',

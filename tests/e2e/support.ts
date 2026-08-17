@@ -31,14 +31,14 @@ import { expect, type Page } from '@playwright/test'
 const PROBE = `
 self.onmessage = async () => {
   const name = 'e2e-probe-' + Math.random().toString(36).slice(2) + '.bin'
-  let dir = null, access = null
+  let dir = null, access = null, answer
   try {
     dir = await navigator.storage.getDirectory()
     access = await (await dir.getFileHandle(name, { create: true })).createSyncAccessHandle()
     access.getSize()
-    postMessage({ usable: true })
+    answer = { usable: true }
   } catch (error) {
-    postMessage({ usable: false, why: String((error && error.message) || error) })
+    answer = { usable: false, why: String((error && error.message) || error) }
   } finally {
     // A per-probe filename and a release in \`finally\`: a fixed name plus an
     // exclusive handle is what deadlocked two tabs in RE-007, and a precondition
@@ -46,6 +46,10 @@ self.onmessage = async () => {
     try { if (access) access.close() } catch {}
     try { if (dir) await dir.removeEntry(name) } catch {}
   }
+  // Answered *after* the cleanup: the page terminates this worker on the
+  // answer, and Firefox is quick enough about it that a probe file posted
+  // first was left in OPFS — where a spec listing the directory counted it.
+  postMessage(answer)
 }
 `
 

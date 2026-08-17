@@ -20,33 +20,14 @@ import type { QueryResult } from '@/lib/protocol'
  * whole corpus, one that tries to write.
  */
 
-export const EXAMPLES: { label: string; sql: string }[] = [
-  {
-    label: 'Top CWEs',
-    sql: `SELECT w.cwe, w.descr, count(*) AS cves
-FROM cve c
-JOIN cve_cwe x ON x.cve_id = c.id
-JOIN cwe w ON w.id = x.cwe_id
-WHERE c.state = 1
-GROUP BY w.id
-ORDER BY cves DESC
-LIMIT 20`,
-  },
-  {
-    label: 'Critical CVEs mentioning "deserialization"',
-    sql: `SELECT c.cve_id, c.cvss_score, substr(t.descr, 1, 120) AS about
-FROM fts
-JOIN cve c ON c.id = fts.rowid
-JOIN cve_text t ON t.cve_id = c.id
-WHERE fts MATCH 'deserialization' AND c.state = 1 AND c.cvss_sev = 4
-ORDER BY c.cvss_score DESC
-LIMIT 20`,
-  },
-  {
-    label: 'What the schema looks like',
-    sql: `SELECT name, sql FROM sqlite_schema WHERE type = 'table' ORDER BY name`,
-  },
-]
+/**
+ * The one canned query the panel offers: the schema, because it is the thing a
+ * reader cannot type from memory. The panel otherwise carries the SQL of
+ * whatever last ran on the canvas (UI polish, 2026-08-16) — the example
+ * buttons it used to open on were what a workspace with nothing on it needed,
+ * and the canvas never opens empty now.
+ */
+export const SCHEMA_SQL = `SELECT name, sql FROM sqlite_schema WHERE type = 'table' ORDER BY name`
 
 export function Console({
   disabled,
@@ -82,11 +63,11 @@ export function Console({
 }) {
   return (
     <section aria-labelledby="sql-heading">
-      <h2 id="sql-heading">SQL console</h2>
+      <h2 id="sql-heading">SQL</h2>
       <p className="muted">
-        Read-only, and not by inspecting what you type: SQLite&rsquo;s own authorizer refuses every
-        action but reading, for the duration of the statement. Results are capped at{' '}
-        {CONSOLE_ROW_LIMIT.toLocaleString()} rows
+        The query behind whatever last ran, editable. Read-only, and not by inspecting what you
+        type: SQLite&rsquo;s own authorizer refuses every action but reading, for the duration of
+        the statement. Results are capped at {CONSOLE_ROW_LIMIT.toLocaleString()} rows
         {hosted
           ? ', and until the corpus is downloaded your SQL runs on this site’s server, ' +
             'bounded by its deadline rather than a Cancel button.'
@@ -109,19 +90,15 @@ export function Console({
           />
         </label>
         <div className="actions">
-          <button type="submit" disabled={disabled}>
-            Run SQL
+          {/* Visible word "Run", accessible name "Run SQL": the visible label
+              is contained in the accessible one (WCAG 2.5.3), and the panel
+              heading already says SQL. */}
+          <button type="submit" disabled={disabled} aria-label="Run SQL">
+            Run
           </button>
-          {EXAMPLES.map((example) => (
-            <button
-              key={example.label}
-              type="button"
-              className="quiet"
-              onClick={() => onSql(example.sql)}
-            >
-              {example.label}
-            </button>
-          ))}
+          <button type="button" className="quiet" onClick={() => onSql(SCHEMA_SQL)}>
+            Schema
+          </button>
         </div>
       </form>
 

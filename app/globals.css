@@ -286,14 +286,6 @@ h3 {
   grid-template-columns: minmax(0, 1fr) minmax(20rem, 26rem);
 }
 
-.workspace:has(#filters-panel) {
-  grid-template-columns: minmax(17rem, 21rem) minmax(0, 1fr);
-}
-
-.workspace[data-chat-open='1']:has(#filters-panel) {
-  grid-template-columns: minmax(17rem, 21rem) minmax(0, 1fr) minmax(20rem, 26rem);
-}
-
 .side-panel {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -322,9 +314,7 @@ h3 {
 /* On narrow screens everything stacks, and the chat column becomes a sheet. */
 @media (max-width: 68rem) {
   .workspace,
-  .workspace[data-chat-open='1'],
-  .workspace:has(#filters-panel),
-  .workspace[data-chat-open='1']:has(#filters-panel) {
+  .workspace[data-chat-open='1'] {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -432,6 +422,118 @@ fieldset.granularity {
   border: none;
   padding: 0;
   gap: 0.15rem 0.9rem;
+}
+
+/* The quick ranges: a segmented row of quiet buttons, the current one pressed. */
+.quick-ranges {
+  display: inline-flex;
+  gap: 0.2rem;
+}
+
+.quick-ranges button {
+  padding: 0.2rem 0.45rem;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.quick-ranges button[aria-pressed='true'] {
+  background: var(--surface-2);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+/* Reset sits at the far end of the strip: a way out, not the main action. */
+.canvas-reset {
+  margin-left: auto;
+  font-size: 0.82rem;
+}
+
+/* --- The vendor / product pickers (UI polish, 2026-08-16) ---------------- */
+
+.picker {
+  position: relative;
+  font-size: 0.82rem;
+}
+
+.picker-box {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.picker-input {
+  width: 11rem;
+  padding-right: 1.6rem;
+}
+
+/* A committed value reads as a choice; the "All …" placeholder as the default. */
+.picker-input[data-picker-value='1'] {
+  border-color: var(--accent);
+}
+
+.picker-clear {
+  position: absolute;
+  right: 0.15rem;
+  width: 1.3rem;
+  height: 1.3rem;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.picker-list {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  min-width: 100%;
+  width: max-content;
+  max-width: min(32rem, calc(100vw - 2rem));
+  max-height: 20rem;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.picker-option,
+.picker-empty {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.3rem 0.5rem;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--fg);
+}
+
+.picker-empty {
+  cursor: default;
+}
+
+.picker-option.active {
+  background: var(--surface-2);
+}
+
+.picker-name {
+  overflow-wrap: anywhere;
+}
+
+.picker-detail {
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.picker-hint {
+  margin-left: auto;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* --- Controls ------------------------------------------------------------ */
@@ -598,12 +700,42 @@ td {
 }
 
 .notice {
-  margin-top: 3rem;
+  margin-top: 1rem;
   padding-top: 1rem;
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-size: 0.82rem;
   max-width: 60rem;
+}
+
+/* The footer's about-this-copy block: the hosted disclosure and the data &
+   diagnostics disclosure, below the workspace and out of its way. */
+footer.about {
+  margin-top: 2.5rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+
+footer.about > p {
+  margin: 0.2rem 0 0.6rem;
+  font-size: 0.82rem;
+}
+
+details.diagnostics-panel > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+details.diagnostics-panel[open] > summary {
+  margin-bottom: 0.6rem;
+}
+
+/* The page's own explanation over a progress bar it started itself. */
+.progress-lead {
+  margin: 0 0 0.35rem;
+  font-size: 0.9rem;
 }
 
 /* --- M3: the filter surface and the SQL console ------------------------- */
@@ -1572,4 +1704,42 @@ button.link {
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;
+}
+
+/* The chat panel's opening hint: a sentence and three example questions. */
+.chat-hint ul {
+  margin: 0.4rem 0 0 1.1rem;
+  padding: 0;
+}
+
+.chat-hint li {
+  margin: 0.15rem 0;
+}
+
+/* A compute step's output: the returned value, as text, scrolling rather than wrapping the panel. */
+.compute-output {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.78rem;
+}
+
+/* The "Agent activity" log (D-086): what an agent did on this page, as chat steps. */
+.agent-log {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.7rem 1.1rem;
+}
+
+.agent-log summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.agent-log-steps {
+  margin-top: 0.4rem;
+  max-height: 24rem;
+  overflow: auto;
 }
