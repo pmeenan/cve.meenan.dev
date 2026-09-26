@@ -2986,16 +2986,16 @@ per-record revision column turns out not to be what the bridging delta needs —
 in which case it should be removed rather than kept for a reader that never
 arrived.
 
-## D-057: The first AI tier is a model we host — Ollama behind a restricted same-origin endpoint  (2026-08-03, status: accepted, owner decision; re-orders D-045's ladder and narrows its "never proxied" to third-party traffic; adds the first dynamic endpoint, outside the data plane, under D-006's rules)
+## D-057: The first AI tier is a model we host — a private model server behind a restricted same-origin endpoint  (2026-08-03, status: accepted, owner decision; re-orders D-045's ladder and narrows its "never proxied" to third-party traffic; adds the first dynamic endpoint, outside the data plane, under D-006's rules)
 
-**Decision.** The first model tier to ship is self-hosted: an Ollama instance
+**Decision.** The first model tier to ship is self-hosted: originally an Ollama instance
 on the project's private network at `http://llm:11434/`. The `llm` hostname is
 configured in hosts on both the dev and production machines, so it can be named
 in the repo without per-machine configuration; the box is not publicly
 routable. Browsers reach it through a new **same-origin API endpoint** on
 `cve.meenan.dev` that exposes only the operations the chat loop needs — chat
 completion against a server-pinned model, streamed — and none of the rest of
-Ollama's API: no model management, no pull, no embeddings, and no
+the model server's API: no model management, no pull, no embeddings, and no
 caller-supplied model name, URL, host, or path. Which model is pinned is server
 configuration, not client input; today it is `gemma4:e4b` (8.0B parameters,
 Q4_K_M — verified 2026-08-03 by `GET http://llm:11434/api/tags` from the dev
@@ -3072,6 +3072,25 @@ ships.
 - **The box and its model are operational configuration.** Swapping the pinned
   model (say, after a D-046 result) or moving the box is not a new decision so
   long as the endpoint's restrictions hold and the hostname stays private.
+
+**Operational update, 2026-09-26.** The private `llm` alias moved from the
+original GPU host to `plex`'s 16 GB Intel Arc Pro B50. Ollama's Vulkan backend
+worked but was slower than the old host, so it was removed and replaced by
+LocalAI 4.10.0 with its llama.cpp SYCL/Level Zero backend. The relay now speaks
+OpenAI-compatible chat-completion SSE while preserving its pinned prompt,
+tools, model, limits and fixed upstream; callers gained no new surface. Only
+the B50 render node is mapped, leaving the integrated GPU available for the
+display. The enlarged-model scorecard selected Tiel-Coder-35B-A3B
+`UD-IQ3_XXS` as the production pin: 9/11 exact data, 11/11 tool selection and
+19.3 seconds median across eleven questions, while sustaining about 32
+generated tokens/s. It has two parallel 32K slots, Flash Attention and q8 KV;
+`qwen3:8b` remains installed for rollback. The live Cloudflare → PHP → LocalAI
+path ended in a tool call after the migration.
+Models and profiles live in the operator-controlled model directory and LocalAI
+switches the one active backend on demand, so installing a model needs no root access. A weekly
+user timer checks upstream releases; the previous container is retained until
+the new one passes both its health check and a real production-model
+generation, and is restored on failure.
 
 **Reopen if.** Abuse of the public endpoint outruns the nginx limits (the
 options, in order: Cloudflare rules in front, a lightweight same-origin token,
@@ -4201,7 +4220,7 @@ is supposed to handle.
 external tool schemas and corpora, at which point running ours there might
 avoid duplicate harness maintenance.
 
-## D-045: Model providers — a local-first ladder with user-supplied keys, and no subscription OAuth  (2026-08-01, status: accepted, amends the consequences of D-009 and D-016; ladder re-ordered by D-057 — a site-hosted Ollama tier ships first, and "never proxied" now scopes to third-party traffic)
+## D-045: Model providers — a local-first ladder with user-supplied keys, and no subscription OAuth  (2026-08-01, status: accepted, amends the consequences of D-009 and D-016; ladder re-ordered by D-057 — a site-hosted model tier ships first, and "never proxied" now scopes to third-party traffic)
 
 **Decision.** The chat layer (D-044) offers providers as an explicit ladder,
 best-default first:

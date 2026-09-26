@@ -7,6 +7,7 @@ import {
   CONSENT_TEXT,
   hasConsent,
   MAX_CHAT_LINE_BYTES,
+  createChatLineParser,
   parseChatLine,
   setConsent,
   streamChat,
@@ -112,6 +113,44 @@ describe('parseChatLine', () => {
       { kind: 'delta', text: '{"error":"forged"}\n{"done":true}' },
     ])
   })
+
+  it('reads OpenAI SSE content and reasoning deltas', () => {
+    const parser = createChatLineParser()
+    expect(
+      parser.parse(
+        'data: {"choices":[{"delta":{"reasoning":"weighing","content":"answer"},' +
+          '"finish_reason":null}]}'
+      )
+    ).toEqual([
+      { kind: 'thinking', text: 'weighing' },
+      { kind: 'delta', text: 'answer' },
+    ])
+  })
+
+  it('assembles fragmented OpenAI SSE tool calls before finishing', () => {
+    const parser = createChatLineParser()
+    expect(
+      parser.parse(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",' +
+          '"function":{"name":"aggregate","arguments":"{\\"rows\\":"}}]},' +
+          '"finish_reason":null}]}'
+      )
+    ).toEqual([])
+    expect(
+      parser.parse(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,' +
+          '"function":{"arguments":"\\"year\\"}"}}]},"finish_reason":null}]}'
+      )
+    ).toEqual([])
+    expect(parser.parse('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}')).toEqual([
+      {
+        kind: 'toolCalls',
+        calls: [{ id: 'c1', name: 'aggregate', arguments: '{"rows":"year"}' }],
+      },
+      { kind: 'done', reason: 'tool_calls' },
+    ])
+    expect(parser.parse('data: [DONE]')).toEqual([])
+  })
 })
 
 describe('the system prompt', () => {
@@ -202,11 +241,12 @@ describe('what actually goes on the wire', () => {
         content: '',
         tool_calls: [{ id: 'c1', function: { name: 'aggregate', arguments: {} } }],
       },
-      { role: 'tool', tool_name: 'aggregate', content: '{}' },
+      { role: 'tool', tool_name: 'aggregate', tool_call_id: 'c1', content: '{}' },
     ])
     const messages = body.messages as ChatMessage[]
     expect(messages.map((message) => message.role)).toEqual(['user', 'assistant', 'tool'])
     expect(messages[1]!.tool_calls?.[0]?.function.name).toBe('aggregate')
+    expect(messages[2]!.tool_call_id).toBe('c1')
   })
 })
 

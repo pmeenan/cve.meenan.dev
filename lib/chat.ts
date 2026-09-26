@@ -1,9 +1,11 @@
 /**
  * The chat transport and the wire it speaks (M7, D-044, D-057).
  *
- * The relay (`public/api/chat.php`) forwards Ollama's NDJSON lines unchanged
- * rather than re-framing them, so the parsing lives here — in TypeScript, where
- * it has tests, rather than in the one dynamic endpoint, where it would not.
+ * The relay (`public/api/chat.php`) forwards LocalAI's OpenAI-compatible SSE
+ * lines unchanged rather than re-framing them, so the parsing lives here — in
+ * TypeScript, where it has tests, rather than in the one dynamic endpoint,
+ * where it would not. The parser still accepts the former Ollama NDJSON frames
+ * so an in-flight old response is harmless across a deploy.
  * That split is deliberate: the endpoint is the part of this project that
  * cannot be exercised by `pnpm check`, so the less it decides, the better.
  *
@@ -64,15 +66,16 @@ export interface WireToolCall {
 /**
  * One message in the conversation, in the shape the relay accepts.
  *
- * Snake-case on the wire fields because that is Ollama's spelling and the relay
- * forwards them; renaming them here would mean a translation layer in PHP,
- * which is the thing this file exists to avoid.
+ * Snake-case on the wire fields because both provider protocols use it. The
+ * relay translates these bounded conversation messages to OpenAI's request
+ * shape while keeping the pinned prompt, tools, model and upstream private.
  */
 export interface ChatMessage {
   role: ChatRole
   content: string
   tool_calls?: { id: string; function: { name: string; arguments: unknown } }[]
   tool_name?: string
+  tool_call_id?: string
 }
 
 export type ChatEvent =
@@ -96,11 +99,52 @@ export type ChatEvent =
  * content delta, the tool calls, and `done` together.
  */
 export function parseChatLine(line: string): ChatEvent[] {
-  const trimmed = line.trim()
-  if (!trimmed) return []
-  if (trimmed.length > MAX_CHAT_LINE_BYTES) {
-    return [{ kind: 'error', message: 'the model host sent a frame too large to read' }]
+  return createChatLineParser().parse(line)
+}
+
+interface BufferedToolCall {
+  id: string
+  name: string
+  arguments: string
+}
+
+/**
+ * A parser for one response stream.
+ *
+ * OpenAI-compatible tool arguments are split across SSE deltas, so their
+ * fragments have to live for the duration of the stream. Keeping that state in
+ * TypeScript leaves PHP as a bounded request translator and byte forwarder.
+ */
+export function createChatLineParser(): { parse(line: string): ChatEvent[] } {
+  const buffered = new Map<number, BufferedToolCall>()
+
+  return {
+    parse(line: string): ChatEvent[] {
+      const trimmed = line.trim()
+      if (!trimmed) return []
+      if (trimmed.length > MAX_CHAT_LINE_BYTES) {
+        return [{ kind: 'error', message: 'the model host sent a frame too large to read' }]
+      }
+
+      if (trimmed.startsWith('data:')) {
+        const data = trimmed.slice(5).trim()
+        if (!data || data === '[DONE]') return []
+        let value: unknown
+        try {
+          value = JSON.parse(data)
+        } catch {
+          return []
+        }
+        return readOpenAIFrame(value, buffered)
+      }
+
+      return readOllamaFrame(trimmed)
+    },
   }
+}
+
+/** Read one legacy Ollama NDJSON frame. */
+function readOllamaFrame(trimmed: string): ChatEvent[] {
   let value: unknown
   try {
     value = JSON.parse(trimmed)
@@ -134,6 +178,74 @@ export function parseChatLine(line: string): ChatEvent[] {
     events.push({ kind: 'done', reason })
   }
   return events
+}
+
+/** Read one OpenAI-compatible SSE data object. */
+function readOpenAIFrame(value: unknown, buffered: Map<number, BufferedToolCall>): ChatEvent[] {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return []
+  const frame = value as Record<string, unknown>
+  if (typeof frame.error === 'object' && frame.error !== null) {
+    const message = (frame.error as Record<string, unknown>).message
+    if (typeof message === 'string' && message) {
+      return [{ kind: 'error', message: message.slice(0, 300) }]
+    }
+  }
+
+  if (!Array.isArray(frame.choices) || frame.choices.length === 0) return []
+  const first = frame.choices[0]
+  if (typeof first !== 'object' || first === null || Array.isArray(first)) return []
+  const choice = first as Record<string, unknown>
+  const events: ChatEvent[] = []
+  const delta = choice.delta
+  if (typeof delta === 'object' && delta !== null && !Array.isArray(delta)) {
+    const part = delta as Record<string, unknown>
+    const reasoning =
+      typeof part.reasoning === 'string'
+        ? part.reasoning
+        : typeof part.reasoning_content === 'string'
+          ? part.reasoning_content
+          : ''
+    if (reasoning) events.push({ kind: 'thinking', text: reasoning })
+    if (typeof part.content === 'string' && part.content) {
+      events.push({ kind: 'delta', text: part.content })
+    }
+    bufferOpenAIToolCalls(part.tool_calls, buffered)
+  }
+
+  if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
+    if (buffered.size) {
+      const calls = [...buffered.entries()]
+        .sort(([left], [right]) => left - right)
+        .filter(([, call]) => call.name)
+        .map(([index, call]) => ({
+          id: call.id || `call_${index}`,
+          name: call.name,
+          arguments: call.arguments,
+        }))
+      if (calls.length) events.push({ kind: 'toolCalls', calls })
+      buffered.clear()
+    }
+    events.push({ kind: 'done', reason: choice.finish_reason })
+  }
+  return events
+}
+
+function bufferOpenAIToolCalls(value: unknown, buffered: Map<number, BufferedToolCall>): void {
+  if (!Array.isArray(value)) return
+  for (const [position, entry] of value.entries()) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
+    const record = entry as Record<string, unknown>
+    const index = typeof record.index === 'number' && record.index >= 0 ? record.index : position
+    const current = buffered.get(index) ?? { id: '', name: '', arguments: '' }
+    if (typeof record.id === 'string' && record.id) current.id = record.id
+    const fn = record.function
+    if (typeof fn === 'object' && fn !== null && !Array.isArray(fn)) {
+      const fields = fn as Record<string, unknown>
+      if (typeof fields.name === 'string' && fields.name) current.name = fields.name
+      if (typeof fields.arguments === 'string') current.arguments += fields.arguments
+    }
+    buffered.set(index, current)
+  }
 }
 
 /**
@@ -243,6 +355,7 @@ export async function streamChat(options: StreamOptions): Promise<void> {
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
+    const parser = createChatLineParser()
     let buffer = ''
     let total = 0
     for (;;) {
@@ -272,7 +385,7 @@ export async function streamChat(options: StreamOptions): Promise<void> {
       while (newline !== -1) {
         const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
-        for (const event of parseChatLine(line)) options.onEvent(event)
+        for (const event of parser.parse(line)) options.onEvent(event)
         newline = buffer.indexOf('\n')
       }
       if (buffer.length > MAX_CHAT_LINE_BYTES) {
@@ -281,7 +394,7 @@ export async function streamChat(options: StreamOptions): Promise<void> {
         return
       }
     }
-    for (const event of parseChatLine(buffer)) options.onEvent(event)
+    for (const event of parser.parse(buffer)) options.onEvent(event)
     if (stalled) return
   } finally {
     watch.stop()

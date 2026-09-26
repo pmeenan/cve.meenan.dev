@@ -13,7 +13,7 @@ a first visit behind that download: a **hosted query tier** (D-084) lets a
 visitor with no local copy start immediately, their read-only SQL executed by a
 same-origin `api/sql.php` against a server copy of the same database, disclosed
 as a tier and replaced by "Make available offline". Chat is a further opt-in:
-the only model tier is an Ollama instance we host, reached through a restricted
+the only model tier is a LocalAI instance we host, reached through a restricted
 same-origin relay (D-057); in-browser models and user-supplied hosted-model
 keys (chat traffic browser-direct to that provider, D-045) remain the plan, but
 are parked rather than next. The server serves the snapshot and its deltas as
@@ -59,8 +59,9 @@ affected docs. Until then, these govern.
   constraint change. The same six tools are the *agent surface* — WebMCP and
   `window.cveExplorer` (D-086) — on the same terms; anything a third-party
   agent can reach, the chat model could already. The first model tier is site-hosted: our
-  own Ollama on the private `llm` box, relayed through a restricted
-  same-origin endpoint that pins the model — `qwen3:8b` since 2026-08-09,
+  own LocalAI on `plex`'s Arc Pro B50, addressed by the private `llm` alias and relayed through a restricted
+  same-origin endpoint that pins the model — Tiel-Coder-35B-A3B `UD-IQ3_XXS`
+  since 2026-09-26,
   chosen by the D-046 benchmark — stores nothing, and logs no bodies (D-057). Third-party hosted models are the user's own key — stored
   client-side, called browser-direct, never proxied; no bundled key, and no
   consumer-subscription OAuth where providers forbid it (none is sanctioned
@@ -254,8 +255,8 @@ value would write today's boundaries into every permalink. The extent is the
 `coverage` Worker message, answered from the database on either tier.
 
 **M7 complete — the AI chat layer is live.**
-Five read-only tools over the local corpus (`lib/tools.ts`), a same-origin PHP
-relay to our own Ollama (`public/api/chat.php`, D-057), and a side panel that
+Five read-only data tools plus `compute` over the local corpus (`lib/tools.ts`),
+a same-origin PHP relay to our own LocalAI (`public/api/chat.php`, D-057), and a side panel that
 renders every answer through the *same* components the Report and Explore tabs
 use — no parallel renderer, and an aggregate leaves the conversation through
 "Open in Report" while a record search goes to Explore, because those are the
@@ -306,6 +307,16 @@ and `qwen3:8b` (2026-08-09), **ten of ten in a single turn**. **D-046 item #1 �
 the founding question — is tool ✓ axes ✓ data ✓ in one turn, in every run.**
 Item #2, the three-way breakdown, now scores fully for the first time.
 
+**The Arc migration's 2026-09-26 comparison selected a new production pin.**
+Direct replay of the production prompt, schemas and hosted
+tool runtime across eleven questions put Tiel-Coder-35B-A3B `UD-IQ3_XXS` at
+9/11 exact, 11/11 tool selection and 19.3 s median. Gemma 4 31B reached 10/11
+but took 101.6 s median; Qwen3.8 27B also reached 9/11 at 99.9 s. Tiel generated
+about 32 tokens/s and fits two 32K slots on the 16 GB B50. MTP variants are not
+usable with the current LocalAI/llama.cpp Intel backend, so speculative decode
+is disabled. Tiel-Coder-35B-A3B `UD-IQ3_XXS` is now pinned; the complete
+scorecard and backend exceptions are in plan.md.
+
 **The run before it scored 7/10, and three of those four failures were mine,
 not the model's.** Both KEV questions failed inside the *ground truth* with "no
 such table: kev" — the harness never waited for the catalog the download
@@ -346,7 +357,7 @@ item #2 produced a different wrong axis pair in every run. Item #1 never varied.
 
 **Every remaining failure then turned out to be the tool surface, not the
 model** — D-057's accepted risk, walked into and then caught by a fast probe
-(the real prompt and schemas straight to Ollama, no browser). The dimensions
+(the real prompt and schemas straight to the model server, no UI). The dimensions
 were a bare enum of sixteen names with no descriptions, so nothing said
 `product` is labelled `vendor / product` and carries both; and the prompt's
 "prefer `aggregate` for anything countable" steered models off the SQL tool for
@@ -466,7 +477,7 @@ by structure rather than by inspection (D-065 – D-068), M2 closed the server h
 in production (daily ingest D-058, monthly rotation D-060 — whose first
 unattended firing, 1 September, is still unobserved), and M1 proved the browser
 data path end to end (D-049 – D-051). The AI ladder was re-ordered 2026-08-03 so
-the first model tier is site-hosted Ollama behind a restricted same-origin relay
+the first model tier is site-hosted LocalAI behind a restricted same-origin relay
 (D-057). Process was rightsized for MVP scale 2026-08-04 (D-062). Details live in
 plan.md and the decision log; keep this paragraph short and current when
 milestone status changes (rule 5).

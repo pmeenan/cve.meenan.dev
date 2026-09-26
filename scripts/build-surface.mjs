@@ -7,7 +7,7 @@
  * rate limit was the only thing standing between us and that, and a rate limit
  * is a poor substitute for "it cannot do the thing". Pinning both server-side
  * means the endpoint can only ever run CVE analysis against our schema with our
- * five read-only tools, whatever is posted to it. That is worth far more than a
+ * six read-only/render-only tools, whatever is posted to it. That is worth far more than a
  * low request cap, and it is what let the cap be raised tenfold.
  *
  * Generated rather than hand-copied, for the reason `build-sw.mjs` derives its

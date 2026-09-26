@@ -390,7 +390,12 @@ export async function runChatTurn(
         if (outcome.kind === 'refused') step.error = outcome.error
         described = describeToolResult(outcome)
       }
-      conversation.push({ role: 'tool', tool_name: call.name, content: described })
+      conversation.push({
+        role: 'tool',
+        tool_name: call.name,
+        tool_call_id: call.id,
+        content: described,
+      })
       emit()
     }
 

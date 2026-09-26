@@ -4,27 +4,28 @@
  * The chat relay (M7, D-057) — the one dynamic endpoint in this project, and
  * the only code here that is not a static file.
  *
- * It relays a chat completion to an Ollama instance on the private network at
+ * It relays a chat completion to LocalAI on the private network at
  * http://llm:11434/ and streams the answer back. It is deliberately the
  * thinnest thing that can do that, for two reasons: D-006's rules bound what a
  * dynamic endpoint may be, and every line of logic here is a line that cannot
  * be unit-tested the way the rest of this project is. Normalising the stream
  * into the shape the chat loop wants happens in TypeScript (`lib/chat.ts`),
- * where it has tests; this forwards upstream's NDJSON lines unchanged.
+ * where it has tests; this forwards upstream's OpenAI-compatible SSE lines
+ * unchanged.
  *
  * What it will not do, structurally rather than by checking:
  *
  *   - **No caller-supplied model, URL, host or path.** UPSTREAM and MODEL are
  *     constants. There is one operation — chat completion — because there is
  *     one URL in this file, and nothing the caller sends is concatenated into
- *     it. Ollama's model management, pull and embeddings endpoints are not
+ *     it. LocalAI's model management, pull and embeddings endpoints are not
  *     reachable through here because nothing here can name them.
  *   - **No caller-supplied system prompt or tools.** Both are pinned from
  *     `surface.php`, generated at build time from `lib/chat.ts` and
  *     `lib/tools.ts` (`scripts/build-surface.mjs`). This is what stops the
  *     endpoint being a free general-purpose assistant: whatever is posted to
- *     it, it answers as the CVE analyst with the five read-only tools, and a
- *     caller who wants a poem gets a model trying to query a vulnerability
+ *     it, it answers as the CVE analyst with the six read-only/render-only
+ *     tools, and a caller who wants a poem gets a model trying to query a vulnerability
  *     database. A `system` message in the request is **refused**, not ignored,
  *     because silently dropping it would let a caller believe they had changed
  *     the behaviour.
@@ -51,8 +52,8 @@
 
 declare(strict_types=1);
 
-/** The private box. Not routable from the internet, and not caller-supplied. */
-const UPSTREAM = 'http://llm:11434/api/chat';
+/** The private service alias. It resolves to plex and is not caller-supplied. */
+const UPSTREAM = 'http://llm:11434/v1/chat/completions';
 
 /**
  * Server-pinned (D-057). Swapping it is operational configuration, and this
@@ -61,11 +62,15 @@ const UPSTREAM = 'http://llm:11434/api/chat';
  * `qwen3:8b` replaced `gemma4:e4b` on 2026-08-09 on measured tool-calling
  * quality, not on reputation: 6/6 against 0/6 on benchmark item #2, 6/6 against
  * 3/6 on choosing the SQL tool, identical on item #1 — at 5.2 GB against
- * 9.6 GB and the same ~1.25 s warm latency. It advertises `tools` and
- * `thinking`, which the chat loop uses. Notably `qwen3:14b` is *worse* on item
- * #2 and three times slower, so this is not "bigger is better".
+ * 9.6 GB and the same ~1.25 s warm latency on the original host. It advertises
+ * `tools` and `thinking`, which the chat loop uses. Notably `qwen3:14b` was
+ * *worse* on item #2 and three times slower, so this is not "bigger is better".
+ * A larger-model comparison on the Arc host is recorded in plan.md; this pin
+ * changed on 2026-09-26 to Tiel-Coder-35B-A3B `UD-IQ3_XXS`: 9/11 exact and
+ * 11/11 tool selection at 19.3 s median, versus the accurate but roughly
+ * five-times-slower dense 27B and 31B alternatives.
  */
-const MODEL = 'qwen3:8b';
+const MODEL = 'Tiel-Coder-35B-A3B-UD-IQ3_XXS.gguf';
 
 /** The origin this endpoint belongs to. A different one is somebody else's page. */
 const ORIGIN = 'https://cve.meenan.dev';
@@ -86,11 +91,8 @@ const MAX_TOOLS          = 12;
  *
  * 8,192 rather than more, bounded by the two limits either side of it:
  *
- *   - **Wall clock.** Decode measured 126 tok/s idle on this box, and ~82 tok/s
- *     per stream with both `OLLAMA_NUM_PARALLEL` slots busy. 8,192 is ~65 s
- *     idle and ~100 s loaded, inside `TIMEOUT_SECONDS`. 16,384 would be ~205 s
- *     loaded — past the timeout, so the tail would fail as a dropped
- *     connection rather than as a long answer.
+ *   - **Wall clock.** `TIMEOUT_SECONDS` remains the hard cost bound when a
+ *     larger model cannot exhaust this token allowance in time.
  *   - **Context.** This is added to the prompt, not carved out of it. A turn
  *     carrying an aggregate result is ~5,300 tokens and a six-round
  *     conversation more, so 8,192 leaves room inside `NUM_CTX`. Exceeding it
@@ -116,18 +118,16 @@ const MAX_PREDICT        = 8192;
 const SURFACE_FILE = __DIR__ . '/surface.php';
 
 /**
- * The context window to ask for, rather than inheriting the box's default.
+ * The context window the named LocalAI model configuration must provide.
  *
- * Measured 2026-08-08: the system prompt plus the five tool schemas is ~3,500
+ * Measured 2026-08-08: the system prompt plus its tool schemas is ~3,500
  * tokens *before the question*, and one turn carrying an aggregate result is
- * ~5,300. A six-round conversation goes well past that. Ollama's own default is
- * 4,096 unless `OLLAMA_CONTEXT_LENGTH` says otherwise — this box sets 32,768,
- * so nothing is being truncated today, and that is exactly the problem: the
- * relay would silently start dropping the oldest messages, schema and all, if
- * the box were ever rebuilt without that variable. Asking explicitly makes the
- * app say what it needs instead of depending on somebody's systemd unit.
+ * ~5,300. A six-round conversation goes well past that. LocalAI's OpenAI route
+ * does not take an Ollama-style per-request `num_ctx`, so this value is an
+ * operational invariant checked against the server-side YAML rather than a
+ * caller-controlled option.
  *
- * 32,768 is a **measured pairing with `OLLAMA_NUM_PARALLEL=2` on the box**, not
+ * 32,768 is a **measured pairing with two parallel slots on the box**, not
  * an arbitrary number, and the two have to move together: the KV cache is
  * allocated per slot, so the context this asks for is multiplied by the number
  * of slots. A cache that does not fit does not fail — it silently spills to
@@ -146,13 +146,12 @@ const SURFACE_FILE = __DIR__ . '/surface.php';
  * carrying an aggregate result ~5,300, so six rounds plus `thinking` sit well
  * inside it.
  *
- * **Raising this above 32,768 without dropping to one slot puts the model back
- * on the CPU.** The relay states the value rather than inheriting
- * `OLLAMA_CONTEXT_LENGTH` so the pairing is visible here, next to the code that
- * depends on it.
+ * **Raising this above 32,768 without re-measuring two concurrent requests can
+ * exhaust VRAM.** The relay states the requirement next to the code that
+ * depends on it even though LocalAI owns the actual allocation.
  */
 const NUM_CTX           = 32768;
-const MAX_UPSTREAM_BYTES = 8388608;  // 8 MB of NDJSON is far past any real answer
+const MAX_UPSTREAM_BYTES = 8388608;  // 8 MB of SSE is far past any real answer
 const TIMEOUT_SECONDS    = 180;
 
 /**
@@ -209,8 +208,8 @@ if (!is_array($in)) {
 //
 // Every field below is one this file chose. Anything else the caller sent —
 // `model`, `keep_alive`, `format`, a different `stream` — is not copied, so it
-// cannot reach Ollama at all. That is the difference between a relay and a
-// proxy, and it is the whole of D-057's "none of the rest of Ollama's API".
+// cannot reach LocalAI at all. That is the difference between a relay and a
+// proxy, and it is the whole of D-057's "none of the rest of the API".
 
 $messages = $in['messages'] ?? null;
 if (!is_array($messages) || $messages === [] || count($messages) > MAX_MESSAGES) {
@@ -235,10 +234,45 @@ foreach ($messages as $message) {
     // A tool round trip needs two more fields, and only in the roles that can
     // carry them: the assistant turn that asked, and the tool turn answering.
     if ($role === 'assistant' && isset($message['tool_calls']) && is_array($message['tool_calls'])) {
-        $entry['tool_calls'] = array_slice($message['tool_calls'], 0, MAX_TOOLS);
+        $calls = [];
+        foreach (array_slice($message['tool_calls'], 0, MAX_TOOLS) as $index => $call) {
+            if (!is_array($call) || !is_array($call['function'] ?? null)) {
+                continue;
+            }
+            $function = $call['function'];
+            $name = $function['name'] ?? '';
+            if (!is_string($name) || $name === '') {
+                continue;
+            }
+            $arguments = $function['arguments'] ?? new stdClass();
+            if (!is_string($arguments)) {
+                $arguments = json_encode($arguments, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+            }
+            if (!is_string($arguments)) {
+                continue;
+            }
+            $id = $call['id'] ?? "call_{$index}";
+            if (!is_string($id) || $id === '') {
+                $id = "call_{$index}";
+            }
+            $calls[] = [
+                'id' => substr($id, 0, 128),
+                'type' => 'function',
+                'function' => [
+                    'name' => substr($name, 0, 64),
+                    'arguments' => substr($arguments, 0, MAX_MESSAGE_CHARS),
+                ],
+            ];
+        }
+        if ($calls !== []) {
+            $entry['tool_calls'] = $calls;
+        }
     }
     if ($role === 'tool' && isset($message['tool_name']) && is_string($message['tool_name'])) {
-        $entry['tool_name'] = substr($message['tool_name'], 0, 64);
+        $entry['name'] = substr($message['tool_name'], 0, 64);
+    }
+    if ($role === 'tool' && isset($message['tool_call_id']) && is_string($message['tool_call_id'])) {
+        $entry['tool_call_id'] = substr($message['tool_call_id'], 0, 128);
     }
     $clean[] = $entry;
 }
@@ -270,7 +304,7 @@ $payload = [
     // Ours, always first, and not negotiable.
     'messages' => array_merge([['role' => 'system', 'content' => $system]], $clean),
     'tools'    => array_slice($surface['tools'], 0, MAX_TOOLS),
-    'options'  => ['num_predict' => MAX_PREDICT, 'num_ctx' => NUM_CTX],
+    'max_tokens' => MAX_PREDICT,
 ];
 
 // A caller-supplied `tools` is refused rather than ignored, for the same reason
@@ -284,7 +318,7 @@ if (isset($in['tools'])) {
 // the answer. A boolean the caller may set, because it changes nothing about
 // what this endpoint can reach.
 if (isset($in['think'])) {
-    $payload['think'] = (bool) $in['think'];
+    $payload['reasoning_effort'] = (bool) $in['think'] ? 'high' : 'none';
 }
 
 $encoded = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
@@ -327,7 +361,7 @@ $ch = curl_init(UPSTREAM);
 curl_setopt_array($ch, [
     CURLOPT_POST           => true,
     CURLOPT_POSTFIELDS     => $encoded,
-    CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'Accept: application/x-ndjson'],
+    CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'Accept: text/event-stream'],
     CURLOPT_RETURNTRANSFER => false,
     CURLOPT_CONNECTTIMEOUT => 5,
     CURLOPT_TIMEOUT        => TIMEOUT_SECONDS,

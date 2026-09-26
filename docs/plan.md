@@ -137,8 +137,8 @@ an M5 `always` regression that let the edge cache 404s `immutable` for a year.
 
 ### M7 — AI chat layer: tool surface, site-hosted endpoint, benchmark  `done` (2026-08-08, hardened through 2026-08-09)
 
-Five read-only tools over the local corpus (`lib/tools.ts`), a same-origin PHP
-relay to our own Ollama (`public/api/chat.php`, D-057), and a side panel that
+Five read-only data tools plus `compute` over the local corpus (`lib/tools.ts`),
+a same-origin PHP relay to our own model server (`public/api/chat.php`, D-057), and a side panel that
 renders every answer through the *same* components Report and Explore use — an
 aggregate leaves the conversation through "Open in Report", a record search
 through Explore, because those are the surfaces that render each. Chat prose is
@@ -184,11 +184,43 @@ results, never by summarising (D-080). Two scorecards are recorded rather than
 one overwriting the other: `gemma4:e4b` at 10/10 tool and 8/10 data, `qwen3:8b`
 at 9/10 and 8/10 with ten of ten in a single turn.
 
+**The 16 GB Arc migration reopened model selection on 2026-09-26.**
+`scripts/benchmark-model.mts` replays the production prompt, schemas and tool
+round trips directly against LocalAI; one headless page supplies the exact
+deployed hosted-tier Worker and deterministic ground truth, but no UI is driven
+and no LLM judges the answer. All complete runs used 1,024 output tokens and
+medium reasoning. The score grew to eleven questions, so these figures do not
+replace the historical ten-question score above:
+
+| Model / quant | Exact data | Tool choice | Median | Result |
+| --- | ---: | ---: | ---: | --- |
+| Tiel-Coder-35B-A3B `UD-IQ3_XXS` | 9/11 | 11/11 | 19.3 s | Best balance; finalist |
+| Gemma 4 31B `UD-IQ3_XXS` | 10/11 | 10/11 | 101.6 s | Best accuracy, but `compute` timed out |
+| Qwen3.8 27B `UD-IQ3_XXS` | 9/11 | 11/11 | 99.9 s | Accurate, about 5× slower than Tiel |
+| Qwen3.6 35B-A3B `UD-IQ3_XXS` | 7/11 | 8/11 | 37.3 s | Worse and slower than Tiel |
+| Ornith 1.5 9B `Q8_0` | 1/3 | 3/3 | 50.9 s | Screen only; wrong cross-tab and SQL answer |
+| Qwen3.8 27B `UD-IQ2_S` | 2/3 | 3/3 | 217.3 s | Screen only; too slow and one wrong answer |
+| Muse-Glimmer 30B `UD-IQ2_XS` | 1/3 | 2/3 | — | Screen only; one timeout |
+| Gemma 4 26B-A4B `UD-IQ3_S` | 0/3 | 0/3 | — | Coherent failure also on CPU; backend regression suspected |
+
+Tiel sustained about 32 generated tokens/s and accepted two simultaneous 32K
+slots; a concurrent probe yielded 37–38 tokens/s combined even though one
+answer ended early. Its two misses were the maximum-score SQL shape and the
+same `compute` arithmetic case Qwen3.8 missed. The separate Tiel MTP GGUF fits
+in memory but produces unrelated output both with MTP enabled and disabled in
+the current backend, while Qwen3.8's MTP context fails to construct even at one
+4K slot. Speculative decoding is therefore disabled. Prism Bonsai was not
+scored: its custom backend has no Intel SYCL path, so it would be a CPU test on
+the hardware being selected. The owner selected Tiel as the production pin on
+2026-09-26; `qwen3:8b` remains installed as the rollback model.
+
 **Left open at closure**: the decline paragraph's lexical coverage (~1/11 leak
 on an unlisted noun); `cisco-criticals`, where the benchmark wants `aggregate`
 and our own prompt says `sql`, and measurement says tightening either way
 breaks the other; and two environment changes that live outside git —
-`OLLAMA_NUM_PARALLEL=2` on the llm box and the nginx rate limit.
+two parallel inference slots on the model host and the nginx rate limit. Both
+are now installed; the model host moved to `plex`'s Arc Pro B50 and LocalAI's
+SYCL backend on 2026-09-26.
 
 ## What's next — user experience and testing  `not decomposed`
 

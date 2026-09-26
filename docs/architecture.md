@@ -682,10 +682,11 @@ transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
   and record URLs appear only through the fixed UI's existing
   never-auto-fetched treatment.
 - **Provider ladder (D-045, re-ordered by D-057):** first to ship is the
-  **site-hosted tier** — Ollama on the private `llm` box (`http://llm:11434/`,
-  hostname in hosts on dev and prod, not publicly routable), relayed through a
-  restricted same-origin endpoint: server-pinned model (`qwen3:8b` since
-  2026-08-09, chosen on the D-046 scorecard),
+  **site-hosted tier** — LocalAI on `plex`'s Arc Pro B50, addressed by the
+  private `llm` alias (`http://llm:11434/`, hostname in hosts on dev and prod,
+  not publicly routable), relayed through a
+  restricted same-origin endpoint: server-pinned model (Tiel-Coder-35B-A3B
+  `UD-IQ3_XXS` since 2026-09-26, chosen on the D-046 scorecard),
   chat completion as the only exposed operation, POST-only, body-capped, nginx
   rate- and concurrency-limited, nothing stored, no body logging. On this tier
   the question and its tool results transit this server — disclosed at first
@@ -695,6 +696,17 @@ transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
   Gemini Nano, and user-supplied keys for Gemini / OpenRouter / Anthropic /
   OpenAI, called browser-direct with keys client-side only. `cve.meenan.dev`
   proxies no third-party model traffic and bundles no key.
+- **Model-host operations:** LocalAI's Intel GPU image runs under the operator's
+  Docker credentials. Only the Arc Pro B50 render node is mapped, so the
+  integrated GPU remains available for the console. The llama.cpp backend uses
+  SYCL/Level Zero, Flash Attention, q8 KV caches and two parallel 32K slots;
+  one active backend is retained and models switch on demand. Models and YAML
+  profiles live in the operator's home directory and require no root access to
+  add or replace. The service exposes no agents, MCP, assistant, tracing or
+  metrics endpoints. A weekly user timer checks the latest upstream
+  release, preserves all mounts and GPU settings, and retains the old container
+  until the replacement passes its health check and a real production-model
+  generation; failure restores the old container.
 - **Model selection is benchmarked, not assumed (D-046).** Ground-truth analyst
   questions scored by data comparison against the real corpus, run through the
   actual integration.

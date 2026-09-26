@@ -29,9 +29,12 @@ import { awaitIdle, importCorpus, openChat, openPanel } from './ui'
  *
  * Everything below the model is the shipped path — our tool schemas, our system
  * prompt, our SQLite schema, the real relay — because a benchmark against a
- * mock integration measures the mock. What is scored is *data*: the definition
- * the model emitted and the rows it produced, against hand-written SQL run in
- * the same browser moments later (lib/benchmark.ts). No LLM judge.
+ * mock integration measures the mock. By default the deployed origin's hosted
+ * tier supplies the corpus; `BENCH_LOCAL=1` opts into the much slower browser
+ * download/catch-up path. Both tiers compile and run the same tool SQL (D-084).
+ * What is scored is *data*: the definition the model emitted and the rows it
+ * produced, against hand-written SQL run in the same browser moments later
+ * (lib/benchmark.ts). No LLM judge.
  *
  * The scorecard is the milestone's honest-expectations artifact. A failing
  * question is a *result*, not a broken test — so the run records every score
@@ -40,6 +43,7 @@ import { awaitIdle, importCorpus, openChat, openPanel } from './ui'
  */
 
 const RUN = process.env.BENCH === '1'
+const LOCAL = process.env.BENCH_LOCAL === '1'
 const OUT = 'measurements/benchmark.jsonl'
 
 /** Where the run writes its scorecard. Beside the M1–M5 measurements. */
@@ -142,8 +146,14 @@ test.describe('D-046 tool-calling benchmark', () => {
 
     await page.goto('/')
     await requireLocalStorage(page)
-    // `importCorpus` navigates again; the probe above only needs a loaded page.
-    await importCorpus(page, 900_000)
+    if (LOCAL) {
+      // `importCorpus` navigates again; the probe above only needs a loaded page.
+      await importCorpus(page, 900_000)
+    } else {
+      await expect(page.locator('main')).toHaveAttribute('data-tier', 'hosted', {
+        timeout: 60_000,
+      })
+    }
     // **And then wait for the catalog**, which the download rebuilds *after* the
     // import heading appears (`refreshKev`, workers/db.worker.ts). Without this
     // the first `page.reload()` below tore down the Worker mid-refresh, and
@@ -186,7 +196,13 @@ test.describe('D-046 tool-calling benchmark', () => {
           // calls behind them, so wait for quiet first. (The reload was
           // always inside the question's clock; against the deployed origin
           // the copy is hours old and no catch-up fires.)
-          await awaitIdle(page, 300_000)
+          if (LOCAL) {
+            await awaitIdle(page, 300_000)
+          } else {
+            await expect(page.locator('main')).toHaveAttribute('data-tier', 'hosted', {
+              timeout: 60_000,
+            })
+          }
           // The column reopens itself once the copy is ready; `openChat` waits
           // for the workspace either way, and the consent flag survives the
           // reload so the composer is what renders.

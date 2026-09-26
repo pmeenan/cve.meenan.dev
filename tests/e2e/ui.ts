@@ -220,7 +220,10 @@ export async function importCorpus(page: Page, timeout = 90_000): Promise<void> 
   // passes Playwright's actionability check and then lands on a disabled
   // button, which swallows it. Returning only once the Worker is quiet makes
   // "import finished" mean what callers assume it means.
-  await awaitIdle(page, 60_000)
+  // The same operation budget covers the post-import catch-up. A production
+  // snapshot can be several revisions behind, and rebuilding its indexes plus
+  // applying those deltas is part of the import the caller asked us to await.
+  await awaitIdle(page, timeout)
 }
 
 /**
