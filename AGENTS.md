@@ -60,8 +60,8 @@ affected docs. Until then, these govern.
   `window.cveExplorer` (D-086) — on the same terms; anything a third-party
   agent can reach, the chat model could already. The first model tier is site-hosted: our
   own LocalAI on `plex`'s Arc Pro B50, addressed by the private `llm` alias and relayed through a restricted
-  same-origin endpoint that pins the model — Tiel-Coder-35B-A3B `UD-IQ3_XXS`
-  since 2026-09-26,
+  same-origin endpoint that pins the model — Gemma 4 26B-A4B `UD-IQ4_XS` since
+  2026-09-26,
   chosen by the D-046 benchmark — stores nothing, and logs no bodies (D-057). Third-party hosted models are the user's own key — stored
   client-side, called browser-direct, never proxied; no bundled key, and no
   consumer-subscription OAuth where providers forbid it (none is sanctioned
@@ -307,15 +307,22 @@ and `qwen3:8b` (2026-08-09), **ten of ten in a single turn**. **D-046 item #1 �
 the founding question — is tool ✓ axes ✓ data ✓ in one turn, in every run.**
 Item #2, the three-way breakdown, now scores fully for the first time.
 
-**The Arc migration's 2026-09-26 comparison selected a new production pin.**
+**The Arc migration's 2026-09-26 comparison initially selected Tiel.**
 Direct replay of the production prompt, schemas and hosted
 tool runtime across eleven questions put Tiel-Coder-35B-A3B `UD-IQ3_XXS` at
 9/11 exact, 11/11 tool selection and 19.3 s median. Gemma 4 31B reached 10/11
 but took 101.6 s median; Qwen3.8 27B also reached 9/11 at 99.9 s. Tiel generated
 about 32 tokens/s and fits two 32K slots on the 16 GB B50. MTP variants are not
 usable with the current LocalAI/llama.cpp Intel backend, so speculative decode
-is disabled. Tiel-Coder-35B-A3B `UD-IQ3_XXS` is now pinned; the complete
-scorecard and backend exceptions are in plan.md.
+is disabled. The complete scorecard and backend exceptions are in plan.md.
+
+**Gemma 4 26B-A4B was requalified after its LocalAI llama.cpp batch-prompt fix
+landed later on 2026-09-26.** `UD-IQ4_XS` scored 10/11 exact and 11/11 tool
+selection at 14.4 s median; `UD-IQ3_S` also scored 10/11 and 11/11, at 33.2 s.
+The 13.6 GB IQ4 fits two 32K q8-KV slots and sustained 33.8 aggregate tokens/s
+across two full simultaneous generations. The old 0/3 result was backend
+corruption, not model quality. The owner promoted Gemma IQ4 later that day;
+Tiel remains installed for rollback.
 
 **The run before it scored 7/10, and three of those four failures were mine,
 not the model's.** Both KEV questions failed inside the *ground truth* with "no

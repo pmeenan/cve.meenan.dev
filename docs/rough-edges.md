@@ -22,6 +22,36 @@ Newest first. RE-numbers are never reused.
 
 ---
 
+## RE-040: A llama.cpp batch-prompt regression made a tool-capable Gemma model look incoherent  (2026-09-26, status: fixed-upstream)
+
+**Environment:** LocalAI 4.10.0's Intel SYCL llama.cpp backend on an Arc Pro B50,
+Gemma 4 26B-A4B `UD-IQ3_S`, and the D-046 production prompt plus six tool
+schemas. The fixed backend identifies its llama.cpp source as
+`95887577ab5fead779581a7030a83c7752ff3234`.
+
+**Repro and observation:** the original backend produced unrelated prose and
+zero tool calls on all three screening questions; forcing the same GGUF to CPU
+did not restore coherent answers, and its checksum matched Hugging Face. After
+the backend's batch prompt processing fix was installed, the identical IQ3 file
+and profile scored 2/3 exact with 3/3 tool selection in screening and 10/11
+exact with 11/11 tool selection over the full scorecard. `UD-IQ4_XS` then
+scored 10/11 and 11/11 at a 14.4-second median.
+
+**Expected:** a backend defect should fail visibly. This one returned fluent,
+unrelated text, so it looked like a model/template limitation and survived a
+CPU control intended to distinguish GPU execution bugs.
+
+**Impact:** do not disqualify a newly supported architecture from plausible but
+off-topic generations alone. Verify a current backend, record its source
+revision, and rerun a fixed prompt/tool probe before blaming the model or its
+chat template. The full production prompt is important: the failure lived in
+batch prompt processing and a toy prompt was not representative.
+
+**Links.**
+
+- [Gemma 4 26B-A4B GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF)
+- [llama.cpp prompt splitting can silently change logits](https://github.com/ggml-org/llama.cpp/issues/28211)
+
 ## RE-039: An HTML entity in a multi-line JSX text node drops the text's leading space in the compiled bundle  (2026-08-16, status: worked-around)
 
 **Environment:** Next.js 16.2 (`next build`, its bundled SWC/Turbopack),

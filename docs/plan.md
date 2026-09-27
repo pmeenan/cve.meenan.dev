@@ -194,14 +194,24 @@ replace the historical ten-question score above:
 
 | Model / quant | Exact data | Tool choice | Median | Result |
 | --- | ---: | ---: | ---: | --- |
-| Tiel-Coder-35B-A3B `UD-IQ3_XXS` | 9/11 | 11/11 | 19.3 s | Best balance; finalist |
+| Gemma 4 26B-A4B `UD-IQ4_XS` | 10/11 | 11/11 | 14.4 s | Best result; production pin |
+| Gemma 4 26B-A4B `UD-IQ3_S` | 10/11 | 11/11 | 33.2 s | Same accuracy, slower and a different miss |
+| Tiel-Coder-35B-A3B `UD-IQ3_XXS` | 9/11 | 11/11 | 19.3 s | Production pin before Gemma retest |
 | Gemma 4 31B `UD-IQ3_XXS` | 10/11 | 10/11 | 101.6 s | Best accuracy, but `compute` timed out |
 | Qwen3.8 27B `UD-IQ3_XXS` | 9/11 | 11/11 | 99.9 s | Accurate, about 5× slower than Tiel |
 | Qwen3.6 35B-A3B `UD-IQ3_XXS` | 7/11 | 8/11 | 37.3 s | Worse and slower than Tiel |
 | Ornith 1.5 9B `Q8_0` | 1/3 | 3/3 | 50.9 s | Screen only; wrong cross-tab and SQL answer |
 | Qwen3.8 27B `UD-IQ2_S` | 2/3 | 3/3 | 217.3 s | Screen only; too slow and one wrong answer |
 | Muse-Glimmer 30B `UD-IQ2_XS` | 1/3 | 2/3 | — | Screen only; one timeout |
-| Gemma 4 26B-A4B `UD-IQ3_S` | 0/3 | 0/3 | — | Coherent failure also on CPU; backend regression suspected |
+
+The first Gemma 4 26B run was invalidated later the same day: a refreshed
+LocalAI llama.cpp backend fixed batch prompt processing, changing IQ3 from 0/3
+tool calls to 10/11 exact over the full scorecard. IQ4 was both better and
+faster: its only miss was the `compute` share, while IQ3 missed the
+maximum-score SQL result. Two simultaneous IQ4 generations each produced the
+full 512 tokens in 30.3 seconds — 16.9 tokens/s each, 33.8 combined — with two
+32K q8-KV slots. The 13.6 GB model therefore fits the 16 GB card under the
+actual concurrency requirement, not just as a single-request load.
 
 Tiel sustained about 32 generated tokens/s and accepted two simultaneous 32K
 slots; a concurrent probe yielded 37–38 tokens/s combined even though one
@@ -211,8 +221,9 @@ in memory but produces unrelated output both with MTP enabled and disabled in
 the current backend, while Qwen3.8's MTP context fails to construct even at one
 4K slot. Speculative decoding is therefore disabled. Prism Bonsai was not
 scored: its custom backend has no Intel SYCL path, so it would be a CPU test on
-the hardware being selected. The owner selected Tiel as the production pin on
-2026-09-26; `qwen3:8b` remains installed as the rollback model.
+the hardware being selected. The owner initially selected Tiel, then promoted
+the corrected Gemma IQ4 result later on 2026-09-26. Tiel and `qwen3:8b` remain
+installed as rollback models.
 
 **Left open at closure**: the decline paragraph's lexical coverage (~1/11 leak
 on an unlisted noun); `cisco-criticals`, where the benchmark wants `aggregate`

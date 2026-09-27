@@ -68,9 +68,11 @@ const UPSTREAM = 'http://llm:11434/v1/chat/completions';
  * A larger-model comparison on the Arc host is recorded in plan.md; this pin
  * changed on 2026-09-26 to Tiel-Coder-35B-A3B `UD-IQ3_XXS`: 9/11 exact and
  * 11/11 tool selection at 19.3 s median, versus the accurate but roughly
- * five-times-slower dense 27B and 31B alternatives.
+ * five-times-slower dense 27B and 31B alternatives. A later fixed-backend
+ * Gemma 4 26B IQ4 retest scored 10/11 at 14.4 s after its backend fix, and the
+ * owner promoted it later on 2026-09-26. Tiel remains installed for rollback.
  */
-const MODEL = 'Tiel-Coder-35B-A3B-UD-IQ3_XXS.gguf';
+const MODEL = 'gemma4-26b-a4b-iq4xs';
 
 /** The origin this endpoint belongs to. A different one is somebody else's page. */
 const ORIGIN = 'https://cve.meenan.dev';

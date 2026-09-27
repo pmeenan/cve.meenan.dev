@@ -3092,6 +3092,12 @@ user timer checks upstream releases; the previous container is retained until
 the new one passes both its health check and a real production-model
 generation, and is restored on failure.
 
+Later the same day, a refreshed llama.cpp backend fixed Gemma 4 26B's broken
+batch prompt processing. Its `UD-IQ4_XS` retest scored 10/11 exact with 11/11
+tool selection at 14.4 seconds median and sustained two simultaneous 32K
+requests on the card. The owner then promoted IQ4 as the production pin; Tiel
+remains installed for rollback.
+
 **Reopen if.** Abuse of the public endpoint outruns the nginx limits (the
 options, in order: Cloudflare rules in front, a lightweight same-origin token,
 gating the tier); the D-046 scorecard shows the pinned model cannot drive the
