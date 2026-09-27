@@ -194,8 +194,8 @@ replace the historical ten-question score above:
 
 | Model / quant | Exact data | Tool choice | Median | Result |
 | --- | ---: | ---: | ---: | --- |
-| Gemma 4 26B-A4B `UD-IQ4_XS` | 10/11 | 11/11 | 14.4 s | Best result; production pin |
-| Gemma 4 26B-A4B `UD-IQ3_S` | 10/11 | 11/11 | 33.2 s | Same accuracy, slower and a different miss |
+| Gemma 4 26B-A4B `UD-IQ4_XS` | 10/11 | 11/11 | 14.4 s | Best isolated result; installed |
+| Gemma 4 26B-A4B `UD-IQ3_S` | 10/11 | 11/11 | 33.2 s | Production pin; shared with another project |
 | Tiel-Coder-35B-A3B `UD-IQ3_XXS` | 9/11 | 11/11 | 19.3 s | Production pin before Gemma retest |
 | Gemma 4 31B `UD-IQ3_XXS` | 10/11 | 10/11 | 101.6 s | Best accuracy, but `compute` timed out |
 | Qwen3.8 27B `UD-IQ3_XXS` | 9/11 | 11/11 | 99.9 s | Accurate, about 5× slower than Tiel |
@@ -222,8 +222,10 @@ the current backend, while Qwen3.8's MTP context fails to construct even at one
 4K slot. Speculative decoding is therefore disabled. Prism Bonsai was not
 scored: its custom backend has no Intel SYCL path, so it would be a CPU test on
 the hardware being selected. The owner initially selected Tiel, then promoted
-the corrected Gemma IQ4 result later on 2026-09-26. Tiel and `qwen3:8b` remain
-installed as rollback models.
+Gemma later on 2026-09-26. Production uses IQ3 rather than the faster IQ4
+because another project shares that quant on this one-active-backend host;
+avoiding reloads is worth more than its isolated latency difference. IQ4, Tiel
+and `qwen3:8b` remain installed.
 
 **Left open at closure**: the decline paragraph's lexical coverage (~1/11 leak
 on an unlisted noun); `cisco-criticals`, where the benchmark wants `aggregate`

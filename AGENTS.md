@@ -60,7 +60,7 @@ affected docs. Until then, these govern.
   `window.cveExplorer` (D-086) — on the same terms; anything a third-party
   agent can reach, the chat model could already. The first model tier is site-hosted: our
   own LocalAI on `plex`'s Arc Pro B50, addressed by the private `llm` alias and relayed through a restricted
-  same-origin endpoint that pins the model — Gemma 4 26B-A4B `UD-IQ4_XS` since
+  same-origin endpoint that pins the model — Gemma 4 26B-A4B `UD-IQ3_S` since
   2026-09-26,
   chosen by the D-046 benchmark — stores nothing, and logs no bodies (D-057). Third-party hosted models are the user's own key — stored
   client-side, called browser-direct, never proxied; no bundled key, and no
@@ -321,8 +321,9 @@ landed later on 2026-09-26.** `UD-IQ4_XS` scored 10/11 exact and 11/11 tool
 selection at 14.4 s median; `UD-IQ3_S` also scored 10/11 and 11/11, at 33.2 s.
 The 13.6 GB IQ4 fits two 32K q8-KV slots and sustained 33.8 aggregate tokens/s
 across two full simultaneous generations. The old 0/3 result was backend
-corruption, not model quality. The owner promoted Gemma IQ4 later that day;
-Tiel remains installed for rollback.
+corruption, not model quality. The owner promoted Gemma, selecting IQ3 because
+another project on the same one-backend host uses that quant and sharing it
+avoids model swaps. IQ4 and Tiel remain installed.
 
 **The run before it scored 7/10, and three of those four failures were mine,
 not the model's.** Both KEV questions failed inside the *ground truth* with "no

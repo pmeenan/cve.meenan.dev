@@ -686,7 +686,8 @@ transport and the orchestration), `app/chat.tsx` (a side panel, not a tab), and
   private `llm` alias (`http://llm:11434/`, hostname in hosts on dev and prod,
   not publicly routable), relayed through a
   restricted same-origin endpoint: server-pinned model (Gemma 4 26B-A4B
-  `UD-IQ4_XS` since 2026-09-26, chosen on the D-046 scorecard),
+  `UD-IQ3_S` since 2026-09-26, chosen from the D-046 scorecard to share one
+  loaded backend with another project),
   chat completion as the only exposed operation, POST-only, body-capped, nginx
   rate- and concurrency-limited, nothing stored, no body logging. On this tier
   the question and its tool results transit this server — disclosed at first

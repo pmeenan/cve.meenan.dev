@@ -70,9 +70,11 @@ const UPSTREAM = 'http://llm:11434/v1/chat/completions';
  * 11/11 tool selection at 19.3 s median, versus the accurate but roughly
  * five-times-slower dense 27B and 31B alternatives. A later fixed-backend
  * Gemma 4 26B IQ4 retest scored 10/11 at 14.4 s after its backend fix, and the
- * owner promoted it later on 2026-09-26. Tiel remains installed for rollback.
+ * owner promoted it later on 2026-09-26, then selected IQ3 for production so a
+ * second project using the same quant does not force needless backend swaps.
+ * IQ4 and Tiel remain installed for rollback or dedicated use.
  */
-const MODEL = 'gemma4-26b-a4b-iq4xs';
+const MODEL = 'gemma4-26b-a4b-iq3s';
 
 /** The origin this endpoint belongs to. A different one is somebody else's page. */
 const ORIGIN = 'https://cve.meenan.dev';
